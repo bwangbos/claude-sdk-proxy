@@ -30,7 +30,7 @@ These constraints mean the following three properties cannot all be offered simu
 
 1. Claude subscription authentication through the official Agent SDK.
 2. Completely stateless, unmodified Messages/Chat Completions semantics.
-3. Faithful multi-turn history, tool, and inference-control behavior.
+3. Faithful multi-turn history and tool behavior for the inference controls the backend actually supports.
 
 This design preserves properties 1 and 3 for linear live sessions and provides a constrained form of property 2 for one-shot requests.
 
@@ -52,11 +52,11 @@ Phase 0 rechecks this policy against current primary documentation. A policy cha
 
 ### 2.2 Trust model and sandbox decision
 
-The release path is a **trusted-local integration**, not a security boundary against other processes running as the same operating-system user. The user, the proxy process, the official Agent SDK/Claude CLI subprocess, and other same-UID local processes are inside the v1 trust boundary. Loopback authentication prevents accidental or cross-user use where the operating system provides meaningful user separation; it does not claim to defeat a malicious process that can inspect, signal, debug, or replace files owned by the same user.
+The release path is a **trusted-local integration**, not a security boundary against other processes running as the same operating-system user. The user, the proxy process, the official Agent SDK/Claude CLI subprocess, and other same-UID local processes are inside the v1 trust boundary. Loopback binding excludes remote network interfaces; it does not authenticate an operating-system user. The local bearer token authenticates HTTP callers. Neither control claims to defeat a malicious process that can inspect, signal, debug, or replace files owned by the same user.
 
 "Prompt isolation" in this specification means minimizing observable ambient Claude Code configuration, tools, persistence, and proxy-added text through documented SDK controls and live canaries. It does not mean cryptographic isolation, a sealed worker, a native trust root, or hostile-local-process containment. Native launcher hardening, macOS Seatbelt/launchd containment, signed evidence ledgers, immutable Python-runtime closure proofs, and credential handoff attestation are explicitly outside the release critical path. That research may continue on an experimental branch, but it cannot block the HTTP proxy and cannot upgrade any production capability claim without a separate approved design.
 
-The trusted-local release still applies practical defense in depth: loopback-only binding, an optional local bearer key, an exact environment allowlist, an empty temporary working directory, disabled ambient Claude Code features, redacted diagnostics, bounded subprocess cleanup, and fail-closed version/capability checks. These controls reduce accidental leakage and semantic drift; they are not advertised as a sandbox.
+The trusted-local release still applies practical defense in depth: loopback-only binding, a generated or explicitly configured local bearer key by default, an exact environment allowlist, an empty temporary working directory, disabled ambient Claude Code features, redacted diagnostics, bounded subprocess cleanup, and fail-closed version/capability checks. These controls reduce accidental leakage and semantic drift; they are not advertised as a sandbox.
 
 ## 3. Goals
 
@@ -112,11 +112,11 @@ GET  /_proxy/capabilities
 - Default bind address: `127.0.0.1`.
 - Port and loopback host may be overridden explicitly.
 - Non-loopback binding is refused in v1. A later version may allow it only behind authenticated TLS termination and an explicit unsafe opt-in.
-- `LOCAL_PROXY_API_KEY` remains optional for loopback-only use.
+- Authentication is enabled by default. `LOCAL_PROXY_API_KEY` supplies the master bearer key; when absent, the server generates one and stores it in a mode-`0600` per-process runtime file that is removed at shutdown, printing only that file's path. `--no-auth` is an explicit unsafe opt-in.
 - `x-api-key` and `Authorization: Bearer` are accepted as local proxy credentials; they are never forwarded to the SDK.
 - Logs always redact authorization, API keys, SDK credentials, cookies, and credential-looking environment values.
 - The server accepts only expected loopback `Host` values, requires `Content-Type: application/json` for mutations, emits no permissive CORS headers, and rejects browser `Origin` headers unless explicitly allowlisted.
-- With authentication disabled, any local process can consume the user's subscription through the proxy. Startup prints that warning; authentication is strongly recommended on shared or partially trusted machines.
+- With authentication disabled, any local user or process able to connect is authorized to consume the user's subscription through the proxy. Startup prints that warning.
 
 ### 5.2 Harness-neutral session extension
 
@@ -311,6 +311,8 @@ Additional isolation:
 
 The controls below are behavioral and operational isolation inside the trusted-local model defined in section 2.2. They must not be described as hostile-process containment or credential sealing.
 
+The Agent SDK/CLI child environment is constructed deny-by-default. The only inherited names are `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, and an optional existing-login location in `CLAUDE_CONFIG_DIR`. `PATH` is constructed from the verified Claude CLI directory plus fixed system directories rather than inherited. `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and their lowercase equivalents are passed only when the user enables the documented network-proxy option. Proxy-owned isolation variables listed below are set to fixed values rather than inherited. `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, provider credential overrides, proxy bearer/master keys, and every unrecognized `ANTHROPIC_*`, `CLAUDE_*`, and `LOCAL_PROXY_*` name are stripped or cause a startup error when their presence makes authentication provenance ambiguous. Additional pass-through names require explicit configuration and appear, by name only, in diagnostics.
+
 - Use an empty, proxy-owned temporary working directory rather than the repository or user's home directory.
 - Set `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` so Python SDK sessions do not write prompt history or transcripts under `~/.claude/projects/`.
 - Set `CLAUDE_CODE_ATTRIBUTION_HEADER=0` so the CLI does not prepend its client-version and prompt-fingerprint attribution block to the system prompt.
@@ -327,7 +329,7 @@ The controls below are behavioral and operational isolation inside the trusted-l
 - Never prepend, append, summarize, or annotate the caller's system prompt or messages.
 - Do not use `--bare`, because it also disables the subscription credential path.
 
-The default Claude configuration directory must remain available to the official CLI for its existing login, so isolation cannot rely on replacing it with an empty directory. The environment controls, `setting_sources=[]`, temporary working directory, startup inspection, and live canaries must jointly prove that no non-authentication state is loaded or written. If the pinned SDK/CLI ignores `CLAUDE_CODE_SKIP_PROMPT_HISTORY`, prompt-purity validation fails and the project stops.
+The default Claude configuration directory, or an explicitly selected existing `CLAUDE_CONFIG_DIR`, must remain available to the official CLI for its existing login, so isolation cannot rely on replacing it with an empty directory. A clean synthetic config-root experiment may remain diagnostic research, but inability to authenticate there is never a release gate. The environment controls, `setting_sources=[]`, temporary working directory, startup inspection, and live canaries must produce no observable ambient capability use or prohibited prompt/tool/response persistence. Unrelated authentication and runtime bookkeeping is classified separately by path and metadata without reading credential contents. If the pinned SDK/CLI ignores `CLAUDE_CODE_SKIP_PROMPT_HISTORY` and persists prohibited content, prompt-purity validation fails and the project stops.
 
 The proxy can minimize ambient Claude Code behavior but cannot prove that the Agent SDK runtime is byte-for-byte equivalent to the raw Messages API. Managed policy and server-side behavior outside the SDK's controls may still exist. The product language and diagnostics must say **prompt-isolated Agent SDK**, not **raw Anthropic prompt**.
 
@@ -505,8 +507,9 @@ The proxy remains one server process, but the SDK may own one Claude subprocess 
 - Use a separate, longer but bounded TTL for pending tool results.
 - Reject new sessions at capacity instead of evicting an active session.
 - Close SDK clients and temporary working directories deterministically.
+- Bound graceful close, process termination, and forced-kill intervals separately. Construction rollback, normal close, request failure, expiry, explicit deletion, capacity rejection, and server shutdown must leave no owned CLI process or temporary workdir after the configured deadline.
 - On shutdown, stop accepting work, give active non-tool streams a short grace period, then cancel and mark unfinished sessions lost.
-- The proxy persists no transcripts, tokens, prompts, or responses to disk. The pinned Python SDK/CLI is launched with transcript/history persistence disabled and that behavior is verified by filesystem canaries after every upgrade.
+- The proxy persists no transcripts, tokens, prompts, tool payloads, or responses to disk. The pinned Python SDK/CLI is launched with transcript/history persistence disabled; canaries search supported Claude-state locations and proxy workdirs for unique prohibited content and leaked temporary artifacts after every upgrade. Authentication/runtime metadata changes are reported separately and never inspected for credential contents.
 
 ## 13. Configuration and models
 
@@ -514,16 +517,19 @@ Configuration is environment- or small-file-based and contains:
 
 - An exact supported Claude Agent SDK version and exact bundled/installed Claude CLI version.
 - Listen host and port.
-- Optional local master API key.
+- Generated or explicitly configured local master API key, unless the explicit `--no-auth` mode is selected.
 - Configured public model names and their SDK model mappings.
 - Default strict/compatibility parameter policy.
 - Session, concurrency, size, and timeout limits.
 - Debug logging toggle.
 - Tool capability toggle, which cannot be enabled unless the SDK-version gate is recorded as passing.
+- Backend kind and authentication source. V1 accepts only `backend_kind=agent_sdk_subscription` and `auth_source=existing_claude_login`.
 
 Startup fails closed when the actual SDK or CLI version differs from the validated pair. Upgrades are intentional changes that rerun prompt-purity, session, streaming, persistence, and tool gates before the supported pair is updated.
 
 `GET /v1/models` returns only the configured public model list. It does not scrape undocumented endpoints or claim capabilities absent from `/_proxy/capabilities`.
+
+`/_proxy/capabilities`, startup diagnostics, and validation manifests expose `backend_kind`, `auth_source`, and `semantic_class=prompt_isolated_agent_sdk`. A future `platform_api_key` backend would use `semantic_class=raw_messages_api`, but it is not implemented by v1 and requires a separate approved design. Startup fails when inherited credential overrides make the selected backend's authentication provenance ambiguous.
 
 ## 14. Diagnostics and observability
 
@@ -541,7 +547,7 @@ Startup fails closed when the actual SDK or CLI version differs from the validat
 
 By default, message bodies and tool results are not logged. A separate explicit `PROXY_DEBUG_CONTENT=1` enables local content logging with a startup warning. OAuth material, authorization headers, API keys, cookies, and credential environment variables are redacted regardless of content logging.
 
-No telemetry leaves the machine.
+The proxy adds no telemetry sink or outbound diagnostics. Network behavior of the official SDK and Anthropic service remains governed by the pinned runtime and its documented controls.
 
 ## 15. Validation strategy
 
@@ -604,7 +610,7 @@ Record behavior differences without treating nondeterministic text equality as a
 - Per-session and total memory.
 - Streaming queue overhead.
 
-The proxy should be observably closer to raw Messages behavior than normal Claude Code in prompt contents and exposed tools, while acknowledging that the transport remains Claude Code/Agent SDK.
+The proxy should be observably closer to raw Messages behavior than normal Claude Code in prompt contents and exposed tools, while acknowledging that the transport remains Claude Code/Agent SDK. Compatibility claims are published per mode and parameter profile. At least one representative full-history agentic harness must pass black-box one-shot, linear-session, streaming, retry, and cancellation tests before the corresponding preset is advertised. The API key supplied to a harness in automatic mode is a derived per-run routing token, never the stable master key. Tool compatibility remains unadvertised until the Phase 3 gate passes.
 
 ## 16. Minimal internal structure
 
@@ -635,6 +641,7 @@ Use a small async HTTP framework and the official Agent SDK. Avoid a database, t
 - Pin and record one exact Python Agent SDK and Claude CLI pair.
 - Prove prompt isolation against the installed SDK/CLI version.
 - Prove compaction is disabled and no transcript/prompt state is written to disk.
+- Prove the effective child environment is allowlisted and authentication provenance is `existing_claude_login`; a synthetic clean config root is optional research, not a core gate.
 - Prove long-lived linear sessions across completed responses.
 - Execute the complete external-tool capability gate.
 - Capture real streaming event traces needed by both dialect adapters.
@@ -656,9 +663,12 @@ A failed policy, prompt-isolation, persistence, or core-session spike stops the 
 - Per-run token launcher with common environment-variable presets.
 - Protocol conformance and failure-mode documentation.
 
-### Phase 3: gated tools and multimodal content
+### Phase 3: gated external tools
 
 - Enable tools only if every required correlation/lifecycle test passes.
+
+### Phase 4: gated multimodal content and diagnostics
+
 - Add images, documents, and richer tool results one content type at a time after conformance tests.
 
 ## 18. Rejected alternatives
@@ -699,7 +709,7 @@ Rejected because it also disables the intended subscription credential path.
 - Disabling compaction preserves prompt purity but makes sufficiently long sessions terminate instead of automatically reclaiming context.
 - Prompt isolation is bounded by public Agent SDK controls and testable observations, not a guarantee about Anthropic's server internals.
 - A malicious or compromised same-UID local process is outside the v1 threat model; the proxy does not provide a credential sandbox against it.
-- The abandoned sealed-worker feasibility branch is research-only and is not a prerequisite for, or part of, the trusted-local release artifact.
+- The separate sealed-worker feasibility branch is research-only and is not a prerequisite for, or part of, the trusted-local release artifact.
 - Tool support may be excluded if callback correlation cannot be proven.
 
 ## 20. Research references
