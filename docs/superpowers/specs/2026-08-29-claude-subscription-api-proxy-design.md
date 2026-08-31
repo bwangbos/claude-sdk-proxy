@@ -1,7 +1,7 @@
 # Claude Subscription API Proxy — Design Specification
 
-**Status:** Draft for review  
-**Date:** 2026-08-29  
+**Status:** Trusted-local pivot amendment for review
+**Date:** 2026-08-31
 **Scope:** Personal, local-only proxy using Anthropic's official Claude Agent SDK
 
 ## 1. Decision summary
@@ -50,12 +50,20 @@ This proxy therefore has a narrow policy scope:
 
 Phase 0 rechecks this policy against current primary documentation. A policy change that disallows the personal workflow stops the subscription backend rather than triggering an authentication workaround.
 
+### 2.2 Trust model and sandbox decision
+
+The release path is a **trusted-local integration**, not a security boundary against other processes running as the same operating-system user. The user, the proxy process, the official Agent SDK/Claude CLI subprocess, and other same-UID local processes are inside the v1 trust boundary. Loopback authentication prevents accidental or cross-user use where the operating system provides meaningful user separation; it does not claim to defeat a malicious process that can inspect, signal, debug, or replace files owned by the same user.
+
+"Prompt isolation" in this specification means minimizing observable ambient Claude Code configuration, tools, persistence, and proxy-added text through documented SDK controls and live canaries. It does not mean cryptographic isolation, a sealed worker, a native trust root, or hostile-local-process containment. Native launcher hardening, macOS Seatbelt/launchd containment, signed evidence ledgers, immutable Python-runtime closure proofs, and credential handoff attestation are explicitly outside the release critical path. That research may continue on an experimental branch, but it cannot block the HTTP proxy and cannot upgrade any production capability claim without a separate approved design.
+
+The trusted-local release still applies practical defense in depth: loopback-only binding, an optional local bearer key, an exact environment allowlist, an empty temporary working directory, disabled ambient Claude Code features, redacted diagnostics, bounded subprocess cleanup, and fail-closed version/capability checks. These controls reduce accidental leakage and semantic drift; they are not advertised as a sandbox.
+
 ## 3. Goals
 
 In priority order:
 
 1. Use only the official Agent SDK transport and its existing-login behavior, subject to the policy gate in section 2.1.
-2. Inject no proxy prompt and suppress as much ambient Claude Code behavior as the public SDK permits.
+2. Inject no proxy prompt and suppress as much ambient Claude Code behavior as the public SDK permits, without treating same-UID process isolation as a release gate.
 3. Preserve native message and tool semantics without serializing prior assistant history into text.
 4. Work automatically with typical single-conversation CLI harnesses through base-URL and API-key configuration alone.
 5. Offer an explicit, harness-neutral session extension for safe multiplexing and concurrency.
@@ -300,6 +308,8 @@ ClaudeAgentOptions(
 ```
 
 Additional isolation:
+
+The controls below are behavioral and operational isolation inside the trusted-local model defined in section 2.2. They must not be described as hostile-process containment or credential sealing.
 
 - Use an empty, proxy-owned temporary working directory rather than the repository or user's home directory.
 - Set `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1` so Python SDK sessions do not write prompt history or transcripts under `~/.claude/projects/`.
@@ -628,6 +638,7 @@ Use a small async HTTP framework and the official Agent SDK. Avoid a database, t
 - Prove long-lived linear sessions across completed responses.
 - Execute the complete external-tool capability gate.
 - Capture real streaming event traces needed by both dialect adapters.
+- Record observable failures honestly, but do not require a native sandbox, sealed runtime, signed evidence ledger, or hostile same-UID containment before Phase 1.
 
 A failed policy, prompt-isolation, persistence, or core-session spike stops the project. A failed tool spike removes tool support from v1 but does not block text-only sessions.
 
@@ -687,6 +698,8 @@ Rejected because it also disables the intended subscription credential path.
 - Unsupported inference parameters prevent exact vLLM/SGLang equivalence.
 - Disabling compaction preserves prompt purity but makes sufficiently long sessions terminate instead of automatically reclaiming context.
 - Prompt isolation is bounded by public Agent SDK controls and testable observations, not a guarantee about Anthropic's server internals.
+- A malicious or compromised same-UID local process is outside the v1 threat model; the proxy does not provide a credential sandbox against it.
+- The abandoned sealed-worker feasibility branch is research-only and is not a prerequisite for, or part of, the trusted-local release artifact.
 - Tool support may be excluded if callback correlation cannot be proven.
 
 ## 20. Research references
