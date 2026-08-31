@@ -119,6 +119,16 @@ GET  /_proxy/capabilities
 - With authentication disabled, any local user or process able to connect is authorized to consume the user's subscription through the proxy. Startup prints that warning.
 - `/health` is the only anonymous endpoint and returns no model, backend, session, or capability detail. Every model, capability, inference, session, and run endpoint requires the bearer token unless `--no-auth` is explicitly selected.
 
+Authorization is credential-class-specific:
+
+| Credential | Allowed endpoints |
+|---|---|
+| Master bearer key | All public and `/_proxy/*` endpoints. Required to create explicit sessions or runs. |
+| Derived run token | Public inference endpoints, `/v1/models`, `/_proxy/capabilities`, and deletion of its own run only. It cannot create sessions, create another run, inspect another run, or use explicit-session headers. |
+| No credential | `/health` only, unless the server was started with `--no-auth`. |
+
+The server mints and signs every derived run token; the launcher only requests, receives, conveys, and revokes it.
+
 ### 5.2 Harness-neutral session extension
 
 Explicit mode uses these request headers:
@@ -137,6 +147,8 @@ X-Claude-Proxy-Head: head_<next-opaque>
 ```
 
 The head value is a compare-and-swap token, not a transcript offset. The server accepts exactly one current head for mutation. Reusing the same idempotency key with the same request returns the cached prior response. Reusing it with different content returns `409 idempotency_conflict`.
+
+Committed idempotency records are never evicted while their session is live. Each session has a configured maximum committed-segment count; when the next operation would exceed it, the proxy returns `409 idempotency_capacity` before reserving a head or touching the SDK. The client must start a new session or run token. This finite session limit keeps the response cache bounded while preserving exact replay for every committed segment. Tombstone expiry deletes all remaining idempotency material.
 
 Session IDs and heads are opaque, random, and contain no Claude credential or SDK session value.
 
@@ -174,7 +186,7 @@ The initial head represents an empty native conversation with fixed configuratio
 
 `claude-proxy run -- <harness command>` generates a per-run proxy token and supplies the harness's ordinary base-URL and API-key environment variables. No harness source modification is required.
 
-Against a separately running server, the launcher first calls `POST /_proxy/runs` with a dialect, parameter policy, and TTL. The server returns a `run_id`, an opaque short-lived API-key value, and its expiry. When a local master key is enabled, this control request requires it and the child receives only the derived token. The first valid public request made with that token binds its model, system prompt, tool definitions, and thinking configuration; subsequent changes are rejected. `DELETE /_proxy/runs/{run_id}` revokes the token and closes its session.
+Against a separately running server, the launcher first calls `POST /_proxy/runs` with a dialect, parameter policy, and TTL. The server mints and returns a `run_id`, an opaque short-lived API-key value, and its expiry. When local authentication is enabled, this control request requires the master key and the child receives only the derived token. The first valid public request made with that token binds its model, system prompt, tool definitions, and thinking configuration; subsequent changes are rejected. `DELETE /_proxy/runs/{run_id}` revokes the token and closes its session.
 
 For a separately running server with a generated master key, `claude-proxy run` requires `--api-key-file <path>` or `LOCAL_PROXY_API_KEY_FILE`; it validates file ownership, regular-file type, exact mode, and runtime path before reading. There is no global implicit key-file search. A launcher that starts its own server transfers the master key in memory and never exposes it to the harness. On orderly shutdown the server removes its key file and runtime directory. On startup, it removes only current-UID-owned stale per-process directories whose recorded server PID is confirmed absent; a stale key is never reused.
 
@@ -404,8 +416,9 @@ Head and idempotency rules:
 - A tool-result request is the only new operation accepted in `WAITING_FOR_TOOLS`. It must use `hN+1`, must carry a new idempotency key in explicit mode, and reserves `hN+2` before resolving callbacks.
 - A continuation may commit another fully established tool-use boundary and return to `WAITING_FOR_TOOLS`, or commit a final answer and return to `IDLE` only after a successful internal SDK `ResultMessage` and iterator completion.
 - An exact retry of any committed public segment returns that segment and its active head without touching the SDK.
+- If the configured committed-segment limit is reached, every new operation fails with `409 idempotency_capacity` before SDK mutation; existing exact retries continue to work.
 
-Entering `LOST` or `CLOSED` immediately starts bounded resource teardown. After the teardown deadline, the state retains only opaque ID, machine-readable reason, and expiry; it owns no SDK client, CLI process, workdir, transcript, or response content. A lost tombstone returns `409 session_lost` until its metadata TTL expires; a closed tombstone returns `410 session_closed`. Metadata expiry changes `LOST` to `CLOSED` or removes `CLOSED` without performing deferred process cleanup. If a pending-tool timeout fires while no HTTP request is outstanding, the actor closes with reason `tool_result_timeout`. The next request receives `410 session_closed` with that cause. If deletion or shutdown wins a race with generation, the actor cancels and closes; it never returns to `IDLE`.
+Entering `LOST` or `CLOSED` immediately erases transcript, response, prompt, tool, SDK-client, and idempotency content and starts bounded resource teardown. The reason-only session tombstone retains only opaque ID, machine-readable reason, and expiry. A separate content-free cleanup registry may retain the minimum tracked process identities, workdir path, attempt state, and last cleanup error until absence/removal is confirmed. A lost tombstone returns `409 session_lost` until its metadata TTL expires; a closed tombstone returns `410 session_closed`. Tombstone expiry is independent of cleanup-registry retry and never discards unconfirmed cleanup authority. If a pending-tool timeout fires while no HTTP request is outstanding, the actor closes with reason `tool_result_timeout`. The next request receives `410 session_closed` with that cause. If deletion or shutdown wins a race with generation, the actor cancels and closes; it never returns to `IDLE`.
 
 Automatic mode applies the same transitions internally but does not require the harness to see head values.
 
@@ -496,13 +509,14 @@ Proxy errors use stable machine-readable codes and the closest public dialect en
 | `409` | `session_ambiguous` | Automatic token cannot identify a unique valid continuation. |
 | `409` | `session_lost` | Live SDK state cannot be proven consistent. |
 | `409` | `idempotency_conflict` | Idempotency key was reused with different content. |
-| `410` | `session_expired` | Session was evicted or explicitly closed. |
+| `409` | `idempotency_capacity` | The live session retained its maximum committed segments; start a new session or run. |
+| `410` | `session_expired` | Session or run TTL elapsed. |
 | `422` | `history_unavailable` | Request contains history that cannot be seeded or validated. |
 | `422` | `context_exhausted` | The non-compacting native session has reached its usable context limit. |
 | `429` | `session_capacity` | Configured live-session/process limit was reached. |
 | `502` | `sdk_protocol_error` | Agent SDK produced an invalid or untranslatable event. |
 | `503` | `sdk_unavailable` | Claude login, CLI, or SDK transport is unavailable. |
-| `410` | `session_closed` | Session closed; the response cause may be `tool_result_timeout`, deletion, expiry, or shutdown. |
+| `410` | `session_closed` | Session closed; the response cause may be `tool_result_timeout`, deletion, or shutdown. |
 
 Errors never trigger transcript flattening, hidden retries, or automatic session replacement.
 
@@ -515,8 +529,8 @@ The proxy remains one server process, but the SDK may own one Claude subprocess 
 - Use a separate, longer but bounded TTL for pending tool results.
 - Reject new sessions at capacity instead of evicting an active session.
 - Close SDK clients and temporary working directories deterministically.
-- Bound graceful close, process termination, and forced-kill intervals separately. Construction rollback, normal close, request failure, expiry, explicit deletion, capacity rejection, and server shutdown must leave no owned CLI process or temporary workdir after the configured deadline.
-- Define ownership as the SDK client plus every process the pinned transport creates for that session. Teardown performs graceful SDK close, bounded terminate, bounded forced kill, reap confirmation, and workdir-removal retries under one total deadline. Failure to confirm absence is recorded as `cleanup_unconfirmed`, keeps the server unhealthy for new work, and never delays tombstone content deletion.
+- Bound graceful close, process termination, and forced-kill intervals separately. Construction rollback, normal close, request failure, expiry, explicit deletion, capacity rejection, and server shutdown must all run the same teardown state machine.
+- Define ownership as the SDK client plus every process the pinned transport can positively track for that session. Teardown performs graceful SDK close, bounded terminate, bounded forced kill, reap confirmation, and workdir-removal retries under one foreground deadline. Success means confirmed absence of every tracked process and removal of the workdir. Failure records `cleanup_unconfirmed`, moves minimal identities into the cleanup registry, rejects new work through unhealthy status, and continues bounded periodic retries or requires explicit operator resolution. Prompt/session content is erased regardless of cleanup outcome.
 - On shutdown, stop accepting work, give active non-tool streams a short grace period, then cancel and mark unfinished sessions lost.
 - Except for the generated local master-key runtime file explicitly defined in section 5.1, the proxy persists no subscription credentials, run tokens, transcripts, prompts, tool payloads, or responses to disk. The pinned Python SDK/CLI is launched with transcript/history persistence disabled. A versioned path policy classifies known credential paths as metadata/event-only and known noncredential state/workdirs as safe for content canaries. The whole relevant Claude root receives path/size/mtime event snapshots; only explicitly safe paths and newly created artifacts classified as noncredential are scanned for unique benign canaries. Unknown new paths fail the gate pending classification rather than being opened. The core probe uses the actual existing-login path without modifying credential files; synthetic-root evidence is supplemental.
 
@@ -546,15 +560,15 @@ Startup fails closed when the actual SDK or CLI version differs from the validat
 
 - Request ID, session ID hash, and head transition.
 - Incoming dialect and redacted request shape.
-- Canonical normalized request.
-- Exact SDK option values after redaction.
-- Exact new SDK input blocks, never reconstructed prior history.
+- Canonical field presence, block types, sizes, and keyed fingerprints; no caller content.
+- SDK option field presence and exact proxy-owned isolation values; caller prompt fields are fingerprinted.
+- New SDK input block types, sizes, and keyed fingerprints, never content or reconstructed prior history.
 - SDK event types and public translated event types.
 - Ignored-parameter warnings.
 - Queue, subprocess, and latency measurements.
 - Session creation, expiry, poisoning, and closure.
 
-By default, message bodies and tool results are not logged. A separate explicit `PROXY_DEBUG_CONTENT=1` enables local content logging with a startup warning. OAuth material, authorization headers, API keys, cookies, and credential environment variables are redacted regardless of content logging.
+By default, message bodies and tool results are not logged. A separate explicit `PROXY_DEBUG_CONTENT=1` enables exact canonical request and SDK input content logging with a startup warning. OAuth material, authorization headers, API keys, cookies, and credential environment variables are redacted regardless of content logging.
 
 The proxy adds no telemetry sink or outbound diagnostics. Network behavior of the official SDK and Anthropic service remains governed by the pinned runtime and its documented controls.
 
@@ -602,7 +616,7 @@ Opt-in tests requiring an existing official Claude login cover:
 - The complete cleanup matrix: partial construction, protocol/request failure, bounded-buffer overflow, expiry, deletion, capacity rollback, tool timeout, launcher cancellation, and shutdown, including stubborn-child terminate/kill escalation and confirmed reap.
 - All tool capability-gate cases.
 - Model selection and supported thinking/effort options.
-- Debug traces showing no credential access by proxy code.
+- Debug traces showing no credential-content reads or credential mutation by proxy code; metadata-only path observations remain permitted.
 - Exact pinned SDK/CLI startup checks and a negative test for version mismatch.
 
 ### 15.4 Comparative behavior and benchmarks
