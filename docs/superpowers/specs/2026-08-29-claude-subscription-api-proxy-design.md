@@ -184,7 +184,7 @@ The initial head represents an empty native conversation with fixed configuratio
 
 ### 5.3 Automatic linear-session mode
 
-`claude-proxy run -- <harness command>` generates a per-run proxy token and supplies the harness's ordinary base-URL and API-key environment variables. No harness source modification is required.
+`claude-proxy run -- <harness command>` requests a server-minted per-run proxy token and supplies the harness's ordinary base-URL and API-key environment variables. No harness source modification is required.
 
 Against a separately running server, the launcher first calls `POST /_proxy/runs` with a dialect, parameter policy, and TTL. The server mints and returns a `run_id`, an opaque short-lived API-key value, and its expiry. When local authentication is enabled, this control request requires the master key and the child receives only the derived token. The first valid public request made with that token binds its model, system prompt, tool definitions, and thinking configuration; subsequent changes are rejected. `DELETE /_proxy/runs/{run_id}` revokes the token and closes its session.
 
@@ -200,7 +200,7 @@ Each generated token owns at most one current live conversation:
 
 The zero-source-change claim is limited to harnesses that honor an injected base URL and API key and run exactly one logical conversation per generated token. A process that multiplexes conversations needs explicit mode or an existing request hook that supplies its headers.
 
-When local authentication is disabled, a generated random API-key value is used only as a routing namespace. When authentication is enabled, the launcher mints a short-lived signed derived token so it can authenticate without exposing the configured master key to the child harness. Derived run tokens and signing state remain in memory only. The generated master-key runtime file described above is the sole permitted proxy credential write; it is never confused with a Claude subscription credential.
+When local authentication is disabled, the server mints a random API-key value used only as a routing namespace. When authentication is enabled, the server mints and signs a short-lived derived token so the launcher can convey authentication without exposing the configured master key to the child harness. All generation, signing, run binding, expiry, digest storage, and revocation state is server-side. Derived run tokens and signing state remain in memory only. The generated master-key runtime file described above is the sole permitted proxy credential write; it is never confused with a Claude subscription credential.
 
 Requests with neither explicit session headers nor a distinct routing token use one-shot mode.
 
@@ -403,7 +403,7 @@ WAITING_FOR_TOOLS
   -> CLOSED               tool timeout, deletion, expiry, or shutdown
 
 LOST
-  -> CLOSED               reason-only tombstone expiry; no process or workdir remains
+  -> CLOSED               reason-only lost-tombstone TTL elapsed; cleanup state is independent
 ```
 
 Head and idempotency rules:
@@ -418,7 +418,7 @@ Head and idempotency rules:
 - An exact retry of any committed public segment returns that segment and its active head without touching the SDK.
 - If the configured committed-segment limit is reached, every new operation fails with `409 idempotency_capacity` before SDK mutation; existing exact retries continue to work.
 
-Entering `LOST` or `CLOSED` immediately erases transcript, response, prompt, tool, SDK-client, and idempotency content and starts bounded resource teardown. The reason-only session tombstone retains only opaque ID, machine-readable reason, and expiry. A separate content-free cleanup registry may retain the minimum tracked process identities, workdir path, attempt state, and last cleanup error until absence/removal is confirmed. A lost tombstone returns `409 session_lost` until its metadata TTL expires; a closed tombstone returns `410 session_closed`. Tombstone expiry is independent of cleanup-registry retry and never discards unconfirmed cleanup authority. If a pending-tool timeout fires while no HTTP request is outstanding, the actor closes with reason `tool_result_timeout`. The next request receives `410 session_closed` with that cause. If deletion or shutdown wins a race with generation, the actor cancels and closes; it never returns to `IDLE`.
+Entering `LOST` or `CLOSED` atomically transfers the SDK client and tracked process/workdir handles to a teardown owner, makes them unreachable to request handling, erases proxy-held transcript, response, prompt, tool, and idempotency content, and starts bounded teardown. The reason-only session tombstone retains only opaque ID, machine-readable terminal reason, and expiry. The cleanup registry retains the minimum SDK/process/workdir handles, identities, attempt state, and last error required to close and confirm absence; the child SDK/CLI may still hold model state in memory until termination succeeds, so cleanup failure is never described as complete erasure. A lost tombstone returns `409 session_lost`. A terminal reason of TTL expiry returns `410 session_expired`; deletion, tool timeout, launcher exit, or shutdown returns `410 session_closed`. Tombstone expiry is independent of cleanup retry and never discards unconfirmed cleanup authority. After tombstone expiry an explicit session ID is unknown and returns `404 session_not_found`; an expired/revoked run-token digest is retained only for the configured token-tombstone TTL and then becomes `401 invalid_local_api_key`. If deletion or shutdown wins a race with generation, the actor transfers ownership and closes; it never returns to `IDLE`.
 
 Automatic mode applies the same transitions internally but does not require the harness to see head values.
 
@@ -504,6 +504,7 @@ Proxy errors use stable machine-readable codes and the closest public dialect en
 | `400` | `unsupported_parameter` | Field cannot be honored under the selected policy. |
 | `401` | `invalid_local_api_key` | Local proxy authentication failed. |
 | `404` | `model_not_configured` | Model is not in the configured list. |
+| `404` | `session_not_found` | Explicit session tombstone expired or the session ID never existed. |
 | `409` | `session_busy` | A different operation is already active. |
 | `409` | `stale_session_head` | Request does not extend the current head. |
 | `409` | `session_ambiguous` | Automatic token cannot identify a unique valid continuation. |
@@ -530,7 +531,7 @@ The proxy remains one server process, but the SDK may own one Claude subprocess 
 - Reject new sessions at capacity instead of evicting an active session.
 - Close SDK clients and temporary working directories deterministically.
 - Bound graceful close, process termination, and forced-kill intervals separately. Construction rollback, normal close, request failure, expiry, explicit deletion, capacity rejection, and server shutdown must all run the same teardown state machine.
-- Define ownership as the SDK client plus every process the pinned transport can positively track for that session. Teardown performs graceful SDK close, bounded terminate, bounded forced kill, reap confirmation, and workdir-removal retries under one foreground deadline. Success means confirmed absence of every tracked process and removal of the workdir. Failure records `cleanup_unconfirmed`, moves minimal identities into the cleanup registry, rejects new work through unhealthy status, and continues bounded periodic retries or requires explicit operator resolution. Prompt/session content is erased regardless of cleanup outcome.
+- Define ownership as the SDK client plus every process the pinned transport can positively track for that session. Teardown performs graceful SDK close, bounded terminate, bounded forced kill, reap confirmation, and workdir-removal retries under one foreground deadline. Success means confirmed absence of every tracked process and removal of the workdir. Failure records `cleanup_unconfirmed`, retains the teardown handles and identities in the cleanup registry, rejects new work through unhealthy status, and continues bounded periodic retries or requires explicit operator resolution. Proxy-held prompt/session copies are erased regardless of cleanup outcome; no claim is made about memory still owned by an unconfirmed child.
 - On shutdown, stop accepting work, give active non-tool streams a short grace period, then cancel and mark unfinished sessions lost.
 - Except for the generated local master-key runtime file explicitly defined in section 5.1, the proxy persists no subscription credentials, run tokens, transcripts, prompts, tool payloads, or responses to disk. The pinned Python SDK/CLI is launched with transcript/history persistence disabled. A versioned path policy classifies known credential paths as metadata/event-only and known noncredential state/workdirs as safe for content canaries. The whole relevant Claude root receives path/size/mtime event snapshots; only explicitly safe paths and newly created artifacts classified as noncredential are scanned for unique benign canaries. Unknown new paths fail the gate pending classification rather than being opened. The core probe uses the actual existing-login path without modifying credential files; synthetic-root evidence is supplemental.
 
@@ -588,6 +589,9 @@ The proxy adds no telemetry sink or outbound diagnostics. Network behavior of th
 - Transcript canonicalization over Unicode, JSON argument ordering, empty fields, and content variants.
 - Redaction and secret-canary tests.
 - Loopback `Host`, browser `Origin`, CORS, content-type, and local-authentication tests.
+- Table-driven endpoint-by-credential-class authorization, including rejection of launcher-forged, cross-run, expired, and revoked derived tokens.
+- Reason-aware terminal lookup before and after session/run tombstone expiry, including expiry during generation and tool wait.
+- Cleanup ownership-transfer tests proving request handlers cannot regain the SDK client while unconfirmed resources remain tracked separately.
 
 ### 15.2 Prompt-purity tests
 
