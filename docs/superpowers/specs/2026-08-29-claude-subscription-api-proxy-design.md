@@ -81,7 +81,7 @@ In priority order:
 - Conversation branching from an earlier head in v1.
 - Load balancing, account rotation, model routing, dashboards, analytics, or third-party telemetry.
 - Reproducing unsupported inference controls through approximate prompt tricks.
-- Enabling Claude Code filesystem, shell, web, MCP, skill, memory, or subagent behavior.
+- Enabling Claude Code filesystem, shell, web, ambient or user-configured MCP, skill, memory, or subagent behavior. The single proxy-owned in-process MCP bridge in section 9 is the only gated exception.
 - Claiming byte-for-byte equivalence with Anthropic or OpenAI APIs.
 
 ## 5. Public HTTP surface
@@ -112,11 +112,12 @@ GET  /_proxy/capabilities
 - Default bind address: `127.0.0.1`.
 - Port and loopback host may be overridden explicitly.
 - Non-loopback binding is refused in v1. A later version may allow it only behind authenticated TLS termination and an explicit unsafe opt-in.
-- Authentication is enabled by default. `LOCAL_PROXY_API_KEY` supplies the master bearer key; when absent, the server generates one and stores it in a mode-`0600` per-process runtime file that is removed at shutdown, printing only that file's path. `--no-auth` is an explicit unsafe opt-in.
+- Authentication is enabled by default. `LOCAL_PROXY_API_KEY` supplies the master bearer key; when absent, the server generates one and atomically stores it in a mode-`0600` file below a mode-`0700`, current-UID-owned per-process runtime directory. The server prints only that file's path. `--no-auth` is an explicit unsafe opt-in.
 - `x-api-key` and `Authorization: Bearer` are accepted as local proxy credentials; they are never forwarded to the SDK.
 - Logs always redact authorization, API keys, SDK credentials, cookies, and credential-looking environment values.
 - The server accepts only expected loopback `Host` values, requires `Content-Type: application/json` for mutations, emits no permissive CORS headers, and rejects browser `Origin` headers unless explicitly allowlisted.
 - With authentication disabled, any local user or process able to connect is authorized to consume the user's subscription through the proxy. Startup prints that warning.
+- `/health` is the only anonymous endpoint and returns no model, backend, session, or capability detail. Every model, capability, inference, session, and run endpoint requires the bearer token unless `--no-auth` is explicitly selected.
 
 ### 5.2 Harness-neutral session extension
 
@@ -175,6 +176,8 @@ The initial head represents an empty native conversation with fixed configuratio
 
 Against a separately running server, the launcher first calls `POST /_proxy/runs` with a dialect, parameter policy, and TTL. The server returns a `run_id`, an opaque short-lived API-key value, and its expiry. When a local master key is enabled, this control request requires it and the child receives only the derived token. The first valid public request made with that token binds its model, system prompt, tool definitions, and thinking configuration; subsequent changes are rejected. `DELETE /_proxy/runs/{run_id}` revokes the token and closes its session.
 
+For a separately running server with a generated master key, `claude-proxy run` requires `--api-key-file <path>` or `LOCAL_PROXY_API_KEY_FILE`; it validates file ownership, regular-file type, exact mode, and runtime path before reading. There is no global implicit key-file search. A launcher that starts its own server transfers the master key in memory and never exposes it to the harness. On orderly shutdown the server removes its key file and runtime directory. On startup, it removes only current-UID-owned stale per-process directories whose recorded server PID is confirmed absent; a stale key is never reused.
+
 Each generated token owns at most one current live conversation:
 
 - The first valid request creates the session.
@@ -185,7 +188,7 @@ Each generated token owns at most one current live conversation:
 
 The zero-source-change claim is limited to harnesses that honor an injected base URL and API key and run exactly one logical conversation per generated token. A process that multiplexes conversations needs explicit mode or an existing request hook that supplies its headers.
 
-When local authentication is disabled, a generated random API-key value is used only as a routing namespace. When authentication is enabled, the launcher mints a short-lived signed derived token so it can authenticate without exposing the configured master key to the child harness. Tokens and signing state remain in memory only.
+When local authentication is disabled, a generated random API-key value is used only as a routing namespace. When authentication is enabled, the launcher mints a short-lived signed derived token so it can authenticate without exposing the configured master key to the child harness. Derived run tokens and signing state remain in memory only. The generated master-key runtime file described above is the sole permitted proxy credential write; it is never confused with a Claude subscription credential.
 
 Requests with neither explicit session headers nor a distinct routing token use one-shot mode.
 
@@ -236,7 +239,7 @@ The exact capability matrix is published by `GET /_proxy/capabilities` and versi
 | `system` / system messages | Supported at session creation; passed without proxy text; immutable thereafter. |
 | `messages` | Supported under the transcript rules above. |
 | `stream` | Supported for text; tool streaming remains gated. |
-| `thinking` / effort | Supported only where the installed SDK exposes an equivalent; immutable within a session. |
+| `thinking` / effort | Anthropic dialect only, and only for exact model/configuration tuples whose full block, signature, streaming, and replay semantics pass the Phase 0 capability gate. OpenAI `reasoning_effort` is rejected in v1. Immutable within a session. |
 | `metadata` | Retained for local correlation only; never injected into the model prompt. |
 | `max_tokens`, `max_completion_tokens` | Not enforceable by the SDK. Strict policy rejects them; compatibility policy accepts and explicitly reports them as ignored. |
 | `temperature`, `top_p`, `top_k` | Unsupported. Strict policy rejects; compatibility policy may accept-and-report-as-ignored only when explicitly configured. |
@@ -264,6 +267,8 @@ Initial implementation order:
 4. Tool-result content beyond text only after MCP conversion tests.
 
 URLs, audio, citations, search-result blocks, and unverified content variants are rejected rather than coerced. Content support must be identical in streaming and non-streaming modes unless the capabilities document says otherwise.
+
+Anthropic thinking support is tuple-gated by model, thinking mode/budget, and effort. A passing tuple must preserve thinking and redacted-thinking block types, text or opaque payload bytes, signatures, block order, `thinking_delta`/`signature_delta` ordering, stop behavior, and SDK usage in both streaming and non-streaming traces. The canonical public transcript stores those exposed blocks and signatures exactly so a resent history can be compared byte-for-byte without reinjecting it. Unknown block/delta shapes fail the operation and disable that tuple. Thinking-enabled sessions are Anthropic-only; the OpenAI adapter neither hides nor approximates thinking content.
 
 ### 6.4 OpenAI translation
 
@@ -320,7 +325,7 @@ The Agent SDK/CLI child environment is constructed deny-by-default. The only inh
 - Set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` and `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`.
 - Set `CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1`, `CLAUDE_CODE_DISABLE_POLICY_SKILLS=1`, and `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS=1` where supported by the pinned CLI.
 - Set `ENABLE_CLAUDEAI_MCP_SERVERS=false`, `CLAUDE_CODE_DISABLE_WORKFLOWS=1`, and `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1`.
-- Set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` to prevent telemetry/error reporting, feature fetches, update traffic, marketplace activity, and title-generation model calls not required for inference.
+- Set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` to request the pinned runtime's documented suppression of telemetry/error reporting, feature fetches, update traffic, marketplace activity, and title-generation model calls not required for inference. Phase 0 records observable behavior rather than asserting suppression beyond the public contract.
 - Do not load plugins, connectors, slash commands, skills, hooks, or subagents.
 - If caller tools are enabled, expose only one in-process MCP server created from that session's immutable tool definitions.
 - Set `tools=[]` even when custom MCP tools exist so Claude Code built-ins are absent.
@@ -330,6 +335,8 @@ The Agent SDK/CLI child environment is constructed deny-by-default. The only inh
 - Do not use `--bare`, because it also disables the subscription credential path.
 
 The default Claude configuration directory, or an explicitly selected existing `CLAUDE_CONFIG_DIR`, must remain available to the official CLI for its existing login, so isolation cannot rely on replacing it with an empty directory. A clean synthetic config-root experiment may remain diagnostic research, but inability to authenticate there is never a release gate. The environment controls, `setting_sources=[]`, temporary working directory, startup inspection, and live canaries must produce no observable ambient capability use or prohibited prompt/tool/response persistence. Unrelated authentication and runtime bookkeeping is classified separately by path and metadata without reading credential contents. If the pinned SDK/CLI ignores `CLAUDE_CODE_SKIP_PROMPT_HISTORY` and persists prohibited content, prompt-purity validation fails and the project stops.
+
+For the pinned SDK/CLI pair, Phase 0 must identify a public, non-secret initialization or connection evidence shape that positively distinguishes the user's existing Claude subscription login from API-key, API-key-helper, cloud-provider, custom-endpoint, and unknown modes. The accepted source enum and evidence shape are versioned in the feasibility manifest. Absence, ambiguity, or a negative mode fails Phase 0 and startup; credential contents are never read. Negative tests cover environment overrides and controlled non-secret configuration mode changes. If the official runtime exposes no reliable positive provenance signal, the subscription backend remains unavailable rather than asserting `existing_claude_login`.
 
 The proxy can minimize ambient Claude Code behavior but cannot prove that the Agent SDK runtime is byte-for-byte equivalent to the raw Messages API. Managed policy and server-side behavior outside the SDK's controls may still exist. The product language and diagnostics must say **prompt-isolated Agent SDK**, not **raw Anthropic prompt**.
 
@@ -384,7 +391,7 @@ WAITING_FOR_TOOLS
   -> CLOSED               tool timeout, deletion, expiry, or shutdown
 
 LOST
-  -> CLOSED               resource cleanup after the lost-session tombstone period
+  -> CLOSED               reason-only tombstone expiry; no process or workdir remains
 ```
 
 Head and idempotency rules:
@@ -398,7 +405,7 @@ Head and idempotency rules:
 - A continuation may commit another fully established tool-use boundary and return to `WAITING_FOR_TOOLS`, or commit a final answer and return to `IDLE` only after a successful internal SDK `ResultMessage` and iterator completion.
 - An exact retry of any committed public segment returns that segment and its active head without touching the SDK.
 
-`LOST` and `CLOSED` are tombstone states. A lost session returns `409 session_lost` until cleanup. A closed session retains only its opaque ID, close reason, and expiry for a short tombstone TTL and returns `410 session_closed`; no transcript or response content remains. If a pending-tool timeout fires while no HTTP request is outstanding, the actor closes with reason `tool_result_timeout`. The next request receives `410 session_closed` with that machine-readable cause. If deletion or shutdown wins a race with generation, the actor cancels and closes; it never returns to `IDLE`.
+Entering `LOST` or `CLOSED` immediately starts bounded resource teardown. After the teardown deadline, the state retains only opaque ID, machine-readable reason, and expiry; it owns no SDK client, CLI process, workdir, transcript, or response content. A lost tombstone returns `409 session_lost` until its metadata TTL expires; a closed tombstone returns `410 session_closed`. Metadata expiry changes `LOST` to `CLOSED` or removes `CLOSED` without performing deferred process cleanup. If a pending-tool timeout fires while no HTTP request is outstanding, the actor closes with reason `tool_result_timeout`. The next request receives `410 session_closed` with that cause. If deletion or shutdown wins a race with generation, the actor cancels and closes; it never returns to `IDLE`.
 
 Automatic mode applies the same transitions internally but does not require the harness to see head values.
 
@@ -419,6 +426,7 @@ The server distinguishes HTTP-client disconnect from explicit model cancellation
 - Buffers are strictly bounded. Exceeding the bound cancels the SDK operation and marks the session unusable.
 - Explicit session deletion, idle expiry, process shutdown, or tool timeout cancels pending work and closes the SDK client.
 - A session whose SDK state may have advanced without a complete recorded public event is poisoned and returns `409 session_lost`; it is never guessed back into sync.
+- In automatic mode, termination or exit of the launched harness triggers immediate run-token revocation, server-side operation cancellation, and the same bounded SDK/CLI teardown. An ordinary HTTP disconnect alone retains the retry behavior above.
 
 ## 9. Caller-owned tool bridge
 
@@ -508,8 +516,9 @@ The proxy remains one server process, but the SDK may own one Claude subprocess 
 - Reject new sessions at capacity instead of evicting an active session.
 - Close SDK clients and temporary working directories deterministically.
 - Bound graceful close, process termination, and forced-kill intervals separately. Construction rollback, normal close, request failure, expiry, explicit deletion, capacity rejection, and server shutdown must leave no owned CLI process or temporary workdir after the configured deadline.
+- Define ownership as the SDK client plus every process the pinned transport creates for that session. Teardown performs graceful SDK close, bounded terminate, bounded forced kill, reap confirmation, and workdir-removal retries under one total deadline. Failure to confirm absence is recorded as `cleanup_unconfirmed`, keeps the server unhealthy for new work, and never delays tombstone content deletion.
 - On shutdown, stop accepting work, give active non-tool streams a short grace period, then cancel and mark unfinished sessions lost.
-- The proxy persists no transcripts, tokens, prompts, tool payloads, or responses to disk. The pinned Python SDK/CLI is launched with transcript/history persistence disabled; canaries search supported Claude-state locations and proxy workdirs for unique prohibited content and leaked temporary artifacts after every upgrade. Authentication/runtime metadata changes are reported separately and never inspected for credential contents.
+- Except for the generated local master-key runtime file explicitly defined in section 5.1, the proxy persists no subscription credentials, run tokens, transcripts, prompts, tool payloads, or responses to disk. The pinned Python SDK/CLI is launched with transcript/history persistence disabled. A versioned path policy classifies known credential paths as metadata/event-only and known noncredential state/workdirs as safe for content canaries. The whole relevant Claude root receives path/size/mtime event snapshots; only explicitly safe paths and newly created artifacts classified as noncredential are scanned for unique benign canaries. Unknown new paths fail the gate pending classification rather than being opened. The core probe uses the actual existing-login path without modifying credential files; synthetic-root evidence is supplemental.
 
 ## 13. Configuration and models
 
@@ -529,7 +538,7 @@ Startup fails closed when the actual SDK or CLI version differs from the validat
 
 `GET /v1/models` returns only the configured public model list. It does not scrape undocumented endpoints or claim capabilities absent from `/_proxy/capabilities`.
 
-`/_proxy/capabilities`, startup diagnostics, and validation manifests expose `backend_kind`, `auth_source`, and `semantic_class=prompt_isolated_agent_sdk`. A future `platform_api_key` backend would use `semantic_class=raw_messages_api`, but it is not implemented by v1 and requires a separate approved design. Startup fails when inherited credential overrides make the selected backend's authentication provenance ambiguous.
+`/_proxy/capabilities`, startup diagnostics, and validation manifests expose `backend_kind`, `auth_source`, and `semantic_class=prompt_isolated_agent_sdk`. A future `platform_api_key` backend would use `semantic_class=raw_messages_api`, but it is not implemented by v1 and requires a separate approved design. Startup fails when inherited overrides, stored non-secret mode indicators, or missing/unknown runtime evidence make the selected backend's authentication provenance ambiguous.
 
 ## 14. Diagnostics and observability
 
@@ -577,9 +586,11 @@ Construct a minimal request and assert that SDK configuration and submitted inpu
 
 Canary the isolated environment with `CLAUDE.md`, user/project settings, skills, agents, MCP connectors, plugins, auto-memory, hooks, and built-in tool names. Any observed loading or exposure fails the test.
 
+The real existing-login configuration root is never modified to plant a canary. User-level isolation is evidenced through the pinned runtime's public effective-configuration/init surface plus the versioned metadata/content path policy above. Project-level canaries live only in the proxy-owned temporary workdir. A synthetic config-root probe may plant user-level canaries, but is supplemental because it may not authenticate.
+
 Inspect the effective system prompt for the Claude Code attribution block and its client-version/prompt-fingerprint fields. The test must prove that `CLAUDE_CODE_ATTRIBUTION_HEADER=0` removes it for the pinned subscription connection; a connection type that retains it fails prompt purity.
 
-Force the context near the compaction threshold and assert that the SDK fails without emitting a `compact_boundary` or injecting a summary. Snapshot the relevant Claude state directories before and after a session and assert that no prompt, transcript, debug log, title, memory, or tool payload was written.
+Force the context near the compaction threshold and assert that the SDK fails without emitting a `compact_boundary` or injecting a summary. Apply the versioned path policy before and after a session and assert that no prompt, transcript, debug log, title, memory, tool payload, or leaked temporary artifact was written to a content-safe path; metadata-only credential paths are never opened.
 
 ### 15.3 Live subscription integration tests
 
@@ -588,6 +599,7 @@ Opt-in tests requiring an existing official Claude login cover:
 - One-shot text, automatic linear session, and explicit session mode.
 - Streaming and non-streaming equivalence.
 - Session retry, stale head, new run token, expiry, and shutdown.
+- The complete cleanup matrix: partial construction, protocol/request failure, bounded-buffer overflow, expiry, deletion, capacity rollback, tool timeout, launcher cancellation, and shutdown, including stubborn-child terminate/kill escalation and confirmed reap.
 - All tool capability-gate cases.
 - Model selection and supported thinking/effort options.
 - Debug traces showing no credential access by proxy code.
@@ -598,7 +610,7 @@ Opt-in tests requiring an existing official Claude login cover:
 Where the user separately has legitimate API access, compare identical supported prompts across:
 
 1. Raw Anthropic Messages API.
-2. This isolated Agent SDK proxy.
+2. This prompt-isolated Agent SDK proxy.
 3. Normal Claude Code.
 
 Record behavior differences without treating nondeterministic text equality as a correctness assertion. Measure:
@@ -667,7 +679,7 @@ A failed policy, prompt-isolation, persistence, or core-session spike stops the 
 
 - Enable tools only if every required correlation/lifecycle test passes.
 
-### Phase 4: gated multimodal content and diagnostics
+### Phase 4: gated multimodal content and comparative diagnostics
 
 - Add images, documents, and richer tool results one content type at a time after conformance tests.
 
