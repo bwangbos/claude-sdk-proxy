@@ -7,10 +7,11 @@ import hashlib
 import json
 import os
 import pickle
-import stat
+import shutil
+import struct
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
@@ -45,9 +46,9 @@ from claude_sdk_proxy.environment import (
     build_child_environment,
     environment_fingerprint,
 )
+from claude_sdk_proxy.isolation import IsolationConfig
 from claude_sdk_proxy.journal import Journal, RecordClass
 from claude_sdk_proxy.lifecycle import Record
-from claude_sdk_proxy.isolation import IsolationConfig
 
 pytestmark = pytest.mark.anyio
 
@@ -74,18 +75,10 @@ def _supervisor_path() -> Path:
 
 
 def _write_cli(path: Path) -> None:
-    path.write_text(
-        """#!/bin/sh
-set -eu
-if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
-  printf '2.1.251 (Claude Code)\\n'
-  exit 0
-fi
-while IFS= read -r line; do
-  printf '%s\\n' "$line" >> "$PWD/stdin.txt"
-done
-"""
-    )
+    fixture = _repository_root() / "build/bin/claude-proxy-task6-test-cli"
+    if not fixture.is_file():
+        raise RuntimeError("Task 6 native test CLI is unavailable; run make native")
+    shutil.copyfile(fixture, path)
     path.chmod(0o700)
 
 
@@ -280,6 +273,8 @@ def test_no_installed_production_path_can_mint_positive_attestation() -> None:
     assert not any(name.startswith("_test_only") for name in vars(implementation))
     assert "FullSupervisorEvidence" not in public.__all__
     assert not hasattr(public, "FullSupervisorEvidence")
+    assert "RelayReceipt" not in public.__all__
+    assert not hasattr(public, "RelayReceipt")
     with pytest.raises(TypeError, match="cannot be constructed"):
         ChildAttestation()  # type: ignore[call-arg]
 
@@ -366,7 +361,9 @@ def test_prepare_reapplies_task2_environment_and_rejects_ambient_override(
             )
 
 
-def test_prepare_rejects_prebuilt_environment_or_proxy_bit_drift(tmp_path: Path) -> None:
+def test_prepare_rejects_prebuilt_environment_or_proxy_bit_drift(
+    tmp_path: Path,
+) -> None:
     with _launch_inputs(tmp_path, network_proxy=True) as inputs:
         altered = replace(
             inputs.config,
@@ -385,7 +382,10 @@ def test_prepare_rejects_prebuilt_environment_or_proxy_bit_drift(tmp_path: Path)
             cli_dir=inputs.environment_config.cli_dir,
             network_proxy=False,
         )
-        with pytest.raises(AttestationError, match="environment config|fingerprint"):
+        with pytest.raises(
+            AttestationError,
+            match="effective child environment|environment config|fingerprint",
+        ):
             prepare_supervisor_launch(
                 inputs.config,
                 inputs.descriptors,
@@ -400,6 +400,28 @@ def test_prepare_actually_runs_bounded_exact_cli_version_probe(tmp_path: Path) -
     with _launch_inputs(tmp_path, cli_body=body) as inputs:
         with pytest.raises(AttestationError, match="version"):
             _prepare(inputs)
+
+
+def test_prepare_rejects_nonexact_cli_version_output(tmp_path: Path) -> None:
+    body = "#!/bin/sh\nprintf '  2.1.251 (Claude Code)\\n'\n"
+    with _launch_inputs(tmp_path, cli_body=body) as inputs:
+        with pytest.raises(AttestationError, match="version"):
+            _prepare(inputs)
+
+
+def test_prepare_binds_workdir_to_task5_instance(tmp_path: Path) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        unrelated = tmp_path / "unrelated"
+        unrelated.mkdir(mode=0o700)
+        changed = replace(inputs.config, cwd=unrelated)
+        with pytest.raises(AttestationError, match="Task 5 allocation workdir"):
+            prepare_supervisor_launch(
+                changed,
+                inputs.descriptors,
+                inputs.manifest,
+                source_environment=inputs.source,
+                environment_config=inputs.environment_config,
+            )
 
 
 def test_prepare_rejects_cli_replacement_during_version_probe(tmp_path: Path) -> None:
@@ -437,7 +459,22 @@ def test_prepared_launch_is_opaque_sealed_single_use_and_not_picklable(
             transport = AttestedSupervisorTransport(launch)
             with pytest.raises(AttestationError, match="already claimed"):
                 AttestedSupervisorTransport(launch)
-            assert isinstance(build_attested_sdk_client(launch, transport=transport), ClaudeSDKClient)
+            assert isinstance(
+                build_attested_sdk_client(launch, transport=transport), ClaudeSDKClient
+            )
+        finally:
+            launch.close()
+
+
+def test_prepared_launch_fingerprint_binds_immutable_workdir(tmp_path: Path) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        unrelated = tmp_path / "changed-cwd"
+        unrelated.mkdir(mode=0o700)
+        object.__setattr__(launch._config, "cwd", unrelated)
+        try:
+            with pytest.raises(AttestationError, match="fields changed"):
+                _ = launch.supervisor_environment
         finally:
             launch.close()
 
@@ -489,6 +526,24 @@ def test_initialize_classifier_accepts_only_the_exact_sdk_request_pattern() -> N
     assert implementation._is_safe_initialize(_initialize()) is True
 
 
+def test_cleanup_result_requires_complete_normal_task5_evidence() -> None:
+    normal_flags = 0xFF7
+    implementation._validate_cleanup_result(
+        struct.pack("<IIQQQII", normal_flags, 4, 0xF, 12, 9, 0, 0),
+        expected_done_sequence=12,
+    )
+    with pytest.raises(AttestationError, match="cleanup result"):
+        implementation._validate_cleanup_result(
+            struct.pack("<IIQQQII", normal_flags, 3, 0xF, 12, 9, 0, 0),
+            expected_done_sequence=12,
+        )
+    with pytest.raises(AttestationError, match="cleanup result"):
+        implementation._validate_cleanup_result(
+            struct.pack("<IIQQQII", normal_flags, 4, 0xF, 12, 9, 1, 0),
+            expected_done_sequence=12,
+        )
+
+
 async def test_real_task5_handshake_creates_opaque_runtime_receipt_and_sends_ack(
     tmp_path: Path,
 ) -> None:
@@ -519,8 +574,10 @@ async def test_real_task5_handshake_creates_opaque_runtime_receipt_and_sends_ack
             )
             assert len(set(receipt.canonical_control_hashes)) == 4
             assert receipt.identity_ack_sequence > 0
-            assert receipt.identity_ack_hash in receipt.canonical_control_hashes
+            assert len(receipt.identity_ack_hash) == hashlib.sha256().digest_size
             assert receipt.network_proxy_enabled is True
+            with pytest.raises(AttestationError, match="sealed"):
+                receipt._identity_ack_hash = b"x" * 32
             with pytest.raises((AttestationError, TypeError)):
                 copy.copy(receipt)
         finally:
@@ -543,19 +600,19 @@ async def test_transport_sends_only_one_exact_initialize_and_buffers_everything_
             await transport.write(initialize)
             await transport.write(_initialize("req_2_feedface"))
             await transport.write(
-                json.dumps(
-                    {"type": "user", "message": {"content": "CANARY-USER"}}
-                )
+                json.dumps({"type": "user", "message": {"content": "CANARY-USER"}})
                 + "\n"
             )
             await transport.end_input()
-            stdin_path = inputs.config.cwd / "stdin.txt"
+            stdin_path = inputs.config.cwd.parent / "stdin.txt"
             deadline = time.monotonic() + 2
             while not stdin_path.exists() and time.monotonic() < deadline:
                 await anyio.sleep(0.01)
             assert stdin_path.read_text().splitlines() == [initialize.rstrip("\n")]
             assert transport.buffered_user_write_count == 3
-            with pytest.raises(AttestationError, match="core attestation gate unavailable"):
+            with pytest.raises(
+                AttestationError, match="core attestation gate unavailable"
+            ):
                 await transport.release_buffered()
             assert transport.discarded_user_write_count == 3
         finally:
@@ -576,6 +633,27 @@ class _HangingCloseProcess:
 
     async def aclose(self) -> None:
         await anyio.sleep_forever()
+
+
+class _ImmediateCloseProcess:
+    returncode = 0
+
+    async def wait(self) -> int:
+        return 0
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_confirmed_prehandshake_process_is_released(tmp_path: Path) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        transport._process = _ImmediateCloseProcess()  # type: ignore[assignment]
+
+        await transport.close()
+
+        assert transport._process is None
 
 
 async def test_process_aclose_is_bounded_and_unconfirmed_ownership_is_retained(

@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
+import re
+import socket
 import stat
 import struct
+import subprocess
 import threading
+import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from subprocess import DEVNULL, PIPE
-from typing import Any, Never
+from types import MappingProxyType
+from typing import IO, Any, Never, SupportsIndex
 
 import anyio
-from anyio.streams.text import TextReceiveStream, TextSendStream
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -24,8 +29,13 @@ from claude_agent_sdk import (
     Transport,
 )
 
-from claude_sdk_proxy.environment import environment_fingerprint
+from claude_sdk_proxy.environment import (
+    EnvironmentConfig,
+    build_child_environment,
+    environment_fingerprint,
+)
 from claude_sdk_proxy.isolation import IsolationConfig, build_agent_options
+from claude_sdk_proxy.journal import BootstrapHead, Journal
 
 ATTESTATION_MANIFEST_SCHEMA = "claude_sdk_proxy.child_attestation_manifest"
 EXPECTED_SDK_VERSION = "0.2.148"
@@ -37,10 +47,37 @@ BOOTSTRAP_DESCRIPTOR_NAMES = (
     "LOCAL_PROXY_CONTROL_FD",
 )
 SUPERVISOR_INTERNAL_RELAY_FD = 198
-_NETWORK_PROXY_NAMES = frozenset(
-    {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"}
-)
-_AMBIENT_NETWORK_PROXY_SELECTOR = "LOCAL_PROXY_NETWORK_PROXY"
+
+_JOURNAL_NAME = "allocation.journal"
+_WORKDIR_NAME = "allocation.workdir"
+_NORMAL_LIMIT = 32 * 1024
+_HARD_LIMIT = _NORMAL_LIMIT + 1172 * 14
+_CONTROL_MAGIC = 0x464C5043
+_CONTROL_VERSION = 1
+_CONTROL_MAX_PAYLOAD = 4096
+_CONTROL_HEADER_SIZE = 44
+_CONTROL_CHECKSUM_SIZE = 4
+_PROCESS_IDENTITY_SIZE = 112
+_CLI_ARMED_IDENTITY_SIZE = 192
+_SUPERVISOR_CONFIG_FORMAT = "<HBBIQ32s"
+_SUPERVISOR_CONFIG_VERSION = 1
+_INITIALIZE_MAX_BYTES = 4096
+_REQUEST_ID = re.compile(r"req_[1-9][0-9]*_[0-9a-f]{8}\Z")
+_VERSION_STDOUT = b"2.1.251 (Claude Code)\n"
+_CONTROL_NAMES = {
+    1: "SUPERVISOR_IDENTITY",
+    2: "IDENTITY_ACK",
+    3: "ANCHOR_IDENTITY",
+    4: "ANCHOR_ACK",
+    5: "CLI_ARMED",
+    6: "ARMED_ACK",
+    7: "CLI_RUNNING",
+    8: "CLEANUP_REQUEST",
+    9: "SELF_TERM_REQUEST",
+    10: "CLEANUP_RESULT",
+    11: "CONTROL_ERROR",
+    12: "CLEANUP_ACK",
+}
 _EXPECTED_TRACE = (
     "SUPERVISOR_IDENTITY",
     "IDENTITY_ACK",
@@ -56,9 +93,9 @@ _EXPECTED_CANONICAL_TYPES = (
     "CLI_ARMED",
     "CLI_RUNNING",
 )
-_TEST_ONLY_TOKEN = object()
-_CHILD_TOKEN = object()
-_PERMIT_TOKEN = object()
+_LAUNCH_TOKEN = object()
+_RECEIPT_TOKEN = object()
+_TURN_TOKEN = object()
 
 
 class AttestationError(RuntimeError):
@@ -84,22 +121,17 @@ _CURRENT_REASONS = (
 class AttestationAvailability:
     core_gate_available: bool
     reason_codes: tuple[AttestationReasonCode, ...]
-    _token: object | None = None
 
     def __post_init__(self) -> None:
-        if self._token is _TEST_ONLY_TOKEN:
-            if not self.core_gate_available or self.reason_codes:
-                raise AttestationError("test-only availability must be affirmative")
-        elif self.core_gate_available or self.reason_codes != _CURRENT_REASONS:
+        if self.core_gate_available or self.reason_codes != _CURRENT_REASONS:
             raise AttestationError("production availability must remain false")
 
 
+_CURRENT_AVAILABILITY = AttestationAvailability(False, _CURRENT_REASONS)
+
+
 def current_attestation_availability() -> AttestationAvailability:
-    return AttestationAvailability(False, _CURRENT_REASONS)
-
-
-def _test_only_available_verdict() -> AttestationAvailability:
-    return AttestationAvailability(True, (), _TEST_ONLY_TOKEN)
+    return _CURRENT_AVAILABILITY
 
 
 def _require_sha256(value: object, label: str) -> str:
@@ -125,7 +157,7 @@ def _digest(domain: bytes, value: object) -> str:
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
-    ).encode()
+    ).encode("utf-8")
     return hashlib.sha256(domain + b"\0" + encoded).hexdigest()
 
 
@@ -154,85 +186,17 @@ class CliExecutableIdentity:
         _require_sha256(self.sha256, "CLI executable hash")
 
     def digest(self) -> str:
-        return _digest(b"claude-sdk-proxy:cli-identity:v1", vars(self))
-
-
-@dataclass(frozen=True)
-class FullSupervisorEvidence:
-    control_trace: tuple[str, ...]
-    canonical_control_types: tuple[str, ...]
-    canonical_control_sequences: tuple[int, ...]
-    canonical_control_hashes: tuple[str, ...]
-    supervisor_identity_sha256: str
-    anchor_identity_sha256: str
-    cli_armed_identity_sha256: str
-    cli_running_identity_sha256: str
-    canonical_head_certified: bool
-    same_canonical_journal: bool
-    evidence_observed_not_inferred: bool
-    ack_after_durable_certification: bool
-    exact_canonical_ack_heads: bool
-    post_exec_identity_verified: bool
-    cli_control_fd_closed_on_exec: bool
-    external_control_fd_closed_on_cli_exec: bool
-    internal_control_fd_closed_on_cli_exec: bool
-    bootstrap_environment_removed: bool
-    bootstrap_descriptor_names: tuple[str, ...]
-    private_internal_relay_fd: bool
-    network_proxy_selector_authenticated: bool
-    identity_ack_config_version: int
-    identity_ack_bound_to_certified_head: bool
-    identity_ack_reserved_zero: bool
-    shared_proxy_fallback_channel: bool
-    external_control_read_by_supervisor_while_live: bool
-    anchor_external_read_count_while_supervisor_live: int
-    network_proxy_enabled: bool
-
-    def __post_init__(self) -> None:
-        if self.control_trace != _EXPECTED_TRACE:
-            raise AttestationError("full Task 5 control trace changed")
-        if self.canonical_control_types != _EXPECTED_CANONICAL_TYPES:
-            raise AttestationError("full Task 5 canonical types changed")
-        if self.canonical_control_sequences != (1, 2, 3, 4):
-            raise AttestationError("full Task 5 canonical sequences changed")
-        if len(self.canonical_control_hashes) != 4:
-            raise AttestationError("full Task 5 canonical hashes are incomplete")
-        for value in (
-            *self.canonical_control_hashes,
-            self.supervisor_identity_sha256,
-            self.anchor_identity_sha256,
-            self.cli_armed_identity_sha256,
-            self.cli_running_identity_sha256,
-        ):
-            _require_sha256(value, "Task 5 evidence hash")
-        flags = (
-            self.canonical_head_certified,
-            self.same_canonical_journal,
-            self.evidence_observed_not_inferred,
-            self.ack_after_durable_certification,
-            self.exact_canonical_ack_heads,
-            self.post_exec_identity_verified,
-            self.cli_control_fd_closed_on_exec,
-            self.external_control_fd_closed_on_cli_exec,
-            self.internal_control_fd_closed_on_cli_exec,
-            self.bootstrap_environment_removed,
-            self.private_internal_relay_fd,
-            self.network_proxy_selector_authenticated,
-            self.identity_ack_bound_to_certified_head,
-            self.identity_ack_reserved_zero,
-            self.shared_proxy_fallback_channel,
-            self.external_control_read_by_supervisor_while_live,
+        return _digest(
+            b"claude-sdk-proxy:cli-identity:v1",
+            {
+                "version": self.version,
+                "path_sha256": self.path_sha256,
+                "st_dev": self.st_dev,
+                "st_ino": self.st_ino,
+                "mode": self.mode,
+                "sha256": self.sha256,
+            },
         )
-        if any(not isinstance(flag, bool) for flag in flags) or not all(flags):
-            raise AttestationError("full Task 5 evidence is not affirmative")
-        if self.bootstrap_descriptor_names != BOOTSTRAP_DESCRIPTOR_NAMES:
-            raise AttestationError("Task 5 bootstrap descriptor set changed")
-        if self.identity_ack_config_version != 1:
-            raise AttestationError("Task 5 IDENTITY_ACK config version changed")
-        if self.anchor_external_read_count_while_supervisor_live != 0:
-            raise AttestationError("anchor raced the supervisor control reader")
-        if not isinstance(self.network_proxy_enabled, bool):
-            raise AttestationError("Task 5 network selector is malformed")
 
 
 @dataclass(frozen=True)
@@ -243,7 +207,6 @@ class AttestationManifest:
     cli_version: str
     cli_executable: CliExecutableIdentity
     environment_fingerprint: str
-    supervisor_evidence: FullSupervisorEvidence
     availability: AttestationAvailability
 
     def __post_init__(self) -> None:
@@ -259,114 +222,26 @@ class AttestationManifest:
         if self.cli_executable.version != self.cli_version:
             raise AttestationError("manifest CLI identity version changed")
         _require_sha256(self.environment_fingerprint, "environment fingerprint")
-        if self.availability != current_attestation_availability():
-            raise AttestationError(
-                "production manifest must preserve false availability"
-            )
-
-
-@dataclass(frozen=True)
-class AttestationBinding:
-    allocation_nonce: str
-    child_identity_sha256: str
-    supervisor_certified_sequence: int
-    supervisor_certified_hash: str
-    connection_nonce: str
-
-    def __post_init__(self) -> None:
-        _require_sha256(self.allocation_nonce, "allocation nonce")
-        _require_sha256(self.child_identity_sha256, "child identity")
-        _positive_int(self.supervisor_certified_sequence, "supervisor sequence")
-        _require_sha256(self.supervisor_certified_hash, "supervisor hash")
-        _require_sha256(self.connection_nonce, "connection nonce")
-
-    def digest(self) -> str:
-        return _digest(b"claude-sdk-proxy:attestation-binding:v1", vars(self))
+        if self.availability is not _CURRENT_AVAILABILITY:
+            raise AttestationError("manifest must preserve current false availability")
 
 
 class ChildAttestation:
-    __slots__ = ("_binding_sha256", "_evidence_sequence", "_evidence_sha256")
+    """Opaque future evidence type with no production minting path in this tuple."""
 
-    _binding_sha256: str
-    _evidence_sequence: int
-    _evidence_sha256: str
+    __slots__ = ()
 
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
+    def __new__(cls, *_args: object, **_kwargs: object) -> ChildAttestation:
         raise TypeError("ChildAttestation cannot be constructed publicly")
 
-    @classmethod
-    def _create(
-        cls, token: object, binding: str, sequence: int, evidence: str
-    ) -> ChildAttestation:
-        if token is not _CHILD_TOKEN:
-            raise AttestationError("child attestation mint authority is invalid")
-        value = object.__new__(cls)
-        value._binding_sha256 = _require_sha256(binding, "binding hash")
-        value._evidence_sequence = _positive_int(sequence, "evidence sequence")
-        value._evidence_sha256 = _require_sha256(evidence, "evidence hash")
-        return value
+    def __copy__(self) -> Never:
+        raise AttestationError("child attestation cannot be copied")
 
-    @property
-    def binding_sha256(self) -> str:
-        return self._binding_sha256
+    def __deepcopy__(self, _memo: object) -> Never:
+        raise AttestationError("child attestation cannot be copied")
 
-    @property
-    def evidence_sequence(self) -> int:
-        return self._evidence_sequence
-
-    @property
-    def evidence_sha256(self) -> str:
-        return self._evidence_sha256
-
-
-class _AttestationPermit:
-    __slots__ = ("binding_sha256", "evidence_sequence", "evidence_sha256", "identity")
-
-    def __init__(
-        self, token: object, binding: str, sequence: int, evidence: str
-    ) -> None:
-        if token is not _PERMIT_TOKEN:
-            raise AttestationError("permit constructor is private")
-        self.binding_sha256 = binding
-        self.evidence_sequence = sequence
-        self.evidence_sha256 = evidence
-        self.identity = hashlib.sha256(os.urandom(32)).hexdigest()
-
-
-_CONSUMED: set[str] = set()
-_CONSUMED_LOCK = threading.Lock()
-
-
-def _test_only_mint_permit(
-    binding: AttestationBinding, evidence_sequence: int, event: SystemMessage
-) -> _AttestationPermit:
-    sequence = _positive_int(evidence_sequence, "evidence sequence")
-    evidence = _digest(b"claude-sdk-proxy:research-evidence:v1", event.data)
-    return _AttestationPermit(_PERMIT_TOKEN, binding.digest(), sequence, evidence)
-
-
-def _test_only_extract_synthetic_attestation(
-    event: SystemMessage, permit: object
-) -> ChildAttestation:
-    if not isinstance(permit, _AttestationPermit):
-        raise AttestationError("research permit is invalid")
-    expected = {
-        "schema": "claude_sdk_proxy.research_attestation",
-        "version": 1,
-        "auth_source": "existing_claude_login",
-        "provider": "anthropic",
-        "endpoint": "default",
-        "preinput_model_bytes": 0,
-        "preinput_network_bytes": 0,
-    }
-    if event.subtype != "research_attestation" or event.data != expected:
-        raise AttestationError("synthetic research evidence is not exact")
-    digest = _digest(b"claude-sdk-proxy:research-evidence:v1", event.data)
-    if digest != permit.evidence_sha256:
-        raise AttestationError("research evidence does not match permit")
-    return ChildAttestation._create(
-        _CHILD_TOKEN, permit.binding_sha256, permit.evidence_sequence, digest
-    )
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise AttestationError("child attestation cannot be pickled")
 
 
 def extract_child_attestation(
@@ -380,7 +255,7 @@ def extract_child_attestation(
         or event.data.get("subtype") != "init"
     ):
         raise AttestationError("child evidence is not a raw SDK init SystemMessage")
-    if not isinstance(availability, AttestationAvailability):
+    if availability is not _CURRENT_AVAILABILITY:
         raise AttestationError("attestation availability verdict is invalid")
     raise AttestationError(
         "public auth provenance is absent or unvalidated; pre-input network boundary "
@@ -389,108 +264,48 @@ def extract_child_attestation(
 
 
 @dataclass(frozen=True)
-class ControlFDIdentity:
-    st_dev: int
-    st_ino: int
-    mode: int
-
-    def __post_init__(self) -> None:
-        if not stat.S_ISSOCK(self.mode):
-            raise AttestationError("control FD must be an open socket")
-
-    @classmethod
-    def from_fd(cls, descriptor: int) -> ControlFDIdentity:
-        if isinstance(descriptor, bool) or not isinstance(descriptor, int):
-            raise AttestationError("control FD must be an integer")
-        try:
-            metadata = os.fstat(descriptor)
-        except OSError as error:
-            raise AttestationError("control FD is not open") from error
-        return cls(metadata.st_dev, metadata.st_ino, metadata.st_mode)
-
-
-@dataclass(frozen=True)
 class SupervisorBootstrapDescriptors:
     allocation_nonce: str
     instance_dir: Path
     real_cli: Path
-    control_fd: int
-    control_identity: ControlFDIdentity
+    journal: Journal
 
     def __post_init__(self) -> None:
         _require_sha256(self.allocation_nonce, "allocation nonce")
-        if (
-            not isinstance(self.instance_dir, Path)
-            or not self.instance_dir.is_absolute()
-        ):
-            raise AttestationError("instance directory must be absolute")
-        if not isinstance(self.real_cli, Path) or not self.real_cli.is_absolute():
-            raise AttestationError("real CLI path must be absolute")
-        if isinstance(self.control_fd, bool) or not isinstance(self.control_fd, int):
-            raise AttestationError("control FD must be an integer")
-        if not isinstance(self.control_identity, ControlFDIdentity):
-            raise AttestationError("control FD identity is required")
-
-    def environment(self) -> dict[str, str]:
-        return {
-            "LOCAL_PROXY_ALLOCATION_NONCE": self.allocation_nonce,
-            "LOCAL_PROXY_INSTANCE_DIR": str(self.instance_dir),
-            "LOCAL_PROXY_REAL_CLAUDE": str(self.real_cli),
-            "LOCAL_PROXY_CONTROL_FD": str(self.control_fd),
-        }
+        if not self.instance_dir.is_absolute() or not self.real_cli.is_absolute():
+            raise AttestationError("bootstrap paths must be absolute")
+        if not isinstance(self.journal, Journal):
+            raise AttestationError("authoritative Task 4 journal handle is required")
 
 
-@dataclass(frozen=True)
-class SupervisorIdentityAckConfig:
-    network_proxy_enabled: bool
-    certified_sequence: int
-    certified_hash: bytes
-    version: int = 1
-    reserved_byte: int = 0
-    reserved_word: int = 0
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.network_proxy_enabled, bool):
-            raise AttestationError("network proxy selector must be a boolean")
-        sequence = _positive_int(self.certified_sequence, "certified sequence")
-        if sequence >= 1 << 64:
-            raise AttestationError("certified sequence exceeds uint64")
-        if (
-            not isinstance(self.certified_hash, bytes)
-            or len(self.certified_hash) != 32
-            or self.certified_hash == bytes(32)
-        ):
-            raise AttestationError("certified hash must be nonzero bytes32")
-        if isinstance(self.version, bool) or self.version != 1:
-            raise AttestationError("IDENTITY_ACK config version changed")
-        if (
-            isinstance(self.reserved_byte, bool)
-            or self.reserved_byte != 0
-            or isinstance(self.reserved_word, bool)
-            or self.reserved_word != 0
-        ):
-            raise AttestationError("IDENTITY_ACK reserved fields changed")
-
-    def payload(self) -> bytes:
-        return struct.pack(
-            "<HBBIQ32s",
-            self.version,
-            int(self.network_proxy_enabled),
-            self.reserved_byte,
-            self.reserved_word,
-            self.certified_sequence,
-            self.certified_hash,
-        )
-
-
-def _measure_cli(path: Path) -> CliExecutableIdentity:
+def _snapshot_cli(path: Path) -> CliExecutableIdentity:
+    if not path.is_absolute():
+        raise AttestationError("CLI executable path must be absolute")
+    try:
+        metadata = os.lstat(path)
+    except OSError as error:
+        raise AttestationError("CLI executable is unavailable") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise AttestationError("CLI executable cannot be a symlink")
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise AttestationError("CLI executable is unavailable") from error
+        raise AttestationError(
+            "CLI executable cannot be opened without following"
+        ) from error
     try:
-        metadata = os.fstat(descriptor)
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+        ) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+        ):
+            raise AttestationError("CLI changed during measurement")
         hasher = hashlib.sha256()
         while chunk := os.read(descriptor, 1024 * 1024):
             hasher.update(chunk)
@@ -498,21 +313,47 @@ def _measure_cli(path: Path) -> CliExecutableIdentity:
         os.close(descriptor)
     return CliExecutableIdentity(
         version=EXPECTED_CLI_VERSION,
-        path_sha256=hashlib.sha256(str(path.resolve()).encode()).hexdigest(),
-        st_dev=metadata.st_dev,
-        st_ino=metadata.st_ino,
-        mode=metadata.st_mode,
+        path_sha256=hashlib.sha256(str(path).encode("utf-8")).hexdigest(),
+        st_dev=opened.st_dev,
+        st_ino=opened.st_ino,
+        mode=opened.st_mode,
         sha256=hasher.hexdigest(),
     )
 
 
+def _measure_cli(path: Path, environment: Mapping[str, str]) -> CliExecutableIdentity:
+    before = _snapshot_cli(path)
+    try:
+        completed = subprocess.run(
+            [str(path), "--version"],
+            capture_output=True,
+            check=False,
+            env=dict(environment),
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AttestationError("CLI version measurement failed or timed out") from error
+    after = _snapshot_cli(path)
+    if before != after:
+        raise AttestationError("CLI changed during measurement")
+    if completed.returncode != 0:
+        raise AttestationError("CLI version probe did not succeed")
+    if completed.stdout != _VERSION_STDOUT or completed.stderr:
+        raise AttestationError("CLI version does not match pinned 2.1.251")
+    return before
+
+
 def _require_executable(path: Path, label: str) -> None:
     try:
-        metadata = path.stat()
+        metadata = os.lstat(path)
     except OSError as error:
         raise AttestationError(f"{label} is unavailable") from error
-    if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & stat.S_IXUSR:
-        raise AttestationError(f"{label} must be an executable regular file")
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or not metadata.st_mode & stat.S_IXUSR
+    ):
+        raise AttestationError(f"{label} must be a no-follow executable regular file")
 
 
 def _cli_arguments(options: ClaudeAgentOptions) -> tuple[str, ...]:
@@ -542,105 +383,840 @@ def _cli_arguments(options: ClaudeAgentOptions) -> tuple[str, ...]:
     )
 
 
-@dataclass(frozen=True)
+def _fd_identity(descriptor: int) -> tuple[int, int, int]:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise AttestationError("control FD is not open") from error
+    if not stat.S_ISSOCK(metadata.st_mode):
+        raise AttestationError("control FD must be an open socket")
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode
+
+
 class PreparedSupervisorLaunch:
-    options: ClaudeAgentOptions
-    command: tuple[str, ...]
+    """Sealed, single-consumer launch authority produced by final validation."""
+
+    __slots__ = (
+        "_authority",
+        "_bootstrap_descriptor_names",
+        "_child_control",
+        "_child_control_identity",
+        "_cli_identity",
+        "_command",
+        "_config",
+        "_descriptors",
+        "_fingerprint",
+        "_network_proxy_enabled",
+        "_parent_control",
+        "_parent_control_identity",
+        "_sealed",
+        "_supervisor_environment_items",
+        "_transport_claimed",
+        "_transport_identity",
+    )
+    _authority: object
+    _bootstrap_descriptor_names: tuple[str, ...]
+    _child_control: socket.socket
+    _child_control_identity: tuple[int, int, int]
+    _cli_identity: CliExecutableIdentity
+    _command: tuple[str, ...]
+    _config: IsolationConfig
+    _descriptors: SupervisorBootstrapDescriptors
+    _fingerprint: str
+    _network_proxy_enabled: bool
+    _parent_control: socket.socket
+    _parent_control_identity: tuple[int, int, int]
+    _sealed: bool
     _supervisor_environment_items: tuple[tuple[str, str], ...]
-    inherited_fds: tuple[int, ...]
-    control_identity: ControlFDIdentity
-    bootstrap_descriptor_names: tuple[str, ...]
-    identity_ack_config: SupervisorIdentityAckConfig
-    identity_ack_payload: bytes
-    cli_identity: CliExecutableIdentity
-    full_supervisor_evidence: FullSupervisorEvidence
-    availability: AttestationAvailability
-    network_proxy_items: tuple[tuple[str, str], ...]
-    supervisor_internal_relay_fd: int = SUPERVISOR_INTERNAL_RELAY_FD
+    _transport_claimed: bool
+    _transport_identity: object | None
+
+    def __new__(cls, *_args: object, **_kwargs: object) -> PreparedSupervisorLaunch:
+        raise TypeError("PreparedSupervisorLaunch cannot be constructed publicly")
+
+    @classmethod
+    def _create(
+        cls,
+        token: object,
+        *,
+        config: IsolationConfig,
+        descriptors: SupervisorBootstrapDescriptors,
+        cli_identity: CliExecutableIdentity,
+        effective_environment: Mapping[str, str],
+        network_proxy_enabled: bool,
+    ) -> PreparedSupervisorLaunch:
+        if token is not _LAUNCH_TOKEN:
+            raise AttestationError("launch authority is invalid")
+        value = object.__new__(cls)
+        object.__setattr__(value, "_sealed", False)
+        immutable_config = IsolationConfig(
+            model_id=config.model_id,
+            system_prompt=config.system_prompt,
+            cwd=config.cwd,
+            supervisor_path=config.supervisor_path,
+            environment=MappingProxyType(dict(effective_environment)),
+        )
+        options = build_agent_options(immutable_config)
+        parent, child = socket.socketpair()
+        child.set_inheritable(True)
+        supervisor_environment = {
+            **dict(effective_environment),
+            "LOCAL_PROXY_ALLOCATION_NONCE": descriptors.allocation_nonce,
+            "LOCAL_PROXY_INSTANCE_DIR": str(descriptors.instance_dir),
+            "LOCAL_PROXY_REAL_CLAUDE": str(descriptors.real_cli),
+            "LOCAL_PROXY_CONTROL_FD": str(child.fileno()),
+        }
+        command = (str(config.supervisor_path), *_cli_arguments(options))
+        object.__setattr__(value, "_authority", _LAUNCH_TOKEN)
+        object.__setattr__(
+            value, "_bootstrap_descriptor_names", BOOTSTRAP_DESCRIPTOR_NAMES
+        )
+        object.__setattr__(value, "_child_control", child)
+        object.__setattr__(
+            value, "_child_control_identity", _fd_identity(child.fileno())
+        )
+        object.__setattr__(value, "_cli_identity", cli_identity)
+        object.__setattr__(value, "_command", command)
+        object.__setattr__(value, "_config", immutable_config)
+        object.__setattr__(value, "_descriptors", descriptors)
+        object.__setattr__(value, "_network_proxy_enabled", network_proxy_enabled)
+        object.__setattr__(value, "_parent_control", parent)
+        object.__setattr__(
+            value, "_parent_control_identity", _fd_identity(parent.fileno())
+        )
+        object.__setattr__(
+            value,
+            "_supervisor_environment_items",
+            tuple(sorted(supervisor_environment.items())),
+        )
+        object.__setattr__(value, "_transport_claimed", False)
+        object.__setattr__(value, "_transport_identity", None)
+        object.__setattr__(value, "_fingerprint", value._current_fingerprint())
+        object.__setattr__(value, "_sealed", True)
+        return value
+
+    def __setattr__(self, _name: str, _value: object) -> Never:
+        raise AttestationError("prepared launch is sealed")
+
+    def __copy__(self) -> Never:
+        raise AttestationError("prepared launch cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> Never:
+        raise AttestationError("prepared launch cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise AttestationError("prepared launch cannot be pickled")
+
+    @property
+    def command(self) -> tuple[str, ...]:
+        self._validate()
+        return self._command
+
+    @property
+    def options(self) -> ClaudeAgentOptions:
+        self._validate()
+        return build_agent_options(self._config)
 
     @property
     def supervisor_environment(self) -> Mapping[str, str]:
-        return dict(self._supervisor_environment_items)
+        self._validate()
+        return MappingProxyType(dict(self._supervisor_environment_items))
+
+    @property
+    def bootstrap_descriptor_names(self) -> tuple[str, ...]:
+        self._validate()
+        return self._bootstrap_descriptor_names
+
+    @property
+    def inherited_fds(self) -> tuple[int, ...]:
+        self._validate()
+        return (self._child_control.fileno(),)
+
+    @property
+    def cli_identity(self) -> CliExecutableIdentity:
+        self._validate()
+        return self._cli_identity
+
+    @property
+    def supervisor_internal_relay_fd(self) -> int:
+        return SUPERVISOR_INTERNAL_RELAY_FD
+
+    def _current_fingerprint(self) -> str:
+        return _digest(
+            b"claude-sdk-proxy:prepared-launch:v1",
+            {
+                "command": self._command,
+                "cwd": str(self._config.cwd),
+                "environment": self._supervisor_environment_items,
+                "allocation_nonce": self._descriptors.allocation_nonce,
+                "instance_dir": str(self._descriptors.instance_dir),
+                "real_cli": str(self._descriptors.real_cli),
+                "cli_identity": self._cli_identity.digest(),
+                "network_proxy_enabled": self._network_proxy_enabled,
+                "child_control_identity": self._child_control_identity,
+                "parent_control_identity": self._parent_control_identity,
+                "journal_identity": id(self._descriptors.journal),
+            },
+        )
+
+    def _validate(self) -> None:
+        if self._authority is not _LAUNCH_TOKEN or not self._sealed:
+            raise AttestationError("prepared launch authority is invalid")
+        if self._fingerprint != self._current_fingerprint():
+            raise AttestationError("prepared launch fields changed")
+        if self._child_control.fileno() < 0 or self._parent_control.fileno() < 0:
+            raise AttestationError("prepared launch control channel is closed")
+        if _fd_identity(self._child_control.fileno()) != self._child_control_identity:
+            raise AttestationError("child control FD identity changed")
+        if _fd_identity(self._parent_control.fileno()) != self._parent_control_identity:
+            raise AttestationError("parent control FD identity changed")
+
+    def _claim(self, token: object, transport: object) -> None:
+        if token is not _LAUNCH_TOKEN:
+            raise AttestationError("transport claim authority is invalid")
+        self._validate()
+        if self._transport_claimed:
+            raise AttestationError("prepared launch is already claimed")
+        object.__setattr__(self, "_transport_claimed", True)
+        object.__setattr__(self, "_transport_identity", transport)
+
+    def _require_transport(self, transport: object) -> None:
+        self._validate()
+        if self._transport_identity is not transport:
+            raise AttestationError("prepared launch transport identity changed")
+
+    def close(self) -> None:
+        for control in (self._child_control, self._parent_control):
+            try:
+                control.close()
+            except OSError:
+                pass
 
 
 def prepare_supervisor_launch(
     config: IsolationConfig,
     descriptors: SupervisorBootstrapDescriptors,
-    identity_ack_config: SupervisorIdentityAckConfig,
     manifest: AttestationManifest,
+    *,
+    source_environment: Mapping[str, str],
+    environment_config: EnvironmentConfig,
 ) -> PreparedSupervisorLaunch:
+    if not isinstance(descriptors, SupervisorBootstrapDescriptors):
+        raise AttestationError("Task 5 bootstrap descriptors are required")
+    if not isinstance(manifest, AttestationManifest):
+        raise AttestationError("attestation manifest is required")
+    if config.cwd != descriptors.instance_dir / _WORKDIR_NAME:
+        raise AttestationError("config cwd is not the Task 5 allocation workdir")
     _require_executable(config.supervisor_path, "verified supervisor")
-    measured_cli = _measure_cli(descriptors.real_cli)
+    if environment_config.pass_names:
+        raise AttestationError("native Task 5 environment config forbids pass_names")
+    if environment_config.cli_dir != descriptors.real_cli.parent:
+        raise AttestationError("environment config CLI directory changed")
+    effective = build_child_environment(source_environment, environment_config)
+    if dict(config.environment) != effective:
+        raise AttestationError(
+            "prebuilt environment differs from effective child environment"
+        )
+    fingerprint = environment_fingerprint(effective)
+    if fingerprint != manifest.environment_fingerprint:
+        raise AttestationError("effective child environment fingerprint changed")
+    measured_cli = _measure_cli(descriptors.real_cli, effective)
     if measured_cli != manifest.cli_executable:
         raise AttestationError("CLI executable does not match manifest identity")
-    if descriptors.control_identity != ControlFDIdentity.from_fd(
-        descriptors.control_fd
-    ):
-        raise AttestationError("control FD identity changed before launch")
-    evidence = manifest.supervisor_evidence
-    if identity_ack_config.network_proxy_enabled != evidence.network_proxy_enabled:
-        raise AttestationError("network proxy selector disagrees with Task 5 evidence")
-    if (
-        identity_ack_config.certified_sequence
-        != evidence.canonical_control_sequences[-1]
-    ):
-        raise AttestationError("IDENTITY_ACK sequence disagrees with Task 5 head")
-    if (
-        identity_ack_config.certified_hash.hex()
-        != evidence.canonical_control_hashes[-1]
-    ):
-        raise AttestationError("IDENTITY_ACK hash disagrees with Task 5 head")
-    if environment_fingerprint(config.environment) != manifest.environment_fingerprint:
-        raise AttestationError("effective environment fingerprint changed")
-    proxy_items = tuple(
-        sorted(
-            (name, value)
-            for name, value in config.environment.items()
-            if name in _NETWORK_PROXY_NAMES
-        )
-    )
-    if identity_ack_config.network_proxy_enabled != bool(proxy_items):
-        raise AttestationError(
-            "network proxy bit disagrees with effective proxy values"
-        )
-    forbidden = set(BOOTSTRAP_DESCRIPTOR_NAMES) | {_AMBIENT_NETWORK_PROXY_SELECTOR}
-    if set(config.environment) & forbidden:
+    forbidden = set(BOOTSTRAP_DESCRIPTOR_NAMES) | {"LOCAL_PROXY_NETWORK_PROXY"}
+    if set(effective) & forbidden:
         raise AttestationError("real CLI environment contains ambient bootstrap state")
-    options = build_agent_options(config)
-    supervisor_environment = {**dict(config.environment), **descriptors.environment()}
-    command = (str(config.supervisor_path), *_cli_arguments(options))
-    return PreparedSupervisorLaunch(
-        options=replace(options, env=supervisor_environment),
-        command=command,
-        _supervisor_environment_items=tuple(sorted(supervisor_environment.items())),
-        inherited_fds=(descriptors.control_fd,),
-        control_identity=descriptors.control_identity,
-        bootstrap_descriptor_names=BOOTSTRAP_DESCRIPTOR_NAMES,
-        identity_ack_config=identity_ack_config,
-        identity_ack_payload=identity_ack_config.payload(),
+    return PreparedSupervisorLaunch._create(
+        _LAUNCH_TOKEN,
+        config=config,
+        descriptors=descriptors,
         cli_identity=measured_cli,
-        full_supervisor_evidence=evidence,
-        availability=manifest.availability,
-        network_proxy_items=proxy_items,
+        effective_environment=effective,
+        network_proxy_enabled=environment_config.network_proxy,
     )
+
+
+def _crc32c(payload: bytes) -> int:
+    checksum = 0xFFFFFFFF
+    for byte in payload:
+        checksum ^= byte
+        for _ in range(8):
+            mask = -(checksum & 1) & 0xFFFFFFFF
+            checksum = (checksum >> 1) ^ (0x82F63B78 & mask)
+    return (~checksum) & 0xFFFFFFFF
+
+
+def _encode_control_frame(
+    message_type: int, nonce: bytes, payload: bytes = b""
+) -> bytes:
+    if message_type not in _CONTROL_NAMES or len(payload) > _CONTROL_MAX_PAYLOAD:
+        raise AttestationError("invalid Task 5 control frame")
+    header = struct.pack(
+        "<IHHI32s",
+        _CONTROL_MAGIC,
+        _CONTROL_VERSION,
+        message_type,
+        len(payload),
+        nonce,
+    )
+    return header + payload + struct.pack("<I", _crc32c(header + payload))
+
+
+def _receive_exact(control: socket.socket, length: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining:
+        try:
+            chunk = control.recv(remaining)
+        except (OSError, TimeoutError) as error:
+            raise AttestationError("Task 5 control read failed or timed out") from error
+        if not chunk:
+            raise AttestationError("Task 5 control channel closed early")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _receive_control_frame(
+    control: socket.socket,
+    nonce: bytes,
+    expected_type: int,
+) -> bytes:
+    header = _receive_exact(control, _CONTROL_HEADER_SIZE)
+    magic, version, message_type, payload_length, observed_nonce = struct.unpack(
+        "<IHHI32s", header
+    )
+    expected_size = {
+        1: _PROCESS_IDENTITY_SIZE,
+        3: _PROCESS_IDENTITY_SIZE,
+        5: _CLI_ARMED_IDENTITY_SIZE,
+        7: _PROCESS_IDENTITY_SIZE,
+        10: 40,
+        12: 40,
+    }.get(expected_type)
+    if (
+        magic != _CONTROL_MAGIC
+        or version != _CONTROL_VERSION
+        or message_type != expected_type
+        or observed_nonce != nonce
+        or payload_length > _CONTROL_MAX_PAYLOAD
+        or (expected_size is not None and payload_length != expected_size)
+    ):
+        raise AttestationError("Task 5 control frame is invalid")
+    body = _receive_exact(control, payload_length + _CONTROL_CHECKSUM_SIZE)
+    payload = body[:-_CONTROL_CHECKSUM_SIZE]
+    checksum = struct.unpack("<I", body[-_CONTROL_CHECKSUM_SIZE:])[0]
+    if checksum != _crc32c(header + payload):
+        raise AttestationError("Task 5 control checksum is invalid")
+    return payload
+
+
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    pid: int
+    start_ns: int
+    uid: int
+    pgid: int
+    sid: int
+    flags: int
+    executable_dev: int
+    executable_ino: int
+    boot_id: bytes
+    executable_hash: bytes
+
+
+def _parse_process_identity(payload: bytes) -> _ProcessIdentity:
+    if len(payload) != _PROCESS_IDENTITY_SIZE:
+        raise AttestationError("Task 5 process identity size changed")
+    pid, start_ns, uid, pgid, sid, flags, executable_dev, executable_ino = (
+        struct.unpack_from("<qQIiiIQQ", payload)
+    )
+    identity = _ProcessIdentity(
+        pid,
+        start_ns,
+        uid,
+        pgid,
+        sid,
+        flags,
+        executable_dev,
+        executable_ino,
+        payload[48:80],
+        payload[80:112],
+    )
+    if identity.flags != 0x3F or identity.pid <= 0:
+        raise AttestationError("Task 5 process identity is incomplete")
+    return identity
+
+
+def _same_incarnation(left: _ProcessIdentity, right: _ProcessIdentity) -> bool:
+    return (
+        left.pid,
+        left.start_ns,
+        left.uid,
+        left.pgid,
+        left.sid,
+        left.flags,
+        left.boot_id,
+    ) == (
+        right.pid,
+        right.start_ns,
+        right.uid,
+        right.pgid,
+        right.sid,
+        right.flags,
+        right.boot_id,
+    )
+
+
+class SupervisorHandshakeReceipt:
+    """Opaque receipt minted only after the actual Task 5 runtime handshake."""
+
+    __slots__ = (
+        "_canonical_control_hashes",
+        "_canonical_control_sequences",
+        "_canonical_control_types",
+        "_control_trace",
+        "_identity_ack_hash",
+        "_identity_ack_sequence",
+        "_network_proxy_enabled",
+        "_token",
+    )
+    _canonical_control_hashes: tuple[bytes, ...]
+    _canonical_control_sequences: tuple[int, ...]
+    _canonical_control_types: tuple[str, ...]
+    _control_trace: tuple[str, ...]
+    _identity_ack_hash: bytes
+    _identity_ack_sequence: int
+    _network_proxy_enabled: bool
+    _token: object
+
+    def __new__(cls, *_args: object, **_kwargs: object) -> SupervisorHandshakeReceipt:
+        raise TypeError("SupervisorHandshakeReceipt cannot be constructed publicly")
+
+    def __setattr__(self, _name: str, _value: object) -> Never:
+        raise AttestationError("handshake receipt is sealed")
+
+    @classmethod
+    def _create(
+        cls,
+        token: object,
+        *,
+        sequences: tuple[int, ...],
+        hashes: tuple[bytes, ...],
+        ack_sequence: int,
+        ack_hash: bytes,
+        network_proxy_enabled: bool,
+    ) -> SupervisorHandshakeReceipt:
+        if token is not _RECEIPT_TOKEN:
+            raise AttestationError("handshake receipt authority is invalid")
+        if len(sequences) != 4 or tuple(sorted(sequences)) != sequences:
+            raise AttestationError("Task 5 certified sequences are invalid")
+        if len(hashes) != 4 or len(set(hashes)) != 4:
+            raise AttestationError("Task 5 certified hashes are invalid")
+        value = object.__new__(cls)
+        object.__setattr__(value, "_token", _RECEIPT_TOKEN)
+        object.__setattr__(value, "_control_trace", _EXPECTED_TRACE)
+        object.__setattr__(value, "_canonical_control_types", _EXPECTED_CANONICAL_TYPES)
+        object.__setattr__(value, "_canonical_control_sequences", sequences)
+        object.__setattr__(value, "_canonical_control_hashes", hashes)
+        object.__setattr__(value, "_identity_ack_sequence", ack_sequence)
+        object.__setattr__(value, "_identity_ack_hash", ack_hash)
+        object.__setattr__(value, "_network_proxy_enabled", network_proxy_enabled)
+        return value
+
+    @property
+    def control_trace(self) -> tuple[str, ...]:
+        return self._control_trace
+
+    @property
+    def canonical_control_types(self) -> tuple[str, ...]:
+        return self._canonical_control_types
+
+    @property
+    def canonical_control_sequences(self) -> tuple[int, ...]:
+        return self._canonical_control_sequences
+
+    @property
+    def canonical_control_hashes(self) -> tuple[bytes, ...]:
+        return self._canonical_control_hashes
+
+    @property
+    def identity_ack_sequence(self) -> int:
+        return self._identity_ack_sequence
+
+    @property
+    def identity_ack_hash(self) -> bytes:
+        return self._identity_ack_hash
+
+    @property
+    def network_proxy_enabled(self) -> bool:
+        return self._network_proxy_enabled
+
+    def __copy__(self) -> Never:
+        raise AttestationError("handshake receipt cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> Never:
+        raise AttestationError("handshake receipt cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise AttestationError("handshake receipt cannot be pickled")
+
+
+def _certify_identity(
+    control: socket.socket,
+    journal: Journal,
+    nonce: bytes,
+    expected_type: int,
+) -> tuple[bytes, BootstrapHead]:
+    payload = _receive_control_frame(control, nonce, expected_type)
+    try:
+        certified = journal.certify_bootstrap(expected_type, payload)
+    except Exception as error:
+        raise AttestationError("Task 5 bootstrap identity is not certified") from error
+    return payload, certified
+
+
+def _perform_handshake(
+    control: socket.socket,
+    journal: Journal,
+    nonce: bytes,
+    cli_identity: CliExecutableIdentity,
+    network_proxy_enabled: bool,
+    supervisor_pid: int,
+) -> SupervisorHandshakeReceipt:
+    control.settimeout(5)
+    supervisor_payload, supervisor_head = _certify_identity(control, journal, nonce, 1)
+    supervisor = _parse_process_identity(supervisor_payload)
+    if supervisor.pid != supervisor_pid:
+        raise AttestationError("Task 5 supervisor identity is not the retained child")
+    canonical = journal.certify_head()
+    config = struct.pack(
+        _SUPERVISOR_CONFIG_FORMAT,
+        _SUPERVISOR_CONFIG_VERSION,
+        int(network_proxy_enabled),
+        0,
+        0,
+        canonical.sequence,
+        canonical.hash,
+    )
+    control.sendall(_encode_control_frame(2, nonce, config))
+
+    anchor_payload, anchor_head = _certify_identity(control, journal, nonce, 3)
+    anchor = _parse_process_identity(anchor_payload)
+    if (
+        anchor.pid != anchor.pgid
+        or anchor.pid != anchor.sid
+        or (anchor.pgid, anchor.sid) == (supervisor.pgid, supervisor.sid)
+    ):
+        raise AttestationError("Task 5 anchor identity chain is invalid")
+    control.sendall(_encode_control_frame(4, nonce))
+
+    armed_payload, armed_head = _certify_identity(control, journal, nonce, 5)
+    armed_member = _parse_process_identity(armed_payload[:112])
+    expected_dev, expected_ino = struct.unpack_from("<QQ", armed_payload, 112)
+    expected_hash = armed_payload[128:160]
+    expected_path_hash = armed_payload[160:192]
+    if (
+        (armed_member.pgid, armed_member.sid) != (anchor.pgid, anchor.sid)
+        or expected_dev != cli_identity.st_dev
+        or expected_ino != cli_identity.st_ino
+        or expected_hash.hex() != cli_identity.sha256
+        or expected_path_hash.hex() != cli_identity.path_sha256
+    ):
+        raise AttestationError("Task 5 armed CLI identity is invalid")
+    control.sendall(_encode_control_frame(6, nonce))
+
+    running_payload, running_head = _certify_identity(control, journal, nonce, 7)
+    running = _parse_process_identity(running_payload)
+    if (
+        not _same_incarnation(armed_member, running)
+        or running.executable_dev != cli_identity.st_dev
+        or running.executable_ino != cli_identity.st_ino
+        or running.executable_hash.hex() != cli_identity.sha256
+    ):
+        raise AttestationError("Task 5 running CLI identity is invalid")
+    return SupervisorHandshakeReceipt._create(
+        _RECEIPT_TOKEN,
+        sequences=(
+            supervisor_head.sequence,
+            anchor_head.sequence,
+            armed_head.sequence,
+            running_head.sequence,
+        ),
+        hashes=(
+            supervisor_head.hash,
+            anchor_head.hash,
+            armed_head.hash,
+            running_head.hash,
+        ),
+        ack_sequence=canonical.sequence,
+        ack_hash=canonical.hash,
+        network_proxy_enabled=network_proxy_enabled,
+    )
+
+
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateKey(key)
+        value[key] = item
+    return value
+
+
+def _is_safe_initialize(data: str) -> bool:
+    if not isinstance(data, str):
+        return False
+    try:
+        encoded = data.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    if (
+        len(encoded) > _INITIALIZE_MAX_BYTES
+        or not data.endswith("\n")
+        or data.count("\n") != 1
+        or "\r" in data
+    ):
+        return False
+    try:
+        value = json.loads(data[:-1], object_pairs_hook=_object_without_duplicates)
+    except TypeError, ValueError, _DuplicateKey:
+        return False
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"type", "request_id", "request"}
+        or value.get("type") != "control_request"
+        or not isinstance(value.get("request_id"), str)
+        or _REQUEST_ID.fullmatch(value["request_id"]) is None
+        or not isinstance(value.get("request"), dict)
+    ):
+        return False
+    request = value["request"]
+    return (
+        set(request) in ({"subtype", "hooks"}, {"subtype", "hooks", "skills"})
+        and request.get("subtype") == "initialize"
+        and request.get("hooks") is None
+        and ("skills" not in request or request.get("skills") == [])
+    )
+
+
+def _validate_cleanup_result(
+    result: bytes,
+    *,
+    expected_done_sequence: int,
+) -> None:
+    (
+        flags,
+        batch_count,
+        completed_steps,
+        done_sequence,
+        process_batch_admission_sequence,
+        injection_stage,
+        reserved,
+    ) = struct.unpack("<IIQQQII", result)
+    required_flags = 0xFF7
+    allowed_flags = 0x2FFF
+    if (
+        flags & required_flags != required_flags
+        or flags & ~allowed_flags
+        or batch_count != 4
+        or completed_steps != 0xF
+        or done_sequence != expected_done_sequence
+        or process_batch_admission_sequence == 0
+        or injection_stage != 0
+        or reserved != 0
+    ):
+        raise AttestationError("Task 5 cleanup result is incomplete or ambiguous")
+
+
+def _prepare_cleanup(control: socket.socket, journal: Journal, nonce: bytes) -> None:
+    appended = journal.append_bootstrap(8, b"")
+    certified = journal.certify_bootstrap(8, b"")
+    if appended.sequence != certified.sequence or appended.hash != certified.hash:
+        raise AttestationError("Task 5 cleanup request certification changed")
+    control.sendall(
+        _encode_control_frame(
+            8,
+            nonce,
+            struct.pack("<Q32s", certified.sequence, certified.hash),
+        )
+    )
+    acknowledgement = _receive_control_frame(control, nonce, 12)
+    ack_sequence, ack_hash = struct.unpack("<Q32s", acknowledgement)
+    if ack_sequence != certified.sequence or ack_hash != certified.hash:
+        raise AttestationError("Task 5 cleanup ACK is not bound to the request")
+    result = _receive_control_frame(control, nonce, 10)
+    try:
+        journal.certify_bootstrap(10, result)
+    except Exception as error:
+        raise AttestationError("Task 5 cleanup result is not certified") from error
+    head = journal.certify_head()
+    if head.state.kind.name != "DONE":
+        raise AttestationError("Task 5 cleanup result did not reach DONE")
+    _validate_cleanup_result(result, expected_done_sequence=head.sequence)
+
+
+class _OwnedSupervisorProcess:
+    """Popen owner that leaves the child reapable for Task 4 confirmation."""
+
+    __slots__ = ("_popen", "_stdin", "_stdout")
+
+    def __init__(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path,
+        environment: Mapping[str, str],
+        inherited_fds: tuple[int, ...],
+    ) -> None:
+        process = subprocess.Popen(
+            command,
+            stdin=PIPE,
+            stdout=PIPE,
+            stderr=DEVNULL,
+            cwd=cwd,
+            env=dict(environment),
+            pass_fds=inherited_fds,
+        )
+        if process.stdin is None or process.stdout is None:
+            process.kill()
+            process.wait(timeout=5)
+            raise AttestationError("supervisor pipes are unavailable")
+        self._popen = process
+        self._stdin: IO[bytes] | None = process.stdin
+        self._stdout: IO[bytes] | None = process.stdout
+
+    @property
+    def pid(self) -> int:
+        return self._popen.pid
+
+    @property
+    def returncode(self) -> int | None:
+        return self._popen.returncode
+
+    async def send(self, data: str) -> None:
+        stream = self._stdin
+        if stream is None:
+            raise AttestationError("supervisor stdin is closed")
+        encoded = data.encode("utf-8")
+
+        def write_all() -> None:
+            cursor = 0
+            while cursor < len(encoded):
+                try:
+                    written = os.write(stream.fileno(), encoded[cursor:])
+                except OSError as error:
+                    raise AttestationError("supervisor stdin write failed") from error
+                if written <= 0:
+                    raise AttestationError("supervisor stdin write was incomplete")
+                cursor += written
+
+        with anyio.fail_after(1):
+            await anyio.to_thread.run_sync(write_all, abandon_on_cancel=True)
+
+    async def receive(self) -> bytes:
+        stream = self._stdout
+        if stream is None:
+            return b""
+        return await anyio.to_thread.run_sync(
+            os.read,
+            stream.fileno(),
+            65536,
+            abandon_on_cancel=True,
+        )
+
+    async def close_stdin(self) -> None:
+        stream = self._stdin
+        if stream is not None:
+            await anyio.to_thread.run_sync(stream.close, abandon_on_cancel=True)
+            self._stdin = None
+
+    async def wait(self) -> int:
+        return await anyio.to_thread.run_sync(self._popen.wait, abandon_on_cancel=True)
+
+    def terminate(self) -> None:
+        self._popen.terminate()
+
+    def kill(self) -> None:
+        self._popen.kill()
+
+    def record_confirmed_exit(self, status: int) -> None:
+        if self._popen.returncode is not None:
+            raise AttestationError("supervisor was reaped outside Task 4")
+        self._popen.returncode = status
+
+    async def aclose(self) -> None:
+        def close_streams() -> None:
+            for stream in (self._stdin, self._stdout):
+                if stream is not None:
+                    stream.close()
+
+        await anyio.to_thread.run_sync(close_streams, abandon_on_cancel=True)
+        self._stdin = None
+        self._stdout = None
+
+
+def _observe_successful_unreaped_exit(pid: int) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            observed = os.waitid(
+                os.P_PID,
+                pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except (ChildProcessError, OSError) as error:
+            raise AttestationError(
+                "supervisor was not retained for Task 4 reap"
+            ) from error
+        if observed is None or observed.si_pid == 0:
+            time.sleep(0.001)
+            continue
+        if (
+            observed.si_pid != pid
+            or observed.si_code != os.CLD_EXITED
+            or observed.si_status != 0
+        ):
+            raise AttestationError("supervisor did not exit successfully after cleanup")
+        return
+    raise AttestationError("supervisor did not become reapable after cleanup")
 
 
 class AttestedSupervisorTransport(Transport):
-    """SDK transport using exact environment, pass_fds, and write classification."""
+    """SDK transport with exact env/FD control and an actual Task 5 handshake."""
 
     def __init__(self, launch: PreparedSupervisorLaunch) -> None:
         if not isinstance(launch, PreparedSupervisorLaunch):
             raise AttestationError("validated supervisor launch is required")
+        launch._claim(_LAUNCH_TOKEN, self)
         self.launch = launch
+        self._control = launch._parent_control
+        self._journal = launch._descriptors.journal
+        self._nonce = bytes.fromhex(launch._descriptors.allocation_nonce)
+        self._network_proxy_enabled = launch._network_proxy_enabled
         self._process: Any | None = None
-        self._stdin: TextSendStream | None = None
-        self._stdout: TextReceiveStream | None = None
+        self._stdin: _OwnedSupervisorProcess | None = None
+        self._stdout: _OwnedSupervisorProcess | None = None
         self._lock = anyio.Lock()
         self._ready = False
         self._closed = False
         self._initialize_seen = False
         self._buffered: list[str] = []
         self._discarded = 0
+        self._handshake_receipt: SupervisorHandshakeReceipt | None = None
+        self._cleanup_unconfirmed = False
+
+    @property
+    def handshake_receipt(self) -> SupervisorHandshakeReceipt | None:
+        return self._handshake_receipt
+
+    @property
+    def cleanup_unconfirmed(self) -> bool:
+        return self._cleanup_unconfirmed
 
     @property
     def buffered_user_write_count(self) -> int:
@@ -656,50 +1232,40 @@ class AttestedSupervisorTransport(Transport):
                 raise AttestationError("transport is closed")
             if self._process is not None:
                 return
-            if self.launch.control_identity != ControlFDIdentity.from_fd(
-                self.launch.inherited_fds[0]
-            ):
-                raise AttestationError("control FD identity changed before spawn")
-            self._process = await anyio.open_process(
-                self.launch.command,
-                stdin=PIPE,
-                stdout=PIPE,
-                stderr=DEVNULL,
-                cwd=self.launch.options.cwd,
-                env=self.launch.supervisor_environment,
-                pass_fds=self.launch.inherited_fds,
+            self.launch._require_transport(self)
+            command = self.launch.command
+            cli_identity = self.launch.cli_identity
+            environment = self.launch.supervisor_environment
+            inherited_fds = self.launch.inherited_fds
+            process = await anyio.to_thread.run_sync(
+                lambda: _OwnedSupervisorProcess(
+                    command,
+                    cwd=self.launch._config.cwd,
+                    environment=environment,
+                    inherited_fds=inherited_fds,
+                )
             )
-            if self._process.stdin is None or self._process.stdout is None:
-                await self._close_locked()
-                raise AttestationError("supervisor pipes are unavailable")
-            self._stdin = TextSendStream(self._process.stdin)
-            self._stdout = TextReceiveStream(self._process.stdout)
+            self._process = process
+            self.launch._child_control.close()
+            try:
+                self._handshake_receipt = await anyio.to_thread.run_sync(
+                    _perform_handshake,
+                    self._control,
+                    self._journal,
+                    self._nonce,
+                    cli_identity,
+                    self._network_proxy_enabled,
+                    process.pid,
+                )
+            except Exception as error:
+                self._cleanup_unconfirmed = True
+                self._control.close()
+                raise AttestationError(
+                    "Task 5 supervisor handshake failed closed"
+                ) from error
+            self._stdin = self._process
+            self._stdout = self._process
             self._ready = True
-
-    @staticmethod
-    def _is_initialize(data: str) -> bool:
-        try:
-            lines = data.splitlines()
-            if len(lines) != 1:
-                return False
-            value = json.loads(lines[0])
-        except TypeError, ValueError:
-            return False
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"type", "request_id", "request"}
-            or value.get("type") != "control_request"
-            or not isinstance(value.get("request_id"), str)
-            or not isinstance(value.get("request"), dict)
-        ):
-            return False
-        request = value["request"]
-        return (
-            set(request) in ({"subtype", "hooks"}, {"subtype", "hooks", "skills"})
-            and request.get("subtype") == "initialize"
-            and request.get("hooks") is None
-            and ("skills" not in request or request.get("skills") == [])
-        )
 
     async def write(self, data: str) -> None:
         if not isinstance(data, str):
@@ -707,27 +1273,28 @@ class AttestedSupervisorTransport(Transport):
         async with self._lock:
             if not self._ready or self._stdin is None or self._closed:
                 raise AttestationError("transport is not ready")
-            if not self._initialize_seen and self._is_initialize(data):
+            if not self._initialize_seen and _is_safe_initialize(data):
                 self._initialize_seen = True
                 await self._stdin.send(data)
             else:
                 self._buffered.append(str(data))
 
-    async def release_buffered(self, permit: object) -> None:
-        del permit
+    async def release_buffered(self) -> Never:
         async with self._lock:
-            if not self.launch.availability.core_gate_available:
-                await self._close_locked()
-                raise AttestationError("core attestation gate unavailable")
-            raise AttestationError("production permit release is not implemented")
+            self._discarded += len(self._buffered)
+            self._buffered.clear()
+        await self.close()
+        raise AttestationError("core attestation gate unavailable")
 
     async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
         if self._stdout is None:
             raise AttestationError("transport is not connected")
         buffer = ""
-        async for chunk in self._stdout:
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        while chunk_bytes := await self._stdout.receive():
+            chunk = decoder.decode(chunk_bytes)
             buffer += chunk
-            if len(buffer.encode()) > 1024 * 1024:
+            if len(buffer.encode("utf-8")) > 1024 * 1024:
                 raise AttestationError("supervisor output exceeded transport bound")
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
@@ -737,6 +1304,7 @@ class AttestedSupervisorTransport(Transport):
                 if not isinstance(value, dict):
                     raise AttestationError("supervisor message must be an object")
                 yield value
+        buffer += decoder.decode(b"", final=True)
         if buffer.strip():
             value = json.loads(buffer)
             if not isinstance(value, dict):
@@ -746,42 +1314,105 @@ class AttestedSupervisorTransport(Transport):
     def is_ready(self) -> bool:
         return self._ready and not self._closed
 
+    async def _bounded_stdin_close(self) -> bool:
+        stream = self._stdin
+        if stream is None:
+            return True
+        with anyio.move_on_after(0.25) as scope:
+            await stream.close_stdin()
+        if scope.cancel_called:
+            self._cleanup_unconfirmed = True
+            return False
+        self._stdin = None
+        return True
+
     async def end_input(self) -> None:
         async with self._lock:
-            if self._stdin is not None:
-                await self._stdin.aclose()
-                self._stdin = None
+            if not await self._bounded_stdin_close():
+                raise AttestationError("stdin close timed out; cleanup is unconfirmed")
 
-    async def _close_locked(self) -> None:
-        self._closed = True
-        self._ready = False
-        self._discarded += len(self._buffered)
-        self._buffered.clear()
-        if self._stdin is not None:
-            await self._stdin.aclose()
-            self._stdin = None
+    async def _bounded_wait(self, seconds: float) -> bool:
+        if self._process is None:
+            return True
+        with anyio.move_on_after(seconds) as scope:
+            await self._process.wait()
+        return not scope.cancel_called and self._process.returncode is not None
+
+    async def _bounded_process_aclose(self) -> bool:
+        if self._process is None:
+            return True
+        with anyio.move_on_after(0.25) as scope:
+            await self._process.aclose()
+        return not scope.cancel_called
+
+    async def _close_pre_handshake_process(self) -> bool:
         process = self._process
-        self._process = None
         if process is None:
-            return
-        if process.returncode is None:
-            with anyio.move_on_after(0.25):
-                await process.wait()
-        if process.returncode is None:
+            return True
+        if process.returncode is None and not await self._bounded_wait(0.25):
             process.terminate()
-            with anyio.move_on_after(2):
-                await process.wait()
-        if process.returncode is None:
-            process.kill()
-            with anyio.move_on_after(2):
-                await process.wait()
-        await process.aclose()
+            if not await self._bounded_wait(2):
+                process.kill()
+                if not await self._bounded_wait(2):
+                    return False
+        process_closed = await self._bounded_process_aclose()
+        if process_closed:
+            self._process = None
+            self._stdin = None
+            self._stdout = None
+        return process_closed
+
+    async def _close_running_process(self) -> bool:
+        process = self._process
+        if process is None:
+            return True
+        if not isinstance(process, _OwnedSupervisorProcess):
+            return False
+        try:
+            await anyio.to_thread.run_sync(
+                _prepare_cleanup,
+                self._control,
+                self._journal,
+                self._nonce,
+            )
+            await anyio.to_thread.run_sync(
+                _observe_successful_unreaped_exit, process.pid
+            )
+        except Exception:
+            return False
+        try:
+            await anyio.to_thread.run_sync(self._journal.confirm_executor_reaped)
+            process.record_confirmed_exit(0)
+            authority = await anyio.to_thread.run_sync(self._journal.certify_done)
+            await anyio.to_thread.run_sync(self._journal.delete_at, authority)
+        except Exception:
+            return False
+        if not await self._bounded_process_aclose():
+            return False
+        self._process = None
+        self._stdin = None
+        self._stdout = None
+        return True
 
     async def close(self) -> None:
         async with self._lock:
             if self._closed and self._process is None:
                 return
-            await self._close_locked()
+            self._closed = True
+            self._ready = False
+            self._discarded += len(self._buffered)
+            self._buffered.clear()
+            stdin_closed = await self._bounded_stdin_close()
+            if self._handshake_receipt is None:
+                process_closed = await self._close_pre_handshake_process()
+            else:
+                process_closed = await self._close_running_process()
+            if stdin_closed and process_closed:
+                self._control.close()
+                self.launch._child_control.close()
+                return
+            self._cleanup_unconfirmed = True
+        raise AttestationError("transport cleanup is unconfirmed")
 
 
 def build_attested_sdk_client(
@@ -791,60 +1422,61 @@ def build_attested_sdk_client(
 ) -> ClaudeSDKClient:
     if transport is None or not isinstance(transport, AttestedSupervisorTransport):
         raise AttestationError("custom Task 6 transport is mandatory")
-    if transport.launch is not launch:
-        raise AttestationError("custom Task 6 transport launch identity changed")
+    launch._require_transport(transport)
     return ClaudeSDKClient(options=launch.options, transport=transport)
 
 
-@dataclass(frozen=True)
-class RelayReceipt:
-    model_bytes: int
-    network_bytes: int
-
-    def __post_init__(self) -> None:
-        for value in (self.model_bytes, self.network_bytes):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise AttestationError("relay byte counts must be nonnegative integers")
-
-
-@dataclass(frozen=True)
 class QueuedTurn:
+    __slots__ = ("_identity", "sequence")
+    _identity: object
     sequence: int
 
-    def __post_init__(self) -> None:
-        _positive_int(self.sequence, "queued turn sequence")
+    def __new__(cls, *_args: object, **_kwargs: object) -> QueuedTurn:
+        raise TypeError("QueuedTurn cannot be constructed publicly")
 
+    def __setattr__(self, _name: str, _value: object) -> Never:
+        raise AttestationError("queued turn is sealed")
 
-class _GateState(StrEnum):
-    OPEN = "open"
-    REVALIDATING = "revalidating"
-    RELEASING = "releasing"
-    CLOSED = "closed"
+    @classmethod
+    def _create(cls, token: object, sequence: int) -> QueuedTurn:
+        if token is not _TURN_TOKEN:
+            raise AttestationError("queued turn authority is invalid")
+        value = object.__new__(cls)
+        object.__setattr__(
+            value, "sequence", _positive_int(sequence, "queued turn sequence")
+        )
+        object.__setattr__(value, "_identity", object())
+        return value
+
+    def __copy__(self) -> Never:
+        raise AttestationError("queued turn cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> Never:
+        raise AttestationError("queued turn cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise AttestationError("queued turn cannot be pickled")
 
 
 class AttestationGate:
-    """Locked fail-closed per-turn state machine with exact permit binding."""
+    """Serialized false gate whose close callbacks always run outside its lock."""
 
     def __init__(
         self,
         *,
         availability: AttestationAvailability,
-        binding: AttestationBinding,
-        revalidate: Callable[[], tuple[ChildAttestation, object]],
-        relay: Callable[[bytes], RelayReceipt],
+        relay: Callable[[bytes], object],
         close_child: Callable[[], None],
     ) -> None:
+        if availability is not _CURRENT_AVAILABILITY:
+            raise AttestationError("attestation availability verdict is invalid")
         self._availability = availability
-        self._binding = binding
-        self._revalidate_callback = revalidate
         self._relay = relay
         self._close_child = close_child
-        self._lock = threading.RLock()
-        self._state = _GateState.OPEN
+        self._lock = threading.Lock()
+        self._closed = False
         self._revoked = False
         self._close_called = False
-        self._attestation: ChildAttestation | None = None
-        self._last_evidence_sequence = 0
         self._pending: dict[int, tuple[QueuedTurn, bytes]] = {}
         self._next_turn_sequence = 1
         self._relayed_model_bytes = 0
@@ -853,7 +1485,7 @@ class AttestationGate:
     @property
     def closed(self) -> bool:
         with self._lock:
-            return self._state is _GateState.CLOSED
+            return self._closed
 
     @property
     def revoked(self) -> bool:
@@ -871,11 +1503,6 @@ class AttestationGate:
             return sum(len(payload) for _, payload in self._pending.values())
 
     @property
-    def last_evidence_sequence(self) -> int:
-        with self._lock:
-            return self._last_evidence_sequence
-
-    @property
     def relayed_model_bytes(self) -> int:
         with self._lock:
             return self._relayed_model_bytes
@@ -885,62 +1512,24 @@ class AttestationGate:
         with self._lock:
             return self._relayed_network_bytes
 
-    def _fail_closed(self, error: AttestationError) -> Never:
-        should_close = False
+    def _mark_closed(self) -> bool:
         with self._lock:
-            self._state = _GateState.CLOSED
+            self._closed = True
             self._revoked = True
-            self._attestation = None
             self._pending.clear()
-            if not self._close_called:
-                self._close_called = True
-                should_close = True
+            if self._close_called:
+                return False
+            self._close_called = True
+            return True
+
+    def _fail_closed(self, error: AttestationError) -> Never:
+        should_close = self._mark_closed()
         if should_close:
             try:
                 self._close_child()
             except Exception as close_error:
                 raise AttestationError(f"{error}; child close failed") from close_error
         raise error
-
-    def _require_open(self) -> None:
-        if self._state is not _GateState.OPEN:
-            self._fail_closed(AttestationError("attestation gate is not open"))
-
-    def _consume(
-        self, attestation: ChildAttestation, permit: object, expected_sequence: int
-    ) -> None:
-        if not isinstance(attestation, ChildAttestation) or not isinstance(
-            permit, _AttestationPermit
-        ):
-            raise AttestationError("attestation permit is invalid")
-        if permit.binding_sha256 != self._binding.digest():
-            raise AttestationError("attestation permit binding changed")
-        if attestation.binding_sha256 != permit.binding_sha256:
-            raise AttestationError("attestation binding does not match permit")
-        if permit.evidence_sequence != expected_sequence:
-            raise AttestationError("evidence sequence is stale or nonmonotonic")
-        if attestation.evidence_sequence != permit.evidence_sequence:
-            raise AttestationError("attestation evidence sequence changed")
-        if attestation.evidence_sha256 != permit.evidence_sha256:
-            raise AttestationError("attestation evidence hash changed")
-        with _CONSUMED_LOCK:
-            if permit.identity in _CONSUMED:
-                raise AttestationError("attestation permit replay detected")
-            _CONSUMED.add(permit.identity)
-
-    def attest(self, attestation: ChildAttestation, permit: object) -> None:
-        with self._lock:
-            self._require_open()
-            if not self._availability.core_gate_available:
-                self._fail_closed(AttestationError("core attestation gate unavailable"))
-            if self._attestation is not None:
-                self._fail_closed(AttestationError("duplicate child attestation"))
-            try:
-                self._consume(attestation, permit, 1)
-            except AttestationError as error:
-                self._fail_closed(error)
-            self._attestation = attestation
-            self._last_evidence_sequence = 1
 
     def queue_turn(
         self,
@@ -949,97 +1538,53 @@ class AttestationGate:
         blocks: Sequence[Mapping[str, object]],
         mcp_schema: Mapping[str, object] | None = None,
     ) -> QueuedTurn:
-        with self._lock:
-            self._require_open()
-            try:
-                payload = json.dumps(
-                    {
-                        "system": system,
-                        "blocks": list(blocks),
-                        "mcp_schema": dict(mcp_schema)
-                        if mcp_schema is not None
-                        else None,
-                    },
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-            except TypeError, ValueError:
-                self._fail_closed(AttestationError("turn is not immutable JSON"))
-            turn = QueuedTurn(self._next_turn_sequence)
-            self._next_turn_sequence += 1
-            self._pending[turn.sequence] = (turn, payload)
-            return turn
-
-    def revalidate(self) -> None:
-        with self._lock:
-            self._require_open()
-            if not self._availability.core_gate_available:
-                self._fail_closed(AttestationError("core attestation gate unavailable"))
-            if self._attestation is None:
-                self._fail_closed(AttestationError("child is not attested"))
-            self._state = _GateState.REVALIDATING
-            expected = self._last_evidence_sequence + 1
         try:
-            attestation, permit = self._revalidate_callback()
-            self._consume(attestation, permit, expected)
-        except AttestationError as error:
-            self._fail_closed(error)
-        except Exception:
-            self._fail_closed(AttestationError("public child revalidation failed"))
+            payload = json.dumps(
+                {
+                    "system": system,
+                    "blocks": list(blocks),
+                    "mcp_schema": dict(mcp_schema) if mcp_schema is not None else None,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            self._fail_closed(AttestationError("turn is not immutable JSON"))
+            raise AssertionError("unreachable") from error
         with self._lock:
-            if self._state is not _GateState.REVALIDATING:
-                self._fail_closed(AttestationError("revalidation state changed"))
-            self._attestation = attestation
-            self._last_evidence_sequence = expected
-            self._state = _GateState.OPEN
+            if self._closed:
+                closed = True
+            else:
+                closed = False
+                turn = QueuedTurn._create(_TURN_TOKEN, self._next_turn_sequence)
+                self._next_turn_sequence += 1
+                self._pending[turn.sequence] = (turn, payload)
+        if closed:
+            self._fail_closed(AttestationError("attestation gate is not open"))
+        return turn
 
-    def release(self, turn: QueuedTurn) -> None:
+    def attest(self, _attestation: ChildAttestation, _permit: object) -> Never:
+        self._fail_closed(AttestationError("core attestation gate unavailable"))
+
+    def revalidate(self) -> Never:
+        self._fail_closed(AttestationError("core attestation gate unavailable"))
+
+    def release(self, turn: QueuedTurn) -> Never:
         with self._lock:
-            self._require_open()
-            if not self._availability.core_gate_available:
-                self._fail_closed(AttestationError("core attestation gate unavailable"))
-            if self._attestation is None:
-                self._fail_closed(AttestationError("child is not attested"))
             pending = (
                 self._pending.get(turn.sequence)
                 if isinstance(turn, QueuedTurn)
                 else None
             )
-            if pending is None or pending[0] is not turn:
-                self._fail_closed(AttestationError("queued turn handle is unknown"))
-        self.revalidate()
-        with self._lock:
-            self._require_open()
-            pending = self._pending.pop(turn.sequence, None)
-            if pending is None or pending[0] is not turn:
-                self._fail_closed(AttestationError("queued turn handle changed"))
-            payload = pending[1]
-            self._state = _GateState.RELEASING
-        try:
-            receipt = self._relay(payload)
-        except Exception:
-            self._fail_closed(AttestationError("turn relay failed"))
-        if not isinstance(receipt, RelayReceipt):
-            self._fail_closed(AttestationError("turn relay receipt is invalid"))
-        with self._lock:
-            if self._state is not _GateState.RELEASING:
-                self._fail_closed(AttestationError("release state changed"))
-            self._relayed_model_bytes += receipt.model_bytes
-            self._relayed_network_bytes += receipt.network_bytes
-            self._state = _GateState.OPEN
+            known = pending is not None and pending[0] is turn
+        if not known:
+            self._fail_closed(AttestationError("queued turn handle is unknown"))
+        self._fail_closed(AttestationError("core attestation gate unavailable"))
 
     def close(self) -> None:
-        should_close = False
-        with self._lock:
-            self._state = _GateState.CLOSED
-            self._revoked = True
-            self._attestation = None
-            self._pending.clear()
-            if not self._close_called:
-                self._close_called = True
-                should_close = True
+        should_close = self._mark_closed()
         if should_close:
             self._close_child()
 
@@ -1047,7 +1592,6 @@ class AttestationGate:
 __all__ = [
     "ATTESTATION_MANIFEST_SCHEMA",
     "AttestationAvailability",
-    "AttestationBinding",
     "AttestationError",
     "AttestationGate",
     "AttestationManifest",
@@ -1055,13 +1599,10 @@ __all__ = [
     "AttestedSupervisorTransport",
     "ChildAttestation",
     "CliExecutableIdentity",
-    "ControlFDIdentity",
-    "FullSupervisorEvidence",
     "PreparedSupervisorLaunch",
     "QueuedTurn",
-    "RelayReceipt",
     "SupervisorBootstrapDescriptors",
-    "SupervisorIdentityAckConfig",
+    "SupervisorHandshakeReceipt",
     "build_attested_sdk_client",
     "current_attestation_availability",
     "extract_child_attestation",
