@@ -1,35 +1,72 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from claude_sdk_proxy.lifecycle import (
     ALL_COMPLETED_STEPS,
+    BatchDescriptor,
+    BatchDescriptorKind,
     BatchOutcome,
     IllegalTransition,
     Lifecycle,
+    ProcessIdentity,
     Record,
     State,
     StateKind,
 )
 
 
+def _bound(state: State) -> State:
+    return replace(
+        state,
+        workdir_parent_dev=1,
+        workdir_parent_ino=2,
+        workdir_dev=3,
+        workdir_ino=4,
+        workdir_bound=True,
+        workdir_name="allocation.workdir",
+    )
+
+
+_TARGET = ProcessIdentity(
+    pid=123,
+    start_ns=456,
+    uid=789,
+    pgid=123,
+    sid=123,
+    flags=63,
+    executable_dev=10,
+    executable_ino=11,
+    boot_id=b"b" * 32,
+    executable_hash=b"e" * 32,
+)
+_PROCESS_ABSENT = BatchDescriptor(BatchDescriptorKind.PROCESS_ABSENT, 0, _TARGET)
+_REAP_PROCESS = BatchDescriptor(BatchDescriptorKind.REAP_PROCESS, 1, _TARGET)
+
+
 def test_no_generation_may_prepare_exact_candidate() -> None:
     prepared = Lifecycle.apply(
-        State.no_generation(),
+        _bound(State.no_generation()),
         Record.prepared(1, "helper-1", claim_deadline_ns=100),
     )
 
-    assert prepared == State.prepared(1, "helper-1", claim_deadline_ns=100)
+    assert prepared == _bound(
+        State.prepared(1, "helper-1", claim_deadline_ns=100)
+    )
 
 
 def test_prepared_activates_only_the_exact_candidate() -> None:
-    prepared = State.prepared(1, "helper-1", claim_deadline_ns=100)
+    prepared = _bound(State.prepared(1, "helper-1", claim_deadline_ns=100))
 
     active = Lifecycle.apply(
         prepared,
         Record.active_ready(1, "helper-1", lease_deadline_ns=200),
     )
-    assert active == State.active_ready(1, "helper-1", lease_deadline_ns=200)
+    assert active == _bound(
+        State.active_ready(1, "helper-1", lease_deadline_ns=200)
+    )
 
     with pytest.raises(IllegalTransition):
         Lifecycle.apply(
@@ -58,7 +95,7 @@ def test_expired_prepared_candidate_retires_idle() -> None:
 
 
 def test_active_executor_admits_and_completes_repeatable_batches() -> None:
-    active = State.active_ready(2, "executor-1", lease_deadline_ns=500)
+    active = _bound(State.active_ready(2, "executor-1", lease_deadline_ns=500))
 
     batch = Lifecycle.apply(
         active,
@@ -68,6 +105,7 @@ def test_active_executor_admits_and_completes_repeatable_batches() -> None:
             executor="executor-1",
             lease_deadline_ns=500,
             completed_steps=0,
+            descriptors=(_PROCESS_ABSENT,),
         ),
     )
     assert batch.kind is StateKind.BATCH_ACTIVE
@@ -90,15 +128,16 @@ def test_active_executor_admits_and_completes_repeatable_batches() -> None:
             executor="executor-1",
             lease_deadline_ns=500,
             completed_steps=1,
+            descriptors=(_REAP_PROCESS,),
         ),
     )
 
-    assert again == State.active_ready(
+    assert again == _bound(State.active_ready(
         2,
         "executor-1",
         lease_deadline_ns=500,
         completed_steps=1,
-    )
+    ))
     assert second.exact_batch == "batch-2"
 
 
@@ -118,6 +157,12 @@ def test_batch_cycle_preserves_recorded_process_identity() -> None:
         executable_ino=11,
         boot_id=b"b" * 32,
         executable_hash=b"e" * 32,
+        workdir_parent_dev=1,
+        workdir_parent_ino=2,
+        workdir_dev=3,
+        workdir_ino=4,
+        workdir_bound=True,
+        workdir_name="allocation.workdir",
     )
 
     batch = Lifecycle.apply(
@@ -127,6 +172,7 @@ def test_batch_cycle_preserves_recorded_process_identity() -> None:
             "batch-1",
             executor="executor-1",
             lease_deadline_ns=500,
+            descriptors=(_PROCESS_ABSENT,),
         ),
     )
     again = Lifecycle.apply(
@@ -277,7 +323,7 @@ def test_expired_retirement_authority_can_be_replaced(retiring: State) -> None:
 
 
 def test_retiring_idle_hands_off_to_exact_next_generation() -> None:
-    retired = State.retiring_idle(
+    retired = _bound(State.retiring_idle(
         2,
         "executor-1",
         authority="reconciler-1",
@@ -285,19 +331,19 @@ def test_retiring_idle_hands_off_to_exact_next_generation() -> None:
         deadline_ns=800,
         exact_batch="batch-1",
         batch_outcome=BatchOutcome.INTERRUPTED,
-    )
+    ))
 
     prepared = Lifecycle.apply(
         retired,
         Record.prepared(3, "helper-2", claim_deadline_ns=900),
     )
 
-    assert prepared == State.prepared(
+    assert prepared == _bound(State.prepared(
         3,
         "helper-2",
         claim_deadline_ns=900,
         inherited_batch="batch-1",
-    )
+    ))
 
     with pytest.raises(IllegalTransition):
         Lifecycle.apply(
@@ -307,14 +353,14 @@ def test_retiring_idle_hands_off_to_exact_next_generation() -> None:
 
 
 def test_completed_retiring_batch_is_not_inherited_by_successor() -> None:
-    retiring = State.retiring_batch(
+    retiring = _bound(State.retiring_batch(
         2,
         "batch-1",
         prior_executor="executor-1",
         authority="reconciler-1",
         authority_epoch=1,
         deadline_ns=800,
-    )
+    ))
     idle = Lifecycle.apply(
         retiring,
         Record.batch_done(
@@ -416,3 +462,29 @@ def test_done_is_terminal() -> None:
 
     with pytest.raises(IllegalTransition):
         Lifecycle.apply(done, Record.unconfirmed("late failure"))
+
+
+def test_unbound_or_absence_certified_bootstrap_cannot_prepare() -> None:
+    for state in (
+        State.no_generation(),
+        State(StateKind.NO_GENERATION, no_dependent_artifact=True),
+    ):
+        with pytest.raises(IllegalTransition):
+            Lifecycle.apply(
+                state,
+                Record.prepared(1, "helper-1", claim_deadline_ns=100),
+            )
+
+
+def test_active_ready_revalidates_certified_workdir_prerequisite() -> None:
+    prepared_without_binding = State.prepared(
+        1,
+        "helper-1",
+        claim_deadline_ns=100,
+    )
+
+    with pytest.raises(IllegalTransition):
+        Lifecycle.apply(
+            prepared_without_binding,
+            Record.active_ready(1, "helper-1", lease_deadline_ns=200),
+        )

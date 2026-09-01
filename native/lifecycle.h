@@ -13,6 +13,24 @@ extern "C" {
 #define CPL_REASON_SIZE 64U
 #define CPL_WORKDIR_NAME_SIZE 64U
 #define CPL_MAX_BATCH_DESCRIPTORS 4U
+#define CPL_PHYSICAL_RECORD_SIZE 1172U
+#define CPL_RECOVERY_RECORD_COUNT 8U
+#define CPL_RECOVERY_BYTES                                                \
+    (CPL_PHYSICAL_RECORD_SIZE * CPL_RECOVERY_RECORD_COUNT)
+
+#define CPL_ABI_PROCESS_IDENTITY_SIZE 112U
+#define CPL_ABI_BATCH_DESCRIPTOR_SIZE 120U
+#define CPL_ABI_STATE_SIZE 1032U
+#define CPL_ABI_RECORD_SIZE 1064U
+#define CPL_ABI_CHAIN_SIZE 1112U
+#define CPL_ABI_CERTIFIED_HEAD_SIZE 1088U
+#define CPL_ABI_APPEND_RESULT_SIZE 1072U
+#define CPL_ABI_CREATE_RECEIPT_SIZE 68U
+#define CPL_ABI_WORKDIR_RECEIPT_SIZE 88U
+#define CPL_ABI_DELETE_AUTHORITY_SIZE 100U
+#define CPL_ABI_DELETE_RECEIPT_SIZE 40U
+#define CPL_ABI_ACTION_TOKEN_SIZE 72U
+#define CPL_ABI_REAP_PROOF_SIZE 72U
 
 typedef struct cpl_journal cpl_journal;
 
@@ -349,6 +367,12 @@ int cpl_journal_retire_executor(cpl_journal *j,
     const uint8_t authority[CPL_ID_SIZE], uint64_t authority_epoch,
     uint64_t authority_deadline_ns, uint64_t deadline_ns,
     struct cpl_append_result *out);
+int cpl_journal_replace_retirement_authority(cpl_journal *j,
+    const uint8_t authority[CPL_ID_SIZE], uint64_t authority_epoch,
+    uint64_t authority_deadline_ns, uint64_t deadline_ns,
+    struct cpl_append_result *out);
+int cpl_journal_mark_unconfirmed(cpl_journal *j, uint32_t reason_code,
+    uint64_t deadline_ns, struct cpl_append_result *out);
 int cpl_journal_confirm_executor_reaped(cpl_journal *j,
     uint64_t deadline_ns, struct cpl_reap_proof *proof);
 int cpl_journal_reconcile_interrupted_batch(cpl_journal *j,
@@ -368,7 +392,24 @@ int cpl_journal_reconcile_absent_after_crash(cpl_journal **inout_j,
     uint64_t deadline_ns, struct cpl_delete_receipt *receipt);
 void cpl_journal_close(cpl_journal *j);
 
+enum cpl_fault_pause_point {
+    CPL_FAULT_BEFORE_WORKDIR_BOUND_APPEND = 1,
+    CPL_FAULT_BEFORE_RETIREMENT_EXPIRY_CHECK = 2,
+    CPL_FAULT_AFTER_BATCH_ADMISSION_APPEND = 3,
+    CPL_FAULT_BEFORE_RETIREMENT_APPEND = 4,
+};
+
+enum cpl_unconfirmed_reason {
+    CPL_UNCONFIRMED_PROOF_UNAVAILABLE = 1,
+    CPL_UNCONFIRMED_NORMAL_REGION_EXHAUSTED = 2,
+    CPL_UNCONFIRMED_IDENTITY_UNAVAILABLE = 3,
+};
 #ifdef CPL_ENABLE_FAULT_INJECTION
+int cpl_fault_configure_lifecycle_pause(cpl_journal *j, uint32_t point,
+    int notify_fd, int wait_fd);
+int cpl_fault_fail_batch_after_step(cpl_journal *j, uint32_t step);
+int cpl_fault_fail_next_workdir_parent_fsync(cpl_journal *j);
+int cpl_fault_force_atfork_registration_failure(bool enabled);
 int cpl_fault_hold_append_lock(cpl_journal *j, int notify_fd, int wait_fd,
     uint64_t deadline_ns);
 int cpl_fault_hold_action_lock(cpl_journal *j, int notify_fd, int wait_fd,

@@ -1,6 +1,7 @@
 #include "lifecycle.h"
 
 #include <CommonCrypto/CommonDigest.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libproc.h>
@@ -27,7 +28,6 @@
 #define CPL_MAX_NAME 180U
 #define CPL_LOCK_RETRY_NS 500000ULL
 #define CPL_DEFAULT_DEADLINE_NS 1000000000ULL
-#define CPL_MIN_RECOVERY_RECORDS 8U
 
 static const uint8_t CPL_MAGIC[CPL_MAGIC_SIZE] = {
     'C', 'P', 'L', 'J', 'R', 'N', '0', '1'
@@ -66,27 +66,60 @@ struct cpl_journal {
     bool reap_proof_valid;
     bool fork_invalid;
     bool unhealthy;
+#ifdef CPL_ENABLE_FAULT_INJECTION
+    uint32_t pause_point;
+    int pause_notify_fd;
+    int pause_wait_fd;
+    uint32_t fail_batch_after_step;
+    bool fail_workdir_parent_fsync;
+#endif
     struct cpl_journal *registry_next;
 };
 
-_Static_assert(sizeof(struct cpl_process_identity) == 112U,
+_Static_assert(sizeof(struct cpl_process_identity) ==
+    CPL_ABI_PROCESS_IDENTITY_SIZE,
     "cpl_process_identity ABI layout changed");
-_Static_assert(sizeof(struct cpl_batch_descriptor) == 120U,
+_Static_assert(sizeof(struct cpl_batch_descriptor) ==
+    CPL_ABI_BATCH_DESCRIPTOR_SIZE,
     "cpl_batch_descriptor ABI layout changed");
-_Static_assert(sizeof(struct cpl_state) == 1032U,
+_Static_assert(sizeof(struct cpl_state) == CPL_ABI_STATE_SIZE,
     "cpl_state ABI layout changed");
-_Static_assert(sizeof(struct cpl_record) == 1064U,
+_Static_assert(sizeof(struct cpl_record) == CPL_ABI_RECORD_SIZE,
     "cpl_record ABI layout changed");
+_Static_assert(sizeof(struct cpl_chain) == CPL_ABI_CHAIN_SIZE,
+    "cpl_chain ABI layout changed");
+_Static_assert(sizeof(struct cpl_certified_head) == CPL_ABI_CERTIFIED_HEAD_SIZE,
+    "cpl_certified_head ABI layout changed");
+_Static_assert(sizeof(struct cpl_append_result) == CPL_ABI_APPEND_RESULT_SIZE,
+    "cpl_append_result ABI layout changed");
+_Static_assert(sizeof(struct cpl_create_receipt) == CPL_ABI_CREATE_RECEIPT_SIZE,
+    "cpl_create_receipt ABI layout changed");
+_Static_assert(sizeof(struct cpl_workdir_receipt) ==
+    CPL_ABI_WORKDIR_RECEIPT_SIZE,
+    "cpl_workdir_receipt ABI layout changed");
+_Static_assert(sizeof(struct cpl_delete_authority) ==
+    CPL_ABI_DELETE_AUTHORITY_SIZE,
+    "cpl_delete_authority ABI layout changed");
+_Static_assert(sizeof(struct cpl_delete_receipt) == CPL_ABI_DELETE_RECEIPT_SIZE,
+    "cpl_delete_receipt ABI layout changed");
+_Static_assert(sizeof(struct cpl_action_token) == CPL_ABI_ACTION_TOKEN_SIZE,
+    "cpl_action_token ABI layout changed");
+_Static_assert(sizeof(struct cpl_reap_proof) == CPL_ABI_REAP_PROOF_SIZE,
+    "cpl_reap_proof ABI layout changed");
+_Static_assert(CPL_HEADER_SIZE + sizeof(struct cpl_record) ==
+    CPL_PHYSICAL_RECORD_SIZE, "physical record size changed");
 
 static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t atfork_once = PTHREAD_ONCE_INIT;
 static cpl_journal *registry_head = NULL;
+static int atfork_status = CPL_ERR_SYSTEM;
 
 #ifdef CPL_ENABLE_FAULT_INJECTION
 #define CPL_RECEIPT_REGISTRY_CAPACITY 64U
 static pthread_mutex_t receipt_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t delete_receipts[CPL_RECEIPT_REGISTRY_CAPACITY][CPL_HASH_SIZE];
 static bool delete_receipt_used[CPL_RECEIPT_REGISTRY_CAPACITY];
+static bool force_atfork_registration_failure = false;
 #endif
 
 static int validate_parent_identity(cpl_journal *journal, int parent_dirfd);
@@ -125,11 +158,17 @@ static void atfork_child(void) {
 }
 
 static void install_atfork(void) {
-    (void)pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
+    atfork_status = pthread_atfork(atfork_prepare, atfork_parent,
+        atfork_child) == 0 ? CPL_OK : CPL_ERR_SYSTEM;
 }
 
 static int register_handle(cpl_journal *journal) {
     if (pthread_once(&atfork_once, install_atfork) != 0 ||
+        atfork_status != CPL_OK
+#ifdef CPL_ENABLE_FAULT_INJECTION
+        || force_atfork_registration_failure
+#endif
+        ||
         pthread_mutex_lock(&registry_mutex) != 0) {
         return CPL_ERR_SYSTEM;
     }
@@ -343,6 +382,45 @@ static int validate_workdir_component(const char *name) {
     if (length == 0U || length >= CPL_WORKDIR_NAME_SIZE ||
         strchr(name, '/') != NULL || strcmp(name, ".") == 0 ||
         strcmp(name, "..") == 0) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    return CPL_OK;
+}
+
+static int derive_workdir_name(const char *journal_name,
+    char out[CPL_WORKDIR_NAME_SIZE]) {
+    static const char journal_suffix[] = ".journal";
+    static const char workdir_suffix[] = ".workdir";
+    size_t name_length;
+    size_t stem_length;
+
+    if (validate_component(journal_name) != CPL_OK) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    name_length = strlen(journal_name);
+    if (name_length <= sizeof(journal_suffix) - 1U ||
+        memcmp(journal_name + name_length - (sizeof(journal_suffix) - 1U),
+            journal_suffix, sizeof(journal_suffix) - 1U) != 0) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    stem_length = name_length - (sizeof(journal_suffix) - 1U);
+    if (stem_length + sizeof(workdir_suffix) > CPL_WORKDIR_NAME_SIZE) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memcpy(out, journal_name, stem_length);
+    (void)memcpy(out + stem_length, workdir_suffix,
+        sizeof(workdir_suffix));
+    return CPL_OK;
+}
+
+static int validate_derived_workdir_name(const char *journal_name,
+    const char *requested_workdir_name) {
+    char derived[CPL_WORKDIR_NAME_SIZE] = {0};
+    int status = derive_workdir_name(journal_name, derived);
+
+    if (status != CPL_OK ||
+        validate_workdir_component(requested_workdir_name) != CPL_OK ||
+        strcmp(derived, requested_workdir_name) != 0) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
     return CPL_OK;
@@ -644,11 +722,9 @@ static int open_lock_at(int parent_dirfd, const char *journal_name,
 }
 
 static int validate_limits(uint64_t normal_limit, uint64_t hard_limit) {
-    uint64_t record_size = CPL_HEADER_SIZE + sizeof(struct cpl_record);
-    uint64_t recovery_min = record_size * CPL_MIN_RECOVERY_RECORDS;
-
-    if (normal_limit < record_size || normal_limit >= hard_limit ||
-        hard_limit - normal_limit < recovery_min) {
+    if (normal_limit < CPL_PHYSICAL_RECORD_SIZE ||
+        normal_limit >= hard_limit || hard_limit > (uint64_t)INT64_MAX ||
+        hard_limit - normal_limit < CPL_RECOVERY_BYTES) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
     return CPL_OK;
@@ -711,6 +787,10 @@ static int initialize_handle(int fd, int parent_dirfd, const char *journal_name,
     journal->hard_limit = hard_limit;
     journal->workdir_parent_dev = workdir_parent_stat.st_dev;
     journal->workdir_parent_ino = workdir_parent_stat.st_ino;
+#ifdef CPL_ENABLE_FAULT_INJECTION
+    journal->pause_notify_fd = -1;
+    journal->pause_wait_fd = -1;
+#endif
     (void)memcpy(journal->nonce, nonce, CPL_HASH_SIZE);
     (void)memcpy(journal->journal_name, journal_name, strlen(journal_name) + 1U);
     (void)memcpy(journal->workdir_name, workdir_name,
@@ -862,6 +942,98 @@ static void preserve_process_identity(struct cpl_state *out,
         CPL_HASH_SIZE);
 }
 
+static uint32_t descriptor_step(uint32_t kind) {
+    switch (kind) {
+    case CPL_DESCRIPTOR_PROCESS_ABSENT:
+        return CPL_STEP_PROCESS_ABSENT;
+    case CPL_DESCRIPTOR_REAP_PROCESS:
+        return CPL_STEP_EXECUTOR_REAPED;
+    case CPL_DESCRIPTOR_REMOVE_WORKDIR:
+        return CPL_STEP_WORKDIR_REMOVED;
+    case CPL_DESCRIPTOR_TERMINAL_CHECKS:
+        return CPL_STEP_TERMINAL_CHECKS;
+    default:
+        return 0U;
+    }
+}
+
+static uint32_t descriptor_required(uint32_t kind) {
+    switch (kind) {
+    case CPL_DESCRIPTOR_PROCESS_ABSENT:
+        return 0U;
+    case CPL_DESCRIPTOR_REAP_PROCESS:
+        return CPL_STEP_PROCESS_ABSENT;
+    case CPL_DESCRIPTOR_REMOVE_WORKDIR:
+        return CPL_STEP_PROCESS_ABSENT | CPL_STEP_EXECUTOR_REAPED;
+    case CPL_DESCRIPTOR_TERMINAL_CHECKS:
+        return CPL_STEP_PROCESS_ABSENT | CPL_STEP_EXECUTOR_REAPED |
+            CPL_STEP_WORKDIR_REMOVED;
+    default:
+        return UINT32_MAX;
+    }
+}
+
+static int validate_descriptors(const struct cpl_batch_descriptor *descriptors,
+    uint32_t count, uint64_t completed_steps) {
+    uint32_t index;
+    uint32_t expected = (uint32_t)completed_steps;
+
+    if (descriptors == NULL || count == 0U ||
+        count > CPL_MAX_BATCH_DESCRIPTORS ||
+        completed_steps > CPL_ALL_COMPLETED_STEPS) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    for (index = 0U; index < count; ++index) {
+        uint32_t step = descriptor_step(descriptors[index].kind);
+        uint32_t required = descriptor_required(descriptors[index].kind);
+
+        if (step == 0U || required == UINT32_MAX ||
+            descriptors[index].required_steps != required ||
+            (expected & required) != required || (expected & step) != 0U) {
+            return CPL_ERR_PRECONDITION;
+        }
+        if ((descriptors[index].kind == CPL_DESCRIPTOR_PROCESS_ABSENT ||
+             descriptors[index].kind == CPL_DESCRIPTOR_REAP_PROCESS) &&
+            !complete_identity(&descriptors[index].target)) {
+            return CPL_ERR_PROCESS_IDENTITY;
+        }
+        if (descriptors[index].kind == CPL_DESCRIPTOR_REAP_PROCESS &&
+            index > 0U &&
+            !same_process_identity(&descriptors[index - 1U].target,
+                &descriptors[index].target)) {
+            return CPL_ERR_PROCESS_IDENTITY;
+        }
+        expected |= step;
+    }
+    return CPL_OK;
+}
+
+static int validate_record_descriptors(const struct cpl_record *record) {
+    if (record->kind == CPL_RECORD_BATCH_ACTIVE) {
+        uint32_t index;
+        int status = validate_descriptors(record->descriptors,
+            record->descriptor_count, record->completed_steps);
+
+        if (status != CPL_OK) {
+            return status;
+        }
+        for (index = record->descriptor_count;
+             index < CPL_MAX_BATCH_DESCRIPTORS; ++index) {
+            if (!is_zero((const uint8_t *)&record->descriptors[index],
+                    sizeof(record->descriptors[index]))) {
+                return CPL_ERR_PRECONDITION;
+            }
+        }
+        return CPL_OK;
+    }
+    if (record->descriptor_count != 0U ||
+        !is_zero((const uint8_t *)record->descriptors,
+            sizeof(record->descriptors))) {
+        return CPL_ERR_PRECONDITION;
+    }
+    return CPL_OK;
+}
+
 int cpl_lifecycle_apply(const struct cpl_state *current,
     const struct cpl_record *record, struct cpl_state *out) {
     struct cpl_state next;
@@ -872,6 +1044,9 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
     (void)memset(out, 0, sizeof(*out));
     if (current->kind == CPL_STATE_DONE ||
         current->kind == CPL_STATE_UNCONFIRMED) {
+        return CPL_ERR_ILLEGAL_TRANSITION;
+    }
+    if (validate_record_descriptors(record) != CPL_OK) {
         return CPL_ERR_ILLEGAL_TRANSITION;
     }
 
@@ -903,7 +1078,10 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
         next.no_dependent_artifact = 1U;
         break;
     case CPL_RECORD_PREPARED:
-        if (!has_id(record->candidate) || record->generation == 0U) {
+        if (!has_id(record->candidate) || record->generation == 0U ||
+            current->workdir_bound != 1U || current->workdir_dev == 0U ||
+            current->workdir_ino == 0U ||
+            current->no_dependent_artifact != 0U) {
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
         if (current->kind == CPL_STATE_NO_GENERATION) {
@@ -924,7 +1102,9 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
     case CPL_RECORD_ACTIVE_READY:
         if (current->kind != CPL_STATE_PREPARED ||
             record->generation != current->generation ||
-            !same_id(record->executor, current->candidate)) {
+            !same_id(record->executor, current->candidate) ||
+            current->workdir_bound != 1U || current->workdir_dev == 0U ||
+            current->workdir_ino == 0U) {
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
         state_from_record(&next, record, CPL_STATE_ACTIVE_READY);
@@ -1078,10 +1258,7 @@ static int scan_internal(cpl_journal *journal, struct cpl_chain *out) {
     }
     out->physical_eof = (uint64_t)file_stat.st_size;
     out->unhealthy = journal->unhealthy ||
-        out->physical_eof > journal->hard_limit ||
-        (out->physical_eof <= journal->hard_limit &&
-         journal->hard_limit - out->physical_eof <
-            CPL_HEADER_SIZE + sizeof(struct cpl_record));
+        out->physical_eof > journal->hard_limit;
     readable = out->physical_eof;
     if (readable > journal->hard_limit) {
         readable = journal->hard_limit;
@@ -1206,6 +1383,11 @@ static int scan_internal(cpl_journal *journal, struct cpl_chain *out) {
     if (out->physical_eof > readable) {
         out->invalid_bytes += out->physical_eof - readable;
     }
+    if (out->physical_eof <= journal->hard_limit &&
+        journal->hard_limit - out->physical_eof < CPL_PHYSICAL_RECORD_SIZE &&
+        out->state.kind != CPL_STATE_DONE) {
+        out->unhealthy = true;
+    }
     free(bytes);
     return CPL_OK;
 }
@@ -1257,12 +1439,35 @@ static int fault_certify_pause(void) {
     certify_wait_fd = -1;
     return status;
 }
+
+static int fault_lifecycle_pause(cpl_journal *journal, uint32_t point) {
+    int status;
+
+    if (journal->pause_point != point) {
+        return CPL_OK;
+    }
+    status = checked_byte_write(journal->pause_notify_fd);
+    if (status == CPL_OK) {
+        status = checked_byte_read(journal->pause_wait_fd);
+    }
+    journal->pause_point = 0U;
+    journal->pause_notify_fd = -1;
+    journal->pause_wait_fd = -1;
+    return status;
+}
 #else
 static void fault_exit(const char *point) {
     (void)point;
 }
 
 static int fault_certify_pause(void) {
+    return CPL_OK;
+}
+
+
+static int fault_lifecycle_pause(cpl_journal *journal, uint32_t point) {
+    (void)journal;
+    (void)point;
     return CPL_OK;
 }
 #endif
@@ -1312,7 +1517,8 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
     *out = NULL;
     (void)memset(receipt, 0, sizeof(*receipt));
     status = validate_component(journal_name);
-    if (status != CPL_OK || validate_workdir_component(workdir_name) != CPL_OK ||
+    if (status != CPL_OK ||
+        validate_derived_workdir_name(journal_name, workdir_name) != CPL_OK ||
         nonce == NULL || validate_limits(normal_limit, hard_limit) != CPL_OK) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
@@ -1379,6 +1585,12 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
         cpl_journal_close(journal);
         return status;
     }
+    if (monotonic_ns() >= deadline) {
+        (void)release_flock(journal->append_lock_fd);
+        (void)pthread_mutex_unlock(&journal->append_mutex);
+        cpl_journal_close(journal);
+        return CPL_ERR_LOCK_TIMEOUT;
+    }
     written = write(fd, encoded, encoded_length);
     (void)release_flock(journal->append_lock_fd);
     (void)pthread_mutex_unlock(&journal->append_mutex);
@@ -1437,7 +1649,8 @@ int cpl_journal_open_at(int parent_dirfd, const char *journal_name,
     }
     *out = NULL;
     status = validate_component(journal_name);
-    if (status != CPL_OK || validate_workdir_component(workdir_name) != CPL_OK ||
+    if (status != CPL_OK ||
+        validate_derived_workdir_name(journal_name, workdir_name) != CPL_OK ||
         nonce == NULL || validate_limits(normal_limit, hard_limit) != CPL_OK) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
@@ -1512,7 +1725,11 @@ static bool recovery_allowed(const struct cpl_chain *chain,
         record->kind == CPL_RECORD_BATCH_DONE ||
         record->kind == CPL_RECORD_UNCONFIRMED ||
         record->kind == CPL_RECORD_REPLACE_AUTHORITY ||
-        record->kind == CPL_RECORD_NO_DEPENDENT_ARTIFACT) {
+        record->kind == CPL_RECORD_NO_DEPENDENT_ARTIFACT ||
+        (record->authority_epoch != 0U &&
+         (record->kind == CPL_RECORD_ACTIVE_READY ||
+          record->kind == CPL_RECORD_BATCH_ACTIVE ||
+          record->kind == CPL_RECORD_DONE))) {
         return true;
     }
     return record->kind == CPL_RECORD_PREPARED &&
@@ -1570,6 +1787,8 @@ int cpl_journal_append(cpl_journal *journal, const uint8_t *record_bytes,
          record.kind == CPL_RECORD_RETIRING_IDLE ||
          record.kind == CPL_RECORD_RETIRING_BATCH ||
          record.kind == CPL_RECORD_DONE ||
+         record.kind == CPL_RECORD_REPLACE_AUTHORITY ||
+         record.kind == CPL_RECORD_UNCONFIRMED ||
          record.kind == CPL_RECORD_WORKDIR_BOUND ||
          record.kind == CPL_RECORD_NO_DEPENDENT_ARTIFACT) &&
         (journal->authorized_record_kind != record.kind ||
@@ -1914,6 +2133,41 @@ static int append_authorized(cpl_journal *journal, struct cpl_record *record,
     return status;
 }
 
+int cpl_journal_mark_unconfirmed(cpl_journal *journal, uint32_t reason_code,
+    uint64_t deadline_ns, struct cpl_append_result *out) {
+    static const char proof_unavailable[] = "proof unavailable";
+    static const char normal_exhausted[] = "normal region exhausted";
+    static const char identity_unavailable[] = "identity unavailable";
+    const char *reason;
+    struct cpl_record record;
+    uint64_t deadline = effective_deadline(deadline_ns);
+
+    if (out == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    switch (reason_code) {
+    case CPL_UNCONFIRMED_PROOF_UNAVAILABLE:
+        reason = proof_unavailable;
+        break;
+    case CPL_UNCONFIRMED_NORMAL_REGION_EXHAUSTED:
+        reason = normal_exhausted;
+        break;
+    case CPL_UNCONFIRMED_IDENTITY_UNAVAILABLE:
+        reason = identity_unavailable;
+        break;
+    default:
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = CPL_RECORD_UNCONFIRMED;
+    (void)memcpy(record.reason, reason, strlen(reason));
+    if (monotonic_ns() >= deadline) {
+        return CPL_ERR_LOCK_TIMEOUT;
+    }
+    return append_authorized(journal, &record, CPL_RECORD_RECOVERY, deadline,
+        out);
+}
+
 static int validate_workdir_parent_identity(cpl_journal *journal,
     int parent_dirfd) {
     struct stat parent;
@@ -1927,6 +2181,55 @@ static int validate_workdir_parent_identity(cpl_journal *journal,
         return CPL_ERR_IDENTITY_DRIFT;
     }
     return CPL_OK;
+}
+
+static int require_dependent_namespace_absent(cpl_journal *journal,
+    int parent_dirfd) {
+    static const char suffix[] = ".journal";
+    char append_lock[CPL_MAX_NAME + 32U];
+    char action_lock[CPL_MAX_NAME + 32U];
+    size_t journal_length = strlen(journal->journal_name);
+    size_t stem_length = journal_length - (sizeof(suffix) - 1U);
+    DIR *directory;
+    struct dirent *entry;
+    int duplicate_fd;
+    int status = CPL_OK;
+
+    if (snprintf(append_lock, sizeof(append_lock), "%s.append.lock",
+            journal->journal_name) < 0 ||
+        snprintf(action_lock, sizeof(action_lock), "%s.action.lock",
+            journal->journal_name) < 0) {
+        return CPL_ERR_SYSTEM;
+    }
+    duplicate_fd = dup(parent_dirfd);
+    if (duplicate_fd < 0) {
+        return CPL_ERR_SYSTEM;
+    }
+    directory = fdopendir(duplicate_fd);
+    if (directory == NULL) {
+        (void)close(duplicate_fd);
+        return CPL_ERR_SYSTEM;
+    }
+    errno = 0;
+    while ((entry = readdir(directory)) != NULL) {
+        const char *name = entry->d_name;
+
+        if (strncmp(name, journal->journal_name, stem_length) != 0 ||
+            name[stem_length] != '.') {
+            continue;
+        }
+        if (strcmp(name, journal->journal_name) == 0 ||
+            strcmp(name, append_lock) == 0 || strcmp(name, action_lock) == 0) {
+            continue;
+        }
+        status = CPL_ERR_WORKDIR_PRESENT;
+        break;
+    }
+    if (status == CPL_OK && errno != 0) {
+        status = CPL_ERR_SYSTEM;
+    }
+    (void)closedir(directory);
+    return status;
 }
 
 static int certify_exact_result(cpl_journal *journal,
@@ -1951,6 +2254,7 @@ int cpl_journal_create_workdir(cpl_journal *journal,
     struct cpl_append_result appended;
     struct cpl_record record;
     struct stat directory;
+    struct stat path_identity;
     uint64_t deadline = effective_deadline(deadline_ns);
     int directory_fd = -1;
     int status;
@@ -2003,8 +2307,28 @@ int cpl_journal_create_workdir(cpl_journal *journal,
         status = CPL_ERR_UNSAFE_FILE;
         goto done;
     }
+    if (monotonic_ns() >= deadline) {
+        status = CPL_ERR_LOCK_TIMEOUT;
+        goto done;
+    }
     if (fsync(workdir_parent_dirfd) < 0) {
         status = CPL_ERR_SYSTEM;
+        goto done;
+    }
+    status = fault_lifecycle_pause(journal,
+        CPL_FAULT_BEFORE_WORKDIR_BOUND_APPEND);
+    if (status != CPL_OK) {
+        goto done;
+    }
+    if (fstatat(workdir_parent_dirfd, journal->workdir_name, &path_identity,
+            AT_SYMLINK_NOFOLLOW) < 0 || !S_ISDIR(path_identity.st_mode) ||
+        path_identity.st_uid != geteuid() ||
+        (path_identity.st_mode & (mode_t)0777) != (mode_t)0700 ||
+        path_identity.st_dev != directory.st_dev ||
+        path_identity.st_ino != directory.st_ino ||
+        monotonic_ns() >= deadline) {
+        status = monotonic_ns() >= deadline ? CPL_ERR_LOCK_TIMEOUT :
+            CPL_ERR_IDENTITY_DRIFT;
         goto done;
     }
     (void)memset(&record, 0, sizeof(record));
@@ -2047,7 +2371,6 @@ int cpl_journal_certify_no_dependent_artifact(cpl_journal *journal,
     struct cpl_certified_head certified;
     struct cpl_append_result appended;
     struct cpl_record record;
-    struct stat path;
     uint64_t deadline = effective_deadline(deadline_ns);
     int status;
 
@@ -2067,13 +2390,9 @@ int cpl_journal_certify_no_dependent_artifact(cpl_journal *journal,
     if (status != CPL_OK) {
         return status;
     }
-    if (fstatat(workdir_parent_dirfd, journal->workdir_name, &path,
-            AT_SYMLINK_NOFOLLOW) == 0) {
-        status = CPL_ERR_WORKDIR_PRESENT;
-        goto done;
-    }
-    if (errno != ENOENT) {
-        status = CPL_ERR_SYSTEM;
+    status = require_dependent_namespace_absent(journal,
+        workdir_parent_dirfd);
+    if (status != CPL_OK) {
         goto done;
     }
     status = cpl_journal_certify(journal, deadline, &certified);
@@ -2085,6 +2404,12 @@ int cpl_journal_certify_no_dependent_artifact(cpl_journal *journal,
             certified.state.workdir_bound != 0U ||
             certified.state.no_dependent_artifact != 0U) {
             status = CPL_ERR_AUTHORITY;
+            goto done;
+        }
+        status = require_dependent_namespace_absent(journal,
+            workdir_parent_dirfd);
+        if (status != CPL_OK || monotonic_ns() >= deadline) {
+            status = status != CPL_OK ? status : CPL_ERR_LOCK_TIMEOUT;
             goto done;
         }
         (void)memset(&record, 0, sizeof(record));
@@ -2100,6 +2425,12 @@ int cpl_journal_certify_no_dependent_artifact(cpl_journal *journal,
         status = CPL_ERR_CORRUPT;
     }
     if (status != CPL_OK) {
+        goto done;
+    }
+    status = require_dependent_namespace_absent(journal,
+        workdir_parent_dirfd);
+    if (status != CPL_OK || monotonic_ns() >= deadline) {
+        status = status != CPL_OK ? status : CPL_ERR_LOCK_TIMEOUT;
         goto done;
     }
     random_capability(journal->reap_capability);
@@ -2204,11 +2535,14 @@ int cpl_journal_activate_executor(cpl_journal *journal, uint64_t generation,
     (void)memset(&record, 0, sizeof(record));
     record.kind = CPL_RECORD_ACTIVE_READY;
     record.generation = generation;
+    record.authority_epoch = chain.state.authority_epoch;
     record.lease_deadline_ns = lease_deadline_ns;
     (void)memcpy(record.executor, executor, CPL_ID_SIZE);
     identity_to_record(&identity, &record);
-    status = append_authorized(journal, &record, CPL_RECORD_NORMAL, deadline,
-        out);
+    status = append_authorized(journal, &record,
+        record.authority_epoch == 0U ? CPL_RECORD_NORMAL :
+            CPL_RECORD_RECOVERY,
+        deadline, out);
     if (status == CPL_OK) {
         status = certify_exact_result(journal, out, deadline, &certified);
     }
@@ -2216,75 +2550,6 @@ int cpl_journal_activate_executor(cpl_journal *journal, uint64_t generation,
 done:
     unlock_action(journal);
     return status;
-}
-
-static uint32_t descriptor_step(uint32_t kind) {
-    switch (kind) {
-    case CPL_DESCRIPTOR_PROCESS_ABSENT:
-        return CPL_STEP_PROCESS_ABSENT;
-    case CPL_DESCRIPTOR_REAP_PROCESS:
-        return CPL_STEP_EXECUTOR_REAPED;
-    case CPL_DESCRIPTOR_REMOVE_WORKDIR:
-        return CPL_STEP_WORKDIR_REMOVED;
-    case CPL_DESCRIPTOR_TERMINAL_CHECKS:
-        return CPL_STEP_TERMINAL_CHECKS;
-    default:
-        return 0U;
-    }
-}
-
-static uint32_t descriptor_required(uint32_t kind) {
-    switch (kind) {
-    case CPL_DESCRIPTOR_PROCESS_ABSENT:
-        return 0U;
-    case CPL_DESCRIPTOR_REAP_PROCESS:
-        return CPL_STEP_PROCESS_ABSENT;
-    case CPL_DESCRIPTOR_REMOVE_WORKDIR:
-        return CPL_STEP_PROCESS_ABSENT | CPL_STEP_EXECUTOR_REAPED;
-    case CPL_DESCRIPTOR_TERMINAL_CHECKS:
-        return CPL_STEP_PROCESS_ABSENT | CPL_STEP_EXECUTOR_REAPED |
-            CPL_STEP_WORKDIR_REMOVED;
-    default:
-        return UINT32_MAX;
-    }
-}
-
-static int validate_descriptors(const struct cpl_batch_descriptor *descriptors,
-    uint32_t count, uint64_t completed_steps) {
-    uint32_t index;
-    uint32_t expected = (uint32_t)completed_steps;
-
-    if (descriptors == NULL || count == 0U ||
-        count > CPL_MAX_BATCH_DESCRIPTORS ||
-        completed_steps > CPL_ALL_COMPLETED_STEPS) {
-        return CPL_ERR_INVALID_ARGUMENT;
-    }
-    for (index = 0U; index < count; ++index) {
-        uint32_t step = descriptor_step(descriptors[index].kind);
-        uint32_t required = descriptor_required(descriptors[index].kind);
-
-        if (step == 0U || required == UINT32_MAX ||
-            descriptors[index].required_steps != required ||
-            (expected & required) != required || (expected & step) != 0U) {
-            return CPL_ERR_PRECONDITION;
-        }
-        if ((descriptors[index].kind == CPL_DESCRIPTOR_PROCESS_ABSENT ||
-             descriptors[index].kind == CPL_DESCRIPTOR_REAP_PROCESS) &&
-            !complete_identity(&descriptors[index].target)) {
-            return CPL_ERR_PROCESS_IDENTITY;
-        }
-        if (descriptors[index].kind == CPL_DESCRIPTOR_REAP_PROCESS &&
-            index == 0U) {
-            return CPL_ERR_PRECONDITION;
-        }
-        if (descriptors[index].kind == CPL_DESCRIPTOR_REAP_PROCESS &&
-            !same_process_identity(&descriptors[index - 1U].target,
-                &descriptors[index].target)) {
-            return CPL_ERR_PROCESS_IDENTITY;
-        }
-        expected |= step;
-    }
-    return CPL_OK;
 }
 
 int cpl_journal_admit_batch(cpl_journal *journal, uint64_t generation,
@@ -2332,6 +2597,7 @@ int cpl_journal_admit_batch(cpl_journal *journal, uint64_t generation,
     (void)memset(&record, 0, sizeof(record));
     record.kind = CPL_RECORD_BATCH_ACTIVE;
     record.generation = generation;
+    record.authority_epoch = chain.state.authority_epoch;
     record.lease_deadline_ns = chain.state.lease_deadline_ns;
     record.completed_steps = chain.state.completed_steps;
     record.descriptor_count = descriptor_count;
@@ -2339,8 +2605,14 @@ int cpl_journal_admit_batch(cpl_journal *journal, uint64_t generation,
     (void)memcpy(record.exact_batch, batch_nonce, CPL_ID_SIZE);
     (void)memcpy(record.descriptors, descriptors,
         descriptor_count * sizeof(*descriptors));
-    status = append_authorized(journal, &record, CPL_RECORD_NORMAL, deadline,
-        out);
+    status = append_authorized(journal, &record,
+        record.authority_epoch == 0U ? CPL_RECORD_NORMAL :
+            CPL_RECORD_RECOVERY,
+        deadline, out);
+    if (status == CPL_OK) {
+        status = fault_lifecycle_pause(journal,
+            CPL_FAULT_AFTER_BATCH_ADMISSION_APPEND);
+    }
     if (status == CPL_OK) {
         status = cpl_journal_certify(journal, deadline, &certified);
     }
@@ -2430,6 +2702,9 @@ int cpl_journal_execute_batch(cpl_journal *journal,
         }
         descriptor = &certified.state.descriptors[index];
         step = descriptor_step(descriptor->kind);
+        if ((journal->action_completed_steps & step) != 0U) {
+            continue;
+        }
         if ((journal->action_completed_steps & descriptor->required_steps) !=
             descriptor->required_steps) {
             return CPL_ERR_PRECONDITION;
@@ -2451,20 +2726,45 @@ int cpl_journal_execute_batch(cpl_journal *journal,
             }
         } else if (descriptor->kind == CPL_DESCRIPTOR_REMOVE_WORKDIR) {
             struct stat workdir;
+            bool already_absent = false;
 
-            if (certified.state.workdir_bound == 0U ||
-                fstatat(workdir_parent_dirfd, journal->workdir_name, &workdir,
-                    AT_SYMLINK_NOFOLLOW) < 0 || !S_ISDIR(workdir.st_mode) ||
+            if (certified.state.workdir_bound == 0U) {
+                return CPL_ERR_IDENTITY_DRIFT;
+            }
+            if (fstatat(workdir_parent_dirfd, journal->workdir_name, &workdir,
+                    AT_SYMLINK_NOFOLLOW) < 0) {
+                if (errno != ENOENT) {
+                    return CPL_ERR_IDENTITY_DRIFT;
+                }
+                already_absent = true;
+            } else if (!S_ISDIR(workdir.st_mode) ||
                 workdir.st_uid != geteuid() ||
                 (workdir.st_mode & (mode_t)0777) != (mode_t)0700 ||
                 (uint64_t)workdir.st_dev != certified.state.workdir_dev ||
                 (uint64_t)workdir.st_ino != certified.state.workdir_ino) {
                 return CPL_ERR_IDENTITY_DRIFT;
             }
-            if (unlinkat(workdir_parent_dirfd, journal->workdir_name,
-                    AT_REMOVEDIR) < 0 || fsync(workdir_parent_dirfd) < 0) {
-                return errno == ENOTEMPTY ? CPL_ERR_WORKDIR_PRESENT :
-                    CPL_ERR_SYSTEM;
+            if (!already_absent) {
+                if (monotonic_ns() >= deadline) {
+                    return CPL_ERR_LOCK_TIMEOUT;
+                }
+                if (unlinkat(workdir_parent_dirfd, journal->workdir_name,
+                        AT_REMOVEDIR) < 0) {
+                    return errno == ENOTEMPTY ? CPL_ERR_WORKDIR_PRESENT :
+                        CPL_ERR_SYSTEM;
+                }
+            }
+            if (monotonic_ns() >= deadline) {
+                return CPL_ERR_LOCK_TIMEOUT;
+            }
+#ifdef CPL_ENABLE_FAULT_INJECTION
+            if (journal->fail_workdir_parent_fsync) {
+                journal->fail_workdir_parent_fsync = false;
+                return CPL_ERR_SYSTEM;
+            }
+#endif
+            if (fsync(workdir_parent_dirfd) < 0) {
+                return CPL_ERR_SYSTEM;
             }
         } else if (descriptor->kind == CPL_DESCRIPTOR_TERMINAL_CHECKS) {
             struct stat workdir;
@@ -2477,6 +2777,12 @@ int cpl_journal_execute_batch(cpl_journal *journal,
             return CPL_ERR_PRECONDITION;
         }
         journal->action_completed_steps |= step;
+#ifdef CPL_ENABLE_FAULT_INJECTION
+        if (journal->fail_batch_after_step == step) {
+            journal->fail_batch_after_step = 0U;
+            return CPL_ERR_SYSTEM;
+        }
+#endif
     }
     journal->action_executed = true;
     *completed_steps = journal->action_completed_steps;
@@ -2502,12 +2808,15 @@ int cpl_journal_complete_batch(cpl_journal *journal,
     (void)memset(&record, 0, sizeof(record));
     record.kind = CPL_RECORD_BATCH_DONE;
     record.generation = token->generation;
+    record.authority_epoch = certified.state.authority_epoch;
     record.lease_deadline_ns = certified.state.lease_deadline_ns;
     record.completed_steps = journal->action_completed_steps;
     (void)memcpy(record.executor, certified.state.executor, CPL_ID_SIZE);
     (void)memcpy(record.exact_batch, token->batch_nonce, CPL_ID_SIZE);
     if (certified.state.kind == CPL_STATE_RETIRING_BATCH) {
         record.batch_outcome = CPL_BATCH_COMPLETED;
+        record_class = CPL_RECORD_RECOVERY;
+    } else if (record.authority_epoch != 0U) {
         record_class = CPL_RECORD_RECOVERY;
     }
     status = append_authorized(journal, &record, record_class, deadline, out);
@@ -2558,9 +2867,12 @@ int cpl_journal_finish_done(cpl_journal *journal, uint64_t generation,
     (void)memset(&record, 0, sizeof(record));
     record.kind = CPL_RECORD_DONE;
     record.generation = generation;
+    record.authority_epoch = chain.state.authority_epoch;
     (void)memcpy(record.executor, executor, CPL_ID_SIZE);
-    status = append_authorized(journal, &record, CPL_RECORD_NORMAL, deadline,
-        out);
+    status = append_authorized(journal, &record,
+        record.authority_epoch == 0U ? CPL_RECORD_NORMAL :
+            CPL_RECORD_RECOVERY,
+        deadline, out);
     if (status == CPL_OK) {
         status = certify_exact_result(journal, out, deadline, &certified);
     }
@@ -2586,44 +2898,68 @@ int cpl_journal_retire_executor(cpl_journal *journal,
         return CPL_ERR_INVALID_ARGUMENT;
     }
     for (;;) {
+        struct cpl_chain rechecked;
+        uint64_t now;
+
         status = cpl_journal_scan(journal, &chain);
         if (status != CPL_OK) {
             return status;
         }
-        if (chain.state.kind == CPL_STATE_PREPARED) {
-            if (chain.state.deadline_ns > monotonic_ns()) {
-                return CPL_ERR_AUTHORITY;
-            }
-            status = lock_action(journal, deadline);
-            action_locked = status == CPL_OK;
-        } else if (chain.state.kind == CPL_STATE_ACTIVE_READY) {
-            if (chain.state.lease_deadline_ns > monotonic_ns()) {
-                return CPL_ERR_AUTHORITY;
-            }
-            status = lock_action(journal, deadline);
-            action_locked = status == CPL_OK;
-        } else if (chain.state.kind == CPL_STATE_BATCH_ACTIVE) {
-            status = CPL_OK;
-        } else {
+        if (chain.state.kind != CPL_STATE_PREPARED &&
+            chain.state.kind != CPL_STATE_ACTIVE_READY &&
+            chain.state.kind != CPL_STATE_BATCH_ACTIVE) {
             return CPL_ERR_AUTHORITY;
         }
+        status = fault_lifecycle_pause(journal,
+            CPL_FAULT_BEFORE_RETIREMENT_EXPIRY_CHECK);
         if (status != CPL_OK) {
             return status;
         }
-        if (action_locked) {
-            struct cpl_chain rechecked;
-
-            status = cpl_journal_scan(journal, &rechecked);
+        now = monotonic_ns();
+        if ((chain.state.kind == CPL_STATE_PREPARED &&
+             chain.state.deadline_ns > now) ||
+            ((chain.state.kind == CPL_STATE_ACTIVE_READY ||
+              chain.state.kind == CPL_STATE_BATCH_ACTIVE) &&
+             chain.state.lease_deadline_ns > now)) {
+            return CPL_ERR_AUTHORITY;
+        }
+        if (chain.state.kind != CPL_STATE_BATCH_ACTIVE) {
+            status = lock_action(journal, deadline);
             if (status != CPL_OK) {
-                unlock_action(journal);
                 return status;
             }
-            chain = rechecked;
-            if (chain.state.kind == CPL_STATE_BATCH_ACTIVE) {
+            action_locked = true;
+        }
+        status = fault_lifecycle_pause(journal,
+            CPL_FAULT_BEFORE_RETIREMENT_APPEND);
+        if (status == CPL_OK) {
+            status = cpl_journal_scan(journal, &rechecked);
+        }
+        if (status != CPL_OK) {
+            if (action_locked) {
+                unlock_action(journal);
+            }
+            return status;
+        }
+        if (memcmp(chain.head_hash, rechecked.head_hash, CPL_HASH_SIZE) != 0) {
+            if (action_locked) {
                 unlock_action(journal);
                 action_locked = false;
             }
+            continue;
         }
+        now = monotonic_ns();
+        if ((rechecked.state.kind == CPL_STATE_PREPARED &&
+             rechecked.state.deadline_ns > now) ||
+            ((rechecked.state.kind == CPL_STATE_ACTIVE_READY ||
+              rechecked.state.kind == CPL_STATE_BATCH_ACTIVE) &&
+             rechecked.state.lease_deadline_ns > now)) {
+            if (action_locked) {
+                unlock_action(journal);
+            }
+            return CPL_ERR_AUTHORITY;
+        }
+        chain = rechecked;
         break;
     }
     (void)memset(&record, 0, sizeof(record));
@@ -2645,10 +2981,51 @@ int cpl_journal_retire_executor(cpl_journal *journal,
             (void)memcpy(record.prior_actor, chain.state.executor, CPL_ID_SIZE);
         }
     }
-    status = append_authorized(journal, &record, record_class, deadline, out);
+    status = monotonic_ns() >= deadline ? CPL_ERR_LOCK_TIMEOUT :
+        append_authorized(journal, &record, record_class, deadline, out);
     if (action_locked) {
         unlock_action(journal);
     }
+    return status;
+}
+
+int cpl_journal_replace_retirement_authority(cpl_journal *journal,
+    const uint8_t authority[CPL_ID_SIZE], uint64_t authority_epoch,
+    uint64_t authority_deadline_ns, uint64_t deadline_ns,
+    struct cpl_append_result *out) {
+    struct cpl_chain chain;
+    struct cpl_record record;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status;
+
+    if (authority == NULL || !has_id(authority) || out == NULL ||
+        authority_deadline_ns <= monotonic_ns()) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_scan(journal, &chain);
+    if (status != CPL_OK ||
+        (chain.state.kind != CPL_STATE_RETIRING_IDLE &&
+         chain.state.kind != CPL_STATE_RETIRING_BATCH) ||
+        chain.state.deadline_ns > monotonic_ns() ||
+        authority_epoch != chain.state.authority_epoch + 1U) {
+        status = status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+        goto done;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = CPL_RECORD_REPLACE_AUTHORITY;
+    record.authority_epoch = authority_epoch;
+    record.deadline_ns = authority_deadline_ns;
+    (void)memcpy(record.authority, authority, CPL_ID_SIZE);
+    status = monotonic_ns() >= deadline ? CPL_ERR_LOCK_TIMEOUT :
+        append_authorized(journal, &record, CPL_RECORD_RECOVERY, deadline,
+            out);
+
+done:
+    unlock_action(journal);
     return status;
 }
 
@@ -2767,6 +3144,7 @@ int cpl_journal_reconcile_interrupted_batch(cpl_journal *journal,
     (void)memset(&record, 0, sizeof(record));
     record.kind = CPL_RECORD_BATCH_DONE;
     record.generation = chain.state.generation;
+    record.authority_epoch = chain.state.authority_epoch;
     record.lease_deadline_ns = chain.state.lease_deadline_ns;
     record.completed_steps = chain.state.completed_steps;
     record.batch_outcome = CPL_BATCH_INTERRUPTED;
@@ -2801,6 +3179,7 @@ int cpl_journal_prepare_successor(cpl_journal *journal,
     (void)memset(&record, 0, sizeof(record));
     record.kind = CPL_RECORD_PREPARED;
     record.generation = generation;
+    record.authority_epoch = chain.state.authority_epoch;
     record.deadline_ns = claim_deadline_ns;
     (void)memcpy(record.candidate, candidate, CPL_ID_SIZE);
     status = append_authorized(journal, &record, CPL_RECORD_RECOVERY, deadline,
@@ -2911,9 +3290,21 @@ int cpl_journal_delete_at(cpl_journal **inout_j, int parent_dirfd,
     head_locked = true;
     fault_exit("after_authority_revalidated");
     if (authority->kind == CPL_DELETE_CERTIFIED_DONE) {
+        bool execution_absent = false;
+
         if (!journal->reap_proof_valid ||
             certified.state.workdir_bound == 0U) {
             status = CPL_ERR_REAP_REQUIRED;
+            goto done;
+        }
+        status = observed_identity_status(&journal->reaped_identity,
+            &execution_absent);
+        if (status != CPL_OK || !execution_absent) {
+            status = status == CPL_OK ? CPL_ERR_PROCESS_PRESENT : status;
+            goto done;
+        }
+        if (monotonic_ns() >= deadline) {
+            status = CPL_ERR_LOCK_TIMEOUT;
             goto done;
         }
         fault_exit("after_process_absence_verified");
@@ -3070,6 +3461,50 @@ void cpl_journal_close(cpl_journal *journal) {
 }
 
 #ifdef CPL_ENABLE_FAULT_INJECTION
+int cpl_fault_configure_lifecycle_pause(cpl_journal *journal, uint32_t point,
+    int notify_fd, int wait_fd) {
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK || point < CPL_FAULT_BEFORE_WORKDIR_BOUND_APPEND ||
+        point > CPL_FAULT_BEFORE_RETIREMENT_APPEND || notify_fd < 0 ||
+        wait_fd < 0) {
+        return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
+    }
+    journal->pause_point = point;
+    journal->pause_notify_fd = notify_fd;
+    journal->pause_wait_fd = wait_fd;
+    return CPL_OK;
+}
+
+int cpl_fault_fail_batch_after_step(cpl_journal *journal, uint32_t step) {
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK ||
+        (step != CPL_STEP_PROCESS_ABSENT &&
+         step != CPL_STEP_EXECUTOR_REAPED &&
+         step != CPL_STEP_WORKDIR_REMOVED &&
+         step != CPL_STEP_TERMINAL_CHECKS)) {
+        return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
+    }
+    journal->fail_batch_after_step = step;
+    return CPL_OK;
+}
+
+int cpl_fault_fail_next_workdir_parent_fsync(cpl_journal *journal) {
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    journal->fail_workdir_parent_fsync = true;
+    return CPL_OK;
+}
+
+int cpl_fault_force_atfork_registration_failure(bool enabled) {
+    force_atfork_registration_failure = enabled;
+    return CPL_OK;
+}
+
 int cpl_fault_hold_append_lock(cpl_journal *journal, int notify_fd, int wait_fd,
     uint64_t deadline_ns) {
     uint64_t deadline = effective_deadline(deadline_ns);

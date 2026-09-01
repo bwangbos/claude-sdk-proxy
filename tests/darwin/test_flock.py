@@ -44,7 +44,7 @@ def _make_journal(tmp_path: Path, *, fault: bool = False) -> tuple[Journal, int]
         )
         os.close(fd)
     if fault:
-        journal, _ = Journal._create_at_for_test(
+        journal, receipt = Journal._create_at_for_test(
             parent_dirfd,
             "allocation.journal",
             b"n" * 32,
@@ -53,13 +53,14 @@ def _make_journal(tmp_path: Path, *, fault: bool = False) -> tuple[Journal, int]
             library_path=_fault_library(),
         )
     else:
-        journal, _ = Journal.create_at(
+        journal, receipt = Journal.create_at(
             parent_dirfd,
             "allocation.journal",
             b"n" * 32,
             NORMAL_LIMIT,
             HARD_LIMIT,
         )
+    journal.create_workdir(receipt)
     return journal, parent_dirfd
 
 
@@ -200,7 +201,7 @@ def test_forked_child_rejects_inherited_handle(tmp_path: Path) -> None:
     _, status = os.waitpid(pid, 0)
     try:
         assert os.waitstatus_to_exitcode(status) == 0
-        assert journal.scan().head.sequence == 0
+        assert journal.scan().head.sequence == 1
     finally:
         journal.close()
         os.close(parent_dirfd)
@@ -356,6 +357,121 @@ def test_public_scan_waits_for_append_admission(tmp_path: Path) -> None:
         os.close(release_read)
         os.close(release_write)
         journal.close()
+        os.close(parent_dirfd)
+
+
+def test_close_waits_for_inflight_ctypes_operation(tmp_path: Path) -> None:
+    script = r'''
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+from claude_sdk_proxy.journal import Journal
+
+root = Path(sys.argv[1])
+root.mkdir(mode=0o700)
+parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+for suffix in (".append.lock", ".action.lock"):
+    fd = os.open(
+        "allocation.journal" + suffix,
+        os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent,
+    )
+    os.close(fd)
+library = Path(sys.argv[2])
+journal, receipt = Journal._create_at_for_test(
+    parent,
+    "allocation.journal",
+    b"n" * 32,
+    32768,
+    49152,
+    workdir_parent_dirfd=parent,
+    workdir_name="allocation.workdir",
+    library_path=library,
+)
+journal.create_workdir(receipt)
+notified_read, notified_write = os.pipe()
+release_read, release_write = os.pipe()
+operation = threading.Thread(
+    target=journal.hold_append_lock_for_test,
+    args=(notified_write, release_read),
+)
+operation.start()
+if os.read(notified_read, 1) != b"1":
+    os._exit(6)
+closer = threading.Thread(target=journal.close)
+closer.start()
+closer.join(timeout=0.05)
+if not closer.is_alive():
+    os._exit(7)
+os.write(release_write, b"1")
+operation.join(timeout=2)
+closer.join(timeout=2)
+if operation.is_alive() or closer.is_alive() or not journal.closed:
+    os._exit(8)
+os._exit(0)
+'''
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path / "close-race"),
+            str(_fault_library()),
+        ],
+        check=False,
+        timeout=5,
+    )
+    assert completed.returncode == 0
+
+
+def test_owner_death_releases_lock_while_fork_child_remains_alive(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    journal.close()
+    notified_read, notified_write = os.pipe()
+    child_pid_read, child_pid_write = os.pipe()
+    hold_read, hold_write = os.pipe()
+    owner_pid = os.fork()
+    if owner_pid == 0:
+        os.close(notified_read)
+        os.close(child_pid_read)
+        os.close(hold_write)
+        owner = _open_second(parent_dirfd)
+        sleeper_pid = os.fork()
+        if sleeper_pid == 0:
+            os.close(notified_write)
+            os.close(child_pid_write)
+            os.read(hold_read, 1)
+            os._exit(0)
+        os.write(child_pid_write, str(sleeper_pid).encode("ascii"))
+        owner.hold_append_lock_for_test(notified_write, hold_read)
+        os._exit(0)
+
+    os.close(notified_write)
+    os.close(child_pid_write)
+    os.close(hold_read)
+    sleeper_pid = int(os.read(child_pid_read, 32).decode("ascii"))
+    contender = _open_second(parent_dirfd)
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        os.kill(owner_pid, 9)
+        _, status = os.waitpid(owner_pid, 0)
+        assert os.waitstatus_to_exitcode(status) == -9
+        os.kill(sleeper_pid, 0)
+        contender.append(
+            Record.prepared(1, "candidate-1", claim_deadline_ns=_future()),
+            RecordClass.NORMAL,
+        )
+    finally:
+        os.write(hold_write, b"1")
+        os.close(hold_write)
+        os.close(notified_read)
+        os.close(child_pid_read)
+        contender.close()
         os.close(parent_dirfd)
 
 

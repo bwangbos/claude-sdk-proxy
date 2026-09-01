@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import select
+import threading
 import time
 from pathlib import Path
 
@@ -15,10 +16,11 @@ from claude_sdk_proxy.journal import (
     RecordClass,
     UnreleasedPartialCreate,
 )
-from claude_sdk_proxy.lifecycle import Record
+from claude_sdk_proxy.lifecycle import Record, StateKind
 
 NORMAL_LIMIT = 64 * 1024
 HARD_LIMIT = 96 * 1024
+PHYSICAL_RECORD_SIZE = 108 + 1064
 CREATE_POINTS = (
     "after_openat",
     "after_preallocate",
@@ -32,6 +34,17 @@ PARTIAL_DELETE_POINTS = (
     "after_journal_unlinkat",
     "after_journal_unlink_parent_fsync",
 )
+DONE_DELETE_POINTS = (
+    "after_authority_revalidated",
+    "after_process_absence_verified",
+    "after_workdir_absence_verified",
+    "after_journal_unlinkat",
+    "after_journal_unlink_parent_fsync",
+)
+
+
+def _future() -> int:
+    return time.monotonic_ns() + 5_000_000_000
 
 
 def _fault_library() -> Path:
@@ -212,6 +225,97 @@ def test_delete_crash_releases_slot_only_after_fresh_absent_reconciliation(
         os.close(parent_dirfd)
 
 
+@pytest.mark.parametrize("point", DONE_DELETE_POINTS)
+def test_certified_done_delete_crash_never_returns_slot_receipt(
+    tmp_path: Path,
+    point: str,
+) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    worker_pid = os.fork()
+    if worker_pid == 0:
+        journal, create_receipt = Journal._create_at_for_test(
+            parent_dirfd,
+            "allocation.journal",
+            b"n" * 32,
+            NORMAL_LIMIT,
+            HARD_LIMIT,
+            workdir_parent_dirfd=parent_dirfd,
+            workdir_name="allocation.workdir",
+            library_path=_fault_library(),
+        )
+        journal.create_workdir(create_receipt)
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+            RecordClass.NORMAL,
+        )
+        ready_read, ready_write = os.pipe()
+        executor_pid = os.fork()
+        if executor_pid == 0:
+            os.close(ready_read)
+            journal.close()
+            executor = _open(parent_dirfd, library_path=_fault_library())
+            executor.activate_executor(
+                1,
+                "executor-1",
+                os.getpid(),
+                lease_deadline_ns=_future(),
+            )
+            target_pid = os.fork()
+            if target_pid == 0:
+                time.sleep(30)
+                os._exit(0)
+            target = executor.observe_process(target_pid)
+            os.kill(target_pid, 9)
+            batch = executor.admit_batch(
+                1,
+                "executor-1",
+                "cleanup-1",
+                [
+                    executor.process_absent_descriptor(target),
+                    executor.reap_process_descriptor(target),
+                    executor.remove_bound_workdir_descriptor(),
+                    executor.terminal_checks_descriptor(),
+                ],
+            )
+            batch.execute()
+            batch.complete()
+            executor.finish_done(1, "executor-1")
+            os.write(ready_write, b"1")
+            os.close(ready_write)
+            executor.close()
+            os._exit(0)
+        os.close(ready_write)
+        if os.read(ready_read, 1) != b"1":
+            os._exit(92)
+        os.close(ready_read)
+        journal.confirm_executor_reaped(deadline_ns=_future())
+        authority = journal.certify_done()
+        os.environ["CPL_FAULT_POINT"] = point
+        journal.delete_at(authority)
+        marker = os.open(
+            "slot-released",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent_dirfd,
+        )
+        os.close(marker)
+        os._exit(0)
+
+    _, status = os.waitpid(worker_pid, 0)
+    try:
+        assert os.waitstatus_to_exitcode(status) == 91
+        assert not (tmp_path / "slot-released").exists()
+        unlinked = point in {
+            "after_journal_unlinkat",
+            "after_journal_unlink_parent_fsync",
+        }
+        assert (tmp_path / "allocation.journal").exists() is not unlinked
+        assert not (tmp_path / "allocation.workdir").exists()
+    finally:
+        os.close(parent_dirfd)
+
+
 def test_reconcile_absent_rejects_fabricated_authority(tmp_path: Path) -> None:
     parent_dirfd, retained, authority = _prepare_delete_case(tmp_path)
     child = _open(parent_dirfd)
@@ -244,6 +348,96 @@ def test_delete_rejects_false_done_and_missing_reap_proof(tmp_path: Path) -> Non
             journal.certify_done()
         assert caught.value.code is JournalErrorCode.REAP_REQUIRED
     finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_done_authority_denies_live_executor_and_missing_reap(
+    tmp_path: Path,
+) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    journal, create_receipt = Journal._create_at_for_test(
+        parent_dirfd,
+        "allocation.journal",
+        b"n" * 32,
+        NORMAL_LIMIT,
+        HARD_LIMIT,
+        workdir_parent_dirfd=parent_dirfd,
+        workdir_name="allocation.workdir",
+        library_path=_fault_library(),
+    )
+    journal.create_workdir(create_receipt)
+    journal.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+        RecordClass.NORMAL,
+    )
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    executor_pid = os.fork()
+    if executor_pid == 0:
+        os.close(ready_read)
+        os.close(release_write)
+        journal.close()
+        executor = _open(parent_dirfd, library_path=_fault_library())
+        executor.activate_executor(
+            1,
+            "executor-1",
+            os.getpid(),
+            lease_deadline_ns=_future(),
+        )
+        target_pid = os.fork()
+        if target_pid == 0:
+            time.sleep(30)
+            os._exit(0)
+        target = executor.observe_process(target_pid)
+        os.kill(target_pid, 9)
+        batch = executor.admit_batch(
+            1,
+            "executor-1",
+            "cleanup-1",
+            [
+                executor.process_absent_descriptor(target),
+                executor.reap_process_descriptor(target),
+                executor.remove_bound_workdir_descriptor(),
+                executor.terminal_checks_descriptor(),
+            ],
+        )
+        batch.execute()
+        batch.complete()
+        executor.finish_done(1, "executor-1")
+        os.write(ready_write, b"1")
+        os.read(release_read, 1)
+        executor.close()
+        os._exit(0)
+
+    os.close(ready_write)
+    os.close(release_read)
+    try:
+        assert os.read(ready_read, 1) == b"1"
+        with pytest.raises(JournalError) as caught:
+            journal.confirm_executor_reaped(
+                deadline_ns=time.monotonic_ns() + 20_000_000
+            )
+        assert caught.value.code is JournalErrorCode.REAP_REQUIRED
+        with pytest.raises(JournalError) as caught:
+            journal.certify_done()
+        assert caught.value.code is JournalErrorCode.REAP_REQUIRED
+        os.write(release_write, b"1")
+        proof = journal.confirm_executor_reaped(deadline_ns=_future())
+        assert proof.pid == executor_pid
+        assert journal.certify_done()
+    finally:
+        os.close(ready_read)
+        os.close(release_write)
+        try:
+            os.kill(executor_pid, 9)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(executor_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
         journal.close()
         os.close(parent_dirfd)
 
@@ -372,6 +566,60 @@ def test_controlled_create_gate_requires_durable_bound_workdir_receipt(
         os.close(parent_dirfd)
 
 
+def test_workdir_name_must_still_resolve_to_opened_inode_before_bound_append(
+    tmp_path: Path,
+) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    journal, create_receipt = Journal._create_at_for_test(
+        parent_dirfd,
+        "allocation.journal",
+        b"n" * 32,
+        NORMAL_LIMIT,
+        HARD_LIMIT,
+        workdir_parent_dirfd=parent_dirfd,
+        workdir_name="allocation.workdir",
+        library_path=_fault_library(),
+    )
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    journal.configure_lifecycle_pause_for_test(
+        "before_workdir_bound_append",
+        notified_write,
+        release_read,
+    )
+    results: list[object] = []
+
+    def create_workdir() -> None:
+        try:
+            results.append(journal.create_workdir(create_receipt))
+        except BaseException as error:
+            results.append(error)
+
+    thread = threading.Thread(target=create_workdir)
+    thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        os.rename(
+            tmp_path / "allocation.workdir",
+            tmp_path / "allocation.workdir.original",
+        )
+        (tmp_path / "allocation.workdir").mkdir(mode=0o700)
+        os.write(release_write, b"1")
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert isinstance(results[0], JournalError)
+        assert results[0].code is JournalErrorCode.IDENTITY_DRIFT
+        assert journal.scan().head.record.workdir_bound is False
+    finally:
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        journal.close()
+        os.close(parent_dirfd)
+
+
 def test_controlled_cleanup_slot_gate_consumes_only_native_delete_receipt(
     tmp_path: Path,
 ) -> None:
@@ -488,5 +736,270 @@ def test_real_executor_identity_batches_reap_and_done_authority(
             os.waitpid(executor_pid, os.WNOHANG)
         except ChildProcessError:
             pass
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_batch_retry_skips_already_completed_waitpid_step(tmp_path: Path) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    journal, create_receipt = Journal._create_at_for_test(
+        parent_dirfd,
+        "allocation.journal",
+        b"n" * 32,
+        NORMAL_LIMIT,
+        HARD_LIMIT,
+        workdir_parent_dirfd=parent_dirfd,
+        workdir_name="allocation.workdir",
+        library_path=_fault_library(),
+    )
+    journal.create_workdir(create_receipt)
+    future = time.monotonic_ns() + 5_000_000_000
+    target_pid = os.fork()
+    if target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    try:
+        target = journal.observe_process(target_pid)
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=future),
+            RecordClass.NORMAL,
+        )
+        journal.activate_executor(
+            1,
+            "executor-1",
+            os.getpid(),
+            lease_deadline_ns=future,
+        )
+        os.kill(target_pid, 9)
+        batch = journal.admit_batch(
+            1,
+            "executor-1",
+            "batch-1",
+            [
+                journal.process_absent_descriptor(target),
+                journal.reap_process_descriptor(target),
+            ],
+        )
+        journal.fail_batch_after_step_for_test(2)
+        with pytest.raises(JournalError) as caught:
+            batch.execute()
+        assert caught.value.code is JournalErrorCode.SYSTEM
+        assert batch.execute() & 3 == 3
+        assert batch.complete().record.completed_steps & 3 == 3
+    finally:
+        try:
+            os.kill(target_pid, 9)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(target_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_batch_retry_reconciles_unlink_with_fresh_parent_fsync(
+    tmp_path: Path,
+) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    journal, create_receipt = Journal._create_at_for_test(
+        parent_dirfd,
+        "allocation.journal",
+        b"n" * 32,
+        NORMAL_LIMIT,
+        HARD_LIMIT,
+        workdir_parent_dirfd=parent_dirfd,
+        workdir_name="allocation.workdir",
+        library_path=_fault_library(),
+    )
+    journal.create_workdir(create_receipt)
+    future = time.monotonic_ns() + 5_000_000_000
+    target_pid = os.fork()
+    if target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    try:
+        target = journal.observe_process(target_pid)
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=future),
+            RecordClass.NORMAL,
+        )
+        journal.activate_executor(
+            1,
+            "executor-1",
+            os.getpid(),
+            lease_deadline_ns=future,
+        )
+        os.kill(target_pid, 9)
+        batch = journal.admit_batch(
+            1,
+            "executor-1",
+            "batch-1",
+            [
+                journal.process_absent_descriptor(target),
+                journal.reap_process_descriptor(target),
+                journal.remove_bound_workdir_descriptor(),
+                journal.terminal_checks_descriptor(),
+            ],
+        )
+        journal.fail_next_workdir_parent_fsync_for_test()
+        with pytest.raises(JournalError) as caught:
+            batch.execute()
+        assert caught.value.code is JournalErrorCode.SYSTEM
+        assert not (tmp_path / "allocation.workdir").exists()
+
+        assert batch.execute() == 15
+        assert batch.complete().record.completed_steps == 15
+    finally:
+        try:
+            os.kill(target_pid, 9)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(target_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_exact_eight_record_recovery_tail_reaches_done(tmp_path: Path) -> None:
+    normal_limit = PHYSICAL_RECORD_SIZE * 12
+    hard_limit = normal_limit + PHYSICAL_RECORD_SIZE * 8
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    journal, create_receipt = Journal._create_at_for_test(
+        parent_dirfd,
+        "allocation.journal",
+        b"n" * 32,
+        normal_limit,
+        hard_limit,
+        workdir_parent_dirfd=parent_dirfd,
+        workdir_name="allocation.workdir",
+        library_path=_fault_library(),
+    )
+    journal.create_workdir(create_receipt)
+    first_target_pid = os.fork()
+    if first_target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    first_target = journal.observe_process(first_target_pid)
+    lease = time.monotonic_ns() + 200_000_000
+    journal.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+        RecordClass.NORMAL,
+    )
+    admitted_read, admitted_write = os.pipe()
+    executor_pid = os.fork()
+    if executor_pid == 0:
+        os.close(admitted_read)
+        journal.close()
+        executor = Journal._open_at_for_test(
+            parent_dirfd,
+            "allocation.journal",
+            b"n" * 32,
+            normal_limit,
+            hard_limit,
+            workdir_parent_dirfd=parent_dirfd,
+            workdir_name="allocation.workdir",
+            library_path=_fault_library(),
+        )
+        executor.activate_executor(
+            1,
+            "executor-1",
+            os.getpid(),
+            lease_deadline_ns=lease,
+        )
+        os.kill(first_target_pid, 9)
+        executor.admit_batch(
+            1,
+            "executor-1",
+            "interrupted-1",
+            [executor.process_absent_descriptor(first_target)],
+        )
+        os.write(admitted_write, b"1")
+        os.close(admitted_write)
+        time.sleep(30)
+        os._exit(0)
+
+    os.close(admitted_write)
+    second_target_pid = 0
+    try:
+        assert os.read(admitted_read, 1) == b"1"
+        physical_eof = journal.scan().physical_eof
+        journal.raw_append_for_test(b"x" * (normal_limit - physical_eof))
+        assert journal.scan().physical_eof == normal_limit
+        while time.monotonic_ns() <= lease:
+            time.sleep(0.001)
+        authority_deadline = time.monotonic_ns() + 40_000_000
+        assert journal.retire_executor(
+            authority="reconciler-1",
+            authority_epoch=1,
+            authority_deadline_ns=authority_deadline,
+        ).record.kind is StateKind.RETIRING_BATCH
+        os.kill(executor_pid, 9)
+        while time.monotonic_ns() <= authority_deadline:
+            time.sleep(0.001)
+        journal.replace_retirement_authority(
+            authority="reconciler-2",
+            authority_epoch=2,
+            authority_deadline_ns=_future(),
+        )
+        proof = journal.confirm_executor_reaped(deadline_ns=_future())
+        journal.reconcile_interrupted_batch(proof)
+        journal.prepare_successor(
+            proof,
+            2,
+            "executor-2",
+            claim_deadline_ns=_future(),
+        )
+        journal.activate_executor(
+            2,
+            "executor-2",
+            os.getpid(),
+            lease_deadline_ns=_future(),
+        )
+
+        second_target_pid = os.fork()
+        if second_target_pid == 0:
+            time.sleep(30)
+            os._exit(0)
+        second_target = journal.observe_process(second_target_pid)
+        os.kill(second_target_pid, 9)
+        cleanup = journal.admit_batch(
+            2,
+            "executor-2",
+            "cleanup-2",
+            [
+                journal.process_absent_descriptor(second_target),
+                journal.reap_process_descriptor(second_target),
+                journal.remove_bound_workdir_descriptor(),
+                journal.terminal_checks_descriptor(),
+            ],
+        )
+        assert cleanup.execute() == 15
+        cleanup.complete()
+        done = journal.finish_done(2, "executor-2")
+        assert done.record.kind is StateKind.DONE
+        assert journal.scan().physical_eof == hard_limit
+    finally:
+        os.close(admitted_read)
+        for pid in (executor_pid, first_target_pid, second_target_pid):
+            if pid <= 0:
+                continue
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+        for pid in (executor_pid, first_target_pid, second_target_pid):
+            if pid <= 0:
+                continue
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
         journal.close()
         os.close(parent_dirfd)

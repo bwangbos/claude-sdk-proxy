@@ -42,7 +42,7 @@ def _make_journal(tmp_path: Path, *, fault: bool = False) -> tuple[Journal, int]
         )
         os.close(fd)
     if fault:
-        journal, _ = Journal._create_at_for_test(
+        journal, receipt = Journal._create_at_for_test(
             parent_dirfd,
             "allocation.journal",
             b"n" * 32,
@@ -51,13 +51,14 @@ def _make_journal(tmp_path: Path, *, fault: bool = False) -> tuple[Journal, int]
             library_path=_fault_library(),
         )
     else:
-        journal, _ = Journal.create_at(
+        journal, receipt = Journal.create_at(
             parent_dirfd,
             "allocation.journal",
             b"n" * 32,
             NORMAL_LIMIT,
             HARD_LIMIT,
         )
+    journal.create_workdir(receipt)
     return journal, parent_dirfd
 
 
@@ -229,11 +230,12 @@ def test_retirement_preserves_admitted_batch_until_exact_outcome(
             Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
             RecordClass.NORMAL,
         )
+        lease = time.monotonic_ns() + 40_000_000
         journal.activate_executor(
             1,
             "executor-1",
             os.getpid(),
-            lease_deadline_ns=_future(),
+            lease_deadline_ns=lease,
         )
         os.kill(target_pid, 9)
         admitted = journal.admit_batch(
@@ -245,6 +247,8 @@ def test_retirement_preserves_admitted_batch_until_exact_outcome(
                 journal.reap_process_descriptor(target),
             ],
         )
+        while time.monotonic_ns() <= lease:
+            time.sleep(0.001)
         retired = reconciler.retire_executor(
             authority="reconciler-1",
             authority_epoch=1,
@@ -286,7 +290,7 @@ def test_executor_death_interrupts_only_the_admitted_batch(tmp_path: Path) -> No
             1,
             "executor-1",
             os.getpid(),
-            lease_deadline_ns=_future(),
+            lease_deadline_ns=time.monotonic_ns() + 40_000_000,
         )
         target_pid = os.fork()
         if target_pid == 0:
@@ -308,6 +312,7 @@ def test_executor_death_interrupts_only_the_admitted_batch(tmp_path: Path) -> No
     try:
         target_pid = int(os.read(notified_read, 32).decode("ascii"))
         os.kill(executor_pid, 9)
+        time.sleep(0.05)
         retired = journal.retire_executor(
             authority="reconciler-1",
             authority_epoch=1,
@@ -444,4 +449,267 @@ def test_only_native_lock_backed_batch_can_advance_cleanup_proofs(
         except ChildProcessError:
             pass
         journal.close()
+        os.close(parent_dirfd)
+
+
+def test_batch_active_cannot_retire_before_executor_lease_expiry(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    lease = time.monotonic_ns() + 5_000_000_000
+    try:
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+            RecordClass.NORMAL,
+        )
+        journal.activate_executor(
+            1,
+            "executor-1",
+            os.getpid(),
+            lease_deadline_ns=lease,
+        )
+        journal.admit_batch(
+            1,
+            "executor-1",
+            "batch-1",
+            [journal.process_absent_descriptor(journal.observe_process(os.getpid()))],
+        )
+        with pytest.raises(JournalError) as caught:
+            journal.retire_executor(
+                authority="reconciler-1",
+                authority_epoch=1,
+                authority_deadline_ns=_future(),
+            )
+        assert caught.value.code is JournalErrorCode.AUTHORITY
+        assert journal.scan().head.record.kind is StateKind.BATCH_ACTIVE
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+@pytest.mark.parametrize("release_after_expiry", [False, True])
+def test_batch_retirement_rechecks_expiry_at_barrier(
+    tmp_path: Path,
+    release_after_expiry: bool,
+) -> None:
+    executor, parent_dirfd = _make_journal(tmp_path, fault=True)
+    reconciler = _open(parent_dirfd, fault=True)
+    lease = time.monotonic_ns() + 200_000_000
+    executor.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+        RecordClass.NORMAL,
+    )
+    executor.activate_executor(
+        1,
+        "executor-1",
+        os.getpid(),
+        lease_deadline_ns=lease,
+    )
+    executor.admit_batch(
+        1,
+        "executor-1",
+        "batch-1",
+        [executor.process_absent_descriptor(executor.observe_process(os.getpid()))],
+    )
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    reconciler.configure_lifecycle_pause_for_test(
+        "before_retirement_expiry_check",
+        notified_write,
+        release_read,
+    )
+    results: list[object] = []
+
+    def retire() -> None:
+        try:
+            results.append(
+                reconciler.retire_executor(
+                    authority="reconciler-1",
+                    authority_epoch=1,
+                    authority_deadline_ns=_future(),
+                )
+            )
+        except BaseException as error:
+            results.append(error)
+
+    thread = threading.Thread(target=retire)
+    thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        if release_after_expiry:
+            while time.monotonic_ns() <= lease:
+                time.sleep(0.001)
+        os.write(release_write, b"1")
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        if release_after_expiry:
+            assert not isinstance(results[0], BaseException)
+            assert results[0].record.kind is StateKind.RETIRING_BATCH  # type: ignore[union-attr]
+        else:
+            assert isinstance(results[0], JournalError)
+            assert results[0].code is JournalErrorCode.AUTHORITY
+    finally:
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        reconciler.close()
+        executor.close()
+        os.close(parent_dirfd)
+
+
+def test_batch_admission_barrier_wins_before_retirement(tmp_path: Path) -> None:
+    executor, parent_dirfd = _make_journal(tmp_path, fault=True)
+    reconciler = _open(parent_dirfd, fault=True)
+    lease = time.monotonic_ns() + 40_000_000
+    target_pid = os.fork()
+    if target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    target = executor.observe_process(target_pid)
+    executor.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+        RecordClass.NORMAL,
+    )
+    executor.activate_executor(
+        1,
+        "executor-1",
+        os.getpid(),
+        lease_deadline_ns=lease,
+    )
+    os.kill(target_pid, 9)
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    executor.configure_lifecycle_pause_for_test(
+        "after_batch_admission_append",
+        notified_write,
+        release_read,
+    )
+    admitted: list[object] = []
+
+    def admit() -> None:
+        try:
+            batch = executor.admit_batch(
+                1,
+                "executor-1",
+                "batch-1",
+                [executor.process_absent_descriptor(target)],
+            )
+            admitted.append(batch)
+            batch.execute()
+            batch.complete()
+        except BaseException as error:
+            admitted.append(error)
+
+    thread = threading.Thread(target=admit)
+    thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        while time.monotonic_ns() <= lease:
+            time.sleep(0.001)
+        retired = reconciler.retire_executor(
+            authority="reconciler-1",
+            authority_epoch=1,
+            authority_deadline_ns=_future(),
+        )
+        assert retired.record.kind is StateKind.RETIRING_BATCH
+        assert retired.record.exact_batch == "batch-1"
+        os.write(release_write, b"1")
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert admitted and not isinstance(admitted[0], BaseException)
+        assert executor.scan().head.record.kind is StateKind.RETIRING_IDLE
+    finally:
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        try:
+            os.waitpid(target_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        reconciler.close()
+        executor.close()
+        os.close(parent_dirfd)
+
+
+def test_retirement_barrier_wins_before_batch_admission(tmp_path: Path) -> None:
+    executor, parent_dirfd = _make_journal(tmp_path, fault=True)
+    reconciler = _open(parent_dirfd, fault=True)
+    lease = time.monotonic_ns() + 40_000_000
+    executor.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+        RecordClass.NORMAL,
+    )
+    executor.activate_executor(
+        1,
+        "executor-1",
+        os.getpid(),
+        lease_deadline_ns=lease,
+    )
+    while time.monotonic_ns() <= lease:
+        time.sleep(0.001)
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    reconciler.configure_lifecycle_pause_for_test(
+        "before_retirement_append",
+        notified_write,
+        release_read,
+    )
+    retired: list[object] = []
+    admitted: list[object] = []
+
+    def retire() -> None:
+        try:
+            retired.append(
+                reconciler.retire_executor(
+                    authority="reconciler-1",
+                    authority_epoch=1,
+                    authority_deadline_ns=_future(),
+                )
+            )
+        except BaseException as error:
+            retired.append(error)
+
+    def admit() -> None:
+        try:
+            admitted.append(
+                executor.admit_batch(
+                    1,
+                    "executor-1",
+                    "batch-1",
+                    [
+                        executor.process_absent_descriptor(
+                            executor.observe_process(os.getpid())
+                        )
+                    ],
+                )
+            )
+        except BaseException as error:
+            admitted.append(error)
+
+    retire_thread = threading.Thread(target=retire)
+    admit_thread = threading.Thread(target=admit)
+    retire_thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        admit_thread.start()
+        time.sleep(0.03)
+        assert admit_thread.is_alive()
+        os.write(release_write, b"1")
+        retire_thread.join(timeout=2)
+        admit_thread.join(timeout=2)
+        assert not retire_thread.is_alive()
+        assert not admit_thread.is_alive()
+        assert retired and not isinstance(retired[0], BaseException)
+        assert isinstance(admitted[0], JournalError)
+        assert admitted[0].code is JournalErrorCode.AUTHORITY
+        assert executor.scan().head.record.kind is StateKind.RETIRING_IDLE
+    finally:
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        reconciler.close()
+        executor.close()
         os.close(parent_dirfd)

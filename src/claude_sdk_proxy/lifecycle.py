@@ -362,6 +362,7 @@ class Record:
         executor: str,
         lease_deadline_ns: int,
         completed_steps: int = 0,
+        descriptors: tuple[BatchDescriptor, ...] = (),
         parent: bytes | None = None,
     ) -> Self:
         return cls(
@@ -369,9 +370,11 @@ class Record:
             generation=generation,
             lease_deadline_ns=lease_deadline_ns,
             completed_steps=completed_steps,
+            descriptor_count=len(descriptors),
             parent=parent,
             executor=executor,
             exact_batch=batch_nonce,
+            descriptors=descriptors,
         )
 
     @classmethod
@@ -593,6 +596,17 @@ class _CRecord(ctypes.Structure):
         ("workdir_name", ctypes.c_uint8 * WORKDIR_NAME_SIZE),
         ("descriptors", _CBatchDescriptor * MAX_BATCH_DESCRIPTORS),
     ]
+
+
+_LIFECYCLE_ABI_SIZES: Final = {
+    _CProcessIdentity: 112,
+    _CBatchDescriptor: 120,
+    _CState: 1032,
+    _CRecord: 1064,
+}
+for _abi_type, _abi_size in _LIFECYCLE_ABI_SIZES.items():
+    if ctypes.sizeof(_abi_type) != _abi_size:
+        raise RuntimeError(f"ctypes ABI size mismatch for {_abi_type.__name__}")
 
 
 def _set_bytes(target: ctypes.Array[ctypes.c_uint8], value: bytes) -> None:
