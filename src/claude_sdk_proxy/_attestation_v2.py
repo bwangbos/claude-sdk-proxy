@@ -329,6 +329,7 @@ def _snapshot_cli(path: Path) -> CliExecutableIdentity:
 
 
 class _VersionProbeOwnerState(StrEnum):
+    AMBIGUOUS_SPAWN = "ambiguous_spawn"
     LIVE_CLEANUP_PENDING = "live_cleanup_pending"
     REAPED_RESOURCE_CLOSE_PENDING = "reaped_resource_close_pending"
 
@@ -337,15 +338,16 @@ class _VersionProbeOwnerState(StrEnum):
 class _VersionProbeOwner:
     """Exact direct-child/group ownership retained until group absence."""
 
-    process: subprocess.Popen[bytes]
-    leader_pid: int
-    pgid: int
-    state: _VersionProbeOwnerState = _VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+    process: subprocess.Popen[bytes] | None = None
+    leader_pid: int = 0
+    pgid: int = 0
+    state: _VersionProbeOwnerState = _VersionProbeOwnerState.AMBIGUOUS_SPAWN
     selector: selectors.BaseSelector | None = None
 
 
 _VERSION_PROBE_LOCK = threading.RLock()
 _RETAINED_VERSION_PROBES: dict[int, _VersionProbeOwner] = {}
+_VERSION_PROBE_RESERVATION_KEY = 0
 _LIBPROC: ctypes.CDLL | None = None
 
 
@@ -353,39 +355,105 @@ def _validate_version_probe_owner(
     owner: _VersionProbeOwner,
     *,
     expected_state: _VersionProbeOwnerState | None = None,
+    allow_live_exit_status: bool = False,
 ) -> None:
-    if (
-        not isinstance(owner, _VersionProbeOwner)
-        or owner.leader_pid <= 0
-        or owner.leader_pid != owner.pgid
-        or owner.process.pid != owner.leader_pid
-        or len(_RETAINED_VERSION_PROBES) != 1
-        or _RETAINED_VERSION_PROBES.get(owner.leader_pid) is not owner
-        or not isinstance(owner.state, _VersionProbeOwnerState)
-    ):
-        raise AttestationError("version probe owner state is invalid")
-    if expected_state is not None and owner.state is not expected_state:
-        raise AttestationError("version probe owner state transition is invalid")
-    if (
-        owner.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING
-        and owner.process.returncode is not None
-    ):
-        raise AttestationError("live version probe owner was reaped unexpectedly")
-    if (
-        owner.state is _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
-        and owner.process.returncode is None
-    ):
-        raise AttestationError("reaped version probe owner lacks exit status")
-
-
-def _register_version_probe_owner(owner: _VersionProbeOwner) -> None:
     with _VERSION_PROBE_LOCK:
-        if _RETAINED_VERSION_PROBES and (
-            _RETAINED_VERSION_PROBES.get(owner.leader_pid) is not owner
+        if (
+            not isinstance(owner, _VersionProbeOwner)
+            or len(_RETAINED_VERSION_PROBES) != 1
+            or not isinstance(owner.state, _VersionProbeOwnerState)
         ):
+            raise AttestationError("version probe owner state is invalid")
+        if expected_state is not None and owner.state is not expected_state:
+            raise AttestationError("version probe owner state transition is invalid")
+        if owner.state is _VersionProbeOwnerState.AMBIGUOUS_SPAWN:
+            process = owner.process
+            if (
+                (
+                    process is None
+                    and (owner.leader_pid != 0 or owner.pgid != 0)
+                )
+                or (
+                    process is not None
+                    and (
+                        owner.leader_pid <= 0
+                        or owner.leader_pid != owner.pgid
+                        or process.pid != owner.leader_pid
+                    )
+                )
+                or owner.selector is not None
+                or _RETAINED_VERSION_PROBES.get(_VERSION_PROBE_RESERVATION_KEY)
+                is not owner
+            ):
+                raise AttestationError("version probe owner state is invalid")
+            return
+        process = owner.process
+        if (
+            process is None
+            or owner.leader_pid <= 0
+            or owner.leader_pid != owner.pgid
+            or process.pid != owner.leader_pid
+            or _RETAINED_VERSION_PROBES.get(owner.leader_pid) is not owner
+        ):
+            raise AttestationError("version probe owner state is invalid")
+        if (
+            owner.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+            and process.returncode is not None
+            and not allow_live_exit_status
+        ):
+            raise AttestationError("live version probe owner was reaped unexpectedly")
+        if (
+            owner.state is _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+            and process.returncode is None
+        ):
+            raise AttestationError("reaped version probe owner lacks exit status")
+
+
+def _reserve_version_probe_capacity() -> _VersionProbeOwner:
+    with _VERSION_PROBE_LOCK:
+        if _RETAINED_VERSION_PROBES:
             raise AttestationError("version probe owner capacity is exhausted")
-        _RETAINED_VERSION_PROBES[owner.leader_pid] = owner
-        _validate_version_probe_owner(owner)
+        reservation = _VersionProbeOwner()
+        _RETAINED_VERSION_PROBES[_VERSION_PROBE_RESERVATION_KEY] = reservation
+        _validate_version_probe_owner(
+            reservation, expected_state=_VersionProbeOwnerState.AMBIGUOUS_SPAWN
+        )
+        return reservation
+
+
+def _promote_version_probe_reservation(
+    reservation: _VersionProbeOwner, process: subprocess.Popen[bytes]
+) -> _VersionProbeOwner:
+    with _VERSION_PROBE_LOCK:
+        if (
+            reservation.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+            and reservation.process is process
+        ):
+            _validate_version_probe_owner(
+                reservation,
+                expected_state=_VersionProbeOwnerState.LIVE_CLEANUP_PENDING,
+            )
+            return reservation
+        _validate_version_probe_owner(
+            reservation, expected_state=_VersionProbeOwnerState.AMBIGUOUS_SPAWN
+        )
+        if process.pid <= 0:
+            raise AttestationError("version probe returned an invalid process identity")
+
+        # Attach the exact handle before the only allocation which can fail.
+        # Until the registry move succeeds the reservation remains deliberately
+        # non-actionable, but it still strongly owns any returned child/pipes.
+        reservation.process = process
+        reservation.leader_pid = process.pid
+        reservation.pgid = process.pid
+        _RETAINED_VERSION_PROBES[process.pid] = reservation
+        reservation.state = _VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+        del _RETAINED_VERSION_PROBES[_VERSION_PROBE_RESERVATION_KEY]
+        _validate_version_probe_owner(
+            reservation,
+            expected_state=_VersionProbeOwnerState.LIVE_CLEANUP_PENDING,
+        )
+        return reservation
 
 
 def _libproc() -> ctypes.CDLL:
@@ -492,46 +560,86 @@ def _signal_version_probe_group(owner: _VersionProbeOwner, signal_number: int) -
 
 
 def _reap_version_probe_leader(owner: _VersionProbeOwner) -> int:
-    _validate_version_probe_owner(
-        owner, expected_state=_VersionProbeOwnerState.LIVE_CLEANUP_PENDING
-    )
-    if not _version_probe_group_is_absent(owner):
-        raise AttestationError("version probe group absence is unconfirmed")
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
-    try:
-        returncode = owner.process.wait(timeout=0.25)
-    except subprocess.TimeoutExpired as error:
-        raise AttestationError("version probe leader could not be reaped") from error
-    else:
-        with _VERSION_PROBE_LOCK:
+    with _VERSION_PROBE_LOCK:
+        _validate_version_probe_owner(
+            owner, expected_state=_VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+        )
+        if not _version_probe_group_is_absent(owner):
+            raise AttestationError("version probe group absence is unconfirmed")
+        process = owner.process
+        assert process is not None
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        try:
+            try:
+                returncode = process.wait(timeout=0.25)
+            except BaseException as error:
+                if process.returncode is not None:
+                    _validate_version_probe_owner(
+                        owner,
+                        expected_state=_VersionProbeOwnerState.LIVE_CLEANUP_PENDING,
+                        allow_live_exit_status=True,
+                    )
+                    owner.state = (
+                        _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+                    )
+                    _validate_version_probe_owner(
+                        owner,
+                        expected_state=(
+                            _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+                        ),
+                    )
+                if isinstance(error, subprocess.TimeoutExpired):
+                    raise AttestationError(
+                        "version probe leader could not be reaped"
+                    ) from error
+                raise
             owner.state = _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
             _validate_version_probe_owner(
                 owner,
-                expected_state=(_VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING),
+                expected_state=(
+                    _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+                ),
             )
-        return returncode
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            return returncode
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _terminate_version_probe(owner: _VersionProbeOwner) -> None:
-    _validate_version_probe_owner(owner)
-    if owner.state is _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING:
-        return
-    if not _wait_for_version_probe_group_absence(owner, 0):
-        _signal_version_probe_group(owner, signal.SIGTERM)
-    if not _wait_for_version_probe_group_absence(owner, _VERSION_PROBE_TERM_SECONDS):
-        _signal_version_probe_group(owner, signal.SIGKILL)
-    if not _wait_for_version_probe_group_absence(owner, _VERSION_PROBE_KILL_SECONDS):
-        raise AttestationError("version probe group cleanup is unconfirmed")
-    _reap_version_probe_leader(owner)
+    with _VERSION_PROBE_LOCK:
+        _validate_version_probe_owner(owner)
+        if owner.state is _VersionProbeOwnerState.AMBIGUOUS_SPAWN:
+            raise AttestationError("version probe cleanup is unconfirmed")
+        if owner.state is _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING:
+            return
+        if not _wait_for_version_probe_group_absence(owner, 0):
+            _signal_version_probe_group(owner, signal.SIGTERM)
+        if not _wait_for_version_probe_group_absence(
+            owner, _VERSION_PROBE_TERM_SECONDS
+        ):
+            _signal_version_probe_group(owner, signal.SIGKILL)
+        if not _wait_for_version_probe_group_absence(
+            owner, _VERSION_PROBE_KILL_SECONDS
+        ):
+            raise AttestationError("version probe group cleanup is unconfirmed")
+        _reap_version_probe_leader(owner)
 
 
 def _capture_version_probe_owner(
     process: subprocess.Popen[bytes],
 ) -> _VersionProbeOwner:
-    owner = _VersionProbeOwner(process, process.pid, process.pid)
-    _register_version_probe_owner(owner)
+    with _VERSION_PROBE_LOCK:
+        if len(_RETAINED_VERSION_PROBES) != 1:
+            raise AttestationError("version probe owner capacity is invalid")
+        owner = next(iter(_RETAINED_VERSION_PROBES.values()))
+        if owner.state is _VersionProbeOwnerState.AMBIGUOUS_SPAWN:
+            owner = _promote_version_probe_reservation(owner, process)
+        elif owner.process is process:
+            _validate_version_probe_owner(
+                owner, expected_state=_VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+            )
+        else:
+            raise AttestationError("version probe owner identity is invalid")
     try:
         try:
             current_pgid = os.getpgid(owner.leader_pid)
@@ -558,6 +666,7 @@ def _capture_version_probe_owner(
 def _spawn_and_register_version_probe(
     path: Path, environment: Mapping[str, str]
 ) -> _VersionProbeOwner:
+    reservation = _reserve_version_probe_capacity()
     # Defer Python's KeyboardInterrupt across the only otherwise-unowned
     # Popen-return-to-registry window. The isolated probe child intentionally
     # inherits blocked SIGINT; its bounded cleanup authority is TERM/KILL on
@@ -575,10 +684,18 @@ def _spawn_and_register_version_probe(
             )
         except OSError as error:
             raise AttestationError("CLI version measurement failed") from error
+        # Once Popen returns, make the reservation strongly own the exact
+        # handle before invoking any operation which could raise. Promotion
+        # may still fail, but an ambiguous reservation will retain the handle.
+        with _VERSION_PROBE_LOCK:
+            reservation.process = process
+            reservation.leader_pid = process.pid
+            reservation.pgid = process.pid
+        _promote_version_probe_reservation(reservation, process)
         return _capture_version_probe_owner(process)
     finally:
-        # A pending SIGINT may raise here, but capture has already installed the
-        # strong authoritative registry entry before this restoration point.
+        # A pending SIGINT may raise here, but the reservation already retains
+        # either the exact returned handle or the ambiguous spawn disposition.
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
@@ -597,6 +714,8 @@ def _close_version_probe_resources(owner: _VersionProbeOwner) -> None:
         owner,
         expected_state=_VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING,
     )
+    process = owner.process
+    assert process is not None
     first_error: BaseException | None = None
     selector = owner.selector
     if selector is not None:
@@ -607,9 +726,9 @@ def _close_version_probe_resources(owner: _VersionProbeOwner) -> None:
         else:
             owner.selector = None
     for stream in (
-        owner.process.stdin,
-        owner.process.stdout,
-        owner.process.stderr,
+        process.stdin,
+        process.stdout,
+        process.stderr,
     ):
         if stream is None or stream.closed:
             continue
@@ -623,9 +742,9 @@ def _close_version_probe_resources(owner: _VersionProbeOwner) -> None:
     if owner.selector is not None or any(
         stream is not None and not stream.closed
         for stream in (
-            owner.process.stdin,
-            owner.process.stdout,
-            owner.process.stderr,
+            process.stdin,
+            process.stdout,
+            process.stderr,
         )
     ):
         raise AttestationError("version probe resource close is unconfirmed")
@@ -638,10 +757,13 @@ def _close_version_probe_resources(owner: _VersionProbeOwner) -> None:
 
 
 def _cleanup_version_probe_owner(owner: _VersionProbeOwner) -> None:
-    _validate_version_probe_owner(owner)
-    if owner.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING:
-        _terminate_version_probe(owner)
-    _close_version_probe_resources(owner)
+    with _VERSION_PROBE_LOCK:
+        _validate_version_probe_owner(owner)
+        if owner.state is _VersionProbeOwnerState.AMBIGUOUS_SPAWN:
+            raise AttestationError("version probe cleanup is unconfirmed")
+        if owner.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING:
+            _terminate_version_probe(owner)
+        _close_version_probe_resources(owner)
 
 
 def _run_bounded_version_probe(
@@ -658,6 +780,7 @@ def _run_bounded_version_probe_locked(
 ) -> tuple[int, bytes, bytes]:
     owner = _spawn_and_register_version_probe(path, environment)
     process = owner.process
+    assert process is not None
     try:
         if process.stdout is None or process.stderr is None:
             raise AttestationError("CLI version probe pipes are unavailable")
