@@ -29,6 +29,31 @@ FIXED_ISOLATION_ENV = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
 }
+FORBIDDEN_OVERRIDE_NAMES = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_LITELLM",
+    "ANTHROPIC_EXTRA_API_KEY",
+    "CLAUDE_OAUTH_OVERRIDE",
+    "AZURE_OPENAI_ENDPOINT",
+    "VERTEXAI_PROJECT",
+    "ANTHROPIC_API_HOST",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_PROFILE",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    "CLOUD_ML_REGION",
+)
+PROXY_OWNED_NAMES = (
+    "LOCAL_PROXY_API_KEY",
+    "LOCAL_PROXY_API_KEY_FILE",
+    "LOCAL_PROXY_MASTER_KEY",
+    "LOCAL_PROXY_RUN_TOKEN",
+    "LOCAL_PROXY_ALLOCATION_ID",
+)
 
 
 def test_child_environment_is_deny_by_default(tmp_path: Path) -> None:
@@ -83,19 +108,7 @@ def test_safe_inherited_names_include_existing_login_location(tmp_path: Path) ->
 
 @pytest.mark.parametrize(
     "name",
-    [
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "AWS_ACCESS_KEY_ID",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "ANTHROPIC_BASE_URL",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_LITELLM",
-        "ANTHROPIC_EXTRA_API_KEY",
-        "CLAUDE_OAUTH_OVERRIDE",
-        "AZURE_OPENAI_ENDPOINT",
-        "VERTEXAI_PROJECT",
-    ],
+    FORBIDDEN_OVERRIDE_NAMES,
 )
 def test_auth_provider_and_custom_endpoint_overrides_reject(
     name: str, tmp_path: Path
@@ -111,10 +124,7 @@ def test_auth_provider_and_custom_endpoint_overrides_reject(
 @pytest.mark.parametrize(
     "name",
     [
-        "LOCAL_PROXY_API_KEY",
-        "LOCAL_PROXY_MASTER_KEY",
-        "LOCAL_PROXY_RUN_TOKEN",
-        "LOCAL_PROXY_ALLOCATION_ID",
+        *PROXY_OWNED_NAMES,
         "CLAUDE_UNKNOWN",
         "ANTHROPIC_UNRELATED",
         "LOCAL_PROXY_UNRELATED",
@@ -177,7 +187,7 @@ def test_explicit_pass_names_are_the_only_additional_values(tmp_path: Path) -> N
     assert "OTHER_HOST_SETTING" not in env
 
 
-@pytest.mark.parametrize("pass_name", ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])
+@pytest.mark.parametrize("pass_name", FORBIDDEN_OVERRIDE_NAMES)
 def test_pass_names_cannot_admit_authentication_overrides(
     pass_name: str, tmp_path: Path
 ) -> None:
@@ -187,6 +197,28 @@ def test_pass_names_cannot_admit_authentication_overrides(
             {"HOME": str(tmp_path), pass_name: "override"},
             EnvironmentConfig(cli_dir=Path("/opt/claude"), pass_names=(pass_name,)),
         )
+
+
+@pytest.mark.parametrize("pass_name", PROXY_OWNED_NAMES)
+def test_proxy_owned_pass_names_are_rejected(pass_name: str) -> None:
+    """Proxy-owned credentials and metadata cannot be explicitly passed through."""
+    with pytest.raises(EnvironmentAmbiguityError, match="proxy-owned"):
+        EnvironmentConfig(cli_dir=Path("/opt/claude"), pass_names=(pass_name,))
+
+
+@pytest.mark.parametrize("pass_name", PROXY_OWNED_NAMES)
+def test_final_merge_defensively_strips_proxy_owned_pass_names(
+    pass_name: str, tmp_path: Path
+) -> None:
+    """A bypassed configuration object still cannot inject proxy-owned values."""
+    config = EnvironmentConfig(cli_dir=Path("/opt/claude"))
+    object.__setattr__(config, "pass_names", (pass_name,))
+
+    env = build_child_environment(
+        {"HOME": str(tmp_path), pass_name: "proxy-only"}, config
+    )
+
+    assert pass_name not in env
 
 
 def test_environment_fingerprint_is_sorted_and_value_sensitive() -> None:

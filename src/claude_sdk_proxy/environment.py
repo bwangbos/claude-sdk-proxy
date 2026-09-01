@@ -58,6 +58,8 @@ _CLOUD_PROVIDER_PREFIXES = (
     "VERTEX",
     "VERTEXAI_",
     "BEDROCK_",
+    "CLOUDSDK_",
+    "CLOUD_ML_",
 )
 _AUTH_OR_PROVIDER_TERMS = (
     "API_KEY",
@@ -77,6 +79,9 @@ _AUTH_OR_PROVIDER_TERMS = (
     "PROVIDER",
     "BASE_URL",
     "ENDPOINT",
+    "API_HOST",
+    "CUSTOM_HEADERS",
+    "PROFILE",
 )
 
 
@@ -101,6 +106,10 @@ class EnvironmentConfig:
                 raise ValueError("pass-through names must be nonempty strings")
             if "\x00" in name:
                 raise ValueError("pass-through names cannot contain NUL")
+            if name.startswith(_PROXY_OWNED_PREFIX):
+                raise EnvironmentAmbiguityError(
+                    "proxy-owned names cannot be passed through"
+                )
             if _is_authentication_or_provider_override(name):
                 raise EnvironmentAmbiguityError(
                     "authentication or provider override cannot be passed through"
@@ -152,7 +161,11 @@ def build_child_environment(
             {name: source[name] for name in _NETWORK_PROXY_NAMES if name in source}
         )
     environment.update(
-        {name: source[name] for name in config.pass_names if name in source}
+        {
+            name: source[name]
+            for name in config.pass_names
+            if name in source and not name.startswith(_PROXY_OWNED_PREFIX)
+        }
     )
     environment.update(_FIXED_ISOLATION_ENV)
     return environment
