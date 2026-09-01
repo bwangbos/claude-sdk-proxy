@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -252,6 +254,360 @@ def test_abandon_rejects_unrecorded_batch_effects_and_preserves_completion(
         _reap_target(target_pid)
         journal.close()
         os.close(parent_dirfd)
+
+
+@pytest.mark.parametrize(
+    "pause_point",
+    ["before_batch_completion_append", "after_batch_completion_append"],
+)
+def test_completion_failure_retains_batch_until_exact_retry(
+    tmp_path: Path,
+    pause_point: str,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    batch, target_pid = _admit_absence_batch(journal)
+    notify_read, notify_write = os.pipe()
+    wait_read, wait_write = os.pipe()
+    close_errors: list[BaseException] = []
+    close_threads: list[threading.Thread] = []
+    close_was_blocked: list[bool] = []
+    deadline = time.monotonic_ns() + 250_000_000
+
+    def close() -> None:
+        try:
+            journal.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+    def release_after_deadline() -> None:
+        assert os.read(notify_read, 1) == b"1"
+        closer = threading.Thread(target=close)
+        close_threads.append(closer)
+        closer.start()
+        closer.join(timeout=0.05)
+        close_was_blocked.append(closer.is_alive())
+        while time.monotonic_ns() <= deadline:
+            time.sleep(0.001)
+        os.write(wait_write, b"x")
+
+    try:
+        assert batch.execute() == 1
+        sequence_before_completion = journal.scan().head.sequence
+        journal.configure_lifecycle_pause_for_test(
+            pause_point, notify_write, wait_read
+        )
+        coordinator = threading.Thread(target=release_after_deadline)
+        coordinator.start()
+        with pytest.raises(JournalError) as caught:
+            batch.complete(deadline_ns=deadline)
+        assert caught.value.code is JournalErrorCode.LOCK_TIMEOUT
+        coordinator.join(timeout=2)
+        assert not coordinator.is_alive()
+        assert close_was_blocked == [True]
+        assert len(close_threads) == 1
+        closer = close_threads[0]
+        closer.join(timeout=0.05)
+        assert closer.is_alive()
+
+        completed = batch.complete(deadline_ns=_future())
+        assert completed.sequence == sequence_before_completion + 1
+        assert completed.record.completed_steps == 1
+        with pytest.raises(JournalError) as consumed:
+            batch.complete(deadline_ns=_future())
+        assert consumed.value.code is JournalErrorCode.BATCH_TOKEN
+
+        closer.join(timeout=2)
+        assert not closer.is_alive()
+        assert close_errors == []
+        assert journal.closed is True
+    finally:
+        for fd in (notify_read, notify_write, wait_read, wait_write):
+            os.close(fd)
+        _reap_target(target_pid)
+        try:
+            journal.close()
+        except JournalError:
+            pass
+        os.close(parent_dirfd)
+
+
+def test_remove_workdir_effect_attempt_blocks_abandon_until_retry(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    target_pid = os.fork()
+    if target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    future = _future()
+    close_errors: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            journal.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+    try:
+        target = journal.observe_process(target_pid)
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=future),
+            RecordClass.NORMAL,
+        )
+        journal.activate_executor(
+            1,
+            "executor-1",
+            os.getpid(),
+            lease_deadline_ns=future,
+        )
+        os.kill(target_pid, 9)
+        prerequisite = journal.admit_batch(
+            1,
+            "executor-1",
+            "batch-prerequisite",
+            [
+                journal.process_absent_descriptor(target),
+                journal.reap_process_descriptor(target),
+            ],
+        )
+        assert prerequisite.execute() == 3
+        assert prerequisite.complete().record.completed_steps == 3
+
+        removal = journal.admit_batch(
+            1,
+            "executor-1",
+            "batch-remove",
+            [journal.remove_bound_workdir_descriptor()],
+        )
+        journal.fail_next_workdir_parent_fsync_for_test()
+        with pytest.raises(JournalError) as failed_effect:
+            removal.execute()
+        assert failed_effect.value.code is JournalErrorCode.SYSTEM
+        assert not (tmp_path / "allocation.workdir").exists()
+
+        closer = threading.Thread(target=close)
+        closer.start()
+        closer.join(timeout=0.05)
+        assert closer.is_alive()
+        with pytest.raises(JournalError) as abandon:
+            removal.abandon()
+        assert abandon.value.code is JournalErrorCode.PRECONDITION
+        closer.join(timeout=0.05)
+        assert closer.is_alive()
+
+        assert removal.execute() == 7
+        assert removal.complete().record.completed_steps == 7
+        closer.join(timeout=2)
+        assert not closer.is_alive()
+        assert close_errors == []
+    finally:
+        _reap_target(target_pid)
+        try:
+            journal.close()
+        except JournalError:
+            pass
+        os.close(parent_dirfd)
+
+
+def test_reap_effect_attempt_blocks_abandon_until_retry(tmp_path: Path) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    target_pid = os.fork()
+    if target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    future = _future()
+    close_errors: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            journal.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+    try:
+        target = journal.observe_process(target_pid)
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=future),
+            RecordClass.NORMAL,
+        )
+        journal.activate_executor(
+            1,
+            "executor-1",
+            os.getpid(),
+            lease_deadline_ns=future,
+        )
+        os.kill(target_pid, 9)
+        absence = journal.admit_batch(
+            1,
+            "executor-1",
+            "batch-absence",
+            [journal.process_absent_descriptor(target)],
+        )
+        assert absence.execute() == 1
+        assert absence.complete().record.completed_steps == 1
+
+        reaping = journal.admit_batch(
+            1,
+            "executor-1",
+            "batch-reap",
+            [journal.reap_process_descriptor(target)],
+        )
+        journal.fail_batch_after_effect_for_test(2)
+        with pytest.raises(JournalError) as failed_effect:
+            reaping.execute()
+        assert failed_effect.value.code is JournalErrorCode.SYSTEM
+
+        closer = threading.Thread(target=close)
+        closer.start()
+        closer.join(timeout=0.05)
+        assert closer.is_alive()
+        with pytest.raises(JournalError) as abandon:
+            reaping.abandon()
+        assert abandon.value.code is JournalErrorCode.PRECONDITION
+        closer.join(timeout=0.05)
+        assert closer.is_alive()
+
+        assert reaping.execute() == 3
+        assert reaping.complete().record.completed_steps == 3
+        closer.join(timeout=2)
+        assert not closer.is_alive()
+        assert close_errors == []
+    finally:
+        _reap_target(target_pid)
+        try:
+            journal.close()
+        except JournalError:
+            pass
+        os.close(parent_dirfd)
+
+
+def test_foreign_thread_last_reference_does_not_finalize_admitted_batch(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    batch, target_pid = _admit_absence_batch(journal)
+    contender = _open(parent_dirfd, fault=True)
+    retained: list[object] = [journal, batch]
+    del batch
+    del journal
+
+    def drop_last_references() -> None:
+        retained.clear()
+
+    dropper = threading.Thread(target=drop_last_references, daemon=True)
+    try:
+        dropper.start()
+        dropper.join(timeout=0.5)
+        assert not dropper.is_alive()
+        with pytest.raises(JournalError) as blocked:
+            contender.probe_action_lock_for_test(
+                deadline_ns=time.monotonic_ns() + 100_000_000
+            )
+        assert blocked.value.code is JournalErrorCode.LOCK_TIMEOUT
+    finally:
+        _reap_target(target_pid)
+        contender.close()
+        os.close(parent_dirfd)
+
+
+def test_native_close_cannot_consume_outstanding_batch(tmp_path: Path) -> None:
+    script = r'''
+import ctypes
+import os
+import sys
+import time
+from pathlib import Path
+
+from claude_sdk_proxy.journal import (
+    Journal,
+    JournalError,
+    JournalErrorCode,
+    RecordClass,
+)
+from claude_sdk_proxy.lifecycle import Record
+
+root = Path(sys.argv[1])
+root.mkdir(mode=0o700)
+parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+for suffix in (".append.lock", ".action.lock"):
+    fd = os.open(
+        "allocation.journal" + suffix,
+        os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent,
+    )
+    os.close(fd)
+library = Path(sys.argv[2])
+journal, receipt = Journal._create_at_for_test(
+    parent,
+    "allocation.journal",
+    b"n" * 32,
+    65536,
+    81944,
+    library_path=library,
+)
+journal.create_workdir(receipt)
+future = time.monotonic_ns() + 5_000_000_000
+journal.append(
+    Record.prepared(1, "executor-1", claim_deadline_ns=future),
+    RecordClass.NORMAL,
+)
+journal.activate_executor(
+    1,
+    "executor-1",
+    os.getpid(),
+    lease_deadline_ns=future,
+)
+target_pid = os.fork()
+if target_pid == 0:
+    time.sleep(30)
+    os._exit(0)
+target = journal.observe_process(target_pid)
+os.kill(target_pid, 9)
+batch = journal.admit_batch(
+    1,
+    "executor-1",
+    "batch-1",
+    [journal.process_absent_descriptor(target)],
+)
+contender = Journal._open_at_for_test(
+    parent,
+    "allocation.journal",
+    b"n" * 32,
+    65536,
+    81944,
+    library_path=library,
+)
+journal._library.cpl_journal_close(ctypes.c_void_p(journal._handle.value))
+try:
+    contender.probe_action_lock_for_test(
+        deadline_ns=time.monotonic_ns() + 100_000_000
+    )
+except JournalError as error:
+    if error.code is not JournalErrorCode.LOCK_TIMEOUT:
+        os._exit(11)
+else:
+    os._exit(12)
+if batch.execute() != 1 or batch.complete().record.completed_steps != 1:
+    os._exit(13)
+journal.close()
+contender.close()
+os.waitpid(target_pid, 0)
+os.close(parent)
+raise SystemExit(0)
+'''
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path / "native-close-retained"),
+            str(_fault_library()),
+        ],
+        check=False,
+        timeout=5,
+    )
+    assert completed.returncode == 0
 
 
 def test_concurrent_sibling_appends_admit_exactly_one_child(tmp_path: Path) -> None:

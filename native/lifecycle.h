@@ -140,6 +140,11 @@ enum cpl_completed_step {
     CPL_STEP_TERMINAL_CHECKS = 1U << 3,
 };
 
+enum cpl_action_token_state {
+    CPL_ACTION_TOKEN_RETAINED = 1,
+    CPL_ACTION_TOKEN_CONSUMED = 2,
+};
+
 #define CPL_ALL_COMPLETED_STEPS                                                \
     (CPL_STEP_PROCESS_ABSENT | CPL_STEP_EXECUTOR_REAPED |                     \
      CPL_STEP_WORKDIR_REMOVED | CPL_STEP_TERMINAL_CHECKS)
@@ -375,7 +380,7 @@ int cpl_journal_execute_batch(cpl_journal *j,
     uint64_t deadline_ns, uint64_t *completed_steps);
 int cpl_journal_complete_batch(cpl_journal *j,
     const struct cpl_action_token *token, uint64_t deadline_ns,
-    struct cpl_append_result *out);
+    uint32_t *token_state, struct cpl_append_result *out);
 int cpl_journal_abandon_batch(cpl_journal *j,
     const struct cpl_action_token *token);
 int cpl_journal_finish_done(cpl_journal *j, uint64_t generation,
@@ -419,6 +424,8 @@ enum cpl_fault_pause_point {
     CPL_FAULT_BEFORE_ACTIVATION_APPEND = 6,
     CPL_FAULT_BEFORE_SUCCESSOR_APPEND = 7,
     CPL_FAULT_BEFORE_AUTHORITY_REPLACEMENT_APPEND = 8,
+    CPL_FAULT_BEFORE_BATCH_COMPLETION_APPEND = 9,
+    CPL_FAULT_AFTER_BATCH_COMPLETION_APPEND = 10,
 };
 
 enum cpl_fault_create_pause_point {
@@ -440,6 +447,7 @@ int cpl_fault_configure_create_pause(uint32_t point, int notify_fd,
 int cpl_fault_configure_lifecycle_pause(cpl_journal *j, uint32_t point,
     int notify_fd, int wait_fd);
 int cpl_fault_fail_batch_after_step(cpl_journal *j, uint32_t step);
+int cpl_fault_fail_batch_after_effect(cpl_journal *j, uint32_t step);
 int cpl_fault_fail_next_workdir_parent_fsync(cpl_journal *j);
 int cpl_fault_force_atfork_registration_failure(bool enabled);
 int cpl_fault_hold_append_lock(cpl_journal *j, int notify_fd, int wait_fd,

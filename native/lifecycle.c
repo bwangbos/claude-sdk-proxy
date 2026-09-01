@@ -57,13 +57,17 @@ struct cpl_journal {
     uint8_t reap_capability[CPL_HASH_SIZE];
     uint8_t reap_head_hash[CPL_HASH_SIZE];
     struct cpl_process_identity reaped_identity;
+    struct cpl_append_result action_completion_result;
     uint64_t action_initial_completed_steps;
     uint64_t action_completed_steps;
+    uint64_t action_effect_completed_steps;
     uint32_t authorized_record_kind;
     pthread_t authorized_thread;
     pthread_t action_owner_thread;
     bool action_held;
     bool action_executed;
+    bool action_effect_started;
+    bool action_completion_pending;
     bool reap_proof_valid;
     bool fork_invalid;
     bool unhealthy;
@@ -72,6 +76,7 @@ struct cpl_journal {
     int pause_notify_fd;
     int pause_wait_fd;
     uint32_t fail_batch_after_step;
+    uint32_t fail_batch_after_effect;
     bool fail_workdir_parent_fsync;
 #endif
     struct cpl_journal *registry_next;
@@ -2765,9 +2770,14 @@ int cpl_journal_admit_batch(cpl_journal *journal, uint64_t generation,
     random_capability(journal->action_capability);
     journal->action_initial_completed_steps = chain.state.completed_steps;
     journal->action_completed_steps = chain.state.completed_steps;
+    journal->action_effect_completed_steps = 0U;
     journal->action_owner_thread = pthread_self();
     journal->action_held = true;
     journal->action_executed = false;
+    journal->action_effect_started = false;
+    journal->action_completion_pending = false;
+    (void)memset(&journal->action_completion_result, 0,
+        sizeof(journal->action_completion_result));
     (void)memcpy(token->capability, journal->action_capability,
         CPL_HASH_SIZE);
     (void)memcpy(token->batch_nonce, batch_nonce, CPL_ID_SIZE);
@@ -2794,6 +2804,11 @@ static void release_action_token(cpl_journal *journal) {
     journal->action_executed = false;
     journal->action_initial_completed_steps = 0U;
     journal->action_completed_steps = 0U;
+    journal->action_effect_completed_steps = 0U;
+    journal->action_effect_started = false;
+    journal->action_completion_pending = false;
+    (void)memset(&journal->action_completion_result, 0,
+        sizeof(journal->action_completion_result));
     (void)memset(journal->action_capability, 0, CPL_HASH_SIZE);
     (void)memset(&journal->action_owner_thread, 0,
         sizeof(journal->action_owner_thread));
@@ -2867,12 +2882,23 @@ int cpl_journal_execute_batch(cpl_journal *journal,
                 return status == CPL_OK ? CPL_ERR_PROCESS_PRESENT : status;
             }
         } else if (descriptor->kind == CPL_DESCRIPTOR_REAP_PROCESS) {
-            int wait_status;
-            pid_t reaped = waitpid((pid_t)descriptor->target.pid,
-                &wait_status, WNOHANG);
+            if ((journal->action_effect_completed_steps & step) == 0U) {
+                int wait_status;
+                pid_t reaped;
 
-            if (reaped != (pid_t)descriptor->target.pid) {
-                return CPL_ERR_REAP_REQUIRED;
+                journal->action_effect_started = true;
+                reaped = waitpid((pid_t)descriptor->target.pid,
+                    &wait_status, WNOHANG);
+                if (reaped != (pid_t)descriptor->target.pid) {
+                    return CPL_ERR_REAP_REQUIRED;
+                }
+                journal->action_effect_completed_steps |= step;
+#ifdef CPL_ENABLE_FAULT_INJECTION
+                if (journal->fail_batch_after_effect == step) {
+                    journal->fail_batch_after_effect = 0U;
+                    return CPL_ERR_SYSTEM;
+                }
+#endif
             }
         } else if (descriptor->kind == CPL_DESCRIPTOR_REMOVE_WORKDIR) {
             struct stat workdir;
@@ -2898,15 +2924,23 @@ int cpl_journal_execute_batch(cpl_journal *journal,
                 if (monotonic_ns() >= deadline) {
                     return CPL_ERR_LOCK_TIMEOUT;
                 }
+                journal->action_effect_started = true;
                 if (unlinkat(workdir_parent_dirfd, journal->workdir_name,
                         AT_REMOVEDIR) < 0) {
                     return errno == ENOTEMPTY ? CPL_ERR_WORKDIR_PRESENT :
                         CPL_ERR_SYSTEM;
                 }
+#ifdef CPL_ENABLE_FAULT_INJECTION
+                if (journal->fail_batch_after_effect == step) {
+                    journal->fail_batch_after_effect = 0U;
+                    return CPL_ERR_SYSTEM;
+                }
+#endif
             }
             if (monotonic_ns() >= deadline) {
                 return CPL_ERR_LOCK_TIMEOUT;
             }
+            journal->action_effect_started = true;
 #ifdef CPL_ENABLE_FAULT_INJECTION
             if (journal->fail_workdir_parent_fsync) {
                 journal->fail_workdir_parent_fsync = false;
@@ -2941,19 +2975,45 @@ int cpl_journal_execute_batch(cpl_journal *journal,
 
 int cpl_journal_complete_batch(cpl_journal *journal,
     const struct cpl_action_token *token, uint64_t deadline_ns,
-    struct cpl_append_result *out) {
+    uint32_t *token_state, struct cpl_append_result *out) {
     struct cpl_certified_head certified;
     struct cpl_record record;
     uint64_t deadline = effective_deadline(deadline_ns);
     uint32_t record_class = CPL_RECORD_NORMAL;
-    int status = validate_action_token(journal, token);
+    int status;
 
-    if (out == NULL || status != CPL_OK || !journal->action_executed) {
+    if (token_state == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    *token_state = CPL_ACTION_TOKEN_RETAINED;
+    if (out == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(out, 0, sizeof(*out));
+    status = validate_action_token(journal, token);
+    if (status != CPL_OK || !journal->action_executed) {
         return status == CPL_OK ? CPL_ERR_BATCH_TOKEN : status;
+    }
+    if (journal->action_completion_pending) {
+        status = cpl_journal_certify(journal, deadline, &certified);
+        if (status != CPL_OK) {
+            return status;
+        }
+        if (certified.head_sequence !=
+                journal->action_completion_result.sequence ||
+            memcmp(certified.head_hash,
+                journal->action_completion_result.hash,
+                CPL_HASH_SIZE) != 0) {
+            return CPL_ERR_AUTHORITY;
+        }
+        *out = journal->action_completion_result;
+        release_action_token(journal);
+        *token_state = CPL_ACTION_TOKEN_CONSUMED;
+        return CPL_OK;
     }
     status = require_certified_batch(journal, token, deadline, &certified);
     if (status != CPL_OK) {
-        goto done;
+        return status;
     }
     (void)memset(&record, 0, sizeof(record));
     record.kind = CPL_RECORD_BATCH_DONE;
@@ -2969,13 +3029,27 @@ int cpl_journal_complete_batch(cpl_journal *journal,
     } else if (record.authority_epoch != 0U) {
         record_class = CPL_RECORD_RECOVERY;
     }
+    status = fault_lifecycle_pause(journal,
+        CPL_FAULT_BEFORE_BATCH_COMPLETION_APPEND);
+    if (status != CPL_OK) {
+        return status;
+    }
     status = append_authorized(journal, &record, record_class, deadline, out);
+    if (out->sequence != 0U) {
+        journal->action_completion_result = *out;
+        journal->action_completion_pending = true;
+    }
+    if (status == CPL_OK) {
+        status = fault_lifecycle_pause(journal,
+            CPL_FAULT_AFTER_BATCH_COMPLETION_APPEND);
+    }
     if (status == CPL_OK) {
         status = certify_exact_result(journal, out, deadline, &certified);
     }
-
-done:
-    release_action_token(journal);
+    if (status == CPL_OK) {
+        release_action_token(journal);
+        *token_state = CPL_ACTION_TOKEN_CONSUMED;
+    }
     return status;
 }
 
@@ -2990,7 +3064,8 @@ int cpl_journal_abandon_batch(cpl_journal *journal,
     if (status != CPL_OK) {
         return status;
     }
-    if (journal->action_executed || journal->action_completed_steps !=
+    if (journal->action_executed || journal->action_effect_started ||
+        journal->action_completed_steps !=
             journal->action_initial_completed_steps) {
         return CPL_ERR_PRECONDITION;
     }
@@ -3619,12 +3694,10 @@ void cpl_journal_close(cpl_journal *journal) {
     if (journal == NULL) {
         return;
     }
-    unregister_handle(journal);
     if (journal->action_held && !journal->fork_invalid) {
-        journal->action_held = false;
-        (void)release_flock(journal->action_lock_fd);
-        (void)pthread_mutex_unlock(&journal->action_mutex);
+        return;
     }
+    unregister_handle(journal);
     if (journal->fd >= 0) {
         (void)close(journal->fd);
     }
@@ -3662,7 +3735,7 @@ int cpl_fault_configure_lifecycle_pause(cpl_journal *journal, uint32_t point,
     int status = ensure_owner(journal);
 
     if (status != CPL_OK || point < CPL_FAULT_BEFORE_WORKDIR_BOUND_APPEND ||
-        point > CPL_FAULT_BEFORE_AUTHORITY_REPLACEMENT_APPEND ||
+        point > CPL_FAULT_AFTER_BATCH_COMPLETION_APPEND ||
         notify_fd < 0 ||
         wait_fd < 0) {
         return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
@@ -3684,6 +3757,18 @@ int cpl_fault_fail_batch_after_step(cpl_journal *journal, uint32_t step) {
         return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
     }
     journal->fail_batch_after_step = step;
+    return CPL_OK;
+}
+
+int cpl_fault_fail_batch_after_effect(cpl_journal *journal, uint32_t step) {
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK ||
+        (step != CPL_STEP_EXECUTOR_REAPED &&
+         step != CPL_STEP_WORKDIR_REMOVED)) {
+        return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
+    }
+    journal->fail_batch_after_effect = step;
     return CPL_OK;
 }
 

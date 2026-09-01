@@ -93,6 +93,11 @@ class _HandleState(IntEnum):
     CLOSED = 3
 
 
+class _ActionTokenState(IntEnum):
+    RETAINED = 1
+    CONSUMED = 2
+
+
 @dataclass(frozen=True)
 class JournalCreateReceipt:
     intent_parent_dirsynced: bool
@@ -478,6 +483,7 @@ def _load_library(path: Path) -> ctypes.CDLL:
         ctypes.c_void_p,
         ctypes.POINTER(_CActionToken),
         ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint32),
         ctypes.POINTER(_CAppendResult),
     ]
     library.cpl_journal_complete_batch.restype = ctypes.c_int
@@ -598,15 +604,21 @@ class AdmittedBatch:
 
     def complete(self, deadline_ns: int | None = None) -> CanonicalRecord:
         output = _CAppendResult()
+        token_state = ctypes.c_uint32()
         status = self._journal._batch_native_call(
             self,
             self._journal._library.cpl_journal_complete_batch,
             ctypes.byref(self._token),
             _deadline(deadline_ns),
+            ctypes.byref(token_state),
             ctypes.byref(output),
         )
-        if status != JournalErrorCode.BATCH_TOKEN:
+        if token_state.value == _ActionTokenState.CONSUMED:
             self._journal._release_batch_lease(self)
+        elif token_state.value != _ActionTokenState.RETAINED:
+            raise JournalError(JournalErrorCode.SYSTEM)
+        if status == 0 and token_state.value != _ActionTokenState.CONSUMED:
+            raise JournalError(JournalErrorCode.SYSTEM)
         _raise_status(status)
         return _canonical(output)
 
@@ -879,9 +891,33 @@ class Journal:
 
     def __del__(self) -> None:
         try:
-            self.close()
+            self._finalize_nonblocking()
         except Exception:
             pass
+
+    def _finalize_nonblocking(self) -> None:
+        condition = getattr(self, "_operation_condition", None)
+        if condition is None or not condition.acquire(blocking=False):
+            return
+        try:
+            if (
+                self._handle_state is not _HandleState.OPEN
+                or self._active_operations != 0
+                or self._outstanding_batch_owner is not None
+            ):
+                return
+            self._handle_state = _HandleState.CLOSING
+            self._closing_thread_id = threading.get_ident()
+            handle = ctypes.c_void_p(self._handle.value)
+            try:
+                self._library.cpl_journal_close(handle)
+            finally:
+                self._handle = ctypes.c_void_p()
+                self._handle_state = _HandleState.CLOSED
+                self._closing_thread_id = None
+                self._operation_condition.notify_all()
+        finally:
+            condition.release()
 
     def _require_open(self) -> None:
         with self._operation_condition:
@@ -1457,6 +1493,8 @@ class Journal:
             "before_activation_append": 6,
             "before_successor_append": 7,
             "before_authority_replacement_append": 8,
+            "before_batch_completion_append": 9,
+            "after_batch_completion_append": 10,
         }
         try:
             selected = points[point]
@@ -1509,6 +1547,12 @@ class Journal:
 
     def fail_batch_after_step_for_test(self, step: int) -> None:
         function = self._fault("cpl_fault_fail_batch_after_step")
+        function.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        function.restype = ctypes.c_int
+        _raise_status(self._native_call(function, step))
+
+    def fail_batch_after_effect_for_test(self, step: int) -> None:
+        function = self._fault("cpl_fault_fail_batch_after_effect")
         function.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         function.restype = ctypes.c_int
         _raise_status(self._native_call(function, step))
