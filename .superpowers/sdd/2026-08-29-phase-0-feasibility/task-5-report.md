@@ -758,3 +758,101 @@ pre-existing allocation was contacted or modified. Signals were limited to
 freshly spawned, exactly re-observed Task 5 groups, and removals were limited to
 Task 4-verified temporary `allocation.workdir` paths under the user's explicit
 authorization.
+
+## Remediation cycle 2
+
+Remediation base: `9e8dc2f85f2db3c59f67ce73401147fb16512a0b`
+
+Remediation commit: this commit
+
+### Breaker-finding disposition
+
+- The pointer-free reap receipt is now a 224-byte C/Python ABI value carrying
+  the exact allocation nonce, cleanup generation, authority epoch, complete
+  112-byte `cpl_process_identity`, certified head hash, and opaque capability.
+  Native confirmation stores that entire context before returning; idempotent
+  confirmation and historical recovery reissue the same value. Every consumer
+  compares the receipt with the journal's retained context and with the
+  current chain's generation, authority epoch, and complete identity. Thus a
+  changed boot ID, PID, start time, UID, process group, session, identity flags,
+  executable device/inode/hash, generation, epoch, nonce, certified hash, or
+  capability is rejected. A fault-build-only validator supplies a synthetic
+  same-PID/different-start-time chain and proves that incarnation reuse cannot
+  cross the boundary; that symbol is absent from the production dylib.
+- Historical receipt recovery remains possible after a legitimate successor
+  transition because recovery returns only the exact retained prior receipt.
+  It does not mint a new receipt, and generation consumers accept it only while
+  the canonical chain still identifies that exact prior actor and intended
+  retirement transition. Python retained-owner comparison now includes every
+  receipt field instead of PID/hash/capability alone.
+- The retained parent directory descriptor now transfers into a one-shot
+  `_DetachedFD` obligation and the owner field becomes `-1` inside the guarded
+  close region before the syscall starts. A failure known to precede
+  `obligation.begin()` safely restores ownership. Once begin runs, no error --
+  including `EINTR`, `EBADF`, or a post-success injected exception -- can
+  restore or retry the numeric descriptor. A deterministic regression closes
+  the directory, immediately reopens the same directory into the reused
+  numeric slot, raises an ambiguous error, retries keyed release, and proves
+  the unrelated reopened descriptor remains valid while capacity is released.
+- Socket, stderr-stream, and `Journal` close paths were audited against the
+  same aliasing failure. Their owned objects publish durable closed state
+  (`fileno() == -1` or `.closed`) as part of successful close, so a nested
+  post-success exception cannot cause a numeric descriptor retry; a
+  pre-syscall exception leaves the object visibly open and owned. Existing
+  per-class post-success fault rows remain green. Only the raw integer required
+  the explicit detached obligation.
+
+### TDD and mutation evidence
+
+The first receipt RED reported native/Python ABI size 72 instead of 224. After
+the context fields were populated, the field-mutation RED showed a forged
+generation was accepted by `prepare_successor`; the exact validator made the
+full mutation table green. The synthetic same-PID chain test first failed
+because the fault-only validator did not exist, then passed against changed
+generation and changed process start time. The retained-owner comparison test
+also first showed that altered generation compared equal before full receipt
+comparison was added.
+
+The descriptor-reuse RED reached the intended host boundary and ended with
+`EBADF` on the unrelated reopened directory descriptor, proving retry closed
+the reused number. The detached-obligation implementation made the same test
+green, including a distinct pre-syscall fault and an ambiguous `EINTR` after
+successful close. An initial sandbox run could not reach this assertion because
+Darwin process observation returned native `PROCESS_IDENTITY`; diagnostic
+instrumentation isolated that environment boundary and was removed before the
+host-permission RED/GREEN cycle.
+
+A deliberate mutation removed the receipt-generation comparison from
+`valid_reap_proof`. The field-mutation regression immediately failed because
+the changed-generation receipt prepared a successor. Restoring the comparison
+made the mutation and same-PID rows pass again. Three bounded repetitions of
+the four receipt rows plus keyed descriptor release passed all 15 executions.
+
+### Final verification
+
+- Focused Task 5 plus journal-action races: 122 passed, zero skipped or XPASS,
+  in 34.24 seconds. One preceding broad run exposed a timing-sensitive
+  canonical-request row under load (121 passed, one failed); the row passed in
+  isolation and the complete focused rerun passed all 122.
+- `UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache make check`: 151 unit tests
+  passed; Ruff and strict mypy were clean.
+- Host `UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache make darwin`: 195
+  Darwin tests passed, zero skipped and zero XPASS, in 32.24 seconds.
+- `make -B native` rebuilt all seven native targets with Apple clang strict C17
+  flags. Apple clang static analysis of production/fault lifecycle,
+  production/injection supervisor, anchor, and probe child emitted six empty
+  370-byte plist reports with no diagnostics.
+- All executables and dylibs are arm64 Mach-O. Every lifecycle consumer resolves
+  `@rpath/libclaude_proxy_lifecycle.dylib`. Production exports confirmation,
+  recovery, and successor entry points and no `_cpl_fault_*` symbol; the fault
+  dylib alone exports `_cpl_fault_validate_reap_proof`. Production supervisor
+  strings contain no Task 5 injection selector or injection-stage name.
+- Native static ABI assertions and Python ctypes assertions agree on the
+  224-byte receipt. `git diff --check` is clean, and no analyzer plist or object
+  file is present in the worktree.
+
+No Claude CLI, model, credential, network peer, pre-existing process, or
+pre-existing allocation was contacted or modified. Signals were limited to
+freshly spawned, exactly re-observed Task 5 groups, and removals were limited to
+Task 4-verified temporary `allocation.workdir` paths under the user's explicit
+authorization.

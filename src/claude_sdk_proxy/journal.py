@@ -25,6 +25,7 @@ from claude_sdk_proxy.lifecycle import (
     _CState,
     _descriptor_to_c,
     _identity_from_c,
+    _identity_to_c,
     _record_to_c,
     _state_from_c,
 )
@@ -167,9 +168,16 @@ class BootstrapHead:
 
 @dataclass(frozen=True)
 class ReapProof:
-    pid: int
+    allocation_nonce: bytes
+    generation: int
+    authority_epoch: int
+    identity: ProcessIdentity
     _certified_hash: bytes = field(default=b"", compare=False, repr=False)
     _capability: bytes = field(default=b"", compare=False, repr=False)
+
+    @property
+    def pid(self) -> int:
+        return self.identity.pid
 
 
 class _DeletionAuthority:
@@ -275,9 +283,12 @@ class _CActionToken(ctypes.Structure):
 
 class _CReapProof(ctypes.Structure):
     _fields_ = [
-        ("pid", ctypes.c_int64),
+        ("allocation_nonce", ctypes.c_uint8 * HASH_SIZE),
         ("certified_hash", ctypes.c_uint8 * HASH_SIZE),
         ("capability", ctypes.c_uint8 * HASH_SIZE),
+        ("generation", ctypes.c_uint64),
+        ("authority_epoch", ctypes.c_uint64),
+        ("identity", _CProcessIdentity),
     ]
 
 
@@ -332,7 +343,7 @@ _JOURNAL_ABI_SIZES: Final = {
     _CDeleteReceipt: 40,
     _CAppendResult: 1072,
     _CActionToken: 72,
-    _CReapProof: 72,
+    _CReapProof: 224,
     _CChain: 1112,
     _CCertifiedHead: 1088,
 }
@@ -1568,7 +1579,12 @@ class Journal:
             )
         )
         return ReapProof(
-            native.pid, bytes(native.certified_hash), bytes(native.capability)
+            bytes(native.allocation_nonce),
+            native.generation,
+            native.authority_epoch,
+            _identity_from_c(native.identity),
+            bytes(native.certified_hash),
+            bytes(native.capability),
         )
 
     def recover_executor_reap_proof(
@@ -1584,7 +1600,12 @@ class Journal:
             )
         )
         return ReapProof(
-            native.pid, bytes(native.certified_hash), bytes(native.capability)
+            bytes(native.allocation_nonce),
+            native.generation,
+            native.authority_epoch,
+            _identity_from_c(native.identity),
+            bytes(native.certified_hash),
+            bytes(native.capability),
         )
 
     @staticmethod
@@ -1592,9 +1613,12 @@ class Journal:
         if not isinstance(proof, ReapProof):
             raise TypeError("a native reap proof is required")
         native = _CReapProof()
-        native.pid = proof.pid
+        _set_bytes(native.allocation_nonce, proof.allocation_nonce)
         _set_bytes(native.certified_hash, proof._certified_hash)
         _set_bytes(native.capability, proof._capability)
+        native.generation = proof.generation
+        native.authority_epoch = proof.authority_epoch
+        native.identity = _identity_to_c(proof.identity)
         return native
 
     def reconcile_interrupted_batch(

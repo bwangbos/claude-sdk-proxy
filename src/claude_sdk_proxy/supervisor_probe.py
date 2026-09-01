@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import errno
 import hashlib
 import os
 import signal
@@ -60,8 +59,6 @@ class _RetainedActorChain:
     flow: str
     instance: Path
     parent_dirfd: int
-    parent_dev: int
-    parent_ino: int
     journal: Journal
     process: subprocess.Popen[bytes]
     anchor: _ProcessIdentityTuple
@@ -151,6 +148,20 @@ class _RetainedReleaseCertification:
     reap_proof: ReapProof
 
 
+@dataclass
+class _DetachedFD:
+    """A one-shot close obligation detached from its owning registry entry."""
+
+    resource: int
+    started: bool = False
+
+    def begin(self) -> int:
+        if self.started:
+            raise SupervisorProbeError("detached descriptor close already started")
+        self.started = True
+        return self.resource
+
+
 class _RetainedActorRegistry:
     """Fixed cleanup-owner capacity; live or unconfirmed owners are never evicted."""
 
@@ -210,16 +221,11 @@ class _RetainedActorRegistry:
         retained_controls = tuple(
             control for control in controls if control is not None
         )
-        parent_identity = (
-            os.fstat(parent_dirfd) if parent_dirfd >= 0 else None
-        )
         owner = _RetainedActorChain(
             key=key,
             flow=flow,
             instance=instance,
             parent_dirfd=parent_dirfd,
-            parent_dev=0 if parent_identity is None else parent_identity.st_dev,
-            parent_ino=0 if parent_identity is None else parent_identity.st_ino,
             journal=journal,
             process=process,
             anchor=anchor,
@@ -821,7 +827,10 @@ def _group_capability_absent(pgid: int) -> bool:
 
 def _same_reap_proof(left: ReapProof, right: ReapProof) -> bool:
     return (
-        left.pid == right.pid
+        left.allocation_nonce == right.allocation_nonce
+        and left.generation == right.generation
+        and left.authority_epoch == right.authority_epoch
+        and left.identity == right.identity
         and left._certified_hash == right._certified_hash
         and left._capability == right._capability
     )
@@ -840,22 +849,8 @@ def _close_retained_journal(journal: Journal) -> None:
     journal.close()
 
 
-def _close_retained_parent_fd(parent_dirfd: int) -> None:
-    os.close(parent_dirfd)
-
-
-def _refresh_retained_parent_fd_state(owner: _RetainedActorChain) -> None:
-    if owner.parent_dirfd < 0:
-        return
-    try:
-        identity = os.fstat(owner.parent_dirfd)
-    except OSError as error:
-        if error.errno != errno.EBADF:
-            raise
-        owner.parent_dirfd = -1
-        return
-    if identity.st_dev != owner.parent_dev or identity.st_ino != owner.parent_ino:
-        raise SupervisorProbeError("retained parent descriptor identity drifted")
+def _close_retained_parent_fd(obligation: _DetachedFD) -> None:
+    os.close(obligation.begin())
 
 
 def _ensure_unconfirmed(owner: _RetainedActorChain) -> None:
@@ -1070,7 +1065,6 @@ def _reconcile_and_release_retained_actor_chain(key: _RetainedActorKey) -> bool:
     if not owner.journal.closed:
         _reconcile_owner(owner)
     with owner.recovery_lock:
-        _refresh_retained_parent_fd_state(owner)
         if not owner.journal.closed:
             directory_fd, reopened = _open_retained_journal(owner)
             try:
@@ -1110,8 +1104,14 @@ def _reconcile_and_release_retained_actor_chain(key: _RetainedActorKey) -> bool:
         if not owner.journal.closed:
             _close_retained_journal(owner.journal)
         if owner.parent_dirfd >= 0:
-            _close_retained_parent_fd(owner.parent_dirfd)
-            owner.parent_dirfd = -1
+            obligation = _DetachedFD(owner.parent_dirfd)
+            try:
+                owner.parent_dirfd = -1
+                _close_retained_parent_fd(obligation)
+            except BaseException:
+                if not obligation.started:
+                    owner.parent_dirfd = obligation.resource
+                raise
         if (
             any(control.fileno() != -1 for control in owner.controls)
             or (owner.process.stderr is not None and not owner.process.stderr.closed)

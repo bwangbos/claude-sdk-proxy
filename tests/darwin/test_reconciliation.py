@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import gc
 import os
 import signal
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -509,7 +511,16 @@ def test_production_keyed_release_requires_proofs_and_retries_close_failure(
         os.killpg(observed.pgid, signal.SIGCONT)
     os.killpg(observed.pgid, signal.SIGKILL)
     assert supervisor_probe._wait_for_enumerated_group_absence(observed.pgid)
+    assert owner.executor_reap_proof is not None
+    assert not supervisor_probe._same_reap_proof(
+        owner.executor_reap_proof,
+        replace(
+            owner.executor_reap_proof,
+            generation=owner.executor_reap_proof.generation + 1,
+        ),
+    )
 
+    reused_parent_fd = -1
     for helper_name in (
         "_close_retained_control",
         "_close_retained_stderr",
@@ -519,12 +530,45 @@ def test_production_keyed_release_requires_proofs_and_retries_close_failure(
         original_close = getattr(supervisor_probe, helper_name)
         failed = False
 
+        if helper_name == "_close_retained_parent_fd":
+            retained_fd = owner.parent_dirfd
+
+            def fail_before_syscall(resource: object) -> None:
+                assert getattr(resource, "started", True) is False
+                assert owner.parent_dirfd == -1
+                raise OSError("injected before parent close syscall")
+
+            monkeypatch.setattr(
+                supervisor_probe, helper_name, fail_before_syscall
+            )
+            with pytest.raises(OSError, match="before parent close syscall"):
+                supervisor_probe._reconcile_and_release_retained_actor_chain(key)
+            assert owner.parent_dirfd == retained_fd
+            os.fstat(retained_fd)
+            monkeypatch.setattr(supervisor_probe, helper_name, original_close)
+
         def fail_once(resource: object) -> None:
-            nonlocal failed
+            nonlocal failed, reused_parent_fd
             if not failed:
                 failed = True
+                closed_fd = (
+                    resource
+                    if isinstance(resource, int)
+                    else getattr(resource, "resource", -1)
+                )
                 original_close(resource)
-                raise OSError(f"injected {helper_name} failure")
+                if helper_name == "_close_retained_parent_fd":
+                    assert isinstance(closed_fd, int) and closed_fd >= 0
+                    assert owner.parent_dirfd == -1
+                    reused_parent_fd = os.open(
+                        owner.instance,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                    )
+                    assert reused_parent_fd == closed_fd
+                raise OSError(
+                    errno.EINTR,
+                    f"injected ambiguous {helper_name} failure",
+                )
             original_close(resource)
 
         monkeypatch.setattr(supervisor_probe, helper_name, fail_once)
@@ -535,6 +579,9 @@ def test_production_keyed_release_requires_proofs_and_retries_close_failure(
 
     assert supervisor_probe._reconcile_and_release_retained_actor_chain(key)
     assert key not in supervisor_probe._retained_actor_chain_keys()
+    assert reused_parent_fd >= 0
+    os.fstat(reused_parent_fd)
+    os.close(reused_parent_fd)
 
 
 @pytest.mark.parametrize(

@@ -62,6 +62,8 @@ struct cpl_journal {
     uint8_t action_capability[CPL_HASH_SIZE];
     uint8_t reap_capability[CPL_HASH_SIZE];
     uint8_t reap_head_hash[CPL_HASH_SIZE];
+    uint64_t reaped_generation;
+    uint64_t reaped_authority_epoch;
     struct cpl_process_identity reaped_identity;
     struct cpl_append_result action_completion_result;
     uint64_t action_initial_completed_steps;
@@ -3875,6 +3877,17 @@ done:
     return status;
 }
 
+static void fill_reap_proof(const cpl_journal *journal,
+    struct cpl_reap_proof *proof) {
+    (void)memcpy(proof->allocation_nonce, journal->nonce, CPL_HASH_SIZE);
+    (void)memcpy(proof->certified_hash, journal->reap_head_hash,
+        CPL_HASH_SIZE);
+    (void)memcpy(proof->capability, journal->reap_capability, CPL_HASH_SIZE);
+    proof->generation = journal->reaped_generation;
+    proof->authority_epoch = journal->reaped_authority_epoch;
+    proof->identity = journal->reaped_identity;
+}
+
 int cpl_journal_confirm_executor_reaped(cpl_journal *journal,
     uint64_t deadline_ns, struct cpl_reap_proof *proof) {
     struct cpl_certified_head certified;
@@ -3903,16 +3916,15 @@ int cpl_journal_confirm_executor_reaped(cpl_journal *journal,
     }
     if (journal->reap_proof_valid) {
         if (!same_process_identity(&expected, &journal->reaped_identity) ||
+            certified.state.generation != journal->reaped_generation ||
+            certified.state.authority_epoch !=
+                journal->reaped_authority_epoch ||
             is_zero(journal->reap_capability, CPL_HASH_SIZE) ||
             is_zero(journal->reap_head_hash, CPL_HASH_SIZE)) {
             status = CPL_ERR_AUTHORITY;
             goto done;
         }
-        proof->pid = journal->reaped_identity.pid;
-        (void)memcpy(proof->certified_hash, journal->reap_head_hash,
-            CPL_HASH_SIZE);
-        (void)memcpy(proof->capability, journal->reap_capability,
-            CPL_HASH_SIZE);
+        fill_reap_proof(journal, proof);
         status = CPL_OK;
         goto done;
     }
@@ -3939,11 +3951,11 @@ int cpl_journal_confirm_executor_reaped(cpl_journal *journal,
     }
     random_capability(journal->reap_capability);
     journal->reap_proof_valid = true;
+    journal->reaped_generation = certified.state.generation;
+    journal->reaped_authority_epoch = certified.state.authority_epoch;
     journal->reaped_identity = expected;
     (void)memcpy(journal->reap_head_hash, certified.head_hash, CPL_HASH_SIZE);
-    proof->pid = expected.pid;
-    (void)memcpy(proof->certified_hash, certified.head_hash, CPL_HASH_SIZE);
-    (void)memcpy(proof->capability, journal->reap_capability, CPL_HASH_SIZE);
+    fill_reap_proof(journal, proof);
     status = CPL_OK;
 
 done:
@@ -3970,16 +3982,15 @@ int cpl_journal_recover_executor_reap_proof(cpl_journal *journal,
         goto recover_done;
     }
     if (!journal->reap_proof_valid ||
+        journal->reaped_generation == 0U ||
+        journal->reaped_authority_epoch == 0U ||
         !complete_identity(&journal->reaped_identity) ||
         is_zero(journal->reap_capability, CPL_HASH_SIZE) ||
         is_zero(journal->reap_head_hash, CPL_HASH_SIZE)) {
         status = CPL_ERR_REAP_REQUIRED;
         goto recover_done;
     }
-    proof->pid = journal->reaped_identity.pid;
-    (void)memcpy(proof->certified_hash, journal->reap_head_hash,
-        CPL_HASH_SIZE);
-    (void)memcpy(proof->capability, journal->reap_capability, CPL_HASH_SIZE);
+    fill_reap_proof(journal, proof);
     status = CPL_OK;
 
 recover_done:
@@ -4015,12 +4026,25 @@ int cpl_journal_make_delete_authority(cpl_journal *journal, uint32_t kind,
 
 static bool valid_reap_proof(cpl_journal *journal,
     const struct cpl_reap_proof *proof, const struct cpl_chain *chain) {
-    return proof != NULL && journal->reap_proof_valid &&
-        proof->pid == journal->reaped_identity.pid &&
+    struct cpl_process_identity chain_identity;
+
+    if (proof == NULL || chain == NULL) {
+        return false;
+    }
+    identity_from_state(&chain->state, &chain_identity);
+    return journal->reap_proof_valid &&
+        memcmp(proof->allocation_nonce, journal->nonce,
+            CPL_HASH_SIZE) == 0 &&
+        proof->generation == journal->reaped_generation &&
+        proof->authority_epoch == journal->reaped_authority_epoch &&
+        same_process_identity(&proof->identity,
+            &journal->reaped_identity) &&
         same_capability(proof->capability, journal->reap_capability) &&
         memcmp(proof->certified_hash, journal->reap_head_hash,
             CPL_HASH_SIZE) == 0 &&
-        chain->state.process_pid == journal->reaped_identity.pid;
+        chain->state.generation == journal->reaped_generation &&
+        chain->state.authority_epoch == journal->reaped_authority_epoch &&
+        same_process_identity(&chain_identity, &journal->reaped_identity);
 }
 
 int cpl_journal_reconcile_interrupted_batch(cpl_journal *journal,
@@ -4364,6 +4388,20 @@ void cpl_journal_close(cpl_journal *journal) {
 }
 
 #ifdef CPL_ENABLE_FAULT_INJECTION
+int cpl_fault_validate_reap_proof(cpl_journal *journal,
+    const struct cpl_reap_proof *proof, const struct cpl_state *state) {
+    struct cpl_chain chain;
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK || proof == NULL || state == NULL) {
+        return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
+    }
+    (void)memset(&chain, 0, sizeof(chain));
+    chain.state = *state;
+    return valid_reap_proof(journal, proof, &chain) ? CPL_OK :
+        CPL_ERR_AUTHORITY;
+}
+
 int cpl_fault_configure_create_pause(uint32_t point, int notify_fd,
     int wait_fd, uint64_t deadline_ns) {
     if (point < CPL_FAULT_BEFORE_CREATE_OPENAT ||

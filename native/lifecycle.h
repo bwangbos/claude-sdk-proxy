@@ -46,7 +46,7 @@ extern "C" {
 #define CPL_ABI_DELETE_AUTHORITY_SIZE 100U
 #define CPL_ABI_DELETE_RECEIPT_SIZE 40U
 #define CPL_ABI_ACTION_TOKEN_SIZE 72U
-#define CPL_ABI_REAP_PROOF_SIZE 72U
+#define CPL_ABI_REAP_PROOF_SIZE 224U
 #define CPL_ABI_CLEANUP_EVIDENCE_SIZE 40U
 #define CPL_ABI_CLEANUP_ACK_SIZE 40U
 #define CPL_CONTROL_MAGIC 0x464c5043U
@@ -445,9 +445,12 @@ struct cpl_action_token {
 };
 
 struct cpl_reap_proof {
-    int64_t pid;
+    uint8_t allocation_nonce[CPL_HASH_SIZE];
     uint8_t certified_hash[CPL_HASH_SIZE];
     uint8_t capability[CPL_HASH_SIZE];
+    uint64_t generation;
+    uint64_t authority_epoch;
+    struct cpl_process_identity identity;
 };
 
 int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
@@ -601,6 +604,8 @@ int cpl_fault_try_bound_gate(cpl_journal *j, uint32_t gate_kind,
     const char *marker_name);
 int cpl_fault_try_cleanup_gate(const struct cpl_delete_receipt *receipt,
     int marker_parent_dirfd, const char *marker_name);
+int cpl_fault_validate_reap_proof(cpl_journal *j,
+    const struct cpl_reap_proof *proof, const struct cpl_state *state);
 #endif
 
 #ifdef __cplusplus

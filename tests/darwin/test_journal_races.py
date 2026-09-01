@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from claude_sdk_proxy.journal import (
     JournalErrorCode,
     RecordClass,
 )
-from claude_sdk_proxy.lifecycle import Record, StateKind
+from claude_sdk_proxy.lifecycle import Record, StateKind, _state_to_c
 
 NORMAL_LIMIT = 64 * 1024
 PHYSICAL_RECORD_SIZE = 108 + 1064
@@ -1557,7 +1558,7 @@ def test_executor_reap_receipt_is_recoverable_after_native_success_handoff(
         )
 
         native_confirm = journal._library.cpl_journal_confirm_executor_reaped
-        native_receipt: list[tuple[int, bytes, bytes]] = []
+        native_receipt: list[tuple[bytes, int, int, int, bytes, bytes]] = []
 
         def lose_python_handoff(*args: object) -> int:
             status = int(native_confirm(*args))
@@ -1567,7 +1568,14 @@ def test_executor_reap_receipt_is_recoverable_after_native_success_handoff(
                 pointer, journal_module.ctypes.POINTER(journal_module._CReapProof)
             ).contents
             native_receipt.append(
-                (proof.pid, bytes(proof.certified_hash), bytes(proof.capability))
+                (
+                    bytes(proof.allocation_nonce),
+                    proof.generation,
+                    proof.authority_epoch,
+                    proof.identity.pid,
+                    bytes(proof.certified_hash),
+                    bytes(proof.capability),
+                )
             )
             raise RuntimeError("injected after native reap success")
 
@@ -1586,12 +1594,221 @@ def test_executor_reap_receipt_is_recoverable_after_native_success_handoff(
 
         recovered = journal.confirm_executor_reaped(deadline_ns=_future())
         assert native_receipt == [
-            (recovered.pid, recovered._certified_hash, recovered._capability)
+            (
+                recovered.allocation_nonce,
+                recovered.generation,
+                recovered.authority_epoch,
+                recovered.pid,
+                recovered._certified_hash,
+                recovered._capability,
+            )
         ]
         with pytest.raises(ChildProcessError):
             os.waitid(
                 os.P_PID, executor_pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
             )
+    finally:
+        _reap_target(executor_pid)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_reap_receipt_carries_exact_journal_generation_and_process_identity(
+    tmp_path: Path,
+) -> None:
+    """The opaque receipt identifies more than the executor's numeric PID."""
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    executor_pid = os.fork()
+    if executor_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    try:
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+            RecordClass.NORMAL,
+        )
+        lease = time.monotonic_ns() + 40_000_000
+        journal.activate_executor(
+            1,
+            "executor-1",
+            executor_pid,
+            lease_deadline_ns=lease,
+        )
+        os.kill(executor_pid, 9)
+        while time.monotonic_ns() <= lease:
+            time.sleep(0.001)
+        retired = journal.retire_executor(
+            authority="reconciler-1",
+            authority_epoch=1,
+            authority_deadline_ns=_future(),
+        )
+        proof = journal.confirm_executor_reaped(deadline_ns=_future())
+
+        assert journal_module.ctypes.sizeof(journal_module._CReapProof) == 224
+        assert proof.allocation_nonce == b"n" * 32
+        assert proof.generation == 1
+        assert proof.authority_epoch == 1
+        assert proof.identity.pid == executor_pid
+        assert proof.identity.start_ns == retired.record.process_start_ns
+        assert proof.identity.uid == retired.record.process_uid
+        assert proof.identity.pgid == retired.record.process_pgid
+        assert proof.identity.sid == retired.record.process_sid
+        assert proof.identity.flags == retired.record.process_identity_flags
+        assert proof.identity.executable_dev == retired.record.executable_dev
+        assert proof.identity.executable_ino == retired.record.executable_ino
+        assert proof.identity.boot_id == retired.record.boot_id
+        assert proof.identity.executable_hash == retired.record.executable_hash
+    finally:
+        _reap_target(executor_pid)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_successor_rejects_every_altered_reap_authority_field(
+    tmp_path: Path,
+) -> None:
+    """A same-PID receipt cannot be replayed across authority context."""
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    executor_pid = os.fork()
+    if executor_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    try:
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+            RecordClass.NORMAL,
+        )
+        lease = time.monotonic_ns() + 40_000_000
+        journal.activate_executor(
+            1,
+            "executor-1",
+            executor_pid,
+            lease_deadline_ns=lease,
+        )
+        os.kill(executor_pid, 9)
+        while time.monotonic_ns() <= lease:
+            time.sleep(0.001)
+        journal.retire_executor(
+            authority="reconciler-1",
+            authority_epoch=1,
+            authority_deadline_ns=_future(),
+        )
+        proof = journal.confirm_executor_reaped(deadline_ns=_future())
+        identity = proof.identity
+
+        def flip(value: bytes) -> bytes:
+            return bytes([value[0] ^ 1]) + value[1:]
+
+        mutations = (
+            replace(proof, generation=proof.generation + 1),
+            replace(proof, authority_epoch=proof.authority_epoch + 1),
+            replace(proof, allocation_nonce=flip(proof.allocation_nonce)),
+            replace(proof, _certified_hash=flip(proof._certified_hash)),
+            replace(proof, _capability=flip(proof._capability)),
+            replace(proof, identity=replace(identity, pid=identity.pid + 1)),
+            replace(
+                proof, identity=replace(identity, start_ns=identity.start_ns + 1)
+            ),
+            replace(proof, identity=replace(identity, uid=identity.uid + 1)),
+            replace(proof, identity=replace(identity, pgid=identity.pgid + 1)),
+            replace(proof, identity=replace(identity, sid=identity.sid + 1)),
+            replace(proof, identity=replace(identity, flags=identity.flags ^ 1)),
+            replace(
+                proof,
+                identity=replace(
+                    identity, executable_dev=identity.executable_dev + 1
+                ),
+            ),
+            replace(
+                proof,
+                identity=replace(
+                    identity, executable_ino=identity.executable_ino + 1
+                ),
+            ),
+            replace(
+                proof, identity=replace(identity, boot_id=flip(identity.boot_id))
+            ),
+            replace(
+                proof,
+                identity=replace(
+                    identity, executable_hash=flip(identity.executable_hash)
+                ),
+            ),
+        )
+
+        for forged in mutations:
+            with pytest.raises(JournalError) as caught:
+                journal.prepare_successor(
+                    forged,
+                    2,
+                    "executor-2",
+                    claim_deadline_ns=_future(),
+                )
+            assert caught.value.code is JournalErrorCode.AUTHORITY
+            assert journal.scan().head.record.kind is StateKind.RETIRING_IDLE
+    finally:
+        _reap_target(executor_pid)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_same_pid_reap_receipt_rejects_a_different_chain_incarnation(
+    tmp_path: Path,
+) -> None:
+    """Native matching rejects changed chain context even when PID is reused."""
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    executor_pid = os.fork()
+    if executor_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    try:
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+            RecordClass.NORMAL,
+        )
+        lease = time.monotonic_ns() + 40_000_000
+        journal.activate_executor(
+            1,
+            "executor-1",
+            executor_pid,
+            lease_deadline_ns=lease,
+        )
+        os.kill(executor_pid, 9)
+        while time.monotonic_ns() <= lease:
+            time.sleep(0.001)
+        journal.retire_executor(
+            authority="reconciler-1",
+            authority_epoch=1,
+            authority_deadline_ns=_future(),
+        )
+        proof = journal.confirm_executor_reaped(deadline_ns=_future())
+        current = journal.scan().head.record
+        native_proof = journal._proof_to_c(proof)
+        validate = journal._fault("cpl_fault_validate_reap_proof")
+        validate.argtypes = [
+            journal_module.ctypes.c_void_p,
+            journal_module.ctypes.POINTER(journal_module._CReapProof),
+            journal_module.ctypes.POINTER(journal_module._CState),
+        ]
+        validate.restype = journal_module.ctypes.c_int
+
+        for forged_state in (
+            replace(current, generation=current.generation + 1),
+            replace(
+                current,
+                process_start_ns=current.process_start_ns + 1,
+            ),
+        ):
+            native_state = _state_to_c(forged_state)
+            assert (
+                journal._native_call(
+                    validate,
+                    journal_module.ctypes.byref(native_proof),
+                    journal_module.ctypes.byref(native_state),
+                )
+                == int(JournalErrorCode.AUTHORITY)
+            )
+            assert forged_state.process_pid == proof.pid
     finally:
         _reap_target(executor_pid)
         journal.close()
