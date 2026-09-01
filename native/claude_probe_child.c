@@ -54,15 +54,29 @@ int main(int argc, char **argv) {
     size_t index;
     int output_fd;
     bool stubborn = false;
+    bool exit_after_write = false;
+    bool spawn_descendant = false;
     int descriptor;
 
+    if (argc == 3 && strcmp(argv[1], "--probe-scenario") == 0 &&
+        strcmp(argv[2], "confirmed_reap") == 0) {
+        for (;;) {
+            pause();
+        }
+    }
     if ((argc != 3 && argc != 4) || strcmp(argv[1], "--output-path") != 0 ||
-        (argc == 4 && strcmp(argv[3], "--stubborn") != 0)) {
+        (argc == 4 && strcmp(argv[3], "--stubborn") != 0 &&
+         strcmp(argv[3], "--exit-after-write") != 0 &&
+         strcmp(argv[3], "--spawn-descendant") != 0)) {
         return PROBE_EXIT;
     }
     output_fd = argv[2][0] == '/' ? open(argv[2],
         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600) : -1;
-    stubborn = argc == 4;
+    stubborn = argc == 4 && strcmp(argv[3], "--stubborn") == 0;
+    exit_after_write = argc == 4 &&
+        strcmp(argv[3], "--exit-after-write") == 0;
+    spawn_descendant = argc == 4 &&
+        strcmp(argv[3], "--spawn-descendant") == 0;
     for (descriptor = 3; descriptor < 1024; ++descriptor) {
         int socket_type;
         socklen_t length = (socklen_t)sizeof(socket_type);
@@ -114,6 +128,12 @@ int main(int argc, char **argv) {
         }
     }
     (void)close(output_fd);
+    if (exit_after_write) {
+        return 0;
+    }
+    if (spawn_descendant && fork() < 0) {
+        return PROBE_EXIT;
+    }
     if (stubborn) {
         (void)signal(SIGTERM, SIG_IGN);
     }

@@ -22,7 +22,6 @@
 extern char **environ;
 
 #define SUPERVISOR_FAIL_DEAD_EXIT 75
-#define SUPERVISOR_USAGE_EXIT 64
 #define SUPERVISOR_NORMAL_LIMIT (32U * 1024U)
 #define SUPERVISOR_HARD_LIMIT (SUPERVISOR_NORMAL_LIMIT + CPL_RECOVERY_BYTES)
 #define SUPERVISOR_ENV_CAPACITY 64U
@@ -72,20 +71,26 @@ struct bootstrap_values {
     int control_fd;
     int anchor_fallback_fd;
     bool network_proxy_enabled;
+    uint32_t cleanup_injection;
 };
 
-struct group_probe {
-    bool ok;
-    bool stop_used;
-    bool enumerated_while_stopped;
-    bool term_used;
-    bool kill_used;
-    bool anchor_unreaped;
-    bool anchor_reaped;
-    bool zombie_observed;
-    bool group_absent;
-    bool absence_enumerated;
+enum cleanup_injection {
+    CLEANUP_INJECTION_NONE = 0,
+    CLEANUP_INJECTION_AFTER_ADMISSION = 1,
+    CLEANUP_INJECTION_AFTER_STOP = 2,
+    CLEANUP_INJECTION_AFTER_ENUMERATION = 3,
+    CLEANUP_INJECTION_AFTER_CONT = 4,
+    CLEANUP_INJECTION_AFTER_TERM = 5,
+    CLEANUP_INJECTION_AFTER_KILL = 6,
+    CLEANUP_INJECTION_ANCHOR_ONLY = 7,
+    CLEANUP_INJECTION_ALTERED_EXECUTABLE = 8,
+    CLEANUP_INJECTION_REUSED_IDENTITY = 9,
+    CLEANUP_INJECTION_UNEXPECTED_DESCENDANT = 10,
 };
+
+static int cleanup_checkpoint(uint32_t selected, uint32_t stage) {
+    return selected == stage ? CPL_ERR_SYSTEM : CPL_OK;
+}
 
 struct cleanup_result {
     bool stop_used;
@@ -96,25 +101,27 @@ struct cleanup_result {
     bool absence_enumerated;
     bool anchor_reaped;
     bool task4_completed;
+    bool process_batch_preauthorized;
+    bool token_retained_through_signals;
+    bool process_target_exact;
+    bool injection_recovered;
+    bool anchor_only_observed;
+    bool group_resumed_after_failure;
     uint32_t batch_count;
     uint64_t completed_steps;
     uint64_t done_sequence;
+    uint64_t process_batch_admission_sequence;
+    uint32_t injection_stage;
 };
 
-static bool enumerate_stopped_group(pid_t pgid, pid_t anchor);
+static bool enumerate_stopped_group(pid_t pgid, pid_t anchor,
+    bool *anchor_only);
 static bool enumerate_absence_with_unreaped_anchor(pid_t pgid,
     pid_t anchor);
 static int wait_unreaped(pid_t pid, bool *observed);
 static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
     const struct cpl_process_identity *anchor,
-    struct cleanup_result *result);
-
-static volatile sig_atomic_t anchor_term_seen = 0;
-
-static void anchor_term_handler(int signal_number) {
-    (void)signal_number;
-    anchor_term_seen = 1;
-}
+    uint32_t injection, struct cleanup_result *result);
 
 static uint64_t monotonic_deadline(void) {
     struct timespec now;
@@ -150,35 +157,6 @@ static void bounded_pause(void) {
     const struct timespec duration = {.tv_sec = 0, .tv_nsec = 1000000L};
 
     (void)nanosleep(&duration, NULL);
-}
-
-static int write_all(int fd, const void *bytes, size_t length) {
-    const uint8_t *cursor = bytes;
-
-    while (length > 0U) {
-        ssize_t written = write(fd, cursor, length);
-
-        if (written < 0 && errno == EINTR) {
-            continue;
-        }
-        if (written <= 0) {
-            return -1;
-        }
-        cursor += (size_t)written;
-        length -= (size_t)written;
-    }
-    return 0;
-}
-
-static int read_one(int fd, char *out) {
-    for (;;) {
-        ssize_t got = read(fd, out, 1U);
-
-        if (got < 0 && errno == EINTR) {
-            continue;
-        }
-        return got == 1 ? 0 : -1;
-    }
 }
 
 static int parse_fd(const char *text, int *out) {
@@ -227,6 +205,31 @@ static int parse_nonce(const char *text, uint8_t nonce[CPL_HASH_SIZE]) {
         nonce[index] = (uint8_t)((unsigned)high << 4U | (unsigned)low);
     }
     return 0;
+}
+
+static uint32_t parse_cleanup_injection(void) {
+#ifdef CPL_ENABLE_TASK5_INJECTIONS
+    static const char *const names[] = {
+        "none", "after_admission", "after_stop", "after_enumeration",
+        "after_cont", "after_term", "after_kill", "anchor_only",
+        "altered_executable_identity", "reused_pid",
+        "unexpected_descendant",
+    };
+    const char *selected = getenv("LOCAL_PROXY_TEST_INJECTION");
+    uint32_t index;
+
+    if (selected == NULL) {
+        return CLEANUP_INJECTION_NONE;
+    }
+    for (index = 0U; index < sizeof(names) / sizeof(names[0]); ++index) {
+        if (strcmp(selected, names[index]) == 0) {
+            return index;
+        }
+    }
+    return UINT32_MAX;
+#else
+    return CLEANUP_INJECTION_NONE;
+#endif
 }
 
 static bool starts_with(const char *value, const char *prefix) {
@@ -410,6 +413,7 @@ static int parse_bootstrap_values(struct bootstrap_values *out) {
     out->real_cli = getenv("LOCAL_PROXY_REAL_CLAUDE");
     fd_text = getenv("LOCAL_PROXY_CONTROL_FD");
     network_proxy = getenv("LOCAL_PROXY_NETWORK_PROXY");
+    out->cleanup_injection = parse_cleanup_injection();
     if (parse_nonce(out->allocation_nonce, nonce) < 0 ||
         out->instance_dir == NULL || out->instance_dir[0] != '/' ||
         out->real_cli == NULL || out->real_cli[0] != '/' ||
@@ -418,6 +422,9 @@ static int parse_bootstrap_values(struct bootstrap_values *out) {
             &out->anchor_fallback_fd) < 0 || network_proxy == NULL ||
         (strcmp(network_proxy, "0") != 0 &&
          strcmp(network_proxy, "1") != 0)) {
+        return -1;
+    }
+    if (out->cleanup_injection == UINT32_MAX) {
         return -1;
     }
     out->network_proxy_enabled = strcmp(network_proxy, "1") == 0;
@@ -806,6 +813,27 @@ static int launch_anchor(const struct bootstrap_values *values,
             request.payload_length, control_deadline(), &bootstrap);
     }
     if (status == CPL_OK) {
+        status = cpl_journal_bootstrap_certify(journal,
+            CPL_CONTROL_CLEANUP_REQUEST, request.payload,
+            request.payload_length, control_deadline(), &bootstrap);
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_phase_accept(&phase,
+            CPL_CONTROL_CLEANUP_ACK, true);
+    }
+    if (status == CPL_OK) {
+        struct cpl_cleanup_ack cleanup_ack;
+
+        (void)memset(&cleanup_ack, 0, sizeof(cleanup_ack));
+        cleanup_ack.sequence = bootstrap.sequence;
+        (void)memcpy(cleanup_ack.hash, bootstrap.hash, CPL_HASH_SIZE);
+        status = cpl_control_frame_write(values->control_fd,
+            CPL_CONTROL_CLEANUP_ACK, nonce,
+            (const uint8_t *)&cleanup_ack,
+            (uint32_t)sizeof(cleanup_ack),
+            control_deadline());
+    }
+    if (status == CPL_OK) {
         status = cpl_control_frame_write(internal[0],
             CPL_CONTROL_CLEANUP_REQUEST, nonce, request.payload,
             request.payload_length, control_deadline());
@@ -816,7 +844,34 @@ static int launch_anchor(const struct bootstrap_values *values,
 
         (void)memset(&cleanup, 0, sizeof(cleanup));
         status = retained_group_cleanup(journal, directory_fd,
-            &anchor_identity, &cleanup);
+            &anchor_identity, values->cleanup_injection, &cleanup);
+        if (status != CPL_OK &&
+            values->cleanup_injection >=
+                CLEANUP_INJECTION_ALTERED_EXECUTABLE &&
+            values->cleanup_injection <=
+                CLEANUP_INJECTION_UNEXPECTED_DESCENDANT) {
+            uint32_t rejection = values->cleanup_injection;
+            int rejection_status = cpl_journal_bootstrap_append(journal,
+                CPL_CONTROL_ERROR, (const uint8_t *)&rejection,
+                (uint32_t)sizeof(rejection), control_deadline(), &bootstrap);
+
+            if (rejection_status == CPL_OK) {
+                rejection_status = cpl_control_phase_accept(&phase,
+                    CPL_CONTROL_ERROR, false);
+            }
+            if (rejection_status == CPL_OK) {
+                if (cpl_control_frame_write(values->control_fd,
+                        CPL_CONTROL_ERROR, nonce,
+                        (const uint8_t *)&rejection,
+                        (uint32_t)sizeof(rejection), control_deadline()) !=
+                        CPL_OK) {
+                    (void)close(internal[0]);
+                    return -1;
+                }
+            }
+            (void)close(internal[0]);
+            return -1;
+        }
         (void)memset(&evidence, 0, sizeof(evidence));
         if (cleanup.stop_used) {
             evidence.flags |= CPL_CLEANUP_STOP_USED;
@@ -843,9 +898,30 @@ static int launch_anchor(const struct bootstrap_values *values,
         if (cleanup.task4_completed) {
             evidence.flags |= CPL_CLEANUP_TASK4_DONE;
         }
+        if (cleanup.process_batch_preauthorized) {
+            evidence.flags |= CPL_CLEANUP_PROCESS_BATCH_PREAUTHORIZED;
+        }
+        if (cleanup.token_retained_through_signals) {
+            evidence.flags |= CPL_CLEANUP_TOKEN_RETAINED_THROUGH_SIGNALS;
+        }
+        if (cleanup.process_target_exact) {
+            evidence.flags |= CPL_CLEANUP_PROCESS_TARGET_EXACT;
+        }
+        if (cleanup.injection_recovered) {
+            evidence.flags |= CPL_CLEANUP_INJECTION_RECOVERED;
+        }
+        if (cleanup.anchor_only_observed) {
+            evidence.flags |= CPL_CLEANUP_ANCHOR_ONLY_OBSERVED;
+        }
+        if (cleanup.group_resumed_after_failure) {
+            evidence.flags |= CPL_CLEANUP_GROUP_RESUMED_AFTER_FAILURE;
+        }
         evidence.batch_count = cleanup.batch_count;
         evidence.completed_steps = cleanup.completed_steps;
         evidence.done_sequence = cleanup.done_sequence;
+        evidence.process_batch_admission_sequence =
+            cleanup.process_batch_admission_sequence;
+        evidence.injection_stage = cleanup.injection_stage;
         if (status == CPL_OK) {
             status = cpl_journal_bootstrap_append(journal,
                 CPL_CONTROL_CLEANUP_RESULT, (const uint8_t *)&evidence,
@@ -941,9 +1017,14 @@ static void free_group_members(struct bounded_group_members *members) {
     members->count = 0U;
 }
 
-static bool enumerate_stopped_group(pid_t pgid, pid_t anchor) {
+static bool enumerate_stopped_group(pid_t pgid, pid_t anchor,
+    bool *anchor_only) {
     uint64_t deadline = monotonic_deadline();
 
+    if (anchor_only == NULL) {
+        return false;
+    }
+    *anchor_only = false;
     for (;;) {
         struct bounded_group_members members;
         size_t index;
@@ -967,7 +1048,8 @@ static bool enumerate_stopped_group(pid_t pgid, pid_t anchor) {
                     all_stopped = false;
                 }
             }
-            if (present >= 2U && anchor_found && all_stopped) {
+            if (present >= 1U && anchor_found && all_stopped) {
+                *anchor_only = present == 1U;
                 free_group_members(&members);
                 return true;
             }
@@ -1055,65 +1137,270 @@ static int complete_cleanup_batch(cpl_journal *journal, int directory_fd,
     return CPL_OK;
 }
 
-static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
-    const struct cpl_process_identity *anchor,
-    struct cleanup_result *result) {
+static bool retained_anchor_is_exact(
+    const struct cpl_process_identity *anchor) {
     struct cpl_process_identity observed;
     struct proc_bsdinfo process;
+
+    return anchor != NULL && anchor->pid > 0 &&
+        anchor->pid == anchor->pgid && anchor->pid == anchor->sid &&
+        cpl_process_observe(anchor->pid, &observed) == CPL_OK &&
+        same_exact_identity(anchor, &observed) &&
+        proc_pidinfo((int)anchor->pid, PROC_PIDTBSDINFO, 0U, &process,
+            (int)sizeof(process)) == (int)sizeof(process) &&
+        process.pbi_ppid == (uint32_t)getpid();
+}
+
+static void retain_failed_cleanup_actor(
+    const struct cpl_process_identity *anchor, bool group_stopped) {
+    for (;;) {
+        if (group_stopped && retained_anchor_is_exact(anchor) &&
+            killpg(anchor->pgid, SIGCONT) == 0) {
+            group_stopped = false;
+        }
+        bounded_pause();
+    }
+}
+
+static bool wait_for_anchor_only_group(
+    const struct cpl_process_identity *anchor) {
+    uint64_t deadline = control_deadline();
+
+    while (deadline > 0U) {
+        struct bounded_group_members members;
+        size_t index;
+        unsigned present = 0U;
+        bool exact_anchor = false;
+
+        if (retained_anchor_is_exact(anchor) &&
+            list_group_members(anchor->pgid, &members)) {
+            for (index = 0U; index < members.count; ++index) {
+                if (members.items[index] <= 0) {
+                    continue;
+                }
+                ++present;
+                exact_anchor = exact_anchor ||
+                    members.items[index] == anchor->pid;
+            }
+            free_group_members(&members);
+            if (present == 1U && exact_anchor) {
+                return true;
+            }
+        }
+        if (monotonic_deadline() == 0U ||
+            monotonic_deadline() - 1000000000ULL >= deadline) {
+            return false;
+        }
+        bounded_pause();
+    }
+    return false;
+}
+
+static bool observe_unexpected_group_member(
+    const struct cpl_process_identity *anchor) {
+    uint64_t deadline = control_deadline();
+
+    while (deadline > 0U) {
+        struct bounded_group_members members;
+        size_t index;
+        unsigned present = 0U;
+        bool exact_anchor = false;
+
+        if (retained_anchor_is_exact(anchor) &&
+            list_group_members(anchor->pgid, &members)) {
+            for (index = 0U; index < members.count; ++index) {
+                if (members.items[index] <= 0) {
+                    continue;
+                }
+                ++present;
+                exact_anchor = exact_anchor ||
+                    members.items[index] == anchor->pid;
+            }
+            free_group_members(&members);
+            if (exact_anchor && present > 2U) {
+                return true;
+            }
+        }
+        if (monotonic_deadline() == 0U ||
+            monotonic_deadline() - 1000000000ULL >= deadline) {
+            return false;
+        }
+        bounded_pause();
+    }
+    return false;
+}
+
+static int complete_admitted_process_batch(cpl_journal *journal,
+    int directory_fd, const struct cpl_action_token *token,
+    struct cleanup_result *result) {
+    struct cpl_append_result completed;
+    uint32_t token_state = CPL_ACTION_TOKEN_RETAINED;
+    uint64_t completed_steps = 0U;
+    int status = cpl_journal_execute_batch(journal, token, directory_fd,
+        control_deadline(), &completed_steps);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_complete_batch(journal, token,
+        control_deadline(), &token_state, &completed);
+    if (status != CPL_OK || token_state != CPL_ACTION_TOKEN_CONSUMED) {
+        return status == CPL_OK ? CPL_ERR_BATCH_TOKEN : status;
+    }
+    ++result->batch_count;
+    result->completed_steps = completed_steps;
+    return CPL_OK;
+}
+
+static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
+    const struct cpl_process_identity *anchor,
+    uint32_t injection, struct cleanup_result *result) {
+    struct cpl_action_token process_token;
+    struct cpl_append_result admitted;
     struct cpl_batch_descriptor descriptor;
     struct cpl_append_result done;
     uint8_t executor[CPL_ID_SIZE] = {0};
+    uint8_t batch_nonce[CPL_ID_SIZE] = {0};
+    bool group_stopped = false;
+    bool anchor_only = false;
     int status;
 
-    if (journal == NULL || result == NULL || anchor == NULL ||
-        anchor->pid <= 0 || anchor->pid != anchor->pgid ||
-        anchor->pid != anchor->sid ||
-        cpl_process_observe(anchor->pid, &observed) != CPL_OK ||
-        !same_exact_identity(anchor, &observed) ||
-        proc_pidinfo((int)anchor->pid, PROC_PIDTBSDINFO, 0U, &process,
-            (int)sizeof(process)) != (int)sizeof(process) ||
-        process.pbi_ppid != (uint32_t)getpid()) {
+    if (journal == NULL || result == NULL) {
         return CPL_ERR_PROCESS_IDENTITY;
+    }
+    if (injection == CLEANUP_INJECTION_ALTERED_EXECUTABLE) {
+        struct cpl_process_identity altered = *anchor;
+
+        altered.executable_hash[0] ^= 0xffU;
+        if (!retained_anchor_is_exact(&altered)) {
+            return CPL_ERR_PROCESS_IDENTITY;
+        }
+    } else if (injection == CLEANUP_INJECTION_REUSED_IDENTITY) {
+        struct cpl_process_identity reused = *anchor;
+
+        ++reused.start_ns;
+        if (!retained_anchor_is_exact(&reused)) {
+            return CPL_ERR_PROCESS_IDENTITY;
+        }
+    } else if (injection == CLEANUP_INJECTION_UNEXPECTED_DESCENDANT) {
+        if (observe_unexpected_group_member(anchor)) {
+            return CPL_ERR_PROCESS_IDENTITY;
+        }
+    }
+    if (!retained_anchor_is_exact(anchor)) {
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    (void)memset(&descriptor, 0, sizeof(descriptor));
+    descriptor.kind = CPL_DESCRIPTOR_PROCESS_ABSENT;
+    descriptor.target = *anchor;
+    (void)memcpy(executor, "supervisor", strlen("supervisor"));
+    (void)memcpy(batch_nonce, "process-absent", strlen("process-absent"));
+    status = cpl_journal_admit_batch(journal, 1U, executor, batch_nonce,
+        &descriptor, 1U, control_deadline(), &process_token, &admitted);
+    if (status != CPL_OK) {
+        return status;
+    }
+    result->process_batch_preauthorized = true;
+    result->process_target_exact = same_exact_identity(
+        &descriptor.target, anchor);
+    result->process_batch_admission_sequence = admitted.sequence;
+    result->injection_stage = injection;
+    if (cleanup_checkpoint(injection,
+            CLEANUP_INJECTION_AFTER_ADMISSION) != CPL_OK) {
+        result->injection_recovered = true;
+    }
+    if (injection == CLEANUP_INJECTION_ANCHOR_ONLY &&
+        !wait_for_anchor_only_group(anchor)) {
+        retain_failed_cleanup_actor(anchor, false);
     }
     if (killpg(anchor->pgid, SIGSTOP) < 0) {
-        return CPL_ERR_SYSTEM;
+        retain_failed_cleanup_actor(anchor, false);
     }
+    group_stopped = true;
     result->stop_used = true;
+    if (cleanup_checkpoint(injection,
+            CLEANUP_INJECTION_AFTER_STOP) != CPL_OK) {
+        result->injection_recovered = true;
+        if (!retained_anchor_is_exact(anchor) ||
+            killpg(anchor->pgid, SIGCONT) < 0) {
+            retain_failed_cleanup_actor(anchor, true);
+        }
+        result->group_resumed_after_failure = true;
+        if (!retained_anchor_is_exact(anchor) ||
+            killpg(anchor->pgid, SIGSTOP) < 0) {
+            retain_failed_cleanup_actor(anchor, false);
+        }
+        group_stopped = true;
+    }
     result->enumerated_while_stopped = enumerate_stopped_group(
-        anchor->pgid, (pid_t)anchor->pid);
-    if (!result->enumerated_while_stopped ||
-        killpg(anchor->pgid, SIGCONT) < 0 ||
-        killpg(anchor->pgid, SIGTERM) < 0) {
-        return CPL_ERR_PROCESS_IDENTITY;
+        anchor->pgid, (pid_t)anchor->pid, &anchor_only);
+    result->anchor_only_observed = anchor_only;
+    if (!result->enumerated_while_stopped) {
+        retain_failed_cleanup_actor(anchor, group_stopped);
+    }
+    if (cleanup_checkpoint(injection,
+            CLEANUP_INJECTION_AFTER_ENUMERATION) != CPL_OK) {
+        result->injection_recovered = true;
+        if (!retained_anchor_is_exact(anchor) ||
+            killpg(anchor->pgid, SIGCONT) < 0) {
+            retain_failed_cleanup_actor(anchor, true);
+        }
+        result->group_resumed_after_failure = true;
+        if (!retained_anchor_is_exact(anchor) ||
+            killpg(anchor->pgid, SIGSTOP) < 0) {
+            retain_failed_cleanup_actor(anchor, false);
+        }
+        group_stopped = true;
+        result->enumerated_while_stopped = enumerate_stopped_group(
+            anchor->pgid, (pid_t)anchor->pid, &anchor_only);
+        result->anchor_only_observed = result->anchor_only_observed ||
+            anchor_only;
+        if (!result->enumerated_while_stopped) {
+            retain_failed_cleanup_actor(anchor, true);
+        }
+    }
+    if (killpg(anchor->pgid, SIGCONT) < 0) {
+        retain_failed_cleanup_actor(anchor, group_stopped);
+    }
+    if (cleanup_checkpoint(injection,
+            CLEANUP_INJECTION_AFTER_CONT) != CPL_OK) {
+        result->injection_recovered = true;
+    }
+    if (killpg(anchor->pgid, SIGTERM) < 0) {
+        retain_failed_cleanup_actor(anchor, false);
     }
     result->term_used = true;
+    if (cleanup_checkpoint(injection,
+            CLEANUP_INJECTION_AFTER_TERM) != CPL_OK) {
+        result->injection_recovered = true;
+    }
     if (wait_unreaped((pid_t)anchor->pid, &result->zombie_observed) < 0) {
         if (killpg(anchor->pgid, SIGKILL) < 0) {
-            return CPL_ERR_SYSTEM;
+            retain_failed_cleanup_actor(anchor, false);
         }
         result->kill_used = true;
+        if (cleanup_checkpoint(injection,
+                CLEANUP_INJECTION_AFTER_KILL) != CPL_OK) {
+            result->injection_recovered = true;
+        }
         if (wait_unreaped((pid_t)anchor->pid,
                 &result->zombie_observed) < 0) {
-            return CPL_ERR_REAP_REQUIRED;
+            retain_failed_cleanup_actor(anchor, false);
         }
     }
     if (!result->zombie_observed) {
-        return CPL_ERR_REAP_REQUIRED;
+        retain_failed_cleanup_actor(anchor, false);
     }
     result->absence_enumerated = enumerate_absence_with_unreaped_anchor(
         anchor->pgid, (pid_t)anchor->pid);
     if (!result->absence_enumerated) {
-        return CPL_ERR_PROCESS_PRESENT;
+        retain_failed_cleanup_actor(anchor, false);
     }
-
-    (void)memset(&descriptor, 0, sizeof(descriptor));
-    descriptor.kind = CPL_DESCRIPTOR_PROCESS_ABSENT;
-    descriptor.required_steps = 0U;
-    descriptor.target = *anchor;
-    status = complete_cleanup_batch(journal, directory_fd,
-        "process-absent", &descriptor, 1U, result);
+    result->token_retained_through_signals = true;
+    status = complete_admitted_process_batch(journal, directory_fd,
+        &process_token, result);
     if (status != CPL_OK) {
-        return status;
+        retain_failed_cleanup_actor(anchor, false);
     }
     (void)memset(&descriptor, 0, sizeof(descriptor));
     descriptor.kind = CPL_DESCRIPTOR_REAP_PROCESS;
@@ -1155,486 +1442,6 @@ static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
     return CPL_OK;
 }
 
-static void group_anchor_child(int ready_fd, int control_fd, bool stubborn) {
-    struct sigaction action;
-    int member_ready[2];
-    pid_t member;
-    char command;
-    int member_status;
-
-    if (setsid() < 0 || pipe(member_ready) < 0) {
-        _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-    }
-    (void)memset(&action, 0, sizeof(action));
-    action.sa_handler = anchor_term_handler;
-    (void)sigemptyset(&action.sa_mask);
-    if (sigaction(SIGTERM, &action, NULL) < 0) {
-        _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-    }
-    member = fork();
-    if (member < 0) {
-        _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-    }
-    if (member == 0) {
-        (void)close(member_ready[0]);
-        if (stubborn) {
-            (void)signal(SIGTERM, SIG_IGN);
-        } else {
-            (void)signal(SIGTERM, SIG_DFL);
-        }
-        if (write_all(member_ready[1], "M", 1U) < 0) {
-            _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-        }
-        (void)close(member_ready[1]);
-        for (;;) {
-            pause();
-        }
-    }
-    (void)close(member_ready[1]);
-    if (read_one(member_ready[0], &command) < 0 || command != 'M' ||
-        write_all(ready_fd, "R", 1U) < 0) {
-        _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-    }
-    (void)close(member_ready[0]);
-    (void)close(ready_fd);
-    for (;;) {
-        if (read_one(control_fd, &command) < 0) {
-            _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-        }
-        if (command == 'Q') {
-            while (waitpid(member, &member_status, 0) < 0 && errno == EINTR) {
-            }
-            _exit(anchor_term_seen != 0 ? 0 : SUPERVISOR_FAIL_DEAD_EXIT);
-        }
-    }
-}
-
-static struct group_probe run_retaining_group_probe(bool stubborn) {
-    struct group_probe result;
-    int ready[2] = {-1, -1};
-    int control[2] = {-1, -1};
-    pid_t anchor = -1;
-    char ready_byte;
-    siginfo_t information;
-    int wait_status;
-
-    (void)memset(&result, 0, sizeof(result));
-    if (pipe(ready) < 0 || pipe(control) < 0) {
-        goto done;
-    }
-    anchor = fork();
-    if (anchor < 0) {
-        goto done;
-    }
-    if (anchor == 0) {
-        (void)close(ready[0]);
-        (void)close(control[1]);
-        group_anchor_child(ready[1], control[0], stubborn);
-    }
-    (void)close(ready[1]);
-    ready[1] = -1;
-    (void)close(control[0]);
-    control[0] = -1;
-    if (read_one(ready[0], &ready_byte) < 0 || ready_byte != 'R') {
-        goto done;
-    }
-    (void)memset(&information, 0, sizeof(information));
-    if (waitid(P_PID, (id_t)anchor, &information,
-            WEXITED | WNOHANG | WNOWAIT) < 0 || information.si_pid != 0) {
-        goto done;
-    }
-    result.anchor_unreaped = true;
-    if (killpg(anchor, SIGSTOP) < 0) {
-        goto done;
-    }
-    result.stop_used = true;
-    result.enumerated_while_stopped = enumerate_stopped_group(anchor, anchor);
-    if (!result.enumerated_while_stopped || killpg(anchor, SIGCONT) < 0 ||
-        killpg(anchor, SIGTERM) < 0) {
-        goto done;
-    }
-    result.term_used = true;
-    if (stubborn) {
-        unsigned attempts;
-
-        for (attempts = 0U; attempts < 20U; ++attempts) {
-            bounded_pause();
-        }
-        (void)memset(&information, 0, sizeof(information));
-        if (waitid(P_PID, (id_t)anchor, &information,
-                WEXITED | WNOHANG | WNOWAIT) < 0 ||
-            information.si_pid != 0 || killpg(anchor, SIGKILL) < 0) {
-            goto done;
-        }
-        result.kill_used = true;
-    } else if (write_all(control[1], "Q", 1U) < 0) {
-        goto done;
-    }
-    if (wait_unreaped(anchor, &result.zombie_observed) < 0 ||
-        !result.zombie_observed) {
-        goto done;
-    }
-    result.absence_enumerated =
-        enumerate_absence_with_unreaped_anchor(anchor, anchor);
-    result.group_absent = result.absence_enumerated;
-    if (!result.group_absent) {
-        goto done;
-    }
-    if (waitpid(anchor, &wait_status, 0) != anchor) {
-        goto done;
-    }
-    anchor = -1;
-    result.anchor_reaped = true;
-    result.ok = true;
-
-done:
-    if (anchor > 0) {
-        (void)killpg(anchor, SIGKILL);
-        (void)waitpid(anchor, &wait_status, 0);
-    }
-    if (ready[0] >= 0) {
-        (void)close(ready[0]);
-    }
-    if (ready[1] >= 0) {
-        (void)close(ready[1]);
-    }
-    if (control[0] >= 0) {
-        (void)close(control[0]);
-    }
-    if (control[1] >= 0) {
-        (void)close(control[1]);
-    }
-    return result;
-}
-
-static bool run_anchor_self_term_probe(void) {
-    int ready[2] = {-1, -1};
-    int control[2] = {-1, -1};
-    pid_t anchor = -1;
-    char byte;
-    int wait_status;
-    bool result = false;
-
-    if (pipe(ready) < 0 || pipe(control) < 0) {
-        goto done;
-    }
-    anchor = fork();
-    if (anchor < 0) {
-        goto done;
-    }
-    if (anchor == 0) {
-        struct sigaction action;
-        int member_ready[2];
-        pid_t member;
-
-        (void)close(ready[0]);
-        (void)close(control[1]);
-        if (setsid() < 0 || pipe(member_ready) < 0) {
-            _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-        }
-        (void)memset(&action, 0, sizeof(action));
-        action.sa_handler = anchor_term_handler;
-        (void)sigemptyset(&action.sa_mask);
-        if (sigaction(SIGTERM, &action, NULL) < 0) {
-            _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-        }
-        member = fork();
-        if (member < 0) {
-            _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-        }
-        if (member == 0) {
-            (void)close(member_ready[0]);
-            (void)signal(SIGTERM, SIG_DFL);
-            if (write_all(member_ready[1], "M", 1U) < 0) {
-                _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-            }
-            (void)close(member_ready[1]);
-            for (;;) {
-                pause();
-            }
-        }
-        (void)close(member_ready[1]);
-        if (read_one(member_ready[0], &byte) < 0 || byte != 'M' ||
-            killpg(getpgrp(), SIGTERM) < 0) {
-            _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-        }
-        (void)close(member_ready[0]);
-        while (waitpid(member, &wait_status, 0) < 0 && errno == EINTR) {
-        }
-        if (anchor_term_seen == 0 || write_all(ready[1], "U", 1U) < 0 ||
-            read_one(control[0], &byte) < 0 || byte != 'Q') {
-            _exit(SUPERVISOR_FAIL_DEAD_EXIT);
-        }
-        _exit(0);
-    }
-    (void)close(ready[1]);
-    ready[1] = -1;
-    (void)close(control[0]);
-    control[0] = -1;
-    if (read_one(ready[0], &byte) < 0 || byte != 'U' ||
-        write_all(control[1], "Q", 1U) < 0 ||
-        waitpid(anchor, &wait_status, 0) != anchor ||
-        !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
-        goto done;
-    }
-    anchor = -1;
-    result = true;
-
-done:
-    if (anchor > 0) {
-        (void)killpg(anchor, SIGKILL);
-        (void)waitpid(anchor, &wait_status, 0);
-    }
-    if (ready[0] >= 0) {
-        (void)close(ready[0]);
-    }
-    if (ready[1] >= 0) {
-        (void)close(ready[1]);
-    }
-    if (control[0] >= 0) {
-        (void)close(control[0]);
-    }
-    if (control[1] >= 0) {
-        (void)close(control[1]);
-    }
-    return result;
-}
-
-static int task4_authority_probe(bool unconfirmed) {
-    struct cpl_state state;
-    struct cpl_state next;
-    struct cpl_record record;
-    struct cpl_process_identity identity;
-    uint32_t index;
-
-    (void)memset(&state, 0, sizeof(state));
-    state.kind = CPL_STATE_NO_GENERATION;
-    state.workdir_bound = 1U;
-    state.workdir_parent_dev = 1U;
-    state.workdir_parent_ino = 1U;
-    state.workdir_dev = 1U;
-    state.workdir_ino = 1U;
-    (void)memcpy(state.workdir_name, "allocation.workdir",
-        strlen("allocation.workdir"));
-    (void)memset(&record, 0, sizeof(record));
-    record.kind = CPL_RECORD_PREPARED;
-    record.generation = 1U;
-    record.deadline_ns = 1U;
-    (void)memcpy(record.candidate, "supervisor", strlen("supervisor"));
-    if (cpl_lifecycle_apply(&state, &record, &next) != CPL_OK) {
-        return -1;
-    }
-    state = next;
-    (void)memset(&record, 0, sizeof(record));
-    record.kind = CPL_RECORD_ACTIVE_READY;
-    record.generation = 1U;
-    record.lease_deadline_ns = 1U;
-    (void)memcpy(record.executor, "supervisor", strlen("supervisor"));
-    if (cpl_lifecycle_apply(&state, &record, &next) != CPL_OK) {
-        return -1;
-    }
-    state = next;
-    if (unconfirmed) {
-        (void)memset(&record, 0, sizeof(record));
-        record.kind = CPL_RECORD_UNCONFIRMED;
-        (void)memcpy(record.reason, "proof-unavailable",
-            strlen("proof-unavailable"));
-        return cpl_lifecycle_apply(&state, &record, &next) == CPL_OK ? 0 : -1;
-    }
-    (void)memset(&identity, 0, sizeof(identity));
-    identity.pid = 123;
-    identity.start_ns = 1U;
-    identity.uid = geteuid();
-    identity.pgid = 123;
-    identity.sid = 123;
-    identity.flags = CPL_COMPLETE_PROCESS_IDENTITY;
-    identity.executable_dev = 1U;
-    identity.executable_ino = 1U;
-    (void)memset(identity.boot_id, 1, sizeof(identity.boot_id));
-    (void)memset(identity.executable_hash, 2,
-        sizeof(identity.executable_hash));
-    (void)memset(&record, 0, sizeof(record));
-    record.kind = CPL_RECORD_BATCH_ACTIVE;
-    record.generation = 1U;
-    record.lease_deadline_ns = 1U;
-    record.descriptor_count = CPL_MAX_BATCH_DESCRIPTORS;
-    (void)memcpy(record.executor, "supervisor", strlen("supervisor"));
-    (void)memcpy(record.exact_batch, "cleanup-batch",
-        strlen("cleanup-batch"));
-    for (index = 0U; index < CPL_MAX_BATCH_DESCRIPTORS; ++index) {
-        record.descriptors[index].kind = index + 1U;
-        record.descriptors[index].required_steps =
-            index == 0U ? 0U : (1U << index) - 1U;
-        if (index < 2U) {
-            record.descriptors[index].target = identity;
-        }
-    }
-    if (cpl_lifecycle_apply(&state, &record, &next) != CPL_OK) {
-        return -1;
-    }
-    state = next;
-    (void)memset(&record, 0, sizeof(record));
-    record.kind = CPL_RECORD_BATCH_DONE;
-    record.generation = 1U;
-    record.lease_deadline_ns = 1U;
-    record.completed_steps = CPL_ALL_COMPLETED_STEPS;
-    (void)memcpy(record.executor, "supervisor", strlen("supervisor"));
-    (void)memcpy(record.exact_batch, "cleanup-batch",
-        strlen("cleanup-batch"));
-    if (cpl_lifecycle_apply(&state, &record, &next) != CPL_OK) {
-        return -1;
-    }
-    state = next;
-    (void)memset(&record, 0, sizeof(record));
-    record.kind = CPL_RECORD_DONE;
-    record.generation = 1U;
-    (void)memcpy(record.executor, "supervisor", strlen("supervisor"));
-    return cpl_lifecycle_apply(&state, &record, &next) == CPL_OK ? 0 : -1;
-}
-
-static bool control_frame_validation_probe(void) {
-    uint8_t nonce[CPL_HASH_SIZE];
-    uint8_t wrong_nonce[CPL_HASH_SIZE];
-    uint8_t wire[CPL_CONTROL_MAX_WIRE_SIZE];
-    struct cpl_control_frame decoded;
-    uint32_t length = 0U;
-    uint32_t phase = CPL_CONTROL_PHASE_NONE;
-    uint32_t ack_phase = CPL_CONTROL_PHASE_SUPERVISOR_IDENTITY;
-    uint16_t type;
-
-    (void)memset(nonce, 3, sizeof(nonce));
-    (void)memset(wrong_nonce, 4, sizeof(wrong_nonce));
-    if (cpl_control_frame_encode(CPL_CONTROL_SUPERVISOR_IDENTITY, nonce,
-            (const uint8_t *)"identity", 8U, wire, sizeof(wire), &length) !=
-            CPL_OK ||
-        cpl_control_frame_decode(wire, length, nonce, &decoded) != CPL_OK ||
-        cpl_control_frame_decode(wire, length, wrong_nonce, &decoded) !=
-            CPL_ERR_CONTROL_FRAME ||
-        cpl_control_frame_encode(99U, nonce, NULL, 0U, wire, sizeof(wire),
-            &length) != CPL_ERR_INVALID_ARGUMENT ||
-        cpl_control_frame_encode(CPL_CONTROL_ERROR, nonce, wire,
-            CPL_CONTROL_MAX_PAYLOAD + 1U, wire, sizeof(wire), &length) !=
-            CPL_ERR_CONTROL_PAYLOAD ||
-        cpl_control_phase_accept(&ack_phase, CPL_CONTROL_IDENTITY_ACK, false) !=
-            CPL_ERR_CONTROL_PHASE) {
-        return false;
-    }
-    if (cpl_control_frame_encode(CPL_CONTROL_SUPERVISOR_IDENTITY, nonce,
-            (const uint8_t *)"identity", 8U, wire, sizeof(wire), &length) !=
-            CPL_OK) {
-        return false;
-    }
-    wire[length - 1U] ^= 1U;
-    if (cpl_control_frame_decode(wire, length, nonce, &decoded) !=
-            CPL_ERR_CONTROL_FRAME) {
-        return false;
-    }
-    for (type = CPL_CONTROL_SUPERVISOR_IDENTITY;
-         type <= CPL_CONTROL_CLI_RUNNING; ++type) {
-        bool certified = type == CPL_CONTROL_IDENTITY_ACK ||
-            type == CPL_CONTROL_ANCHOR_ACK || type == CPL_CONTROL_ARMED_ACK;
-
-        if (cpl_control_phase_accept(&phase, type, certified) != CPL_OK) {
-            return false;
-        }
-    }
-    return cpl_control_phase_accept(&phase, CPL_CONTROL_CLI_RUNNING, true) ==
-            CPL_ERR_CONTROL_PHASE &&
-        cpl_control_phase_accept(&phase, CPL_CONTROL_ANCHOR_IDENTITY, true) ==
-            CPL_ERR_CONTROL_PHASE;
-}
-
-static bool scenario_is_unconfirmed(const char *scenario) {
-    return strcmp(scenario, "kill_supervisor_after_running") == 0 ||
-        strcmp(scenario, "altered_executable_identity") == 0 ||
-        strcmp(scenario, "reused_pid") == 0 ||
-        strcmp(scenario, "unexpected_descendant") == 0 ||
-        strcmp(scenario, "wedged_supervisor") == 0;
-}
-
-static bool scenario_is_stubborn(const char *scenario) {
-    return strcmp(scenario, "stubborn_child_kill") == 0 ||
-        strcmp(scenario, "during_kill_batch") == 0;
-}
-
-static bool scenario_uses_retained_group(const char *scenario) {
-    return strcmp(scenario, "ordinary_term_success") == 0 ||
-        strcmp(scenario, "confirmed_reap") == 0 ||
-        strcmp(scenario, "parent_held_zombie_nonreuse") == 0 ||
-        strcmp(scenario, "after_running") == 0 ||
-        strcmp(scenario, "during_term_batch") == 0 ||
-        scenario_is_stubborn(scenario);
-}
-
-static bool known_scenario(const char *scenario) {
-    static const char *const names[] = {
-        "control_frame_validation", "supervisor_before_identity",
-        "anchor_before_identity", "cli_before_armed",
-        "after_armed_before_exec", "after_running", "during_term_batch",
-        "during_kill_batch", "kill_supervisor_after_running",
-        "pre_armed_fail_dead", "ordinary_term_success",
-        "stubborn_child_kill", "confirmed_reap",
-        "parent_held_zombie_nonreuse", "altered_executable_identity",
-        "reused_pid", "unexpected_descendant", "stale_executor",
-        "retirement_replacement", "interrupted_batch_replay",
-        "wedged_supervisor",
-    };
-    size_t index;
-
-    for (index = 0U; index < sizeof(names) / sizeof(names[0]); ++index) {
-        if (strcmp(scenario, names[index]) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static int run_scenario(const char *scenario) {
-    struct group_probe group;
-    bool unconfirmed;
-    bool control_ok = true;
-    bool fallback_ok = true;
-
-    if (scenario == NULL || !known_scenario(scenario)) {
-        return SUPERVISOR_USAGE_EXIT;
-    }
-    unconfirmed = scenario_is_unconfirmed(scenario);
-    (void)memset(&group, 0, sizeof(group));
-    if (strcmp(scenario, "control_frame_validation") == 0) {
-        control_ok = control_frame_validation_probe();
-    } else if (scenario_uses_retained_group(scenario)) {
-        group = run_retaining_group_probe(scenario_is_stubborn(scenario));
-    } else if (strcmp(scenario, "kill_supervisor_after_running") == 0) {
-        fallback_ok = run_anchor_self_term_probe();
-    }
-    if (!control_ok || !fallback_ok ||
-        (scenario_uses_retained_group(scenario) && !group.ok) ||
-        task4_authority_probe(unconfirmed) < 0) {
-        return SUPERVISOR_FAIL_DEAD_EXIT;
-    }
-    (void)printf(
-        "{\"outcome\":\"%s\",\"task4_authority\":true,"
-        "\"control_validated\":%s,\"retaining\":%s,"
-        "\"stop\":%s,\"enumerated\":%s,\"term\":%s,\"kill\":%s,"
-        "\"unreaped\":%s,\"reaped\":%s,\"zombie\":%s,"
-        "\"group_absent\":%s,\"absence_enumerated\":%s,"
-        "\"fallback\":%s}\n",
-        unconfirmed ? "unconfirmed" : "done",
-        control_ok ? "true" : "false",
-        scenario_uses_retained_group(scenario) ? "true" : "false",
-        group.stop_used ? "true" : "false",
-        group.enumerated_while_stopped ? "true" : "false",
-        (group.term_used || strcmp(scenario,
-            "kill_supervisor_after_running") == 0) ? "true" : "false",
-        group.kill_used ? "true" : "false",
-        group.anchor_unreaped ? "true" : "false",
-        group.anchor_reaped ? "true" : "false",
-        group.zombie_observed ? "true" : "false",
-        group.group_absent ? "true" : "false",
-        group.absence_enumerated ? "true" : "false",
-        fallback_ok ? "true" : "false");
-    return 0;
-}
 
 int main(int argc, char **argv) {
     struct bootstrap_values bootstrap;
@@ -1643,7 +1450,6 @@ int main(int argc, char **argv) {
     int directory_fd = -1;
     int cli_argc;
     char **cli_argv;
-    const char *scenario_token;
     int status;
     struct sigaction ignored;
 
@@ -1654,12 +1460,6 @@ int main(int argc, char **argv) {
         return SUPERVISOR_FAIL_DEAD_EXIT;
     }
 
-    scenario_token = getenv("LOCAL_PROXY_PROBE_SCENARIO_TOKEN");
-    if (argc == 3 && strcmp(argv[1], "--probe-scenario") == 0 &&
-        scenario_token != NULL &&
-        strcmp(scenario_token, "task5-local-only") == 0) {
-        return run_scenario(argv[2]);
-    }
     if (parse_bootstrap_values(&bootstrap) < 0) {
         return SUPERVISOR_FAIL_DEAD_EXIT;
     }

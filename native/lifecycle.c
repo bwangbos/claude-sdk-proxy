@@ -121,6 +121,8 @@ _Static_assert(sizeof(struct cpl_reap_proof) == CPL_ABI_REAP_PROOF_SIZE,
 _Static_assert(sizeof(struct cpl_cleanup_evidence) ==
     CPL_ABI_CLEANUP_EVIDENCE_SIZE,
     "cpl_cleanup_evidence ABI layout changed");
+_Static_assert(sizeof(struct cpl_cleanup_ack) == CPL_ABI_CLEANUP_ACK_SIZE,
+    "cpl_cleanup_ack ABI layout changed");
 _Static_assert(sizeof(struct cpl_control_frame) == CPL_ABI_CONTROL_FRAME_SIZE,
     "cpl_control_frame ABI layout changed");
 _Static_assert(CPL_HEADER_SIZE + sizeof(struct cpl_record) ==
@@ -388,7 +390,7 @@ static void sha256(const uint8_t *data, size_t length,
 
 static bool valid_control_type(uint16_t type) {
     return type >= CPL_CONTROL_SUPERVISOR_IDENTITY &&
-        type <= CPL_CONTROL_ERROR;
+        type <= CPL_CONTROL_CLEANUP_ACK;
 }
 
 int cpl_control_frame_encode(uint16_t type,
@@ -611,6 +613,10 @@ int cpl_control_phase_accept(uint32_t *inout_phase, uint16_t type,
         *inout_phase = CPL_CONTROL_PHASE_ERROR;
         return CPL_OK;
     }
+    if (type == CPL_CONTROL_CLEANUP_ACK) {
+        return *inout_phase == CPL_CONTROL_PHASE_CLEANUP_REQUEST &&
+            durable_head_certified ? CPL_OK : CPL_ERR_CONTROL_PHASE;
+    }
     expected = *inout_phase + 1U;
     if (((uint32_t)type != expected &&
          !(type == CPL_CONTROL_SELF_TERM_REQUEST &&
@@ -655,7 +661,8 @@ static bool bootstrap_transition(uint16_t current, bool present,
             next == CPL_CONTROL_SELF_TERM_REQUEST;
     }
     if (current == CPL_CONTROL_CLEANUP_REQUEST) {
-        return next == CPL_CONTROL_CLEANUP_RESULT;
+        return next == CPL_CONTROL_CLEANUP_RESULT ||
+            next == CPL_CONTROL_ERROR;
     }
     return false;
 }

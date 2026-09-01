@@ -1,6 +1,6 @@
 # Task 5 report — supervisor and anchor cleanup ownership
 
-Status: DONE — Fix Round 1 implemented and verified
+Status: DONE — Fix Round 2 implemented and verified
 
 Base: `f8bd3776de64acf7bb5748398d3854d2f66b6fe1`
 
@@ -257,3 +257,129 @@ It collected 24 tests and passed all 24 with zero skips, XPASS, or warnings.
 
 No Claude CLI, model, network peer, pre-existing process, or pre-existing
 allocation artifact was contacted or modified during this fix round.
+
+## Fix Round 2
+
+Fix Round 2 base: `50d01ebf3efbca59383fb78a9ecfd3b8a64abed2`
+
+Fix Round 2 commit: this commit
+
+### Review finding disposition
+
+All Fix Round 2 findings are resolved on measured, canonical lifecycles:
+
+- The exact Task 4 `PROCESS_ABSENT` batch is now admitted before STOP or any
+  later group signal. Its opaque action token remains retained through STOP,
+  complete stopped-group enumeration, CONT, TERM, optional KILL, and the final
+  non-anchor absence proof. Only then may the batch execute and complete.
+- Six deterministic test-only checkpoints return an injected failure after
+  admission, STOP, enumeration, CONT, TERM, or KILL. The STOP and enumeration
+  checkpoints first resume the exactly re-observed retained group, then
+  revalidate, restop, and re-enumerate it. If an unexpected recovery operation
+  fails, the live supervisor keeps the Task 4 token and repeatedly resumes an
+  exactly re-observed stopped group instead of exiting or leaving it frozen.
+  The Python driver likewise retains that actor and its temporary directory if
+  it remains live, rather than killing it during exception cleanup.
+- Complete stopped enumeration now accepts the valid anchor-only state after an
+  already-exited CLI. The proof still requires the exact retained direct-child
+  anchor, `PID = PGID = SID`, and every present member stopped.
+- The anchor fallback is gated by all of: canonical RUNNING phase, proven loss
+  of the internal supervisor channel, exact zero-length payload, the dedicated
+  authenticated frame type, and a one-shot consumption latch. It appends and
+  certifies that exact empty payload before self-TERM. Early, healthy-parent,
+  nonempty, wrong-phase, and duplicate requests cause neither a signal nor a
+  canonical journal mutation.
+- Cleanup now has an explicit fixed-size `CLEANUP_ACK` containing the exact
+  certified cleanup-request sequence and hash. This removes the race in which
+  a later authenticated ERROR could become the head before the caller verified
+  cleanup admission. Existing control type numbers remain unchanged.
+- Altered executable, reused identity, and unexpected-descendant rejection all
+  run the real bootstrap through RUNNING and the authenticated cleanup request
+  on one journal. The probe supervisor emits a journaled ERROR reason and exits
+  75 before any signal; the retained anchor is exactly re-observed and the same
+  allocation becomes persistent UNCONFIRMED.
+- Stale executor, retirement-authority replacement, interrupted-batch replay,
+  and wedged-executor rows use fresh real Task 4 journals and process-group
+  executors. Each row admits a bounded exact batch; non-wedged rows observe
+  expiry, retirement, reap proof, exact-batch reconciliation, and successor
+  activation before retaining UNCONFIRMED. The wedged row proves retirement is
+  rejected while the exact executor lease remains live.
+- Control validation now performs six real inherited-FD bootstrap attempts,
+  each on its own canonical allocation, and observes fail-dead exit 75 for an
+  unknown type, wrong nonce, duplicate phase, phase regression, oversized
+  payload, or bad checksum. ACK-without-certification is rejected by the real
+  control phase gate.
+- Pre-release, post-RUNNING, TERM, and KILL boundaries all route through their
+  real canonical lifecycle implementations. The former JSON scenario engine,
+  name-derived Task 4 authority simulator, and all dead native probe code were
+  removed.
+- Production `claude-proxy-supervisor` no longer recognizes
+  `--probe-scenario` or the former magic environment token. Test injections are
+  compiled only into `claude-proxy-supervisor-probe`. A valid production
+  bootstrap forwards the colliding ordinary argv to the substitute CLI and
+  completes the same Task 4-authorized cleanup/deletion lifecycle.
+
+### Fix-round TDD evidence
+
+The new tests were written before each implementation slice and produced the
+expected RED failures:
+
+- seven cleanup-checkpoint/anchor-only rows failed as unknown scenarios;
+- five fallback rejection/replay rows failed as unknown scenarios;
+- the production argv collision row failed because the old supervisor
+  interception produced `cli_exec_count == 0`;
+- identity rejection rows failed their same-journal, authenticated-reason, and
+  observed-evidence assertions;
+- handoff, wedged-executor, crash-boundary, pre-ARMED, and control-validation
+  rows failed after their tests were strengthened to reject synthesized or
+  name-derived evidence;
+- making every handoff row preserve an exact batch first exposed overlong batch
+  IDs, then a retained native action lock; bounded IDs and explicit test-owner
+  abandonment fixed those concrete failures without dropping the canonical
+  active-batch record;
+- mypy caught a teardown identity variable that lacked an explicit optional
+  type, and Apple clang analysis caught four dead stores in the supervisor.
+
+Final exact focused command:
+
+```text
+make -B native && UV_CACHE_DIR=/private/tmp/claude-sdk-proxy-uv-cache uv run pytest --strict-markers --forbid-skips -W error tests/darwin/test_bootstrap.py tests/darwin/test_group_cleanup.py tests/darwin/test_anchor_fallback.py tests/darwin/test_reconciliation.py -v
+```
+
+It rebuilt every native target, collected 36 tests, and passed all 36 with zero
+skips, XPASS, or warnings in 7.93 seconds.
+
+A bounded host-permission stress run executed ten iterations each of
+post-enumeration cleanup failure, duplicate fallback, unexpected-descendant
+rejection, stale executor, retirement replacement, interrupted-batch replay,
+and wedged executor. All 70 iterations completed successfully.
+
+### Fix-round full verification
+
+- `UV_CACHE_DIR=/private/tmp/claude-sdk-proxy-uv-cache make check`: 151 unit
+  tests passed; Ruff and mypy were clean.
+- Host-permission `UV_CACHE_DIR=/private/tmp/claude-sdk-proxy-uv-cache make
+  darwin`: 141 Darwin tests passed with zero skips, XPASS, or warnings.
+- `make -B native` rebuilt all seven native targets with Apple clang strict C17
+  flags (`-Wall -Wextra -Werror -pedantic`), including the separately compiled
+  injection-only supervisor.
+- Apple clang static analysis of `native/lifecycle.c`, production and probe
+  variants of `native/claude_supervisor.c`, `native/claude_anchor.c`, and
+  `native/claude_probe_child.c` produced five empty 370-byte plist reports and
+  no diagnostics.
+- `file` reports arm64 Mach-O for both supervisors, the anchor, probe child, and
+  production dylib. `otool -L` confirms all three lifecycle consumers resolve
+  `@rpath/libclaude_proxy_lifecycle.dylib`, whose install name is the same.
+- The production dylib exports all five control entry points and both bootstrap
+  append/certify entry points, and exports no `_cpl_fault_*` symbol. The fault
+  dylib retains its expected fault-only exports. Compile-time ABI assertions
+  cover the unchanged 4144-byte control frame, expanded 40-byte cleanup
+  evidence, and new 40-byte cleanup ACK.
+- All 34 declared lifecycle scenarios are exhaustively routed to real
+  implementations. `git diff --check` is clean, and no analyzer artifact was
+  written into the worktree.
+
+No Claude CLI, model, network peer, pre-existing process, or pre-existing
+allocation artifact was contacted or modified during Fix Round 2. Signals were
+limited to freshly spawned deterministic Task 5 process groups, and deletion
+was limited to Task 4-certified `allocation.workdir` artifacts.

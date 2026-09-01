@@ -1179,7 +1179,7 @@ class Journal:
     ) -> BootstrapHead:
         if (
             isinstance(message_type, bool)
-            or not 1 <= message_type <= 10
+            or not 1 <= message_type <= 11
             or not isinstance(payload, bytes)
             or len(payload) > 256
         ):

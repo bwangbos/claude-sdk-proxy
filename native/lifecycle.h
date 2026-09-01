@@ -47,7 +47,8 @@ extern "C" {
 #define CPL_ABI_DELETE_RECEIPT_SIZE 40U
 #define CPL_ABI_ACTION_TOKEN_SIZE 72U
 #define CPL_ABI_REAP_PROOF_SIZE 72U
-#define CPL_ABI_CLEANUP_EVIDENCE_SIZE 24U
+#define CPL_ABI_CLEANUP_EVIDENCE_SIZE 40U
+#define CPL_ABI_CLEANUP_ACK_SIZE 40U
 #define CPL_CONTROL_MAGIC 0x464c5043U
 #define CPL_CONTROL_VERSION 1U
 #define CPL_CONTROL_MAX_PAYLOAD 4096U
@@ -110,6 +111,7 @@ enum cpl_control_type {
     CPL_CONTROL_SELF_TERM_REQUEST = 9,
     CPL_CONTROL_CLEANUP_RESULT = 10,
     CPL_CONTROL_ERROR = 11,
+    CPL_CONTROL_CLEANUP_ACK = 12,
 };
 
 enum cpl_control_phase {
@@ -266,6 +268,12 @@ enum cpl_cleanup_evidence_flag {
     CPL_CLEANUP_ANCHOR_REAPED = 1U << 6,
     CPL_CLEANUP_TASK4_DONE = 1U << 7,
     CPL_CLEANUP_GROUP_ENUMERATION_COMPLETE = 1U << 8,
+    CPL_CLEANUP_PROCESS_BATCH_PREAUTHORIZED = 1U << 9,
+    CPL_CLEANUP_TOKEN_RETAINED_THROUGH_SIGNALS = 1U << 10,
+    CPL_CLEANUP_PROCESS_TARGET_EXACT = 1U << 11,
+    CPL_CLEANUP_INJECTION_RECOVERED = 1U << 12,
+    CPL_CLEANUP_ANCHOR_ONLY_OBSERVED = 1U << 13,
+    CPL_CLEANUP_GROUP_RESUMED_AFTER_FAILURE = 1U << 14,
 };
 
 struct cpl_cleanup_evidence {
@@ -273,6 +281,14 @@ struct cpl_cleanup_evidence {
     uint32_t batch_count;
     uint64_t completed_steps;
     uint64_t done_sequence;
+    uint64_t process_batch_admission_sequence;
+    uint32_t injection_stage;
+    uint32_t reserved;
+};
+
+struct cpl_cleanup_ack {
+    uint64_t sequence;
+    uint8_t hash[CPL_HASH_SIZE];
 };
 
 struct cpl_batch_descriptor {

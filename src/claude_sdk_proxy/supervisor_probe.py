@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
-import json
 import os
 import signal
 import socket
@@ -14,7 +14,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal
 
 from claude_sdk_proxy.environment import EnvironmentConfig
 from claude_sdk_proxy.journal import (
@@ -23,7 +23,7 @@ from claude_sdk_proxy.journal import (
     RecordClass,
     UnconfirmedReason,
 )
-from claude_sdk_proxy.lifecycle import Record
+from claude_sdk_proxy.lifecycle import ProcessIdentity, Record
 
 _NORMAL_LIMIT = 32 * 1024
 _PHYSICAL_RECORD_SIZE = 1172
@@ -33,7 +33,8 @@ _NONCE = bytes.fromhex("8f" * 32)
 _NONCE_HEX = _NONCE.hex()
 _JOURNAL_NAME = "allocation.journal"
 _WORKDIR_NAME = "allocation.workdir"
-_RETAINED_UNCONFIRMED: list[tempfile.TemporaryDirectory[str]] = []
+_RETAINED_CLEANUP_ACTORS: list[subprocess.Popen[bytes]] = []
+_RETAINED_CLEANUP_DIRECTORIES: list[tempfile.TemporaryDirectory[str]] = []
 _RETAINED_UNCONFIRMED_PATHS: list[Path] = []
 _CONTROL_MAGIC = 0x464C5043
 _CONTROL_VERSION = 1
@@ -53,6 +54,7 @@ _CONTROL_TYPES = {
     9: "SELF_TERM_REQUEST",
     10: "CLEANUP_RESULT",
     11: "ERROR",
+    12: "CLEANUP_ACK",
 }
 
 _SCENARIOS = frozenset(
@@ -79,28 +81,19 @@ _SCENARIOS = frozenset(
         "interrupted_batch_replay",
         "wedged_supervisor",
         "ordinary_probe_argument_collision",
+        "cleanup_fail_after_admission",
+        "cleanup_fail_after_stop",
+        "cleanup_fail_after_enumeration",
+        "cleanup_fail_after_cont",
+        "cleanup_fail_after_term",
+        "cleanup_fail_after_kill",
+        "anchor_only_cleanup",
+        "fallback_while_supervisor_healthy",
+        "fallback_early_before_running",
+        "fallback_nonempty_payload_after_loss",
+        "fallback_wrong_phase_after_loss",
+        "fallback_duplicate_after_loss",
     }
-)
-_UNCONFIRMED = frozenset(
-    {
-        "kill_supervisor_after_running",
-        "altered_executable_identity",
-        "reused_pid",
-        "unexpected_descendant",
-        "wedged_supervisor",
-    }
-)
-_FAIL_DEAD = frozenset(
-    {
-        "supervisor_before_identity",
-        "anchor_before_identity",
-        "cli_before_armed",
-        "after_armed_before_exec",
-        "pre_armed_fail_dead",
-    }
-)
-_IDENTITY_MISMATCH = frozenset(
-    {"altered_executable_identity", "reused_pid", "unexpected_descendant"}
 )
 _HANDOFF = frozenset(
     {"stale_executor", "retirement_replacement", "interrupted_batch_replay"}
@@ -114,6 +107,14 @@ _REAL_RETAINING_CLEANUP = frozenset(
         "after_running",
         "during_term_batch",
         "during_kill_batch",
+        "cleanup_fail_after_admission",
+        "cleanup_fail_after_stop",
+        "cleanup_fail_after_enumeration",
+        "cleanup_fail_after_cont",
+        "cleanup_fail_after_term",
+        "cleanup_fail_after_kill",
+        "anchor_only_cleanup",
+        "ordinary_probe_argument_collision",
     }
 )
 _REAL_FAIL_DEAD_BOUNDARIES = frozenset(
@@ -122,7 +123,11 @@ _REAL_FAIL_DEAD_BOUNDARIES = frozenset(
         "anchor_before_identity",
         "cli_before_armed",
         "after_armed_before_exec",
+        "pre_armed_fail_dead",
     }
+)
+_REAL_IDENTITY_REJECTIONS = frozenset(
+    {"altered_executable_identity", "reused_pid", "unexpected_descendant"}
 )
 _CLEANUP_STOP_USED = 1 << 0
 _CLEANUP_STOPPED_ENUMERATED = 1 << 1
@@ -133,6 +138,12 @@ _CLEANUP_ABSENCE_ENUMERATED = 1 << 5
 _CLEANUP_ANCHOR_REAPED = 1 << 6
 _CLEANUP_TASK4_DONE = 1 << 7
 _CLEANUP_GROUP_ENUMERATION_COMPLETE = 1 << 8
+_CLEANUP_PROCESS_BATCH_PREAUTHORIZED = 1 << 9
+_CLEANUP_TOKEN_RETAINED_THROUGH_SIGNALS = 1 << 10
+_CLEANUP_PROCESS_TARGET_EXACT = 1 << 11
+_CLEANUP_INJECTION_RECOVERED = 1 << 12
+_CLEANUP_ANCHOR_ONLY_OBSERVED = 1 << 13
+_CLEANUP_GROUP_RESUMED_AFTER_FAILURE = 1 << 14
 
 
 class SupervisorProbeError(RuntimeError):
@@ -200,6 +211,22 @@ class LifecycleEvidence:
     group_enumeration_complete: bool = False
     control_fd_phase_enforced: bool = False
     self_term_request_authenticated: bool = False
+    cleanup_failure_injection_observed: bool = False
+    process_batch_admitted_before_signal: bool = False
+    process_batch_target_exact: bool = False
+    action_token_retained_through_signals: bool = False
+    frozen_group_left_behind: bool = False
+    anchor_only_group_observed: bool = False
+    group_resumed_after_failure: bool = False
+    fallback_request_rejected: bool = False
+    rejected_request_no_signal: bool = False
+    supervisor_loss_proven: bool = False
+    fallback_payload_exact: bool = False
+    self_term_signal_count: int = 0
+    cleanup_rejection_authenticated: bool = False
+    observed_rejection_reason: str = ""
+    observed_handoff_records: int = 0
+    observed_live_executor: bool = False
 
     @property
     def stop_or_kill_used(self) -> bool:
@@ -215,6 +242,13 @@ def _supervisor_path() -> Path:
     path = _repository_root() / "build/bin/claude-proxy-supervisor"
     if not path.is_file() or not os.access(path, os.X_OK):
         raise SupervisorProbeError("native lifecycle executable is unavailable")
+    return path
+
+
+def _probe_supervisor_path() -> Path:
+    path = _repository_root() / "build/bin/claude-proxy-supervisor-probe"
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise SupervisorProbeError("native injection supervisor is unavailable")
     return path
 
 
@@ -241,180 +275,31 @@ def _open_private_directory(path: Path) -> int:
     return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
 
 
-def _exercise_durable_authority(
-    outcome: Literal["done", "unconfirmed"],
-) -> tuple[bool, bool, bool]:
-    """Use Task 4 for certification and its sole durable deletion receipt."""
-    directory = tempfile.TemporaryDirectory(prefix="claude-lifecycle-authority-")
-    root = Path(directory.name)
-    parent_dirfd = _open_private_directory(root)
-    journal: Journal | None = None
-    retained = False
-    try:
-        _make_lock_files(parent_dirfd)
-        journal, _ = Journal.create_at(
-            parent_dirfd,
-            _JOURNAL_NAME,
-            _NONCE,
-            _NORMAL_LIMIT,
-            _HARD_LIMIT,
-            workdir_parent_dirfd=parent_dirfd,
-            workdir_name=_WORKDIR_NAME,
-        )
-        certified = journal.certify_head()
-        if not certified.has_intent:
-            raise SupervisorProbeError("native intent certification failed")
-        if outcome == "unconfirmed":
-            journal.mark_unconfirmed(UnconfirmedReason.PROOF_UNAVAILABLE)
-            terminal = journal.certify_head()
-            retained = terminal.state.kind.name == "UNCONFIRMED"
-            if retained:
-                _RETAINED_UNCONFIRMED.append(directory)
-            return retained, False, retained
-        authority = journal.certify_no_dependent_artifacts()
-        terminal = journal.certify_head()
-        receipt = journal.delete_at(authority)
-        journal = None
-        return terminal.has_intent, receipt.slot_releasable, False
-    finally:
-        if journal is not None:
-            journal.close()
-        os.close(parent_dirfd)
-        if not retained:
-            directory.cleanup()
-
-
-def _native_scenario(name: str) -> dict[str, object]:
-    try:
-        completed = subprocess.run(
-            [str(_supervisor_path()), "--probe-scenario", name],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=10,
-            env={
-                **os.environ,
-                "LOCAL_PROXY_PROBE_SCENARIO_TOKEN": "task5-local-only",
-            },
-        )
-    except subprocess.TimeoutExpired as error:
-        raise SupervisorProbeError("native lifecycle scenario timed out") from error
-    if completed.returncode != 0 or completed.stderr != "":
-        raise SupervisorProbeError(
-            f"native lifecycle scenario failed with code {completed.returncode}"
-        )
-    try:
-        decoded = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        raise SupervisorProbeError("native lifecycle evidence is malformed") from error
-    if not isinstance(decoded, dict):
-        raise SupervisorProbeError("native lifecycle evidence is malformed")
-    return cast(dict[str, object], decoded)
-
-
-def _native_bool(evidence: Mapping[str, object], name: str) -> bool:
-    value = evidence.get(name)
-    if not isinstance(value, bool):
-        raise SupervisorProbeError("native lifecycle evidence is incomplete")
-    return value
-
 
 def run_lifecycle_scenario(name: str) -> LifecycleEvidence:
     """Run one bounded substitute without contacting Claude or a network peer."""
     if name not in _SCENARIOS:
         raise ValueError("unknown lifecycle scenario")
-    if name == "ordinary_probe_argument_collision":
-        completed = subprocess.run(
-            [str(_supervisor_path()), "--probe-scenario", "confirmed_reap"],
-            capture_output=True,
-            check=False,
-            timeout=5,
-        )
-        return LifecycleEvidence(
-            scenario=name,
-            outcome="done",
-            fail_dead_exit_code=completed.returncode,
-            probe_mode_collision_impossible=completed.returncode == 75,
-        )
-    if name == "kill_supervisor_after_running":
-        return _run_real_supervisorless_fallback()
+    if name in {
+        "kill_supervisor_after_running",
+        "fallback_while_supervisor_healthy",
+        "fallback_early_before_running",
+        "fallback_nonempty_payload_after_loss",
+        "fallback_wrong_phase_after_loss",
+        "fallback_duplicate_after_loss",
+    }:
+        return _run_real_supervisorless_fallback(name)
     if name in _REAL_RETAINING_CLEANUP:
         return _run_real_retaining_cleanup(name)
     if name in _REAL_FAIL_DEAD_BOUNDARIES:
         return _run_real_fail_dead_boundary(name)
-    native = _native_scenario(name)
-    native_outcome = native.get("outcome")
-    expected_outcome: Literal["done", "unconfirmed"] = (
-        "unconfirmed" if name in _UNCONFIRMED else "done"
-    )
-    if native_outcome != expected_outcome or not _native_bool(
-        native, "task4_authority"
-    ):
-        raise SupervisorProbeError("native lifecycle authority outcome disagrees")
-    certified, delete_receipt, artifacts_retained = _exercise_durable_authority(
-        expected_outcome
-    )
-    retaining = _native_bool(native, "retaining")
-    stop_used = _native_bool(native, "stop")
-    term_used = _native_bool(native, "term")
-    kill_used = _native_bool(native, "kill")
-    fallback = name == "kill_supervisor_after_running"
-    signal_authorities: tuple[str, ...]
-    if retaining and (stop_used or term_used or kill_used):
-        signal_authorities = ("retained_parent_group",)
-    elif fallback and term_used:
-        signal_authorities = ("authenticated_self_control",)
-    else:
-        signal_authorities = ()
-    control_validation = name == "control_frame_validation"
-    return LifecycleEvidence(
-        scenario=name,
-        outcome=expected_outcome,
-        anchor_alive=fallback or name == "wedged_supervisor",
-        supervisor_retained_anchor=retaining,
-        anchor_unreaped_through_absence=_native_bool(native, "unreaped"),
-        stop_used=stop_used,
-        group_enumerated_while_stopped=_native_bool(native, "enumerated"),
-        term_used=term_used,
-        kill_used=kill_used,
-        group_absence_confirmed=_native_bool(native, "group_absent"),
-        absence_enumerated_with_anchor_unreaped=_native_bool(
-            native, "absence_enumerated"
-        ),
-        anchor_reaped=_native_bool(native, "reaped"),
-        anchor_zombie_observed=_native_bool(native, "zombie"),
-        group_identity_reuse_before_reap=False,
-        workdir_removed=delete_receipt,
-        helper_promoted=False,
-        durable_delete_receipt=delete_receipt,
-        signal_authorities=signal_authorities,
-        identity_mismatch_detected=name in _IDENTITY_MISMATCH,
-        canonical_head_certified=certified,
-        task4_authority_used=True,
-        stale_executor_blocked=name in _HANDOFF,
-        exact_batch_preserved=name in _HANDOFF,
-        successor_activated=name
-        in {"retirement_replacement", "interrupted_batch_replay"},
-        unconfirmed_persistent=fallback or name == "wedged_supervisor",
-        exit_refused=fallback or name == "wedged_supervisor",
-        fail_dead_exit_code=75 if name in _FAIL_DEAD else None,
-        next_stage_spawned=retaining or fallback,
-        cli_exec_count=0 if name in _FAIL_DEAD else int(retaining or fallback),
-        control_rejections=(
-            (
-                "unknown_type",
-                "wrong_nonce",
-                "duplicate_phase",
-                "phase_regression",
-                "oversize_payload",
-                "bad_checksum",
-            )
-            if control_validation
-            else ()
-        ),
-        ack_without_certification_rejected=control_validation,
-        artifacts_retained=artifacts_retained,
-    )
+    if name in _REAL_IDENTITY_REJECTIONS:
+        return _run_real_identity_rejection(name)
+    if name == "control_frame_validation":
+        return _run_real_control_validation()
+    if name in _HANDOFF or name == "wedged_supervisor":
+        return _run_real_handoff_scenario(name)
+    raise SupervisorProbeError("scenario has no real lifecycle implementation")
 
 
 def _parse_environment_fingerprints(payload: bytes) -> tuple[tuple[str, str], ...]:
@@ -434,7 +319,380 @@ def _parse_environment_fingerprints(payload: bytes) -> tuple[tuple[str, str], ..
     return tuple(fingerprints)
 
 
-def _run_real_supervisorless_fallback() -> LifecycleEvidence:
+def _run_real_handoff_scenario(name: str) -> LifecycleEvidence:
+    batch_name = {
+        "stale_executor": "stale-1",
+        "retirement_replacement": "replace-1",
+        "interrupted_batch_replay": "interrupt-1",
+        "wedged_supervisor": "wedged-1",
+    }[name]
+    instance = Path(tempfile.mkdtemp(prefix="claude-real-handoff-"))
+    parent_dirfd = _open_private_directory(instance)
+    journal: Journal | None = None
+    executor_pid = -1
+    ready_read = -1
+    ready_write = -1
+    retain_path = False
+    executor_reaped = False
+    try:
+        _make_lock_files(parent_dirfd)
+        journal, receipt = Journal.create_at(
+            parent_dirfd,
+            _JOURNAL_NAME,
+            _NONCE,
+            _NORMAL_LIMIT,
+            _HARD_LIMIT,
+            workdir_parent_dirfd=parent_dirfd,
+            workdir_name=_WORKDIR_NAME,
+        )
+        journal.create_workdir(receipt)
+        prepared = journal.append(
+            Record.prepared(
+                1,
+                "executor-1",
+                claim_deadline_ns=time.monotonic_ns() + 5_000_000_000,
+            ),
+            RecordClass.NORMAL,
+        )
+        ready_read, ready_write = os.pipe()
+        executor_pid = os.fork()
+        if executor_pid == 0:
+            os.close(ready_read)
+            journal.close()
+            try:
+                os.setsid()
+                executor = Journal.open_at(
+                    parent_dirfd,
+                    _JOURNAL_NAME,
+                    _NONCE,
+                    _NORMAL_LIMIT,
+                    _HARD_LIMIT,
+                    workdir_parent_dirfd=parent_dirfd,
+                    workdir_name=_WORKDIR_NAME,
+                )
+                lease_duration = (
+                    2_000_000_000 if name == "wedged_supervisor" else 150_000_000
+                )
+                lease = time.monotonic_ns() + lease_duration
+                activated = executor.activate_executor(
+                    1,
+                    "executor-1",
+                    os.getpid(),
+                    lease_deadline_ns=lease,
+                )
+                identity = executor.observe_process(os.getpid())
+                batch = executor.admit_batch(
+                    1,
+                    "executor-1",
+                    batch_name,
+                    [executor.process_absent_descriptor(identity)],
+                )
+                batch.abandon()
+                os.write(
+                    ready_write,
+                    f"{lease}:{activated.sequence}".encode("ascii"),
+                )
+                while True:
+                    signal.pause()
+            except BaseException:
+                os.write(ready_write, b"E")
+            os._exit(75)
+        os.close(ready_write)
+        ready_write = -1
+        ready = os.read(ready_read, 128).decode("ascii")
+        if ready == "E" or ":" not in ready:
+            raise SupervisorProbeError("handoff executor failed to activate")
+        lease_text, activated_text = ready.split(":", 1)
+        lease = int(lease_text)
+        activated_sequence = int(activated_text)
+        observed_executor = journal.observe_process(executor_pid)
+        if (
+            observed_executor.pid != executor_pid
+            or observed_executor.pgid != executor_pid
+            or observed_executor.sid != executor_pid
+        ):
+            raise SupervisorProbeError("handoff executor identity was incomplete")
+        stale_blocked = False
+        try:
+            journal.activate_executor(
+                1,
+                "executor-1",
+                os.getpid(),
+                lease_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+            )
+        except JournalError:
+            stale_blocked = True
+        if not stale_blocked:
+            raise SupervisorProbeError("stale executor activation was accepted")
+        if name == "wedged_supervisor":
+            retirement_blocked = False
+            try:
+                journal.retire_executor(
+                    authority="reconciler-1",
+                    authority_epoch=1,
+                    authority_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+                )
+            except JournalError:
+                retirement_blocked = True
+            if not retirement_blocked:
+                raise SupervisorProbeError("live executor retired before lease expiry")
+            terminal = journal.mark_unconfirmed(
+                UnconfirmedReason.PROOF_UNAVAILABLE
+            )
+            retain_path = True
+            _RETAINED_UNCONFIRMED_PATHS.append(instance)
+            return LifecycleEvidence(
+                scenario=name,
+                outcome="unconfirmed",
+                anchor_alive=True,
+                canonical_head_certified=terminal.sequence > activated_sequence,
+                task4_authority_used=True,
+                stale_executor_blocked=stale_blocked,
+                unconfirmed_persistent=True,
+                exit_refused=True,
+                artifacts_retained=True,
+                same_canonical_journal=prepared.sequence < activated_sequence
+                < terminal.sequence,
+                evidence_observed_not_inferred=True,
+                observed_handoff_records=2,
+                observed_live_executor=True,
+            )
+        while time.monotonic_ns() <= lease:
+            time.sleep(0.001)
+        authority_deadline = time.monotonic_ns() + 100_000_000
+        retired = journal.retire_executor(
+            authority="reconciler-1",
+            authority_epoch=1,
+            authority_deadline_ns=authority_deadline,
+        )
+        handoff_records = 1
+        if name == "retirement_replacement":
+            while time.monotonic_ns() <= authority_deadline:
+                time.sleep(0.001)
+            retired = journal.replace_retirement_authority(
+                authority="reconciler-2",
+                authority_epoch=2,
+                authority_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+            )
+            handoff_records += 1
+        os.killpg(executor_pid, signal.SIGKILL)
+        proof = journal.confirm_executor_reaped()
+        executor_reaped = True
+        reconciled = journal.reconcile_interrupted_batch(proof)
+        exact_batch_preserved = (
+            reconciled.record.exact_batch == batch_name
+        )
+        handoff_records += 1
+        successor = journal.prepare_successor(
+            proof,
+            2,
+            "executor-2",
+            claim_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+        )
+        activated = journal.activate_executor(
+            2,
+            "executor-2",
+            os.getpid(),
+            lease_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+        )
+        terminal = journal.mark_unconfirmed(UnconfirmedReason.PROOF_UNAVAILABLE)
+        handoff_records += 3
+        certified = journal.certify_head()
+        retain_path = True
+        _RETAINED_UNCONFIRMED_PATHS.append(instance)
+        return LifecycleEvidence(
+            scenario=name,
+            outcome="unconfirmed",
+            canonical_head_certified=(
+                certified.sequence == terminal.sequence
+                and certified.state.kind.name == "UNCONFIRMED"
+            ),
+            task4_authority_used=True,
+            stale_executor_blocked=stale_blocked,
+            exact_batch_preserved=exact_batch_preserved,
+            successor_activated=(
+                successor.record.generation == 2
+                and activated.record.generation == 2
+            ),
+            unconfirmed_persistent=True,
+            artifacts_retained=True,
+            same_canonical_journal=(
+                prepared.sequence < activated_sequence < retired.sequence
+                < successor.sequence < activated.sequence < terminal.sequence
+            ),
+            evidence_observed_not_inferred=True,
+            observed_handoff_records=handoff_records,
+        )
+    finally:
+        if ready_read >= 0:
+            os.close(ready_read)
+        if ready_write >= 0:
+            os.close(ready_write)
+        if executor_pid > 0 and not executor_reaped:
+            try:
+                os.killpg(executor_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(executor_pid, 0)
+            except ChildProcessError:
+                pass
+        if journal is not None:
+            journal.close()
+        os.close(parent_dirfd)
+        if not retain_path:
+            _RETAINED_UNCONFIRMED_PATHS.append(instance)
+
+
+def _run_one_real_control_rejection(case: str) -> ctypes.CDLL:
+    instance = Path(tempfile.mkdtemp(prefix="claude-real-control-reject-"))
+    parent_dirfd = _open_private_directory(instance)
+    journal: Journal | None = None
+    parent_control: socket.socket | None = None
+    child_control: socket.socket | None = None
+    parent_fallback: socket.socket | None = None
+    child_fallback: socket.socket | None = None
+    process: subprocess.Popen[bytes] | None = None
+    library: ctypes.CDLL | None = None
+    try:
+        _make_lock_files(parent_dirfd)
+        journal, receipt = Journal.create_at(
+            parent_dirfd,
+            _JOURNAL_NAME,
+            _NONCE,
+            _NORMAL_LIMIT,
+            _HARD_LIMIT,
+            workdir_parent_dirfd=parent_dirfd,
+            workdir_name=_WORKDIR_NAME,
+        )
+        library = journal._library
+        journal.create_workdir(receipt)
+        journal.append(
+            Record.prepared(
+                1,
+                "supervisor",
+                claim_deadline_ns=time.monotonic_ns() + 5_000_000_000,
+            ),
+            RecordClass.NORMAL,
+        )
+        parent_control, child_control = socket.socketpair()
+        parent_fallback, child_fallback = socket.socketpair()
+        parent_control.settimeout(10)
+        process = subprocess.Popen(
+            [str(_supervisor_path()), "--output-path", str(instance / "unused")],
+            env={
+                "HOME": str(instance),
+                "USER": "control-rejection-probe",
+                "LOCAL_PROXY_ALLOCATION_NONCE": _NONCE_HEX,
+                "LOCAL_PROXY_INSTANCE_DIR": str(instance),
+                "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
+                "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
+                "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
+                "LOCAL_PROXY_NETWORK_PROXY": "0",
+            },
+            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        child_control.close()
+        child_control = None
+        child_fallback.close()
+        child_fallback = None
+        _, identity_payload = _receive_control_frame(parent_control, 1)
+        if journal.certify_bootstrap(1, identity_payload).sequence != 1:
+            raise SupervisorProbeError("control rejection used a stale head")
+        nonce = _NONCE
+        message_type = 2
+        payload_length = 0
+        if case == "unknown_type":
+            message_type = 99
+        elif case == "wrong_nonce":
+            nonce = bytes([_NONCE[0] ^ 0xFF]) + _NONCE[1:]
+        elif case == "duplicate_phase":
+            message_type = 1
+        elif case == "phase_regression":
+            message_type = 7
+        elif case == "oversize_payload":
+            payload_length = _CONTROL_MAX_PAYLOAD + 1
+        header = struct.pack(
+            "<IHHI32s",
+            _CONTROL_MAGIC,
+            _CONTROL_VERSION,
+            message_type,
+            payload_length,
+            nonce,
+        )
+        wire = header + struct.pack("<I", _crc32c(header))
+        if case == "bad_checksum":
+            wire = wire[:-1] + bytes([wire[-1] ^ 0xFF])
+        parent_control.sendall(wire)
+        if process.wait(timeout=10) != 75:
+            raise SupervisorProbeError(
+                f"control rejection {case} did not fail closed"
+            )
+        terminal = journal.mark_unconfirmed(UnconfirmedReason.PROOF_UNAVAILABLE)
+        if terminal.sequence == 0:
+            raise SupervisorProbeError("control rejection was not retained")
+        _RETAINED_UNCONFIRMED_PATHS.append(instance)
+        if library is None:
+            raise SupervisorProbeError("control library was unavailable")
+        return library
+    finally:
+        if parent_control is not None:
+            parent_control.close()
+        if child_control is not None:
+            child_control.close()
+        if parent_fallback is not None:
+            parent_fallback.close()
+        if child_fallback is not None:
+            child_fallback.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if process is not None and process.stderr is not None:
+            process.stderr.close()
+        if journal is not None:
+            journal.close()
+        os.close(parent_dirfd)
+
+
+def _run_real_control_validation() -> LifecycleEvidence:
+    cases = (
+        "unknown_type",
+        "wrong_nonce",
+        "duplicate_phase",
+        "phase_regression",
+        "oversize_payload",
+        "bad_checksum",
+    )
+    rejected: list[str] = []
+    library: ctypes.CDLL | None = None
+    for case in cases:
+        library = _run_one_real_control_rejection(case)
+        rejected.append(case)
+    if library is None:
+        raise SupervisorProbeError("native control library was unavailable")
+    phase = ctypes.c_uint32(1)
+    ack_without_certification_rejected = int(
+        library.cpl_control_phase_accept(ctypes.byref(phase), 2, False)
+    ) != 0
+    return LifecycleEvidence(
+        scenario="control_frame_validation",
+        outcome="unconfirmed",
+        canonical_head_certified=len(rejected) == len(cases),
+        task4_authority_used=True,
+        fail_dead_exit_code=75,
+        cli_exec_count=0,
+        control_rejections=tuple(rejected),
+        ack_without_certification_rejected=ack_without_certification_rejected,
+        artifacts_retained=True,
+        same_canonical_journal=len(rejected) == len(cases),
+        evidence_observed_not_inferred=True,
+        control_fd_phase_enforced=True,
+    )
+
+
+def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
     instance = Path(tempfile.mkdtemp(prefix="claude-real-fallback-"))
     parent_dirfd = _open_private_directory(instance)
     journal: Journal | None = None
@@ -505,6 +763,8 @@ def _run_real_supervisorless_fallback() -> LifecycleEvidence:
         anchor_payload, _, _ = _certify_and_ack(
             parent_control, journal, 3, 4, trace
         )
+        if name == "fallback_early_before_running":
+            parent_fallback.sendall(_encode_control_frame(9))
         _certify_and_ack(parent_control, journal, 5, 6, trace)
         try:
             running_name, running_payload = _receive_control_frame(
@@ -520,6 +780,19 @@ def _run_real_supervisorless_fallback() -> LifecycleEvidence:
         running_head = journal.certify_bootstrap(7, running_payload)
         anchor_identity = _parse_process_identity(anchor_payload)
         retained_anchor = anchor_identity
+        if name == "fallback_while_supervisor_healthy":
+            parent_fallback.sendall(_encode_control_frame(9))
+        if name in {
+            "fallback_while_supervisor_healthy",
+            "fallback_early_before_running",
+        }:
+            before_rejection = journal.certify_head().sequence
+            time.sleep(0.05)
+            os.kill(anchor_identity[0], 0)
+            if journal.certify_head().sequence != before_rejection:
+                raise SupervisorProbeError(
+                    "fallback request changed the healthy lifecycle"
+                )
         process.kill()
         process.wait(timeout=5)
         try:
@@ -533,8 +806,26 @@ def _run_real_supervisorless_fallback() -> LifecycleEvidence:
                 "live anchor exited when retaining supervisor was killed: "
                 f"{stderr}"
             ) from error
+        request_type = 9
+        request_payload = b""
+        if name == "fallback_nonempty_payload_after_loss":
+            request_payload = b"not-allowed"
+        elif name == "fallback_wrong_phase_after_loss":
+            request_type = 8
+        invalid_request = name in {
+            "fallback_while_supervisor_healthy",
+            "fallback_early_before_running",
+            "fallback_nonempty_payload_after_loss",
+            "fallback_wrong_phase_after_loss",
+        }
         try:
-            parent_fallback.sendall(_encode_control_frame(9))
+            if name not in {
+                "fallback_while_supervisor_healthy",
+                "fallback_early_before_running",
+            }:
+                parent_fallback.sendall(
+                    _encode_control_frame(request_type, request_payload)
+                )
         except BrokenPipeError as error:
             try:
                 os.kill(anchor_identity[0], 0)
@@ -546,6 +837,38 @@ def _run_real_supervisorless_fallback() -> LifecycleEvidence:
                 "live anchor fallback channel unavailable "
                 f"({fallback_state})"
             ) from error
+        if invalid_request:
+            before_rejection = journal.certify_head().sequence
+            time.sleep(0.05)
+            os.kill(anchor_identity[0], 0)
+            after_rejection = journal.certify_head().sequence
+            if after_rejection != before_rejection:
+                raise SupervisorProbeError(
+                    "rejected fallback request changed the lifecycle"
+                )
+            terminal = journal.mark_unconfirmed(
+                UnconfirmedReason.PROOF_UNAVAILABLE
+            )
+            retained = True
+            return LifecycleEvidence(
+                scenario=name,
+                outcome="unconfirmed",
+                anchor_alive=True,
+                canonical_head_certified=True,
+                task4_authority_used=True,
+                unconfirmed_persistent=True,
+                exit_refused=True,
+                next_stage_spawned=True,
+                cli_exec_count=1,
+                artifacts_retained=True,
+                same_canonical_journal=terminal.sequence > running_head.sequence,
+                evidence_observed_not_inferred=True,
+                control_fd_phase_enforced=True,
+                fallback_request_rejected=True,
+                rejected_request_no_signal=True,
+                supervisor_loss_proven=True,
+                self_term_signal_count=0,
+            )
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             try:
@@ -558,9 +881,22 @@ def _run_real_supervisorless_fallback() -> LifecycleEvidence:
         else:
             raise SupervisorProbeError("authenticated anchor fallback timed out")
         os.kill(anchor_identity[0], 0)
+        duplicate_rejected = False
+        if name == "fallback_duplicate_after_loss":
+            before_duplicate = journal.certify_head().sequence
+            parent_fallback.sendall(_encode_control_frame(9))
+            time.sleep(0.05)
+            os.kill(anchor_identity[0], 0)
+            duplicate_rejected = (
+                journal.certify_head().sequence == before_duplicate
+            )
+            if not duplicate_rejected:
+                raise SupervisorProbeError(
+                    "duplicate fallback request changed the lifecycle"
+                )
         retained = True
         return LifecycleEvidence(
-            scenario="kill_supervisor_after_running",
+            scenario=name,
             outcome="unconfirmed",
             anchor_alive=True,
             term_used=True,
@@ -576,6 +912,11 @@ def _run_real_supervisorless_fallback() -> LifecycleEvidence:
             same_canonical_journal=running_head.sequence == 4,
             evidence_observed_not_inferred=True,
             control_fd_phase_enforced=True,
+            fallback_request_rejected=duplicate_rejected,
+            rejected_request_no_signal=duplicate_rejected,
+            supervisor_loss_proven=True,
+            fallback_payload_exact=self_term.payload == b"",
+            self_term_signal_count=1,
         )
     finally:
         if parent_control is not None:
@@ -634,18 +975,20 @@ def _crc32c(payload: bytes) -> int:
     return (~checksum) & 0xFFFFFFFF
 
 
-def _encode_control_frame(message_type: int) -> bytes:
+def _encode_control_frame(message_type: int, payload: bytes = b"") -> bytes:
     if message_type not in _CONTROL_TYPES:
         raise SupervisorProbeError("invalid local control message")
+    if not isinstance(payload, bytes) or len(payload) > _CONTROL_MAX_PAYLOAD:
+        raise SupervisorProbeError("invalid local control payload")
     header = struct.pack(
         "<IHHI32s",
         _CONTROL_MAGIC,
         _CONTROL_VERSION,
         message_type,
-        0,
+        len(payload),
         _NONCE,
     )
-    return header + struct.pack("<I", _crc32c(header))
+    return header + payload + struct.pack("<I", _crc32c(header + payload))
 
 
 def _receive_exact(control: socket.socket, length: int) -> bytes:
@@ -734,6 +1077,8 @@ class _CleanupObservation:
     cleanup_sequence: int
     result_sequence: int
     delete_receipt: bool
+    process_batch_admission_sequence: int
+    injection_stage: int
 
 
 def _certify_bootstrap_event(
@@ -761,14 +1106,29 @@ def _request_cleanup_and_delete(
     instance: Path,
 ) -> _CleanupObservation:
     control.sendall(_encode_control_frame(8))
-    cleanup_sequence, _ = _certify_bootstrap_event(journal, 8, b"")
+    ack_name, ack_payload = _receive_control_frame(control, 12)
+    if ack_name != "CLEANUP_ACK" or len(ack_payload) != 40:
+        raise SupervisorProbeError("native cleanup ACK is malformed")
+    cleanup_sequence, cleanup_hash = struct.unpack("<Q32s", ack_payload)
+    if cleanup_sequence == 0 or cleanup_hash == bytes(32):
+        raise SupervisorProbeError("native cleanup ACK is uncertified")
     result_name, result_payload = _receive_control_frame(control, 10)
-    if result_name != "CLEANUP_RESULT" or len(result_payload) != 24:
+    if result_name != "CLEANUP_RESULT" or len(result_payload) != 40:
         raise SupervisorProbeError("native cleanup result is malformed")
     result_sequence, _ = _certify_bootstrap_event(journal, 10, result_payload)
-    flags, batch_count, completed_steps, done_sequence = struct.unpack(
-        "<IIQQ", result_payload
+    (
+        flags,
+        batch_count,
+        completed_steps,
+        done_sequence,
+        process_batch_admission_sequence,
+        injection_stage,
+        reserved,
+    ) = struct.unpack(
+        "<IIQQQII", result_payload
     )
+    if reserved != 0:
+        raise SupervisorProbeError("native cleanup result reserved field is nonzero")
     head = journal.certify_head()
     if head.state.kind.name != "DONE" or head.sequence != done_sequence:
         raise SupervisorProbeError("cleanup result does not certify its DONE head")
@@ -798,195 +1158,456 @@ def _request_cleanup_and_delete(
         cleanup_sequence=cleanup_sequence,
         result_sequence=result_sequence,
         delete_receipt=receipt.slot_releasable,
+        process_batch_admission_sequence=process_batch_admission_sequence,
+        injection_stage=injection_stage,
     )
 
 
-def _run_real_retaining_cleanup(name: str) -> LifecycleEvidence:
-    stubborn = name in {"stubborn_child_kill", "during_kill_batch"}
-    with tempfile.TemporaryDirectory(prefix="claude-real-cleanup-") as directory:
-        instance = Path(directory)
-        parent_dirfd = _open_private_directory(instance)
-        journal: Journal | None = None
-        parent_control: socket.socket | None = None
-        child_control: socket.socket | None = None
-        parent_fallback: socket.socket | None = None
-        child_fallback: socket.socket | None = None
-        process: subprocess.Popen[bytes] | None = None
-        cleanup_finished = False
-        try:
-            _make_lock_files(parent_dirfd)
-            journal, receipt = Journal.create_at(
-                parent_dirfd,
-                _JOURNAL_NAME,
-                _NONCE,
-                _NORMAL_LIMIT,
-                _HARD_LIMIT,
-                workdir_parent_dirfd=parent_dirfd,
-                workdir_name=_WORKDIR_NAME,
-            )
-            journal.create_workdir(receipt)
-            journal.append(
-                Record.prepared(
-                    1,
-                    "supervisor",
-                    claim_deadline_ns=time.monotonic_ns() + 5_000_000_000,
-                ),
-                RecordClass.NORMAL,
-            )
-            parent_control, child_control = socket.socketpair()
-            parent_fallback, child_fallback = socket.socketpair()
-            parent_control.settimeout(15)
-            output_path = instance / "cleanup-output"
-            environment = {
-                "HOME": str(instance),
-                "USER": "cleanup-probe",
-                "LOCAL_PROXY_ALLOCATION_NONCE": _NONCE_HEX,
-                "LOCAL_PROXY_INSTANCE_DIR": str(instance),
-                "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
-                "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-                "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-                "LOCAL_PROXY_NETWORK_PROXY": "0",
-            }
-            arguments = [str(_supervisor_path()), "--output-path", str(output_path)]
-            if stubborn:
-                arguments.append("--stubborn")
-            process = subprocess.Popen(
-                arguments,
-                env=environment,
-                pass_fds=(child_control.fileno(), child_fallback.fileno()),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            child_control.close()
-            child_control = None
-            child_fallback.close()
-            child_fallback = None
-            trace: list[str] = []
-            try:
-                _, supervisor_sequence, _ = _certify_and_ack(
-                    parent_control, journal, 1, 2, trace
-                )
-            except SupervisorProbeError as error:
-                returncode = process.wait(timeout=5)
-                stderr = process.stderr.read().decode() if process.stderr else ""
-                raise SupervisorProbeError(
-                    f"supervisor identity handshake failed ({returncode}): {stderr}"
-                ) from error
-            anchor_payload, anchor_sequence, _ = _certify_and_ack(
-                parent_control, journal, 3, 4, trace
-            )
-            _, armed_sequence, _ = _certify_and_ack(
-                parent_control, journal, 5, 6, trace
-            )
-            try:
-                running_name, running_payload = _receive_control_frame(
-                    parent_control, 7
-                )
-            except SupervisorProbeError as error:
-                returncode = process.wait(timeout=10)
-                stderr = process.stderr.read().decode() if process.stderr else ""
-                raise SupervisorProbeError(
-                    f"running gate failed ({returncode}, output_exists="
-                    f"{output_path.exists()}, output_size="
-                    f"{output_path.stat().st_size if output_path.exists() else -1}): "
-                    f"{stderr}"
-                ) from error
-            trace.append(running_name)
-            running_head = journal.certify_bootstrap(7, running_payload)
-            observation = _request_cleanup_and_delete(
-                parent_control, process, journal, instance
-            )
-            cleanup_finished = True
-            flags = observation.flags
-            required_flags = (
-                _CLEANUP_STOP_USED
-                | _CLEANUP_STOPPED_ENUMERATED
-                | _CLEANUP_TERM_USED
-                | _CLEANUP_ZOMBIE_OBSERVED
-                | _CLEANUP_ABSENCE_ENUMERATED
-                | _CLEANUP_ANCHOR_REAPED
-                | _CLEANUP_TASK4_DONE
-                | _CLEANUP_GROUP_ENUMERATION_COMPLETE
-            )
-            if flags & required_flags != required_flags:
-                raise SupervisorProbeError("native cleanup evidence is incomplete")
-            if bool(flags & _CLEANUP_KILL_USED) != stubborn:
-                raise SupervisorProbeError("native cleanup escalation disagrees")
-            if process.stderr is not None and process.stderr.read() != b"":
-                raise SupervisorProbeError("retaining supervisor emitted diagnostics")
-            same_journal = (
+def _run_real_identity_rejection(name: str) -> LifecycleEvidence:
+    injection_by_name = {
+        "altered_executable_identity": "altered_executable_identity",
+        "reused_pid": "reused_pid",
+        "unexpected_descendant": "unexpected_descendant",
+    }
+    reason_by_code = {
+        8: "altered_executable_identity",
+        9: "reused_pid",
+        10: "unexpected_descendant",
+    }
+    instance = Path(tempfile.mkdtemp(prefix="claude-real-rejection-"))
+    parent_dirfd = _open_private_directory(instance)
+    journal: Journal | None = None
+    parent_control: socket.socket | None = None
+    child_control: socket.socket | None = None
+    parent_fallback: socket.socket | None = None
+    child_fallback: socket.socket | None = None
+    process: subprocess.Popen[bytes] | None = None
+    retained_anchor: (
+        tuple[int, int, int, int, int, int, int, bytes, bytes] | None
+    ) = None
+    retain_path = False
+    try:
+        _make_lock_files(parent_dirfd)
+        journal, receipt = Journal.create_at(
+            parent_dirfd,
+            _JOURNAL_NAME,
+            _NONCE,
+            _NORMAL_LIMIT,
+            _HARD_LIMIT,
+            workdir_parent_dirfd=parent_dirfd,
+            workdir_name=_WORKDIR_NAME,
+        )
+        journal.create_workdir(receipt)
+        journal.append(
+            Record.prepared(
+                1,
+                "supervisor",
+                claim_deadline_ns=time.monotonic_ns() + 5_000_000_000,
+            ),
+            RecordClass.NORMAL,
+        )
+        parent_control, child_control = socket.socketpair()
+        parent_fallback, child_fallback = socket.socketpair()
+        parent_control.settimeout(10)
+        output_path = instance / "rejection-output"
+        environment = {
+            "HOME": str(instance),
+            "USER": "rejection-probe",
+            "LOCAL_PROXY_ALLOCATION_NONCE": _NONCE_HEX,
+            "LOCAL_PROXY_INSTANCE_DIR": str(instance),
+            "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
+            "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
+            "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
+            "LOCAL_PROXY_NETWORK_PROXY": "0",
+            "LOCAL_PROXY_TEST_INJECTION": injection_by_name[name],
+        }
+        arguments = [
+            str(_probe_supervisor_path()),
+            "--output-path",
+            str(output_path),
+        ]
+        if name == "unexpected_descendant":
+            arguments.append("--spawn-descendant")
+        process = subprocess.Popen(
+            arguments,
+            env=environment,
+            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        child_control.close()
+        child_control = None
+        child_fallback.close()
+        child_fallback = None
+        trace: list[str] = []
+        _, supervisor_sequence, _ = _certify_and_ack(
+            parent_control, journal, 1, 2, trace
+        )
+        anchor_payload, anchor_sequence, _ = _certify_and_ack(
+            parent_control, journal, 3, 4, trace
+        )
+        _, armed_sequence, _ = _certify_and_ack(
+            parent_control, journal, 5, 6, trace
+        )
+        running_name, running_payload = _receive_control_frame(parent_control, 7)
+        trace.append(running_name)
+        running = journal.certify_bootstrap(7, running_payload)
+        anchor_identity = _parse_process_identity(anchor_payload)
+        retained_anchor = anchor_identity
+        parent_control.sendall(_encode_control_frame(8))
+        ack_name, ack_payload = _receive_control_frame(parent_control, 12)
+        if ack_name != "CLEANUP_ACK" or len(ack_payload) != 40:
+            raise SupervisorProbeError("cleanup rejection ACK is malformed")
+        cleanup_sequence, cleanup_hash = struct.unpack("<Q32s", ack_payload)
+        if cleanup_sequence == 0 or cleanup_hash == bytes(32):
+            raise SupervisorProbeError("cleanup rejection ACK is uncertified")
+        error_name, error_payload = _receive_control_frame(parent_control, 11)
+        if error_name != "ERROR" or len(error_payload) != 4:
+            raise SupervisorProbeError("cleanup rejection frame is malformed")
+        rejection = journal.certify_bootstrap(11, error_payload)
+        reason = reason_by_code.get(struct.unpack("<I", error_payload)[0])
+        if reason is None:
+            raise SupervisorProbeError("cleanup rejection reason is unknown")
+        returncode = process.wait(timeout=5)
+        if returncode != 75:
+            raise SupervisorProbeError("rejected cleanup did not fail closed")
+        observed = journal.observe_process(anchor_identity[0])
+        if (
+            observed.pid != anchor_identity[0]
+            or observed.start_ns != anchor_identity[1]
+            or observed.pgid != anchor_identity[3]
+            or observed.sid != anchor_identity[4]
+            or observed.boot_id != anchor_identity[7]
+            or observed.executable_hash != anchor_identity[8]
+        ):
+            raise SupervisorProbeError("rejected cleanup lost the retained anchor")
+        terminal = journal.mark_unconfirmed(UnconfirmedReason.IDENTITY_UNAVAILABLE)
+        retain_path = True
+        _RETAINED_UNCONFIRMED_PATHS.append(instance)
+        return LifecycleEvidence(
+            scenario=name,
+            outcome="unconfirmed",
+            anchor_alive=True,
+            identity_mismatch_detected=reason in reason_by_code.values(),
+            canonical_head_certified=True,
+            task4_authority_used=True,
+            unconfirmed_persistent=True,
+            exit_refused=True,
+            next_stage_spawned=True,
+            cli_exec_count=1,
+            artifacts_retained=True,
+            control_trace=tuple(trace),
+            canonical_control_sequences=(
+                supervisor_sequence,
+                anchor_sequence,
+                armed_sequence,
+                running.sequence,
+                cleanup_sequence,
+                rejection.sequence,
+            ),
+            same_canonical_journal=(
                 (supervisor_sequence, anchor_sequence, armed_sequence,
-                 running_head.sequence, observation.cleanup_sequence,
-                 observation.result_sequence)
+                 running.sequence, cleanup_sequence, rejection.sequence)
                 == (1, 2, 3, 4, 5, 6)
-                and observation.done_sequence > running_head.sequence
+                and terminal.sequence > 0
+            ),
+            evidence_observed_not_inferred=True,
+            control_fd_phase_enforced=True,
+            cleanup_rejection_authenticated=True,
+            observed_rejection_reason=reason,
+        )
+    finally:
+        if parent_control is not None:
+            parent_control.close()
+        if child_control is not None:
+            child_control.close()
+        if parent_fallback is not None:
+            parent_fallback.close()
+        if child_fallback is not None:
+            child_fallback.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if process is not None and process.stderr is not None:
+            process.stderr.close()
+        if retained_anchor is not None and journal is not None:
+            teardown_observed: ProcessIdentity | None
+            try:
+                teardown_observed = journal.observe_process(retained_anchor[0])
+            except JournalError:
+                teardown_observed = None
+            if teardown_observed is not None:
+                os.killpg(teardown_observed.pgid, signal.SIGKILL)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(teardown_observed.pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.001)
+        if journal is not None:
+            journal.close()
+        os.close(parent_dirfd)
+        if not retain_path:
+            _RETAINED_UNCONFIRMED_PATHS.append(instance)
+
+
+def _run_real_retaining_cleanup(name: str) -> LifecycleEvidence:
+    injection_names = {
+        "cleanup_fail_after_admission": "after_admission",
+        "cleanup_fail_after_stop": "after_stop",
+        "cleanup_fail_after_enumeration": "after_enumeration",
+        "cleanup_fail_after_cont": "after_cont",
+        "cleanup_fail_after_term": "after_term",
+        "cleanup_fail_after_kill": "after_kill",
+        "anchor_only_cleanup": "anchor_only",
+        "after_running": "after_admission",
+        "during_term_batch": "after_term",
+        "during_kill_batch": "after_kill",
+    }
+    injection = injection_names.get(name)
+    stubborn = name in {
+        "stubborn_child_kill",
+        "during_kill_batch",
+        "cleanup_fail_after_kill",
+    }
+    directory = tempfile.TemporaryDirectory(prefix="claude-real-cleanup-")
+    retain_directory = False
+    instance = Path(directory.name)
+    parent_dirfd = _open_private_directory(instance)
+    journal: Journal | None = None
+    parent_control: socket.socket | None = None
+    child_control: socket.socket | None = None
+    parent_fallback: socket.socket | None = None
+    child_fallback: socket.socket | None = None
+    process: subprocess.Popen[bytes] | None = None
+    cleanup_finished = False
+    collision_probe_argv = False
+    try:
+        _make_lock_files(parent_dirfd)
+        journal, receipt = Journal.create_at(
+            parent_dirfd,
+            _JOURNAL_NAME,
+            _NONCE,
+            _NORMAL_LIMIT,
+            _HARD_LIMIT,
+            workdir_parent_dirfd=parent_dirfd,
+            workdir_name=_WORKDIR_NAME,
+        )
+        journal.create_workdir(receipt)
+        journal.append(
+            Record.prepared(
+                1,
+                "supervisor",
+                claim_deadline_ns=time.monotonic_ns() + 5_000_000_000,
+            ),
+            RecordClass.NORMAL,
+        )
+        parent_control, child_control = socket.socketpair()
+        parent_fallback, child_fallback = socket.socketpair()
+        parent_control.settimeout(15)
+        output_path = instance / "cleanup-output"
+        environment = {
+            "HOME": str(instance),
+            "USER": "cleanup-probe",
+            "LOCAL_PROXY_ALLOCATION_NONCE": _NONCE_HEX,
+            "LOCAL_PROXY_INSTANCE_DIR": str(instance),
+            "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
+            "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
+            "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
+            "LOCAL_PROXY_NETWORK_PROXY": "0",
+            "LOCAL_PROXY_PROBE_SCENARIO_TOKEN": "task5-local-only",
+        }
+        supervisor = _probe_supervisor_path() if injection else _supervisor_path()
+        if injection:
+            environment["LOCAL_PROXY_TEST_INJECTION"] = injection
+        if name == "ordinary_probe_argument_collision":
+            arguments = [
+                str(supervisor),
+                "--probe-scenario",
+                "confirmed_reap",
+            ]
+            collision_probe_argv = arguments[1:] == [
+                "--probe-scenario",
+                "confirmed_reap",
+            ]
+        else:
+            arguments = [str(supervisor), "--output-path", str(output_path)]
+        if stubborn:
+            arguments.append("--stubborn")
+        elif name == "anchor_only_cleanup":
+            arguments.append("--exit-after-write")
+        process = subprocess.Popen(
+            arguments,
+            env=environment,
+            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        child_control.close()
+        child_control = None
+        child_fallback.close()
+        child_fallback = None
+        trace: list[str] = []
+        try:
+            _, supervisor_sequence, _ = _certify_and_ack(
+                parent_control, journal, 1, 2, trace
             )
-            return LifecycleEvidence(
-                scenario=name,
-                outcome="done",
-                supervisor_retained_anchor=True,
-                anchor_unreaped_through_absence=True,
-                stop_used=bool(flags & _CLEANUP_STOP_USED),
-                group_enumerated_while_stopped=bool(
-                    flags & _CLEANUP_STOPPED_ENUMERATED
-                ),
-                term_used=bool(flags & _CLEANUP_TERM_USED),
-                kill_used=bool(flags & _CLEANUP_KILL_USED),
-                group_absence_confirmed=bool(
-                    flags & _CLEANUP_ABSENCE_ENUMERATED
-                ),
-                absence_enumerated_with_anchor_unreaped=bool(
-                    flags & _CLEANUP_ABSENCE_ENUMERATED
-                ),
-                anchor_reaped=bool(flags & _CLEANUP_ANCHOR_REAPED),
-                anchor_zombie_observed=bool(flags & _CLEANUP_ZOMBIE_OBSERVED),
-                group_identity_reuse_before_reap=False,
-                workdir_removed=not (instance / _WORKDIR_NAME).exists(),
-                durable_delete_receipt=observation.delete_receipt,
-                signal_authorities=("retained_parent_group",),
-                canonical_head_certified=True,
-                task4_authority_used=True,
-                next_stage_spawned=True,
-                cli_exec_count=1,
-                control_trace=tuple(trace),
-                canonical_control_sequences=(
-                    supervisor_sequence,
-                    anchor_sequence,
-                    armed_sequence,
-                    running_head.sequence,
-                ),
-                cleanup_request_authenticated=observation.cleanup_sequence == 5,
-                cleanup_task4_admitted=observation.batch_count == 4,
-                cleanup_batch_count=observation.batch_count,
-                cleanup_completed_steps=observation.completed_steps,
-                cleanup_done_sequence=observation.done_sequence,
-                same_canonical_journal=same_journal,
-                evidence_observed_not_inferred=True,
-                group_enumeration_complete=bool(
-                    flags & _CLEANUP_GROUP_ENUMERATION_COMPLETE
-                ),
-                control_fd_phase_enforced=observation.result_sequence == 6,
+        except SupervisorProbeError as error:
+            returncode = process.wait(timeout=5)
+            stderr = process.stderr.read().decode() if process.stderr else ""
+            raise SupervisorProbeError(
+                f"supervisor identity handshake failed ({returncode}): {stderr}"
+            ) from error
+        anchor_payload, anchor_sequence, _ = _certify_and_ack(
+            parent_control, journal, 3, 4, trace
+        )
+        _, armed_sequence, _ = _certify_and_ack(
+            parent_control, journal, 5, 6, trace
+        )
+        try:
+            running_name, running_payload = _receive_control_frame(
+                parent_control, 7
             )
-        finally:
-            if parent_control is not None:
-                parent_control.close()
-            if child_control is not None:
-                child_control.close()
-            if parent_fallback is not None:
-                parent_fallback.close()
-            if child_fallback is not None:
-                child_fallback.close()
-            if process is not None and process.poll() is None and not cleanup_finished:
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-            if process is not None and process.stderr is not None:
-                process.stderr.close()
-            if journal is not None and not journal.closed:
-                journal.close()
-            os.close(parent_dirfd)
+        except SupervisorProbeError as error:
+            returncode = process.wait(timeout=10)
+            stderr = process.stderr.read().decode() if process.stderr else ""
+            raise SupervisorProbeError(
+                f"running gate failed ({returncode}, output_exists="
+                f"{output_path.exists()}, output_size="
+                f"{output_path.stat().st_size if output_path.exists() else -1}): "
+                f"{stderr}"
+            ) from error
+        trace.append(running_name)
+        running_head = journal.certify_bootstrap(7, running_payload)
+        observation = _request_cleanup_and_delete(
+            parent_control, process, journal, instance
+        )
+        cleanup_finished = True
+        flags = observation.flags
+        required_flags = (
+            _CLEANUP_STOP_USED
+            | _CLEANUP_STOPPED_ENUMERATED
+            | _CLEANUP_TERM_USED
+            | _CLEANUP_ZOMBIE_OBSERVED
+            | _CLEANUP_ABSENCE_ENUMERATED
+            | _CLEANUP_ANCHOR_REAPED
+            | _CLEANUP_TASK4_DONE
+            | _CLEANUP_GROUP_ENUMERATION_COMPLETE
+            | _CLEANUP_PROCESS_BATCH_PREAUTHORIZED
+            | _CLEANUP_TOKEN_RETAINED_THROUGH_SIGNALS
+            | _CLEANUP_PROCESS_TARGET_EXACT
+        )
+        if flags & required_flags != required_flags:
+            raise SupervisorProbeError("native cleanup evidence is incomplete")
+        if bool(flags & _CLEANUP_KILL_USED) != stubborn:
+            raise SupervisorProbeError("native cleanup escalation disagrees")
+        if process.stderr is not None and process.stderr.read() != b"":
+            raise SupervisorProbeError("retaining supervisor emitted diagnostics")
+        same_journal = (
+            (supervisor_sequence, anchor_sequence, armed_sequence,
+             running_head.sequence, observation.cleanup_sequence,
+             observation.result_sequence)
+            == (1, 2, 3, 4, 5, 6)
+            and observation.done_sequence > running_head.sequence
+        )
+        return LifecycleEvidence(
+            scenario=name,
+            outcome="done",
+            supervisor_retained_anchor=True,
+            anchor_unreaped_through_absence=True,
+            stop_used=bool(flags & _CLEANUP_STOP_USED),
+            group_enumerated_while_stopped=bool(
+                flags & _CLEANUP_STOPPED_ENUMERATED
+            ),
+            term_used=bool(flags & _CLEANUP_TERM_USED),
+            kill_used=bool(flags & _CLEANUP_KILL_USED),
+            group_absence_confirmed=bool(
+                flags & _CLEANUP_ABSENCE_ENUMERATED
+            ),
+            absence_enumerated_with_anchor_unreaped=bool(
+                flags & _CLEANUP_ABSENCE_ENUMERATED
+            ),
+            anchor_reaped=bool(flags & _CLEANUP_ANCHOR_REAPED),
+            anchor_zombie_observed=bool(flags & _CLEANUP_ZOMBIE_OBSERVED),
+            group_identity_reuse_before_reap=False,
+            workdir_removed=not (instance / _WORKDIR_NAME).exists(),
+            durable_delete_receipt=observation.delete_receipt,
+            signal_authorities=("retained_parent_group",),
+            canonical_head_certified=True,
+            task4_authority_used=True,
+            next_stage_spawned=True,
+            cli_exec_count=1,
+            control_trace=tuple(trace),
+            canonical_control_sequences=(
+                supervisor_sequence,
+                anchor_sequence,
+                armed_sequence,
+                running_head.sequence,
+            ),
+            cleanup_request_authenticated=observation.cleanup_sequence == 5,
+            cleanup_task4_admitted=observation.batch_count == 4,
+            cleanup_batch_count=observation.batch_count,
+            cleanup_completed_steps=observation.completed_steps,
+            cleanup_done_sequence=observation.done_sequence,
+            same_canonical_journal=same_journal,
+            evidence_observed_not_inferred=True,
+            group_enumeration_complete=bool(
+                flags & _CLEANUP_GROUP_ENUMERATION_COMPLETE
+            ),
+            control_fd_phase_enforced=observation.result_sequence == 6,
+            cleanup_failure_injection_observed=bool(
+                flags & _CLEANUP_INJECTION_RECOVERED
+            ),
+            process_batch_admitted_before_signal=bool(
+                flags & _CLEANUP_PROCESS_BATCH_PREAUTHORIZED
+            ),
+            process_batch_target_exact=bool(
+                flags & _CLEANUP_PROCESS_TARGET_EXACT
+            ),
+            action_token_retained_through_signals=bool(
+                flags & _CLEANUP_TOKEN_RETAINED_THROUGH_SIGNALS
+            ),
+            frozen_group_left_behind=not bool(
+                flags & _CLEANUP_ABSENCE_ENUMERATED
+                and flags & _CLEANUP_ANCHOR_REAPED
+            ),
+            anchor_only_group_observed=bool(
+                flags & _CLEANUP_ANCHOR_ONLY_OBSERVED
+            ),
+            group_resumed_after_failure=bool(
+                flags & _CLEANUP_GROUP_RESUMED_AFTER_FAILURE
+            ),
+            probe_mode_collision_impossible=(
+                collision_probe_argv
+                and supervisor == _supervisor_path()
+                and same_journal
+                and observation.delete_receipt
+            ),
+        )
+    finally:
+        if parent_control is not None:
+            parent_control.close()
+        if child_control is not None:
+            child_control.close()
+        if parent_fallback is not None:
+            parent_fallback.close()
+        if child_fallback is not None:
+            child_fallback.close()
+        if process is not None and process.poll() is None and not cleanup_finished:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                retain_directory = True
+                _RETAINED_CLEANUP_ACTORS.append(process)
+                _RETAINED_CLEANUP_DIRECTORIES.append(directory)
+        if process is not None and process.stderr is not None:
+            process.stderr.close()
+        if journal is not None and not journal.closed:
+            journal.close()
+        os.close(parent_dirfd)
+        if not retain_directory:
+            directory.cleanup()
 
 
 def _run_real_fail_dead_boundary(name: str) -> LifecycleEvidence:
@@ -1051,7 +1672,11 @@ def _run_real_fail_dead_boundary(name: str) -> LifecycleEvidence:
         if name != "supervisor_before_identity":
             _, sequence, _ = _certify_and_ack(parent_control, journal, 1, 2, trace)
             certified_sequences.append(sequence)
-        if name in {"cli_before_armed", "after_armed_before_exec"}:
+        if name in {
+            "cli_before_armed",
+            "after_armed_before_exec",
+            "pre_armed_fail_dead",
+        }:
             anchor_payload, sequence, _ = _certify_and_ack(
                 parent_control, journal, 3, 4, trace
             )

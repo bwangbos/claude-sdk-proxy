@@ -73,7 +73,7 @@ def test_control_frame_round_trip_and_validation_are_bounded() -> None:
     """A malformed or reordered frame must fail before advancing a child gate."""
     evidence = run_lifecycle_scenario("control_frame_validation")
 
-    assert evidence.outcome == "done"
+    assert evidence.outcome == "unconfirmed"
     assert evidence.control_payload_limit == 4096
     assert set(evidence.control_rejections) == {
         "unknown_type",
@@ -84,6 +84,8 @@ def test_control_frame_round_trip_and_validation_are_bounded() -> None:
         "bad_checksum",
     }
     assert evidence.ack_without_certification_rejected
+    assert evidence.same_canonical_journal
+    assert evidence.evidence_observed_not_inferred
     assert evidence.next_stage_spawned is False
     assert evidence.unsafe_numeric_signal_count == 0
 
@@ -107,6 +109,11 @@ def test_ordinary_argv_cannot_select_a_test_probe_mode() -> None:
     """Untrusted ordinary CLI arguments must never intercept the shim itself."""
     evidence = run_lifecycle_scenario("ordinary_probe_argument_collision")
 
-    assert evidence.fail_dead_exit_code == 75
     assert evidence.probe_mode_collision_impossible
-    assert evidence.cli_exec_count == 0
+    assert evidence.outcome == "done"
+    assert evidence.cli_exec_count == 1
+    assert evidence.canonical_control_sequences == (1, 2, 3, 4)
+    assert evidence.cleanup_request_authenticated
+    assert evidence.cleanup_completed_steps == 0xF
+    assert evidence.durable_delete_receipt
+    assert evidence.same_canonical_journal

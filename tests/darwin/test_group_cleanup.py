@@ -60,6 +60,10 @@ def test_observed_or_mismatched_identity_never_authorizes_a_signal(
     assert evidence.kill_used is False
     assert evidence.unsafe_numeric_signal_count == 0
     assert evidence.workdir_removed is False
+    assert evidence.same_canonical_journal
+    assert evidence.evidence_observed_not_inferred
+    assert evidence.cleanup_rejection_authenticated
+    assert evidence.observed_rejection_reason == scenario
 
 
 def test_parent_held_zombie_prevents_anchor_identity_reuse_until_reap() -> None:
@@ -72,3 +76,48 @@ def test_parent_held_zombie_prevents_anchor_identity_reuse_until_reap() -> None:
     assert evidence.group_identity_reuse_before_reap is False
     assert evidence.anchor_reaped
     assert evidence.unsafe_numeric_signal_count == 0
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "cleanup_fail_after_admission",
+        "cleanup_fail_after_stop",
+        "cleanup_fail_after_enumeration",
+        "cleanup_fail_after_cont",
+        "cleanup_fail_after_term",
+        "cleanup_fail_after_kill",
+    ],
+)
+def test_cleanup_failure_retains_admitted_authority_and_never_freezes_group(
+    boundary: str,
+) -> None:
+    """Losing the pre-effect token or exiting after STOP would orphan authority."""
+    evidence = run_lifecycle_scenario(boundary)
+
+    assert evidence.outcome == "done"
+    assert evidence.cleanup_failure_injection_observed
+    assert evidence.process_batch_admitted_before_signal
+    assert evidence.process_batch_target_exact
+    assert evidence.action_token_retained_through_signals
+    assert evidence.frozen_group_left_behind is False
+    if boundary in {"cleanup_fail_after_stop", "cleanup_fail_after_enumeration"}:
+        assert evidence.group_resumed_after_failure
+    assert evidence.group_absence_confirmed
+    assert evidence.anchor_reaped
+    assert evidence.cleanup_completed_steps == 0xF
+    assert evidence.durable_delete_receipt
+    assert evidence.unsafe_numeric_signal_count == 0
+
+
+def test_anchor_only_stopped_enumeration_is_complete_and_safe() -> None:
+    """An already-exited CLI must not turn complete anchor-only state into unknown."""
+    evidence = run_lifecycle_scenario("anchor_only_cleanup")
+
+    assert evidence.outcome == "done"
+    assert evidence.anchor_only_group_observed
+    assert evidence.group_enumerated_while_stopped
+    assert evidence.group_enumeration_complete
+    assert evidence.group_absence_confirmed
+    assert evidence.anchor_reaped
+    assert evidence.durable_delete_receipt

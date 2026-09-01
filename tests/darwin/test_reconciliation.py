@@ -27,6 +27,8 @@ def test_crash_boundary_is_reconcilable(boundary: str) -> None:
     assert result.canonical_head_certified
     assert result.same_canonical_journal
     assert result.evidence_observed_not_inferred
+    if boundary in {"after_running", "during_term_batch", "during_kill_batch"}:
+        assert result.cleanup_failure_injection_observed
 
 
 @pytest.mark.parametrize(
@@ -43,12 +45,15 @@ def test_reconciliation_uses_task4_generation_and_batch_authority(
     """Bypassing Task 4 handoff or exact-batch retention must break reconciliation."""
     result = run_lifecycle_scenario(scenario)
 
-    assert result.outcome == "done"
+    assert result.outcome == "unconfirmed"
     assert result.task4_authority_used
     assert result.stale_executor_blocked
     assert result.exact_batch_preserved
     assert result.canonical_head_certified
     assert result.unsafe_numeric_signal_count == 0
+    assert result.same_canonical_journal
+    assert result.evidence_observed_not_inferred
+    assert result.observed_handoff_records >= 2
 
 
 def test_wedged_supervisor_blocks_successor_and_destructive_actions() -> None:
@@ -61,3 +66,6 @@ def test_wedged_supervisor_blocks_successor_and_destructive_actions() -> None:
     assert result.workdir_removed is False
     assert result.helper_promoted is False
     assert result.unsafe_numeric_signal_count == 0
+    assert result.same_canonical_journal
+    assert result.evidence_observed_not_inferred
+    assert result.observed_live_executor

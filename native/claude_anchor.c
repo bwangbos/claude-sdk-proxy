@@ -336,6 +336,7 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
     bool cleanup = false;
     bool child_reaped = false;
     bool internal_lost = false;
+    bool fallback_consumed = false;
     int child_status = 0;
 
     if (parse_nonce(arguments->allocation_nonce, nonce) < 0) {
@@ -393,22 +394,30 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
             int status = cpl_control_frame_read(
                 arguments->fallback_control_fd, nonce, control_deadline(),
                 &frame);
+            struct cpl_bootstrap_head certified;
 
-            if (!running || status != CPL_OK ||
+            if (status != CPL_OK || !running || !internal_lost ||
+                fallback_consumed || frame.payload_length != 0U ||
                 frame.type != CPL_CONTROL_SELF_TERM_REQUEST ||
-                cpl_control_phase_accept(&phase, frame.type, false) != CPL_OK ||
+                cpl_control_phase_accept(&phase, frame.type, false) != CPL_OK) {
+                continue;
+            }
+            if (
                 cpl_journal_bootstrap_append(journal,
-                    CPL_CONTROL_SELF_TERM_REQUEST, NULL, 0U,
+                    CPL_CONTROL_SELF_TERM_REQUEST, frame.payload,
+                    frame.payload_length,
                     control_deadline(), &bootstrap) != CPL_OK ||
+                cpl_journal_bootstrap_certify(journal,
+                    CPL_CONTROL_SELF_TERM_REQUEST, frame.payload,
+                    frame.payload_length, control_deadline(),
+                    &certified) != CPL_OK ||
                 killpg(getpgrp(), SIGTERM) < 0 ||
                 cpl_journal_mark_unconfirmed(journal,
                     CPL_UNCONFIRMED_PROOF_UNAVAILABLE,
                     control_deadline(), &unconfirmed) != CPL_OK) {
                 return ANCHOR_FAIL_DEAD_EXIT;
             }
-            for (;;) {
-                pause();
-            }
+            fallback_consumed = true;
         }
         if ((controls[0].revents & (POLLHUP | POLLERR)) != 0 && !running) {
             return ANCHOR_FAIL_DEAD_EXIT;
