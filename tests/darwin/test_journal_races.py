@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import claude_sdk_proxy.journal as journal_module
 from claude_sdk_proxy.journal import (
     AdmittedBatch,
     Journal,
@@ -124,6 +125,20 @@ def _reap_target(pid: int) -> None:
         pass
 
 
+def _activate_executor_for_admission(journal: Journal) -> None:
+    future = _future()
+    journal.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=future),
+        RecordClass.NORMAL,
+    )
+    journal.activate_executor(
+        1,
+        "executor-1",
+        os.getpid(),
+        lease_deadline_ns=future,
+    )
+
+
 def test_cross_thread_close_waits_for_admitted_batch_completion(
     tmp_path: Path,
 ) -> None:
@@ -236,6 +251,337 @@ def test_owner_abandon_invalidates_batch_once_and_releases_waiting_close(
     finally:
         _reap_target(target_pid)
         journal.close()
+        os.close(parent_dirfd)
+
+
+def test_admission_reservation_serializes_native_completion_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    contender = _open(parent_dirfd, fault=True)
+    target_pid = os.fork()
+    if target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    target = journal.observe_process(target_pid)
+    os.kill(target_pid, 9)
+    notify_read, notify_write = os.pipe()
+    wait_read, wait_write = os.pipe()
+    second_started = threading.Event()
+    second_entered_native = threading.Event()
+    second_admission_finished = threading.Event()
+    release_second = threading.Event()
+    second_thread_ids: list[int] = []
+    entered_before_completion_return: list[bool] = []
+    second_results: list[object] = []
+    second_abandon_results: list[object] = []
+    coordinator_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    second_thread: threading.Thread | None = None
+    unrelated_operation_held = False
+
+    _activate_executor_for_admission(journal)
+    first = journal.admit_batch(
+        1,
+        "executor-1",
+        "batch-1",
+        [journal.process_absent_descriptor(target)],
+    )
+    assert first.execute() == 1
+    journal.configure_lifecycle_pause_for_test(
+        "before_batch_completion_append", notify_write, wait_read
+    )
+    unrelated_handle = journal._acquire_operation()
+    assert unrelated_handle.value == journal._handle.value
+    unrelated_operation_held = True
+    real_admit = journal._library.cpl_journal_admit_batch
+    real_complete = journal._library.cpl_journal_complete_batch
+
+    def observe_native_admission(*args: object) -> int:
+        if second_thread_ids == [threading.get_ident()]:
+            second_entered_native.set()
+        return int(real_admit(*args))
+
+    def hold_python_completion_handoff(*args: object) -> int:
+        status = int(real_complete(*args))
+        if entered_before_completion_return == [True]:
+            assert second_admission_finished.wait(timeout=2)
+        return status
+
+    monkeypatch.setattr(
+        journal._library, "cpl_journal_admit_batch", observe_native_admission
+    )
+    monkeypatch.setattr(
+        journal._library,
+        "cpl_journal_complete_batch",
+        hold_python_completion_handoff,
+    )
+
+    def admit_second() -> None:
+        second_thread_ids.append(threading.get_ident())
+        second_started.set()
+        try:
+            batch = journal.admit_batch(
+                1,
+                "executor-1",
+                "batch-2",
+                [journal.reap_process_descriptor(target)],
+            )
+            second_results.append(batch)
+            second_admission_finished.set()
+            if not release_second.wait(timeout=2):
+                raise AssertionError("second batch release was not signaled")
+            batch.abandon()
+            second_abandon_results.append(None)
+            try:
+                batch.abandon()
+            except BaseException as error:
+                second_abandon_results.append(error)
+        except BaseException as error:
+            second_results.append(error)
+            second_admission_finished.set()
+
+    def coordinate_overlap() -> None:
+        nonlocal second_thread
+        try:
+            assert os.read(notify_read, 1) == b"1"
+            second_thread = threading.Thread(target=admit_second)
+            second_thread.start()
+            assert second_started.wait(timeout=2)
+            entered_before_completion_return.append(
+                second_entered_native.wait(timeout=0.25)
+            )
+            os.write(wait_write, b"1")
+        except BaseException as error:
+            coordinator_errors.append(error)
+            try:
+                os.write(wait_write, b"1")
+            except OSError:
+                pass
+
+    coordinator = threading.Thread(target=coordinate_overlap)
+    coordinator.start()
+    closer: threading.Thread | None = None
+    try:
+        assert first.complete().record.completed_steps == 1
+        coordinator.join(timeout=2)
+        assert not coordinator.is_alive()
+        assert coordinator_errors == []
+        assert second_admission_finished.wait(timeout=2)
+        assert second_thread is not None
+        journal._release_operation()
+        unrelated_operation_held = False
+
+        third_result: object
+        try:
+            third_result = contender.admit_batch(
+                1,
+                "executor-1",
+                "batch-3",
+                [contender.reap_process_descriptor(target)],
+                deadline_ns=time.monotonic_ns() + 100_000_000,
+            )
+        except BaseException as error:
+            third_result = error
+        if isinstance(third_result, AdmittedBatch):
+            third_result.abandon()
+
+        assert (
+            entered_before_completion_return == [False]
+            and len(second_results) == 1
+            and isinstance(second_results[0], AdmittedBatch)
+            and isinstance(third_result, JournalError)
+            and third_result.code is JournalErrorCode.LOCK_TIMEOUT
+        ), (
+            entered_before_completion_return,
+            second_results,
+            third_result,
+        )
+
+        def close() -> None:
+            try:
+                journal.close()
+            except BaseException as error:
+                close_errors.append(error)
+
+        closer = threading.Thread(target=close)
+        closer.start()
+        closer.join(timeout=0.05)
+        assert closer.is_alive()
+        release_second.set()
+        second_thread.join(timeout=2)
+        assert not second_thread.is_alive()
+        assert second_abandon_results[0] is None
+        assert isinstance(second_abandon_results[1], JournalError)
+        assert second_abandon_results[1].code is JournalErrorCode.BATCH_TOKEN
+        closer.join(timeout=2)
+        assert not closer.is_alive()
+        assert close_errors == []
+        assert journal.closed is True
+    finally:
+        release_second.set()
+        if unrelated_operation_held:
+            journal._release_operation()
+        if second_thread is not None:
+            second_thread.join(timeout=2)
+        coordinator.join(timeout=2)
+        if closer is not None:
+            closer.join(timeout=2)
+        for fd in (notify_read, notify_write, wait_read, wait_write):
+            os.close(fd)
+        _reap_target(target_pid)
+        try:
+            journal.close()
+        except JournalError:
+            pass
+        contender.close()
+        os.close(parent_dirfd)
+
+
+def test_native_admission_failure_rolls_back_reservation_and_notifies_waiter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    _activate_executor_for_admission(journal)
+    target = journal.observe_process(os.getpid())
+    real_admit = journal._library.cpl_journal_admit_batch
+    failing_thread_ids: list[int] = []
+    failing_entered_native = threading.Event()
+    allow_failure = threading.Event()
+    valid_entered_native = threading.Event()
+    failing_results: list[object] = []
+    valid_results: list[object] = []
+    unrelated_handle = journal._acquire_operation()
+    assert unrelated_handle.value == journal._handle.value
+    unrelated_operation_held = True
+
+    def gate_native_admission(*args: object) -> int:
+        if failing_thread_ids == [threading.get_ident()]:
+            failing_entered_native.set()
+            assert allow_failure.wait(timeout=2)
+        else:
+            valid_entered_native.set()
+        return int(real_admit(*args))
+
+    monkeypatch.setattr(
+        journal._library, "cpl_journal_admit_batch", gate_native_admission
+    )
+
+    def fail_admission() -> None:
+        failing_thread_ids.append(threading.get_ident())
+        try:
+            journal.admit_batch(
+                1,
+                "wrong-executor",
+                "batch-failing",
+                [journal.process_absent_descriptor(target)],
+            )
+        except BaseException as error:
+            failing_results.append(error)
+
+    def admit_valid() -> None:
+        try:
+            batch = journal.admit_batch(
+                1,
+                "executor-1",
+                "batch-valid",
+                [journal.process_absent_descriptor(target)],
+            )
+            valid_results.append(batch)
+            batch.abandon()
+        except BaseException as error:
+            valid_results.append(error)
+
+    failing = threading.Thread(target=fail_admission)
+    valid = threading.Thread(target=admit_valid)
+    failing.start()
+    try:
+        assert failing_entered_native.wait(timeout=2)
+        valid.start()
+        valid_crossed_before_rollback = valid_entered_native.wait(timeout=0.1)
+        allow_failure.set()
+        failing.join(timeout=2)
+        assert valid_entered_native.wait(timeout=2)
+        journal._release_operation()
+        unrelated_operation_held = False
+        valid.join(timeout=2)
+        assert not failing.is_alive()
+        assert not valid.is_alive()
+        assert valid_crossed_before_rollback is False
+        assert len(failing_results) == 1
+        assert isinstance(failing_results[0], JournalError)
+        assert failing_results[0].code is JournalErrorCode.AUTHORITY
+        assert len(valid_results) == 1
+        assert isinstance(valid_results[0], AdmittedBatch)
+    finally:
+        allow_failure.set()
+        if unrelated_operation_held:
+            journal._release_operation()
+        failing.join(timeout=2)
+        if valid.ident is not None:
+            valid.join(timeout=2)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_batch_construction_failure_safe_abandons_native_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    contender = _open(parent_dirfd, fault=True)
+    _activate_executor_for_admission(journal)
+    target = journal.observe_process(os.getpid())
+
+    def fail_construction(*args: object) -> AdmittedBatch:
+        del args
+        raise RuntimeError("injected batch construction failure")
+
+    with monkeypatch.context() as construction_patch:
+        construction_patch.setattr(journal_module, "AdmittedBatch", fail_construction)
+        with pytest.raises(RuntimeError, match="injected batch construction failure"):
+            journal.admit_batch(
+                1,
+                "executor-1",
+                "batch-1",
+                [journal.process_absent_descriptor(target)],
+            )
+
+    try:
+        contender_result: object
+        try:
+            contender_result = contender.admit_batch(
+                1,
+                "executor-1",
+                "batch-2",
+                [contender.process_absent_descriptor(target)],
+                deadline_ns=time.monotonic_ns() + 100_000_000,
+            )
+        except BaseException as error:
+            contender_result = error
+        if isinstance(contender_result, AdmittedBatch):
+            contender_result.abandon()
+
+        close_result: BaseException | None = None
+        try:
+            journal.close()
+        except BaseException as error:
+            close_result = error
+
+        assert (
+            isinstance(contender_result, JournalError)
+            and contender_result.code is JournalErrorCode.AUTHORITY
+            and close_result is None
+            and journal.closed is True
+        ), (contender_result, close_result, journal.closed)
+    finally:
+        try:
+            journal.close()
+        except JournalError:
+            pass
+        contender.close()
         os.close(parent_dirfd)
 
 

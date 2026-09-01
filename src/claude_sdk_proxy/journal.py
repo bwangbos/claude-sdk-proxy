@@ -939,6 +939,23 @@ class Journal:
             self._active_operations += 1
             return ctypes.c_void_p(self._handle.value)
 
+    def _acquire_batch_lease(self, deadline_ns: int) -> ctypes.c_void_p:
+        current_thread = threading.get_ident()
+        with self._operation_condition:
+            while True:
+                if self._handle_state is not _HandleState.OPEN:
+                    raise JournalError(JournalErrorCode.CLOSED)
+                if self._outstanding_batch_owner is None:
+                    self._outstanding_batch_owner = current_thread
+                    self._active_operations += 1
+                    return ctypes.c_void_p(self._handle.value)
+                if self._outstanding_batch_owner == current_thread:
+                    raise JournalError(JournalErrorCode.BATCH_TOKEN)
+                remaining_ns = deadline_ns - time.monotonic_ns()
+                if remaining_ns <= 0:
+                    raise JournalError(JournalErrorCode.LOCK_TIMEOUT)
+                self._operation_condition.wait(remaining_ns / 1_000_000_000)
+
     def _release_operation(self) -> None:
         with self._operation_condition:
             self._active_operations -= 1
@@ -965,13 +982,23 @@ class Journal:
 
     def _release_batch_lease(self, batch: AdmittedBatch) -> None:
         with self._operation_condition:
-            if not batch._valid:
+            if (
+                not batch._valid
+                or self._outstanding_batch_owner != threading.get_ident()
+            ):
                 raise JournalError(JournalErrorCode.BATCH_TOKEN)
             batch._valid = False
             self._outstanding_batch_owner = None
             self._active_operations -= 1
-            if self._active_operations == 0:
-                self._operation_condition.notify_all()
+            self._operation_condition.notify_all()
+
+    def _rollback_batch_lease(self) -> None:
+        with self._operation_condition:
+            if self._outstanding_batch_owner != threading.get_ident():
+                raise JournalError(JournalErrorCode.BATCH_TOKEN)
+            self._outstanding_batch_owner = None
+            self._active_operations -= 1
+            self._operation_condition.notify_all()
 
     def _native_call(self, function: Callable[..., int], *args: object) -> int:
         with self._operation() as handle:
@@ -1305,34 +1332,41 @@ class Journal:
             raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
         array_type = _CBatchDescriptor * len(descriptors)
         descriptor_array = array_type(*(_descriptor_to_c(item) for item in descriptors))
+        executor_id = _fixed_id(executor)
+        batch_id = _fixed_id(batch_nonce)
+        selected_deadline = _deadline(deadline_ns)
         token = _CActionToken()
         output = _CAppendResult()
-        handle = self._acquire_operation()
+        handle = self._acquire_batch_lease(selected_deadline)
         try:
             _raise_status(
                 int(
                     self._library.cpl_journal_admit_batch(
                         handle,
                         generation,
-                        _fixed_id(executor),
-                        _fixed_id(batch_nonce),
+                        executor_id,
+                        batch_id,
                         descriptor_array,
                         len(descriptors),
-                        _deadline(deadline_ns),
+                        selected_deadline,
                         ctypes.byref(token),
                         ctypes.byref(output),
                     )
                 )
             )
+            batch = AdmittedBatch(_BATCH_TOKEN, self, token)
         except BaseException:
-            self._release_operation()
+            if any(token.capability):
+                abandon_status = int(
+                    self._library.cpl_journal_abandon_batch(
+                        handle, ctypes.byref(token)
+                    )
+                )
+                if abandon_status != 0:
+                    _raise_status(abandon_status)
+            self._rollback_batch_lease()
             raise
-        with self._operation_condition:
-            if self._outstanding_batch_owner is not None:
-                self._release_operation()
-                raise JournalError(JournalErrorCode.BATCH_TOKEN)
-            self._outstanding_batch_owner = threading.get_ident()
-        return AdmittedBatch(_BATCH_TOKEN, self, token)
+        return batch
 
     def finish_done(
         self,
