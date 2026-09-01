@@ -21,6 +21,10 @@ class _InjectedPythonFailure(RuntimeError):
     pass
 
 
+class _InjectedCloseInterruption(BaseException):
+    pass
+
+
 def _only_new_retained_key(before: set[object]) -> object:
     after = set(supervisor_probe._retained_actor_chain_keys())
     new = after - before
@@ -520,51 +524,19 @@ def test_production_keyed_release_requires_proofs_and_retries_close_failure(
         ),
     )
 
-    reused_parent_fd = -1
     for helper_name in (
         "_close_retained_control",
         "_close_retained_stderr",
         "_close_retained_journal",
-        "_close_retained_parent_fd",
     ):
         original_close = getattr(supervisor_probe, helper_name)
         failed = False
 
-        if helper_name == "_close_retained_parent_fd":
-            retained_fd = owner.parent_dirfd
-
-            def fail_before_syscall(resource: object) -> None:
-                assert getattr(resource, "started", True) is False
-                assert owner.parent_dirfd == -1
-                raise OSError("injected before parent close syscall")
-
-            monkeypatch.setattr(
-                supervisor_probe, helper_name, fail_before_syscall
-            )
-            with pytest.raises(OSError, match="before parent close syscall"):
-                supervisor_probe._reconcile_and_release_retained_actor_chain(key)
-            assert owner.parent_dirfd == retained_fd
-            os.fstat(retained_fd)
-            monkeypatch.setattr(supervisor_probe, helper_name, original_close)
-
         def fail_once(resource: object) -> None:
-            nonlocal failed, reused_parent_fd
+            nonlocal failed
             if not failed:
                 failed = True
-                closed_fd = (
-                    resource
-                    if isinstance(resource, int)
-                    else getattr(resource, "resource", -1)
-                )
                 original_close(resource)
-                if helper_name == "_close_retained_parent_fd":
-                    assert isinstance(closed_fd, int) and closed_fd >= 0
-                    assert owner.parent_dirfd == -1
-                    reused_parent_fd = os.open(
-                        owner.instance,
-                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-                    )
-                    assert reused_parent_fd == closed_fd
                 raise OSError(
                     errno.EINTR,
                     f"injected ambiguous {helper_name} failure",
@@ -577,11 +549,121 @@ def test_production_keyed_release_requires_proofs_and_retries_close_failure(
         assert key in supervisor_probe._retained_actor_chain_keys()
         monkeypatch.setattr(supervisor_probe, helper_name, original_close)
 
+    retained_fd = owner.parent_dirfd
+    reused_parent_fd = -1
+
+    def fail_after_close_proved() -> None:
+        nonlocal reused_parent_fd
+        inspection = supervisor_probe._inspect_retained_close_state(key)
+        assert inspection.parent_state == "closed_proved"
+        assert inspection.parent_fd_detached
+        reused_parent_fd = os.open(
+            owner.instance,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        assert reused_parent_fd == retained_fd
+        raise OSError("injected after parent close proof")
+
+    monkeypatch.setattr(
+        supervisor_probe,
+        "_after_retained_parent_fd_close_proved",
+        fail_after_close_proved,
+        raising=False,
+    )
+    with pytest.raises(OSError, match="after parent close proof"):
+        supervisor_probe._reconcile_and_release_retained_actor_chain(key)
+    assert key in supervisor_probe._retained_actor_chain_keys()
+    inspection = supervisor_probe._inspect_retained_close_state(key)
+    assert inspection.parent_state == "closed_proved"
+    assert inspection.parent_fd_detached
+    monkeypatch.setattr(
+        supervisor_probe,
+        "_after_retained_parent_fd_close_proved",
+        lambda: None,
+    )
     assert supervisor_probe._reconcile_and_release_retained_actor_chain(key)
     assert key not in supervisor_probe._retained_actor_chain_keys()
     assert reused_parent_fd >= 0
     os.fstat(reused_parent_fd)
     os.close(reused_parent_fd)
+
+
+@pytest.mark.parametrize("failure_kind", ["oserror", "base_exception"])
+def test_ambiguous_parent_close_retains_capacity_without_numeric_retry(
+    failure_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unproved close consumes its exact slot and never retries the number."""
+    registry = supervisor_probe._RetainedActorRegistry(capacity=1)
+    monkeypatch.setattr(supervisor_probe, "_RETAINED_ACTOR_REGISTRY", registry)
+
+    def inject(flow: str, checkpoint: str) -> None:
+        if flow == "actor_loss" and checkpoint == "executor_reap_confirmed":
+            raise _InjectedPythonFailure(checkpoint)
+
+    monkeypatch.setattr(supervisor_probe, "_python_exception_checkpoint", inject)
+    with pytest.raises(_InjectedPythonFailure, match="executor_reap_confirmed"):
+        run_lifecycle_scenario("cleanup_fail_after_admission")
+    (key,) = registry.keys()
+    owner = registry.get(key)
+    monkeypatch.setattr(
+        supervisor_probe,
+        "_python_exception_checkpoint",
+        lambda flow, checkpoint: None,
+    )
+    assert supervisor_probe._reconcile_and_release_retained_actor_chain(key) is False
+    observed = owner.journal.observe_process(owner.anchor[0])
+    if supervisor_probe._process_is_stopped(observed.pid):
+        os.killpg(observed.pgid, signal.SIGCONT)
+    os.killpg(observed.pgid, signal.SIGKILL)
+    assert supervisor_probe._wait_for_enumerated_group_absence(observed.pgid)
+
+    retained_fd = owner.parent_dirfd
+    real_close = supervisor_probe.os.close
+    close_attempts = 0
+
+    def fail_selected_close(fd: int) -> None:
+        nonlocal close_attempts
+        if fd == retained_fd:
+            close_attempts += 1
+            if failure_kind == "oserror":
+                raise OSError(errno.EINTR, "injected close ambiguity")
+            raise _InjectedCloseInterruption("injected async close interruption")
+        real_close(fd)
+
+    monkeypatch.setattr(supervisor_probe.os, "close", fail_selected_close)
+    assert supervisor_probe._reconcile_and_release_retained_actor_chain(key) is False
+    os.fstat(retained_fd)
+    inspection = supervisor_probe._inspect_retained_close_state(key)
+    assert inspection.parent_state == "ambiguous"
+    assert inspection.parent_fd_detached
+    assert inspection.release_blocked
+    assert inspection.owner_count_for_key == 1
+    assert registry.count == 1
+    with pytest.raises(supervisor_probe.SupervisorProbeError, match="capacity"):
+        registry.reserve(b"z" * 32)
+    assert supervisor_probe._reconcile_and_release_retained_actor_chain(key) is False
+    assert close_attempts == 1
+
+    monkeypatch.setattr(supervisor_probe.os, "close", real_close)
+    real_close(retained_fd)
+    reused_fd = os.open(
+        owner.instance,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    assert reused_fd == retained_fd
+
+    def forbid_reused_close(fd: int) -> None:
+        if fd == reused_fd:
+            raise AssertionError("ambiguous retry touched a reused descriptor")
+        real_close(fd)
+
+    monkeypatch.setattr(supervisor_probe.os, "close", forbid_reused_close)
+    assert supervisor_probe._reconcile_and_release_retained_actor_chain(key) is False
+    os.fstat(reused_fd)
+    assert close_attempts == 1
+    monkeypatch.setattr(supervisor_probe.os, "close", real_close)
+    real_close(reused_fd)
 
 
 @pytest.mark.parametrize(

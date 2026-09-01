@@ -856,3 +856,71 @@ pre-existing allocation was contacted or modified. Signals were limited to
 freshly spawned, exactly re-observed Task 5 groups, and removals were limited to
 Task 4-verified temporary `allocation.workdir` paths under the user's explicit
 authorization.
+
+## Remediation cycle 3
+
+Remediation base: `18034f8842a79f09eb37aac2d133a8ba29502e72`
+
+Remediation commit: this commit
+
+### Breaker-finding disposition
+
+- The retained raw directory descriptor now has an explicit
+  `OWNED -> DETACHED_IN_FLIGHT -> CLOSED_PROVED | AMBIGUOUS` state machine.
+  Production detaches the numeric descriptor before beginning the one-shot
+  close. Any `BaseException` before close-proof publication tombstones the
+  owner field, publishes `AMBIGUOUS`, and returns false without ever touching
+  that number again. A retry therefore cannot mistake `parent_dirfd == -1` for
+  proof that the close succeeded.
+- `CLOSED_PROVED` is published only after `os.close` returns. The deterministic
+  post-proof injection boundary runs after that publication, so an exception
+  there retains the key but a later retry can release capacity without another
+  numeric close. The regression immediately reuses the closed number and proves
+  that retry leaves the unrelated descriptor valid.
+- An ambiguous close permanently retains the exact keyed owner and one bounded
+  registry slot. Its read-only inspection reports only close state, detached
+  status, release blocking, and exact-key owner count; it exposes no descriptor,
+  path, or journal content. Both a pre-syscall `OSError` and a `BaseException`
+  interruption leave the original descriptor open for the test to verify, and
+  repeated production release attempts remain false with one close attempt.
+- Socket, stderr-stream, and `Journal` close behavior was re-audited. Their
+  owning objects expose durable closure through `fileno() == -1` or `.closed`,
+  and the existing post-success exception rows prove retry consults that object
+  state. They do not require the raw-integer state machine.
+
+### TDD evidence
+
+The two-row ambiguous-close RED raised the injected `OSError` and
+`BaseException` out of production release instead of retaining an ambiguous
+owner. The post-success RED failed because release had no boundary after close
+proof publication. After the state machine was added, all three rows passed:
+pre-syscall failures retained the key, exact owner, open original descriptor,
+and full capacity without retry; post-proof failure retained the key while a
+retry released it without closing a same-number replacement.
+
+### Final verification
+
+- Focused Task 5, reconciliation, and journal-action race suite: 124 passed,
+  zero skipped or XPASS, in 29.80 seconds.
+- `make check`: 151 unit tests passed; Ruff and strict mypy were clean.
+- Host `make darwin`: 197 Darwin tests passed with zero skipped or XPASS; the
+  final concise rerun completed in 40.50 seconds.
+- Three additional bounded repetitions of the two ambiguous-close rows and the
+  post-proof retry row passed all nine executions.
+- `make -B native` rebuilt all seven native targets with Apple clang strict C17
+  flags. Apple clang static analysis of production/fault lifecycle,
+  production/injection supervisor, anchor, and probe child emitted six empty
+  370-byte plist reports with no diagnostics.
+- All executables and dylibs are arm64 Mach-O. Every lifecycle consumer resolves
+  `@rpath/libclaude_proxy_lifecycle.dylib`; the production dylib exports no
+  `_cpl_fault_*` symbol, while the fault dylib retains its fault surface. The
+  production supervisor contains no Task 5 injection selector or stage strings,
+  while the probe supervisor contains the expected test-only strings.
+- Native compile-time ABI assertions passed during rebuild, Python reports the
+  reap-proof ABI as 224 bytes, `git diff --check` is clean, and no analyzer
+  plist or object file is present in the worktree.
+
+No Claude CLI, model, credential, network peer, pre-existing process, or
+pre-existing allocation was contacted or modified. Signals were limited to
+freshly spawned, exactly re-observed Task 5 groups. No retained `UNCONFIRMED`
+artifact was deleted.

@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
@@ -51,6 +52,13 @@ class _RetainedActorKey:
     actor_identity: _ProcessIdentityTuple
 
 
+class _ParentCloseState(Enum):
+    OWNED = "owned"
+    DETACHED_IN_FLIGHT = "detached_in_flight"
+    CLOSED_PROVED = "closed_proved"
+    AMBIGUOUS = "ambiguous"
+
+
 @dataclass
 class _RetainedActorChain:
     """Owned exception-path resources awaiting an explicit reconciler."""
@@ -63,6 +71,7 @@ class _RetainedActorChain:
     process: subprocess.Popen[bytes]
     anchor: _ProcessIdentityTuple
     controls: tuple[socket.socket, ...]
+    parent_close_state: _ParentCloseState = _ParentCloseState.OWNED
     executor_reap_proof: ReapProof | None = None
     cleanup_request_may_have_been_delivered: bool = False
     cleanup_request_sequence: int | None = None
@@ -305,6 +314,14 @@ class _RetainedActorChainInspection:
     exact_group_member_count: int
     group_capability_absent: bool
     retained_child_state: Literal["live", "reapable", "reaped"]
+
+
+@dataclass(frozen=True)
+class _RetainedCloseInspection:
+    parent_state: str
+    parent_fd_detached: bool
+    release_blocked: bool
+    owner_count_for_key: int
 
 
 @dataclass(frozen=True)
@@ -853,6 +870,10 @@ def _close_retained_parent_fd(obligation: _DetachedFD) -> None:
     os.close(obligation.begin())
 
 
+def _after_retained_parent_fd_close_proved() -> None:
+    """Fault-injection boundary after the descriptor close is proven."""
+
+
 def _ensure_unconfirmed(owner: _RetainedActorChain) -> None:
     head = owner.journal.certify_head()
     _python_exception_checkpoint(owner.flow, "recovery_head_certified")
@@ -1059,12 +1080,32 @@ def _reconcile_retained_actor_chain(key: _RetainedActorKey) -> None:
     _reconcile_owner(owner)
 
 
+def _inspect_retained_close_state(
+    key: _RetainedActorKey,
+) -> _RetainedCloseInspection:
+    """Expose only the close proof state, never the retained descriptor."""
+    owner = _RETAINED_ACTOR_REGISTRY.get(key)
+    return _RetainedCloseInspection(
+        parent_state=owner.parent_close_state.value,
+        parent_fd_detached=owner.parent_dirfd == -1,
+        release_blocked=owner.parent_close_state is _ParentCloseState.AMBIGUOUS,
+        owner_count_for_key=sum(
+            candidate == key for candidate in _RETAINED_ACTOR_REGISTRY.keys()
+        ),
+    )
+
+
 def _reconcile_and_release_retained_actor_chain(key: _RetainedActorKey) -> bool:
     """Production keyed release after independently renewed terminal proofs."""
     owner = _RETAINED_ACTOR_REGISTRY.get(key)
     if not owner.journal.closed:
         _reconcile_owner(owner)
     with owner.recovery_lock:
+        if owner.parent_close_state is _ParentCloseState.AMBIGUOUS:
+            return False
+        if owner.parent_close_state is _ParentCloseState.DETACHED_IN_FLIGHT:
+            owner.parent_close_state = _ParentCloseState.AMBIGUOUS
+            return False
         if not owner.journal.closed:
             directory_fd, reopened = _open_retained_journal(owner)
             try:
@@ -1103,20 +1144,31 @@ def _reconcile_and_release_retained_actor_chain(key: _RetainedActorKey) -> bool:
             _close_retained_stderr(owner.process.stderr)
         if not owner.journal.closed:
             _close_retained_journal(owner.journal)
-        if owner.parent_dirfd >= 0:
+        if owner.parent_close_state is _ParentCloseState.OWNED:
+            if owner.parent_dirfd < 0:
+                raise SupervisorProbeError(
+                    "owned retained parent descriptor is unavailable"
+                )
             obligation = _DetachedFD(owner.parent_dirfd)
             try:
                 owner.parent_dirfd = -1
+                owner.parent_close_state = _ParentCloseState.DETACHED_IN_FLIGHT
                 _close_retained_parent_fd(obligation)
+                owner.parent_close_state = _ParentCloseState.CLOSED_PROVED
+                _after_retained_parent_fd_close_proved()
             except BaseException:
-                if not obligation.started:
-                    owner.parent_dirfd = obligation.resource
+                if owner.parent_close_state is not _ParentCloseState.CLOSED_PROVED:
+                    owner.parent_dirfd = -1
+                    owner.parent_close_state = _ParentCloseState.AMBIGUOUS
+                    owner.process.returncode = 86
+                    return False
                 raise
         if (
             any(control.fileno() != -1 for control in owner.controls)
             or (owner.process.stderr is not None and not owner.process.stderr.closed)
             or not owner.journal.closed
             or owner.parent_dirfd >= 0
+            or owner.parent_close_state is not _ParentCloseState.CLOSED_PROVED
         ):
             raise SupervisorProbeError("retained owner handles did not close")
         owner.process.returncode = 86
@@ -1205,6 +1257,7 @@ def _test_release_retained_actor_chain(
                 retained.journal.close()
             os.close(retained.parent_dirfd)
             retained.parent_dirfd = -1
+            retained.parent_close_state = _ParentCloseState.CLOSED_PROVED
             retained.released = True
             _RETAINED_ACTOR_REGISTRY.release(key, retained)
             return _TestActorChainTeardown(
