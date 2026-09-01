@@ -343,6 +343,7 @@ class _VersionProbeOwner:
     pgid: int = 0
     state: _VersionProbeOwnerState = _VersionProbeOwnerState.AMBIGUOUS_SPAWN
     selector: selectors.BaseSelector | None = None
+    cleanup_in_progress: bool = False
 
 
 _VERSION_PROBE_LOCK = threading.RLock()
@@ -362,6 +363,7 @@ def _validate_version_probe_owner(
             not isinstance(owner, _VersionProbeOwner)
             or len(_RETAINED_VERSION_PROBES) != 1
             or not isinstance(owner.state, _VersionProbeOwnerState)
+            or type(owner.cleanup_in_progress) is not bool
         ):
             raise AttestationError("version probe owner state is invalid")
         if expected_state is not None and owner.state is not expected_state:
@@ -759,11 +761,20 @@ def _close_version_probe_resources(owner: _VersionProbeOwner) -> None:
 def _cleanup_version_probe_owner(owner: _VersionProbeOwner) -> None:
     with _VERSION_PROBE_LOCK:
         _validate_version_probe_owner(owner)
-        if owner.state is _VersionProbeOwnerState.AMBIGUOUS_SPAWN:
-            raise AttestationError("version probe cleanup is unconfirmed")
-        if owner.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING:
-            _terminate_version_probe(owner)
-        _close_version_probe_resources(owner)
+        if owner.cleanup_in_progress:
+            raise AttestationError("version probe cleanup is already in progress")
+        owner.cleanup_in_progress = True
+        try:
+            if owner.state is _VersionProbeOwnerState.AMBIGUOUS_SPAWN:
+                raise AttestationError("version probe cleanup is unconfirmed")
+            if owner.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING:
+                _terminate_version_probe(owner)
+            _close_version_probe_resources(owner)
+        finally:
+            if any(
+                retained is owner for retained in _RETAINED_VERSION_PROBES.values()
+            ):
+                owner.cleanup_in_progress = False
 
 
 def _run_bounded_version_probe(
