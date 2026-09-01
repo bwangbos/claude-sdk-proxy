@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import stat
 import subprocess
@@ -63,6 +64,23 @@ class CliIdentity:
     version: str
 
 
+def _require_unchanged_cli_identity(path: Path, expected: os.stat_result) -> None:
+    try:
+        current = path.stat()
+    except OSError as error:
+        raise RuntimeMismatch("CLI identity changed during inspection") from error
+    if (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+    ) != (
+        expected.st_dev,
+        expected.st_ino,
+        expected.st_mode,
+    ):
+        raise RuntimeMismatch("CLI identity changed during inspection")
+
+
 def read_cli_identity(path: Path) -> CliIdentity:
     """Read and validate identity evidence for the exact pinned CLI executable."""
     try:
@@ -84,6 +102,7 @@ def read_cli_identity(path: Path) -> CliIdentity:
     )
     if completed.returncode != 0:
         raise RuntimeMismatch("CLI --version did not succeed")
+    _require_unchanged_cli_identity(resolved_path, metadata)
 
     try:
         output = completed.stdout.decode("utf-8").strip()
@@ -93,12 +112,14 @@ def read_cli_identity(path: Path) -> CliIdentity:
     if matched is None or matched["version"] != EXPECTED_CLI_VERSION:
         raise RuntimeMismatch("CLI version does not match the validated version")
 
+    digest = hashlib.sha256(resolved_path.read_bytes()).hexdigest()
+    _require_unchanged_cli_identity(resolved_path, metadata)
     return CliIdentity(
         path=resolved_path,
         st_dev=metadata.st_dev,
         st_ino=metadata.st_ino,
         mode=metadata.st_mode,
-        sha256=hashlib.sha256(resolved_path.read_bytes()).hexdigest(),
+        sha256=digest,
         version=matched["version"],
     )
 

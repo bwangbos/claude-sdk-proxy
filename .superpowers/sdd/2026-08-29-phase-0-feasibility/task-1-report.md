@@ -167,3 +167,78 @@ claude_sdk_proxy.validated.RuntimeMismatch: CLI version does not match the valid
 2. Current official policy is not an unambiguous affirmative authorization for
    this proxy workflow. The binding plan requires a false policy verdict and
    no live subscription probing.
+
+## Review round 1
+
+### Findings addressed
+
+1. The release gate now rejects non-strict XPASS reports when
+   `--forbid-skips` is present. It still permits explicitly optional developer
+   runs without that gate. The report collector records every skipped report
+   and every passing test report carrying `wasxfail`, then makes the session
+   fail closed.
+2. `read_cli_identity()` now re-stats the resolved executable after
+   `--version` and after hashing. Device, inode, and mode must remain identical
+   to the pre-execution values; disappearance or replacement raises
+   `RuntimeMismatch` instead of returning mixed evidence.
+
+### RED/GREEN evidence
+
+XPASS regression RED before changing the release hook:
+
+```console
+$ uv run pytest --strict-markers --forbid-skips -W error tests/unit/test_pytest_policy.py -v
+... test_forbid_skips_fails_a_non_strict_xpass FAILED
+E       AssertionError: assert <ExitCode.OK: 0> == <ExitCode.TESTS_FAILED: 1>
+========================= 1 failed, 6 passed in 0.10s =========================
+```
+
+XPASS regression GREEN after the hook change:
+
+```console
+$ uv run pytest --strict-markers --forbid-skips -W error tests/unit/test_pytest_policy.py -v
+============================== 7 passed in 0.10s ===============================
+```
+
+Concurrent-replacement regression RED before changing CLI inspection:
+
+```console
+$ uv run pytest --strict-markers --forbid-skips -W error tests/unit/test_validated.py -v
+... test_read_cli_identity_rejects_an_executable_replaced_while_running FAILED
+E       Failed: DID NOT RAISE RuntimeMismatch
+========================= 1 failed, 15 passed in 0.52s =========================
+```
+
+The regression uses an actual shell executable that replaces itself while
+servicing `--version`; it does not mock the filesystem or subprocess boundary.
+GREEN after the two identity re-stat checks:
+
+```console
+$ uv run pytest --strict-markers --forbid-skips -W error tests/unit/test_validated.py -v
+============================== 16 passed in 0.31s ==============================
+```
+
+### Review-round verification
+
+An initial static-analysis run found only a type annotation issue in the new
+identity helper (`object` did not expose `st_dev`, `st_ino`, and `st_mode` to
+mypy). The helper was narrowed to `os.stat_result`. Fresh full verification:
+
+```console
+$ make check
+... clang -std=c17 -Wall -Wextra -Werror -pedantic ...
+============================== 23 passed in 0.44s ==============================
+All checks passed!
+Success: no issues found in 2 source files
+```
+
+The required non-live runtime command was also rerun. Its tests, Ruff, and
+mypy pass, while the installed CLI remains `2.1.252 (Claude Code)`, not the
+required `2.1.251`. The fail-closed runtime concern therefore remains.
+
+### Preserved concerns
+
+- `personal_local_use_allowed=false` remains the policy verdict; no live
+  subscription probe was run.
+- The installed CLI remains outside the pinned supported runtime tuple and is
+  rejected by `read_cli_identity()`.

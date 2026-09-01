@@ -24,7 +24,7 @@ def test_forbid_skips_fails_every_pytest_skip_report(
     pytester.makepyfile(body)
     result = pytester.runpytest("--forbid-skips", "-q")
     assert result.ret == pytest.ExitCode.TESTS_FAILED
-    result.stdout.fnmatch_lines(["*release policy forbids skipped reports:*"])
+    result.stdout.fnmatch_lines(["*release policy forbids skipped or XPASS reports:*"])
 
 
 def test_skip_policy_is_explicitly_opt_in(pytester: pytest.Pytester) -> None:
@@ -35,6 +35,18 @@ def test_skip_policy_is_explicitly_opt_in(pytester: pytest.Pytester) -> None:
     result = pytester.runpytest("-q")
     result.assert_outcomes(skipped=1)
     assert result.ret == pytest.ExitCode.OK
+
+
+def test_forbid_skips_fails_a_non_strict_xpass(pytester: pytest.Pytester) -> None:
+    """A passing expected-failure is not admissible release evidence."""
+    install_policy(pytester)
+    pytester.makepyfile(
+        "import pytest\n\n@pytest.mark.xfail(reason='not release evidence')\n"
+        "def test_xpass(): assert True\n"
+    )
+    result = pytester.runpytest("--forbid-skips", "-q")
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.stdout.fnmatch_lines(["*release policy forbids skipped or XPASS reports:*"])
 
 
 def test_required_anyio_gate_executes_with_zero_skips(

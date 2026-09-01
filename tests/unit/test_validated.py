@@ -113,6 +113,25 @@ def test_read_cli_identity_records_the_resolved_regular_executable(
     )
 
 
+def test_read_cli_identity_rejects_an_executable_replaced_while_running(
+    tmp_path: Path,
+) -> None:
+    """The recorded metadata and hash must come from the same executable file."""
+    cli = tmp_path / "claude"
+    replacement = cli.with_name("claude.next")
+    cli.write_bytes(
+        b"#!/bin/sh\n"
+        b'mv "$0.next" "$0"\n'
+        b"printf '2.1.251 (Claude Code)\\n'\n"
+    )
+    replacement.write_bytes(b"#!/bin/sh\nprintf '2.1.251 (Claude Code)\\n'\n")
+    cli.chmod(0o755)
+    replacement.chmod(0o755)
+
+    with pytest.raises(RuntimeMismatch, match="CLI identity changed"):
+        read_cli_identity(cli)
+
+
 @pytest.mark.parametrize(
     "contents, mode",
     [
