@@ -28,6 +28,13 @@ def test_crash_boundary_is_reconcilable(boundary: str) -> None:
     assert result.same_canonical_journal
     assert result.evidence_observed_not_inferred
     if boundary in {"after_running", "during_term_batch", "during_kill_batch"}:
+        assert result.outcome == "unconfirmed"
+        assert result.actor_loss_observed
+        assert result.actor_loss_exit_code == 86
+        assert result.recovery_executor_reaped
+        assert result.production_recovery_signal_count == 0
+        assert result.test_teardown_group_absent
+        assert result.untracked_orphan_count == 0
         assert result.cleanup_failure_injection_observed
 
 
@@ -52,6 +59,7 @@ def test_reconciliation_uses_task4_generation_and_batch_authority(
     assert result.canonical_head_certified
     assert result.unsafe_numeric_signal_count == 0
     assert result.same_canonical_journal
+    assert result.original_supervisor_actor_chain
     assert result.evidence_observed_not_inferred
     assert result.observed_handoff_records >= 2
 
@@ -67,5 +75,9 @@ def test_wedged_supervisor_blocks_successor_and_destructive_actions() -> None:
     assert result.helper_promoted is False
     assert result.unsafe_numeric_signal_count == 0
     assert result.same_canonical_journal
+    assert result.original_supervisor_actor_chain
     assert result.evidence_observed_not_inferred
     assert result.observed_live_executor
+    assert result.production_recovery_signal_count == 0
+    assert result.test_teardown_group_absent
+    assert result.untracked_orphan_count == 0

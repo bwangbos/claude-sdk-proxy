@@ -127,6 +127,7 @@ enum cpl_control_phase {
     CPL_CONTROL_PHASE_SELF_TERM_REQUEST = 9,
     CPL_CONTROL_PHASE_CLEANUP_RESULT = 10,
     CPL_CONTROL_PHASE_ERROR = 11,
+    CPL_CONTROL_PHASE_CLEANUP_ACK = 12,
 };
 
 struct cpl_control_frame {

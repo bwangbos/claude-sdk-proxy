@@ -1,6 +1,6 @@
 # Task 5 report — supervisor and anchor cleanup ownership
 
-Status: DONE — Fix Round 2 implemented and verified
+Status: DONE — Fix Round 3 implemented and verified
 
 Base: `f8bd3776de64acf7bb5748398d3854d2f66b6fe1`
 
@@ -383,3 +383,87 @@ No Claude CLI, model, network peer, pre-existing process, or pre-existing
 allocation artifact was contacted or modified during Fix Round 2. Signals were
 limited to freshly spawned deterministic Task 5 process groups, and deletion
 was limited to Task 4-certified `allocation.workdir` artifacts.
+
+## Fix Round 3
+
+Fix Round 3 base: `603e423aabebefaf1ba62dfd022ca7e84374781f`
+
+Fix Round 3 commit: this commit
+
+### Review finding disposition
+
+- Every post-RUNNING cleanup checkpoint now kills the actual native supervisor
+  with deterministic exit 86. A same-journal claimant waits for the original
+  lease, retires and reaps that exact executor through Task 4, reconciles the
+  exact admitted batch where present, and persists `UNCONFIRMED`. Production
+  recovery sends no signal. STOP/enumeration deaths leave the real group
+  stopped until separately identified test-only teardown; every teardown proves
+  group absence and zero untracked orphans.
+- Post-RUNNING, TERM, KILL, stale-executor, retirement-replacement,
+  interrupted-batch, and wedged rows all retain the original supervisor's real
+  allocation and actor chain. The former independent synthetic handoff runner
+  and obsolete retaining-cleanup injection routes were removed.
+- Altered executable identity now performs a real post-ARMED `execve` into
+  `/bin/sleep`. The supervisor waits until the observed image differs from both
+  the pre-exec child and the expected CLI before publishing the actual observed
+  identity. PID reuse starts from a real native observation, mutates only its
+  start time as an explicit reuse simulation, and passes that observation
+  through the native exact-identity rejection. Unexpected descendants are
+  actually forked and fully counted through group enumeration.
+- Cleanup request ownership moved to the caller. The caller appends and
+  certifies the exact empty request on the canonical journal, sends its exact
+  sequence/hash expectation, and accepts only an equal ACK. The native ACK
+  phase now advances and latches exactly once. Duplicate, stale-sequence, and
+  wrong-hash ACKs cannot release another action; two real supervisor runs also
+  reject wrong request sequence/hash before forwarding cleanup or signaling.
+- Anchor-only cleanup no longer races a child that exits immediately after
+  exec. A deterministic local marker releases that child only after the caller
+  has certified RUNNING, preserving a real anchor-only group at cleanup.
+
+### TDD evidence
+
+Tests were strengthened before implementation and produced the expected RED
+failures for inferred actor loss, independent handoff journals, absent measured
+identity fields, non-latching ACK phase, and missing ACK replay/binding fields.
+The real post-ARMED row then exposed and fixed a pre-exec observation race, and
+the existing anchor-only row exposed and fixed the immediate-exit race.
+
+Final focused command:
+
+```text
+UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache uv run pytest --strict-markers --forbid-skips -W error tests/darwin/test_bootstrap.py tests/darwin/test_group_cleanup.py tests/darwin/test_anchor_fallback.py tests/darwin/test_reconciliation.py -v
+```
+
+It collected 37 tests and passed all 37 with zero skips, XPASS, or warnings in
+13.15 seconds. A host-permission stress run executed ten iterations of each of
+ten high-risk actor-loss, identity, handoff, and wedged scenarios; all 100
+completed successfully.
+
+### Fix-round full verification
+
+- `UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache make check`: 151 unit tests
+  passed in 1.35 seconds; Ruff and mypy were clean.
+- Host-permission `make darwin`: 142 Darwin tests passed with zero skips,
+  XPASS, or warnings in 20.07 seconds.
+- `make -B native` rebuilt all seven native targets with Apple clang strict C17
+  flags (`-Wall -Wextra -Werror -pedantic`).
+- Apple clang static analysis of `native/lifecycle.c`, production and probe
+  supervisor variants, `native/claude_anchor.c`, and
+  `native/claude_probe_child.c` produced five empty 370-byte plist reports and
+  no diagnostics.
+- `file` reports arm64 Mach-O for both supervisors, the anchor, probe child, and
+  production dylib. `otool -L` confirms all lifecycle consumers resolve the
+  production dylib through its exact `@rpath` install name.
+- The production dylib exports the control and bootstrap entry points and no
+  `_cpl_fault_*` symbol. The production supervisor contains no injection
+  selector or injection-name strings; the separate probe supervisor does.
+- Native compile-time ABI assertions remain green for every public struct,
+  including the 40-byte cleanup ACK and 4144-byte control frame. Python import
+  revalidated all ctypes sizes. `git diff --check` is clean, and no analyzer
+  artifact was written into the worktree.
+
+No Claude CLI, model, credential, network peer, pre-existing process, or
+pre-existing allocation was contacted or modified. Production-path signals
+were emitted only by the original retaining supervisor before injected death;
+all other signals were explicitly separated test teardown of freshly spawned,
+deterministically identified Task 5 process groups.

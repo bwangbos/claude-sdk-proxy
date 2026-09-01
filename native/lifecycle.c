@@ -602,7 +602,7 @@ int cpl_control_phase_accept(uint32_t *inout_phase, uint16_t type,
     bool durable_head_certified) {
     uint32_t expected;
 
-    if (inout_phase == NULL || *inout_phase > CPL_CONTROL_PHASE_ERROR ||
+    if (inout_phase == NULL || *inout_phase > CPL_CONTROL_PHASE_CLEANUP_ACK ||
         !valid_control_type(type)) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
@@ -614,15 +614,19 @@ int cpl_control_phase_accept(uint32_t *inout_phase, uint16_t type,
         return CPL_OK;
     }
     if (type == CPL_CONTROL_CLEANUP_ACK) {
-        return *inout_phase == CPL_CONTROL_PHASE_CLEANUP_REQUEST &&
-            durable_head_certified ? CPL_OK : CPL_ERR_CONTROL_PHASE;
+        if (*inout_phase != CPL_CONTROL_PHASE_CLEANUP_REQUEST ||
+            !durable_head_certified) {
+            return CPL_ERR_CONTROL_PHASE;
+        }
+        *inout_phase = CPL_CONTROL_PHASE_CLEANUP_ACK;
+        return CPL_OK;
     }
     expected = *inout_phase + 1U;
     if (((uint32_t)type != expected &&
          !(type == CPL_CONTROL_SELF_TERM_REQUEST &&
            *inout_phase == CPL_CONTROL_PHASE_CLI_RUNNING) &&
          !(type == CPL_CONTROL_CLEANUP_RESULT &&
-           *inout_phase == CPL_CONTROL_PHASE_CLEANUP_REQUEST)) ||
+           *inout_phase == CPL_CONTROL_PHASE_CLEANUP_ACK)) ||
         ((type == CPL_CONTROL_IDENTITY_ACK ||
           type == CPL_CONTROL_ANCHOR_ACK ||
           type == CPL_CONTROL_ARMED_ACK) && !durable_head_certified)) {
@@ -647,6 +651,9 @@ static bool bootstrap_transition(uint16_t current, bool present,
     if (!present) {
         return next == CPL_CONTROL_SUPERVISOR_IDENTITY;
     }
+    if (next == CPL_CONTROL_ERROR && current != CPL_CONTROL_ERROR) {
+        return true;
+    }
     if (current == CPL_CONTROL_SUPERVISOR_IDENTITY) {
         return next == CPL_CONTROL_ANCHOR_IDENTITY;
     }
@@ -661,8 +668,7 @@ static bool bootstrap_transition(uint16_t current, bool present,
             next == CPL_CONTROL_SELF_TERM_REQUEST;
     }
     if (current == CPL_CONTROL_CLEANUP_REQUEST) {
-        return next == CPL_CONTROL_CLEANUP_RESULT ||
-            next == CPL_CONTROL_ERROR;
+        return next == CPL_CONTROL_CLEANUP_RESULT;
     }
     return false;
 }

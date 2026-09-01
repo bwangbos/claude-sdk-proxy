@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -56,18 +57,26 @@ int main(int argc, char **argv) {
     bool stubborn = false;
     bool exit_after_write = false;
     bool spawn_descendant = false;
+    const char *exit_marker = NULL;
     int descriptor;
 
+    if (argc == 2 && strcmp(argv[1], "--exec-different") == 0) {
+        execl("/bin/sleep", "sleep", "30", (char *)NULL);
+        return PROBE_EXIT;
+    }
     if (argc == 3 && strcmp(argv[1], "--probe-scenario") == 0 &&
         strcmp(argv[2], "confirmed_reap") == 0) {
         for (;;) {
             pause();
         }
     }
-    if ((argc != 3 && argc != 4) || strcmp(argv[1], "--output-path") != 0 ||
+    if ((argc != 3 && argc != 4 && argc != 5) ||
+        strcmp(argv[1], "--output-path") != 0 ||
         (argc == 4 && strcmp(argv[3], "--stubborn") != 0 &&
          strcmp(argv[3], "--exit-after-write") != 0 &&
-         strcmp(argv[3], "--spawn-descendant") != 0)) {
+         strcmp(argv[3], "--spawn-descendant") != 0) ||
+        (argc == 5 && (strcmp(argv[3], "--exit-on-marker") != 0 ||
+         argv[4][0] != '/'))) {
         return PROBE_EXIT;
     }
     output_fd = argv[2][0] == '/' ? open(argv[2],
@@ -77,6 +86,9 @@ int main(int argc, char **argv) {
         strcmp(argv[3], "--exit-after-write") == 0;
     spawn_descendant = argc == 4 &&
         strcmp(argv[3], "--spawn-descendant") == 0;
+    if (argc == 5) {
+        exit_marker = argv[4];
+    }
     for (descriptor = 3; descriptor < 1024; ++descriptor) {
         int socket_type;
         socklen_t length = (socklen_t)sizeof(socket_type);
@@ -129,6 +141,18 @@ int main(int argc, char **argv) {
     }
     (void)close(output_fd);
     if (exit_after_write) {
+        return 0;
+    }
+    while (exit_marker != NULL && access(exit_marker, F_OK) < 0) {
+        const struct timespec pause_duration = {.tv_sec = 0,
+            .tv_nsec = 1000000L};
+
+        if (errno != ENOENT) {
+            return PROBE_EXIT;
+        }
+        (void)nanosleep(&pause_duration, NULL);
+    }
+    if (exit_marker != NULL) {
         return 0;
     }
     if (spawn_descendant && fork() < 0) {

@@ -1209,6 +1209,43 @@ class Journal:
             native.attempts,
         )
 
+    def append_bootstrap(
+        self,
+        message_type: int,
+        payload: bytes,
+        deadline_ns: int | None = None,
+    ) -> BootstrapHead:
+        """Append one authenticated bootstrap event to the canonical journal."""
+        if (
+            isinstance(message_type, bool)
+            or not 1 <= message_type <= 11
+            or not isinstance(payload, bytes)
+            or len(payload) > 256
+        ):
+            raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
+        storage = (ctypes.c_uint8 * max(1, len(payload)))()
+        if payload:
+            ctypes.memmove(storage, payload, len(payload))
+        native = _CBootstrapHead()
+        _raise_status(
+            self._native_call(
+                self._library.cpl_journal_bootstrap_append,
+                message_type,
+                storage,
+                len(payload),
+                _deadline(deadline_ns),
+                ctypes.byref(native),
+            )
+        )
+        return BootstrapHead(
+            bytes(native.hash),
+            native.sequence,
+            native.physical_eof,
+            native.type,
+            bytes(native.payload[: native.payload_length]),
+            native.attempts,
+        )
+
     def _certified_native(self, deadline_ns: int | None = None) -> _CCertifiedHead:
         native = _CCertifiedHead()
         _raise_status(

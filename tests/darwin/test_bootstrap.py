@@ -90,6 +90,26 @@ def test_control_frame_round_trip_and_validation_are_bounded() -> None:
     assert evidence.unsafe_numeric_signal_count == 0
 
 
+def test_cleanup_ack_is_exactly_once_and_bound_to_the_callers_request() -> None:
+    """Replay, stale, or altered ACK proof must never release cleanup action."""
+    evidence = run_lifecycle_scenario("control_frame_validation")
+
+    assert set(evidence.cleanup_ack_rejections) == {
+        "duplicate",
+        "stale_sequence",
+        "wrong_hash",
+    }
+    assert evidence.cleanup_ack_accept_count == 1
+    assert evidence.cleanup_action_release_count == 1
+    assert evidence.cleanup_ack_phase_latched
+    assert evidence.rejected_cleanup_ack_no_action
+    assert set(evidence.cleanup_request_binding_rejections) == {
+        "wrong_hash",
+        "wrong_sequence",
+    }
+    assert evidence.rejected_cleanup_request_no_signal
+
+
 def test_bootstrap_control_eof_is_fail_dead_before_next_stage() -> None:
     """Losing bootstrap control before identity ACK must not spawn the anchor."""
     evidence = run_lifecycle_scenario("supervisor_before_identity")

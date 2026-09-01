@@ -64,6 +64,13 @@ def test_observed_or_mismatched_identity_never_authorizes_a_signal(
     assert evidence.evidence_observed_not_inferred
     assert evidence.cleanup_rejection_authenticated
     assert evidence.observed_rejection_reason == scenario
+    assert evidence.original_supervisor_actor_chain
+    if scenario == "altered_executable_identity":
+        assert evidence.post_armed_executable_mismatch_observed
+    elif scenario == "reused_pid":
+        assert evidence.simulated_reuse_observation_rejected
+    else:
+        assert evidence.unexpected_group_member_count >= 1
 
 
 def test_parent_held_zombie_prevents_anchor_identity_reuse_until_reap() -> None:
@@ -92,21 +99,29 @@ def test_parent_held_zombie_prevents_anchor_identity_reuse_until_reap() -> None:
 def test_cleanup_failure_retains_admitted_authority_and_never_freezes_group(
     boundary: str,
 ) -> None:
-    """Losing the pre-effect token or exiting after STOP would orphan authority."""
+    """A dead cleanup actor must leave only same-journal fail-closed recovery."""
     evidence = run_lifecycle_scenario(boundary)
 
-    assert evidence.outcome == "done"
+    assert evidence.outcome == "unconfirmed"
+    assert evidence.actor_loss_observed
+    assert evidence.actor_loss_exit_code == 86
+    assert evidence.recovery_executor_reaped
+    assert evidence.action_lock_released_after_actor_loss
+    assert evidence.production_recovery_signal_count == 0
     assert evidence.cleanup_failure_injection_observed
     assert evidence.process_batch_admitted_before_signal
     assert evidence.process_batch_target_exact
-    assert evidence.action_token_retained_through_signals
-    assert evidence.frozen_group_left_behind is False
+    assert evidence.exact_batch_preserved
+    if boundary in {"cleanup_fail_after_term", "cleanup_fail_after_kill"}:
+        assert evidence.action_token_retained_through_signals
     if boundary in {"cleanup_fail_after_stop", "cleanup_fail_after_enumeration"}:
-        assert evidence.group_resumed_after_failure
-    assert evidence.group_absence_confirmed
-    assert evidence.anchor_reaped
-    assert evidence.cleanup_completed_steps == 0xF
-    assert evidence.durable_delete_receipt
+        assert evidence.group_stopped_at_recovery
+    assert evidence.workdir_removed is False
+    assert evidence.durable_delete_receipt is False
+    assert evidence.unconfirmed_persistent
+    assert evidence.artifacts_retained
+    assert evidence.test_teardown_group_absent
+    assert evidence.untracked_orphan_count == 0
     assert evidence.unsafe_numeric_signal_count == 0
 
 

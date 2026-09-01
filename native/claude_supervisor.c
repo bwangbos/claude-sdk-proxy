@@ -22,6 +22,7 @@
 extern char **environ;
 
 #define SUPERVISOR_FAIL_DEAD_EXIT 75
+#define SUPERVISOR_INJECTED_DEATH_EXIT 86
 #define SUPERVISOR_NORMAL_LIMIT (32U * 1024U)
 #define SUPERVISOR_HARD_LIMIT (SUPERVISOR_NORMAL_LIMIT + CPL_RECOVERY_BYTES)
 #define SUPERVISOR_ENV_CAPACITY 64U
@@ -86,10 +87,13 @@ enum cleanup_injection {
     CLEANUP_INJECTION_ALTERED_EXECUTABLE = 8,
     CLEANUP_INJECTION_REUSED_IDENTITY = 9,
     CLEANUP_INJECTION_UNEXPECTED_DESCENDANT = 10,
+    CLEANUP_INJECTION_AFTER_RUNNING = 11,
 };
 
-static int cleanup_checkpoint(uint32_t selected, uint32_t stage) {
-    return selected == stage ? CPL_ERR_SYSTEM : CPL_OK;
+static bool actor_loss_injection(uint32_t injection) {
+    return (injection >= CLEANUP_INJECTION_AFTER_ADMISSION &&
+        injection <= CLEANUP_INJECTION_AFTER_KILL) ||
+        injection == CLEANUP_INJECTION_AFTER_RUNNING;
 }
 
 struct cleanup_result {
@@ -112,6 +116,14 @@ struct cleanup_result {
     uint64_t done_sequence;
     uint64_t process_batch_admission_sequence;
     uint32_t injection_stage;
+    struct cpl_process_identity rejection_observed;
+    uint32_t unexpected_group_member_count;
+};
+
+struct identity_rejection_evidence {
+    uint32_t reason;
+    uint32_t unexpected_group_member_count;
+    struct cpl_process_identity observed;
 };
 
 static bool enumerate_stopped_group(pid_t pgid, pid_t anchor,
@@ -122,6 +134,8 @@ static int wait_unreaped(pid_t pid, bool *observed);
 static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
     const struct cpl_process_identity *anchor,
     uint32_t injection, struct cleanup_result *result);
+static _Noreturn void inject_actor_death(cpl_journal *journal,
+    uint32_t injection);
 
 static uint64_t monotonic_deadline(void) {
     struct timespec now;
@@ -151,6 +165,19 @@ static uint64_t lease_deadline(void) {
     }
     return (uint64_t)now.tv_sec * 1000000000ULL +
         (uint64_t)now.tv_nsec + 30000000000ULL;
+}
+
+static uint64_t selected_lease_deadline(uint32_t injection) {
+    struct timespec now;
+
+    if (!actor_loss_injection(injection)) {
+        return lease_deadline();
+    }
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+        return 0U;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ULL +
+        (uint64_t)now.tv_nsec + 250000000ULL;
 }
 
 static void bounded_pause(void) {
@@ -213,7 +240,7 @@ static uint32_t parse_cleanup_injection(void) {
         "none", "after_admission", "after_stop", "after_enumeration",
         "after_cont", "after_term", "after_kill", "anchor_only",
         "altered_executable_identity", "reused_pid",
-        "unexpected_descendant",
+        "unexpected_descendant", "after_running",
     };
     const char *selected = getenv("LOCAL_PROXY_TEST_INJECTION");
     uint32_t index;
@@ -455,7 +482,8 @@ static int own_supervisor_domain(const struct bootstrap_values *values,
     if (status == CPL_OK) {
         (void)memcpy(executor, "supervisor", strlen("supervisor"));
         status = cpl_journal_activate_executor(*out, 1U, executor,
-            (int64_t)getpid(), lease_deadline(), control_deadline(),
+            (int64_t)getpid(), selected_lease_deadline(
+                values->cleanup_injection), control_deadline(),
             &activated);
     }
     if (status == CPL_OK) {
@@ -651,6 +679,45 @@ static int relay_gate(int external_fd, int internal_fd,
     return status;
 }
 
+static int publish_identity_rejection(int external_fd, cpl_journal *journal,
+    const uint8_t nonce[CPL_HASH_SIZE], uint32_t *phase, uint32_t reason,
+    uint32_t unexpected_group_member_count,
+    const struct cpl_process_identity *observed) {
+    struct identity_rejection_evidence evidence;
+    struct cpl_bootstrap_head appended;
+    struct cpl_bootstrap_head certified;
+    int status;
+
+    if (observed == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(&evidence, 0, sizeof(evidence));
+    evidence.reason = reason;
+    evidence.unexpected_group_member_count = unexpected_group_member_count;
+    evidence.observed = *observed;
+    status = cpl_journal_bootstrap_append(journal, CPL_CONTROL_ERROR,
+        (const uint8_t *)&evidence, (uint32_t)sizeof(evidence),
+        control_deadline(), &appended);
+    if (status == CPL_OK) {
+        status = cpl_journal_bootstrap_certify(journal, CPL_CONTROL_ERROR,
+            (const uint8_t *)&evidence, (uint32_t)sizeof(evidence),
+            control_deadline(), &certified);
+    }
+    if (status == CPL_OK && (appended.sequence != certified.sequence ||
+            memcmp(appended.hash, certified.hash, CPL_HASH_SIZE) != 0)) {
+        status = CPL_ERR_AUTHORITY;
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_phase_accept(phase, CPL_CONTROL_ERROR, false);
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_frame_write(external_fd, CPL_CONTROL_ERROR,
+            nonce, (const uint8_t *)&evidence,
+            (uint32_t)sizeof(evidence), control_deadline());
+    }
+    return status;
+}
+
 static int launch_anchor(const struct bootstrap_values *values,
     struct child_environment *child_environment, int cli_argc,
     char **cli_argv, cpl_journal *journal, int directory_fd) {
@@ -675,6 +742,7 @@ static int launch_anchor(const struct bootstrap_values *values,
     size_t index;
     pid_t child;
     int status = CPL_ERR_SYSTEM;
+    bool altered_executable_observed = false;
 
     if (verified_anchor_path(anchor_path) < 0 ||
         verify_real_cli(values->real_cli, &expected) < 0 ||
@@ -766,8 +834,23 @@ static int launch_anchor(const struct bootstrap_values *values,
     }
     while (status == CPL_OK) {
         status = cpl_process_observe(armed.member.pid, &running);
-        if (status == CPL_OK && matches_expected_cli(&running, &armed)) {
-            break;
+        if (status == CPL_OK) {
+            if (values->cleanup_injection ==
+                    CLEANUP_INJECTION_ALTERED_EXECUTABLE) {
+                if ((running.executable_dev !=
+                        armed.member.executable_dev ||
+                     running.executable_ino !=
+                        armed.member.executable_ino ||
+                     memcmp(running.executable_hash,
+                        armed.member.executable_hash,
+                        CPL_HASH_SIZE) != 0) &&
+                    !matches_expected_cli(&running, &armed)) {
+                    altered_executable_observed = true;
+                    break;
+                }
+            } else if (matches_expected_cli(&running, &armed)) {
+                break;
+            }
         }
         if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0 ||
             (uint64_t)now.tv_sec * 1000000000ULL +
@@ -777,6 +860,13 @@ static int launch_anchor(const struct bootstrap_values *values,
         }
         bounded_pause();
         status = CPL_OK;
+    }
+    if (status == CPL_OK && altered_executable_observed) {
+        status = publish_identity_rejection(values->control_fd, journal,
+            nonce, &phase, CLEANUP_INJECTION_ALTERED_EXECUTABLE, 0U,
+            &running);
+        (void)close(internal[0]);
+        return status == CPL_OK ? -1 : status;
     }
     if (status == CPL_OK) {
         status = cpl_journal_bootstrap_append(journal,
@@ -801,21 +891,33 @@ static int launch_anchor(const struct bootstrap_values *values,
         status = cpl_control_frame_read(values->control_fd, nonce,
             lease_deadline(), &request);
     }
+    if (status == CPL_OK && values->cleanup_injection ==
+            CLEANUP_INJECTION_AFTER_RUNNING) {
+        inject_actor_death(journal, values->cleanup_injection);
+    }
     if (status == CPL_OK && request.type != CPL_CONTROL_CLEANUP_REQUEST) {
         status = CPL_ERR_CONTROL_PHASE;
+    }
+    if (status == CPL_OK && request.payload_length !=
+            (uint32_t)sizeof(struct cpl_cleanup_ack)) {
+        status = CPL_ERR_CONTROL_PAYLOAD;
     }
     if (status == CPL_OK) {
         status = cpl_control_phase_accept(&phase, request.type, false);
     }
     if (status == CPL_OK) {
-        status = cpl_journal_bootstrap_append(journal,
-            CPL_CONTROL_CLEANUP_REQUEST, request.payload,
-            request.payload_length, control_deadline(), &bootstrap);
+        status = cpl_journal_bootstrap_certify(journal,
+            CPL_CONTROL_CLEANUP_REQUEST, NULL, 0U,
+            control_deadline(), &bootstrap);
     }
     if (status == CPL_OK) {
-        status = cpl_journal_bootstrap_certify(journal,
-            CPL_CONTROL_CLEANUP_REQUEST, request.payload,
-            request.payload_length, control_deadline(), &bootstrap);
+        struct cpl_cleanup_ack expected;
+
+        (void)memcpy(&expected, request.payload, sizeof(expected));
+        if (expected.sequence != bootstrap.sequence ||
+            memcmp(expected.hash, bootstrap.hash, CPL_HASH_SIZE) != 0) {
+            status = CPL_ERR_AUTHORITY;
+        }
     }
     if (status == CPL_OK) {
         status = cpl_control_phase_accept(&phase,
@@ -835,8 +937,8 @@ static int launch_anchor(const struct bootstrap_values *values,
     }
     if (status == CPL_OK) {
         status = cpl_control_frame_write(internal[0],
-            CPL_CONTROL_CLEANUP_REQUEST, nonce, request.payload,
-            request.payload_length, control_deadline());
+            CPL_CONTROL_CLEANUP_REQUEST, nonce, NULL, 0U,
+            control_deadline());
     }
     if (status == CPL_OK) {
         struct cleanup_result cleanup;
@@ -850,25 +952,10 @@ static int launch_anchor(const struct bootstrap_values *values,
                 CLEANUP_INJECTION_ALTERED_EXECUTABLE &&
             values->cleanup_injection <=
                 CLEANUP_INJECTION_UNEXPECTED_DESCENDANT) {
-            uint32_t rejection = values->cleanup_injection;
-            int rejection_status = cpl_journal_bootstrap_append(journal,
-                CPL_CONTROL_ERROR, (const uint8_t *)&rejection,
-                (uint32_t)sizeof(rejection), control_deadline(), &bootstrap);
-
-            if (rejection_status == CPL_OK) {
-                rejection_status = cpl_control_phase_accept(&phase,
-                    CPL_CONTROL_ERROR, false);
-            }
-            if (rejection_status == CPL_OK) {
-                if (cpl_control_frame_write(values->control_fd,
-                        CPL_CONTROL_ERROR, nonce,
-                        (const uint8_t *)&rejection,
-                        (uint32_t)sizeof(rejection), control_deadline()) !=
-                        CPL_OK) {
-                    (void)close(internal[0]);
-                    return -1;
-                }
-            }
+            (void)publish_identity_rejection(values->control_fd, journal,
+                nonce, &phase, values->cleanup_injection,
+                cleanup.unexpected_group_member_count,
+                &cleanup.rejection_observed);
             (void)close(internal[0]);
             return -1;
         }
@@ -1137,18 +1224,25 @@ static int complete_cleanup_batch(cpl_journal *journal, int directory_fd,
     return CPL_OK;
 }
 
-static bool retained_anchor_is_exact(
-    const struct cpl_process_identity *anchor) {
-    struct cpl_process_identity observed;
+static bool observe_retained_anchor(
+    const struct cpl_process_identity *anchor,
+    struct cpl_process_identity *observed) {
     struct proc_bsdinfo process;
 
-    return anchor != NULL && anchor->pid > 0 &&
+    return anchor != NULL && observed != NULL && anchor->pid > 0 &&
         anchor->pid == anchor->pgid && anchor->pid == anchor->sid &&
-        cpl_process_observe(anchor->pid, &observed) == CPL_OK &&
-        same_exact_identity(anchor, &observed) &&
+        cpl_process_observe(anchor->pid, observed) == CPL_OK &&
         proc_pidinfo((int)anchor->pid, PROC_PIDTBSDINFO, 0U, &process,
             (int)sizeof(process)) == (int)sizeof(process) &&
         process.pbi_ppid == (uint32_t)getpid();
+}
+
+static bool retained_anchor_is_exact(
+    const struct cpl_process_identity *anchor) {
+    struct cpl_process_identity observed;
+
+    return observe_retained_anchor(anchor, &observed) &&
+        same_exact_identity(anchor, &observed);
 }
 
 static void retain_failed_cleanup_actor(
@@ -1196,7 +1290,7 @@ static bool wait_for_anchor_only_group(
     return false;
 }
 
-static bool observe_unexpected_group_member(
+static uint32_t observe_unexpected_group_members(
     const struct cpl_process_identity *anchor) {
     uint64_t deadline = control_deadline();
 
@@ -1218,16 +1312,16 @@ static bool observe_unexpected_group_member(
             }
             free_group_members(&members);
             if (exact_anchor && present > 2U) {
-                return true;
+                return present - 2U;
             }
         }
         if (monotonic_deadline() == 0U ||
             monotonic_deadline() - 1000000000ULL >= deadline) {
-            return false;
+            return 0U;
         }
         bounded_pause();
     }
-    return false;
+    return 0U;
 }
 
 static int complete_admitted_process_batch(cpl_journal *journal,
@@ -1252,6 +1346,26 @@ static int complete_admitted_process_batch(cpl_journal *journal,
     return CPL_OK;
 }
 
+static _Noreturn void inject_actor_death(cpl_journal *journal,
+    uint32_t injection) {
+    struct cpl_bootstrap_head appended;
+    struct cpl_bootstrap_head certified;
+    uint32_t reason = 100U + injection;
+
+    if (journal == NULL || !actor_loss_injection(injection) ||
+        cpl_journal_bootstrap_append(journal, CPL_CONTROL_ERROR,
+            (const uint8_t *)&reason, (uint32_t)sizeof(reason),
+            control_deadline(), &appended) != CPL_OK ||
+        cpl_journal_bootstrap_certify(journal, CPL_CONTROL_ERROR,
+            (const uint8_t *)&reason, (uint32_t)sizeof(reason),
+            control_deadline(), &certified) != CPL_OK ||
+        appended.sequence != certified.sequence ||
+        memcmp(appended.hash, certified.hash, CPL_HASH_SIZE) != 0) {
+        _exit(SUPERVISOR_FAIL_DEAD_EXIT);
+    }
+    _exit(SUPERVISOR_INJECTED_DEATH_EXIT);
+}
+
 static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
     const struct cpl_process_identity *anchor,
     uint32_t injection, struct cleanup_result *result) {
@@ -1268,22 +1382,20 @@ static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
     if (journal == NULL || result == NULL) {
         return CPL_ERR_PROCESS_IDENTITY;
     }
-    if (injection == CLEANUP_INJECTION_ALTERED_EXECUTABLE) {
-        struct cpl_process_identity altered = *anchor;
-
-        altered.executable_hash[0] ^= 0xffU;
-        if (!retained_anchor_is_exact(&altered)) {
+    if (injection == CLEANUP_INJECTION_REUSED_IDENTITY) {
+        if (!observe_retained_anchor(anchor, &result->rejection_observed)) {
             return CPL_ERR_PROCESS_IDENTITY;
         }
-    } else if (injection == CLEANUP_INJECTION_REUSED_IDENTITY) {
-        struct cpl_process_identity reused = *anchor;
-
-        ++reused.start_ns;
-        if (!retained_anchor_is_exact(&reused)) {
+        ++result->rejection_observed.start_ns;
+        if (!same_exact_identity(anchor, &result->rejection_observed)) {
             return CPL_ERR_PROCESS_IDENTITY;
         }
     } else if (injection == CLEANUP_INJECTION_UNEXPECTED_DESCENDANT) {
-        if (observe_unexpected_group_member(anchor)) {
+        result->unexpected_group_member_count =
+            observe_unexpected_group_members(anchor);
+        if (result->unexpected_group_member_count > 0U) {
+            (void)observe_retained_anchor(anchor,
+                &result->rejection_observed);
             return CPL_ERR_PROCESS_IDENTITY;
         }
     }
@@ -1305,9 +1417,8 @@ static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
         &descriptor.target, anchor);
     result->process_batch_admission_sequence = admitted.sequence;
     result->injection_stage = injection;
-    if (cleanup_checkpoint(injection,
-            CLEANUP_INJECTION_AFTER_ADMISSION) != CPL_OK) {
-        result->injection_recovered = true;
+    if (injection == CLEANUP_INJECTION_AFTER_ADMISSION) {
+        inject_actor_death(journal, injection);
     }
     if (injection == CLEANUP_INJECTION_ANCHOR_ONLY &&
         !wait_for_anchor_only_group(anchor)) {
@@ -1318,19 +1429,8 @@ static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
     }
     group_stopped = true;
     result->stop_used = true;
-    if (cleanup_checkpoint(injection,
-            CLEANUP_INJECTION_AFTER_STOP) != CPL_OK) {
-        result->injection_recovered = true;
-        if (!retained_anchor_is_exact(anchor) ||
-            killpg(anchor->pgid, SIGCONT) < 0) {
-            retain_failed_cleanup_actor(anchor, true);
-        }
-        result->group_resumed_after_failure = true;
-        if (!retained_anchor_is_exact(anchor) ||
-            killpg(anchor->pgid, SIGSTOP) < 0) {
-            retain_failed_cleanup_actor(anchor, false);
-        }
-        group_stopped = true;
+    if (injection == CLEANUP_INJECTION_AFTER_STOP) {
+        inject_actor_death(journal, injection);
     }
     result->enumerated_while_stopped = enumerate_stopped_group(
         anchor->pgid, (pid_t)anchor->pid, &anchor_only);
@@ -1338,50 +1438,29 @@ static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
     if (!result->enumerated_while_stopped) {
         retain_failed_cleanup_actor(anchor, group_stopped);
     }
-    if (cleanup_checkpoint(injection,
-            CLEANUP_INJECTION_AFTER_ENUMERATION) != CPL_OK) {
-        result->injection_recovered = true;
-        if (!retained_anchor_is_exact(anchor) ||
-            killpg(anchor->pgid, SIGCONT) < 0) {
-            retain_failed_cleanup_actor(anchor, true);
-        }
-        result->group_resumed_after_failure = true;
-        if (!retained_anchor_is_exact(anchor) ||
-            killpg(anchor->pgid, SIGSTOP) < 0) {
-            retain_failed_cleanup_actor(anchor, false);
-        }
-        group_stopped = true;
-        result->enumerated_while_stopped = enumerate_stopped_group(
-            anchor->pgid, (pid_t)anchor->pid, &anchor_only);
-        result->anchor_only_observed = result->anchor_only_observed ||
-            anchor_only;
-        if (!result->enumerated_while_stopped) {
-            retain_failed_cleanup_actor(anchor, true);
-        }
+    if (injection == CLEANUP_INJECTION_AFTER_ENUMERATION) {
+        inject_actor_death(journal, injection);
     }
     if (killpg(anchor->pgid, SIGCONT) < 0) {
         retain_failed_cleanup_actor(anchor, group_stopped);
     }
-    if (cleanup_checkpoint(injection,
-            CLEANUP_INJECTION_AFTER_CONT) != CPL_OK) {
-        result->injection_recovered = true;
+    if (injection == CLEANUP_INJECTION_AFTER_CONT) {
+        inject_actor_death(journal, injection);
     }
     if (killpg(anchor->pgid, SIGTERM) < 0) {
         retain_failed_cleanup_actor(anchor, false);
     }
     result->term_used = true;
-    if (cleanup_checkpoint(injection,
-            CLEANUP_INJECTION_AFTER_TERM) != CPL_OK) {
-        result->injection_recovered = true;
+    if (injection == CLEANUP_INJECTION_AFTER_TERM) {
+        inject_actor_death(journal, injection);
     }
     if (wait_unreaped((pid_t)anchor->pid, &result->zombie_observed) < 0) {
         if (killpg(anchor->pgid, SIGKILL) < 0) {
             retain_failed_cleanup_actor(anchor, false);
         }
         result->kill_used = true;
-        if (cleanup_checkpoint(injection,
-                CLEANUP_INJECTION_AFTER_KILL) != CPL_OK) {
-            result->injection_recovered = true;
+        if (injection == CLEANUP_INJECTION_AFTER_KILL) {
+            inject_actor_death(journal, injection);
         }
         if (wait_unreaped((pid_t)anchor->pid,
                 &result->zombie_observed) < 0) {
