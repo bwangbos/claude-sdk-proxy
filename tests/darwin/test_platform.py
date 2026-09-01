@@ -12,8 +12,10 @@ import pytest
 
 from claude_sdk_proxy.platform import (
     MountIdentity,
+    PlatformProbeError,
     PlatformUnsupported,
     _parse_platform_evidence,
+    _runtime_root_identity,
     darwin_probe_path,
     fullfsync,
     preallocate,
@@ -106,9 +108,45 @@ def test_injected_nonlocal_evidence_is_rejected(runtime_root: Path) -> None:
     """A remote mount claim cannot become a supported tuple in Python."""
     injected = json.loads(json.dumps(asdict(require_supported_platform(runtime_root))))
     injected["is_local"] = False
+    injected["mount_flags"].remove("local")
 
     with pytest.raises(PlatformUnsupported, match="unsupported"):
         _parse_platform_evidence(injected, runtime_root.stat().st_dev)
+
+
+def test_injected_unknown_mount_flag_is_rejected(runtime_root: Path) -> None:
+    """A name outside the C probe's canonical mount-flag vocabulary is invalid."""
+    injected = json.loads(json.dumps(asdict(require_supported_platform(runtime_root))))
+    injected["mount_flags"].append("unrecognized")
+    injected["mount_flags"].sort()
+
+    with pytest.raises(PlatformProbeError, match="canonical"):
+        _parse_platform_evidence(injected, runtime_root.stat().st_dev)
+
+
+def test_injected_incoherent_local_mount_flag_is_rejected(runtime_root: Path) -> None:
+    """A nonlocal claim cannot retain the canonical local mount flag."""
+    injected = json.loads(json.dumps(asdict(require_supported_platform(runtime_root))))
+    injected["is_local"] = False
+
+    with pytest.raises(PlatformProbeError, match="local"):
+        _parse_platform_evidence(injected, runtime_root.stat().st_dev)
+
+
+def test_runtime_root_identity_rejects_a_replaced_symlink(
+    tmp_path: Path, runtime_root: Path
+) -> None:
+    """A replacement after canonical binding must not be followed by Python."""
+    _runtime_root_identity(runtime_root)
+    original = tmp_path / "original-runtime"
+    replacement = tmp_path / "replacement-runtime"
+    replacement.mkdir(mode=0o700)
+    replacement.chmod(0o700)
+    runtime_root.rename(original)
+    runtime_root.symlink_to(replacement, target_is_directory=True)
+
+    with pytest.raises(PlatformUnsupported, match="unsupported"):
+        _runtime_root_identity(runtime_root)
 
 
 def test_probe_uses_invocation_exit_64() -> None:
@@ -152,3 +190,20 @@ def test_probe_uses_required_syscall_exit_74(runtime_root: Path) -> None:
     assert completed.returncode == 74
     assert completed.stderr == ""
     assert json.loads(completed.stdout) == {"error": "required_syscall"}
+
+
+def test_missing_runtime_root_is_required_syscall_failure(tmp_path: Path) -> None:
+    """A failed root lstat is a failed required syscall, not an unsupported tuple."""
+    missing_root = tmp_path / "missing-runtime"
+    completed = subprocess.run(
+        [str(darwin_probe_path()), "platform", str(missing_root)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 74
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {"error": "required_syscall"}
+    with pytest.raises(PlatformProbeError, match="cannot be inspected"):
+        require_supported_platform(missing_root)

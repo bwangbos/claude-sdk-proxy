@@ -13,6 +13,7 @@
 #include <libproc.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,28 +146,60 @@ static size_t mount_flag_count(void) {
     return sizeof(MOUNT_FLAG_NAMES) / sizeof(MOUNT_FLAG_NAMES[0]);
 }
 
-static void emit_error(const char *name) {
-    (void)printf("{\"error\":\"");
-    (void)printf("%s", name);
-    (void)printf("\"}\n");
+static int checked_printf(const char *format, ...) {
+    int result = 0;
+    va_list arguments;
+
+    va_start(arguments, format);
+    result = vprintf(format, arguments);
+    va_end(arguments);
+    return result < 0 ? -1 : 0;
 }
 
-static void emit_json_string(const char *value) {
+static int checked_putchar(int character) {
+    return putchar(character) == EOF ? -1 : 0;
+}
+
+static int finish_json_output(void) {
+    if (fflush(stdout) == EOF || ferror(stdout)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int emit_error(const char *name) {
+    if (checked_printf("{\"error\":\"") < 0 ||
+        checked_printf("%s", name) < 0 || checked_printf("\"}\n") < 0 ||
+        finish_json_output() < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int emit_json_string(const char *value) {
     const unsigned char *cursor = (const unsigned char *)value;
 
-    (void)putchar('"');
+    if (checked_putchar('"') < 0) {
+        return -1;
+    }
     while (*cursor != '\0') {
         if (*cursor == '"' || *cursor == '\\') {
-            (void)putchar('\\');
-            (void)putchar((int)*cursor);
+            if (checked_putchar('\\') < 0 ||
+                checked_putchar((int)*cursor) < 0) {
+                return -1;
+            }
         } else if (*cursor < 0x20U) {
-            (void)printf("\\u%04x", (unsigned int)*cursor);
+            if (checked_printf("\\u%04x", (unsigned int)*cursor) < 0) {
+                return -1;
+            }
         } else {
-            (void)putchar((int)*cursor);
+            if (checked_putchar((int)*cursor) < 0) {
+                return -1;
+            }
         }
         ++cursor;
     }
-    (void)putchar('"');
+    return checked_putchar('"');
 }
 
 static uint32_t cloud_placeholder_flags(void) {
@@ -197,7 +230,7 @@ static int parse_darwin_major(const char *release, unsigned int *major) {
     return 0;
 }
 
-static int get_root_file_flags(const char *root, uint32_t *flags) {
+static int get_root_file_flags(int root_fd, uint32_t *flags) {
     struct attrlist attributes;
     struct AttrFlags received;
 
@@ -205,8 +238,7 @@ static int get_root_file_flags(const char *root, uint32_t *flags) {
     (void)memset(&received, 0, sizeof(received));
     attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
     attributes.commonattr = ATTR_CMN_FLAGS;
-    if (getattrlist(root, &attributes, &received, sizeof(received), FSOPT_NOFOLLOW) <
-        0) {
+    if (fgetattrlist(root_fd, &attributes, &received, sizeof(received), 0U) < 0) {
         return -1;
     }
     if (received.length < sizeof(received)) {
@@ -230,17 +262,39 @@ static int require_private_regular_file(int fd) {
     return 0;
 }
 
+static bool is_private_runtime_root(const struct stat *metadata) {
+    return S_ISDIR(metadata->st_mode) && metadata->st_uid == geteuid() &&
+           (metadata->st_mode & ALLPERMS) == 0700;
+}
+
+static int revalidate_root_path(
+    const char *root, const struct stat *bound_root_stat
+) {
+    struct stat observed;
+
+    if (lstat(root, &observed) < 0) {
+        return EXIT_REQUIRED_SYSCALL;
+    }
+    if (!is_private_runtime_root(&observed) ||
+        observed.st_dev != bound_root_stat->st_dev ||
+        observed.st_ino != bound_root_stat->st_ino) {
+        return EXIT_UNSUPPORTED;
+    }
+    return 0;
+}
+
 static int prepare_root(const char *root, struct RootContext *context) {
     struct stat initial_stat;
-    struct statfs path_mount_stat;
     struct proc_bsdinfo process_info;
+    int status = 0;
     size_t boot_size = sizeof(context->boot_time);
 
     (void)memset(context, 0, sizeof(*context));
     context->directory_fd = -1;
-    if (lstat(root, &initial_stat) < 0 || !S_ISDIR(initial_stat.st_mode) ||
-        S_ISLNK(initial_stat.st_mode) || initial_stat.st_uid != geteuid() ||
-        (initial_stat.st_mode & ALLPERMS) != 0700) {
+    if (lstat(root, &initial_stat) < 0) {
+        return EXIT_REQUIRED_SYSCALL;
+    }
+    if (!is_private_runtime_root(&initial_stat)) {
         return EXIT_UNSUPPORTED;
     }
 
@@ -248,26 +302,19 @@ static int prepare_root(const char *root, struct RootContext *context) {
         root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
     );
     if (context->directory_fd < 0) {
-        return EXIT_UNSUPPORTED;
+        return EXIT_REQUIRED_SYSCALL;
     }
     if (fstat(context->directory_fd, &context->root_stat) < 0) {
         return EXIT_REQUIRED_SYSCALL;
     }
-    if (context->root_stat.st_dev != initial_stat.st_dev ||
-        context->root_stat.st_ino != initial_stat.st_ino ||
-        context->root_stat.st_uid != geteuid() ||
-        (context->root_stat.st_mode & ALLPERMS) != 0700) {
+    if (!is_private_runtime_root(&context->root_stat) ||
+        context->root_stat.st_dev != initial_stat.st_dev ||
+        context->root_stat.st_ino != initial_stat.st_ino) {
         return EXIT_UNSUPPORTED;
     }
 
-    if (statfs(root, &path_mount_stat) < 0 ||
-        fstatfs(context->directory_fd, &context->mount_stat) < 0) {
+    if (fstatfs(context->directory_fd, &context->mount_stat) < 0) {
         return EXIT_REQUIRED_SYSCALL;
-    }
-    if (strcmp(path_mount_stat.f_fstypename, context->mount_stat.f_fstypename) != 0 ||
-        path_mount_stat.f_fsid.val[0] != context->mount_stat.f_fsid.val[0] ||
-        path_mount_stat.f_fsid.val[1] != context->mount_stat.f_fsid.val[1]) {
-        return EXIT_UNSUPPORTED;
     }
     if (strcmp(context->mount_stat.f_fstypename, "apfs") != 0 ||
         (context->mount_stat.f_flags & MNT_LOCAL) == 0 ||
@@ -275,8 +322,10 @@ static int prepare_root(const char *root, struct RootContext *context) {
         return EXIT_UNSUPPORTED;
     }
 
-    if (uname(&context->uname_info) < 0 ||
-        strcmp(context->uname_info.sysname, "Darwin") != 0 ||
+    if (uname(&context->uname_info) < 0) {
+        return EXIT_REQUIRED_SYSCALL;
+    }
+    if (strcmp(context->uname_info.sysname, "Darwin") != 0 ||
         parse_darwin_major(context->uname_info.release, &context->darwin_major) != 0 ||
         context->darwin_major < 23U) {
         return EXIT_UNSUPPORTED;
@@ -287,7 +336,7 @@ static int prepare_root(const char *root, struct RootContext *context) {
         boot_size != sizeof(context->boot_time) || context->boot_time.tv_sec < 0) {
         return EXIT_REQUIRED_SYSCALL;
     }
-    if (get_root_file_flags(root, &context->root_file_flags) < 0) {
+    if (get_root_file_flags(context->directory_fd, &context->root_file_flags) < 0) {
         return EXIT_REQUIRED_SYSCALL;
     }
     if ((context->root_file_flags & cloud_placeholder_flags()) != 0U) {
@@ -298,7 +347,8 @@ static int prepare_root(const char *root, struct RootContext *context) {
         ) != (int)sizeof(process_info)) {
         return EXIT_REQUIRED_SYSCALL;
     }
-    return 0;
+    status = revalidate_root_path(root, &context->root_stat);
+    return status;
 }
 
 static void close_root(struct RootContext *context) {
@@ -439,19 +489,24 @@ static int emit_mount_flags(uint64_t flags) {
     if ((flags & ~known_mount_flag_bits()) != 0U) {
         return -1;
     }
-    (void)putchar('[');
+    if (checked_putchar('[') < 0) {
+        return -1;
+    }
     for (index = 0U; index < mount_flag_count(); ++index) {
         if ((flags & MOUNT_FLAG_NAMES[index].bit) == 0U) {
             continue;
         }
         if (!first) {
-            (void)putchar(',');
+            if (checked_putchar(',') < 0) {
+                return -1;
+            }
         }
-        emit_json_string(MOUNT_FLAG_NAMES[index].name);
+        if (emit_json_string(MOUNT_FLAG_NAMES[index].name) < 0) {
+            return -1;
+        }
         first = false;
     }
-    (void)putchar(']');
-    return 0;
+    return checked_putchar(']');
 }
 
 static int command_platform(const char *root) {
@@ -482,25 +537,37 @@ static int command_platform(const char *root) {
 
     fsid_first = (uint32_t)context.mount_stat.f_fsid.val[0];
     fsid_second = (uint32_t)context.mount_stat.f_fsid.val[1];
-    (void)printf(
-        "{\"darwin_major\":%u,\"filesystem_type\":\"apfs\",",
-        context.darwin_major
-    );
-    (void)printf("\"is_local\":true,\"mount_device\":");
-    emit_json_string(context.mount_stat.f_mntfromname);
-    (void)printf(",\"mount_fsid\":\"%08" PRIx32 ":%08" PRIx32 "\",\"mount_flags\":", fsid_first, fsid_second);
-    if (emit_mount_flags((uint64_t)(unsigned long)context.mount_stat.f_flags) !=
-        0) {
+    if (checked_printf(
+            "{\"darwin_major\":%u,\"filesystem_type\":\"apfs\",",
+            context.darwin_major
+        ) < 0 ||
+        checked_printf("\"is_local\":true,\"mount_device\":") < 0 ||
+        emit_json_string(context.mount_stat.f_mntfromname) < 0 ||
+        checked_printf(
+            ",\"mount_fsid\":\"%08" PRIx32 ":%08" PRIx32
+            "\",\"mount_flags\":",
+            fsid_first,
+            fsid_second
+        ) < 0 ||
+        emit_mount_flags((uint64_t)(unsigned long)context.mount_stat.f_flags) <
+            0 ||
+        checked_printf(
+            ",\"runtime_root_st_dev\":%ju",
+            (uintmax_t)context.root_stat.st_dev
+        ) < 0 ||
+        checked_printf(",\"os_build\":") < 0 ||
+        emit_json_string(context.uname_info.version) < 0 ||
+        checked_printf(",\"boot_time\":%ju", (uintmax_t)context.boot_time.tv_sec) <
+            0 ||
+        checked_printf(
+            ",\"preallocate\":true,\"fullfsync_file\":true"
+            ",\"renameat\":true,\"unlinkat\":true"
+            ",\"fsync_directory\":true,\"proc_pidinfo\":true}\n"
+        ) < 0 ||
+        finish_json_output() < 0) {
         close_root(&context);
-        return EXIT_UNSUPPORTED;
+        return EXIT_REQUIRED_SYSCALL;
     }
-    (void)printf(",\"runtime_root_st_dev\":%ju", (uintmax_t)context.root_stat.st_dev);
-    (void)printf(",\"os_build\":");
-    emit_json_string(context.uname_info.version);
-    (void)printf(",\"boot_time\":%ju", (uintmax_t)context.boot_time.tv_sec);
-    (void)printf(",\"preallocate\":true,\"fullfsync_file\":true");
-    (void)printf(",\"renameat\":true,\"unlinkat\":true");
-    (void)printf(",\"fsync_directory\":true,\"proc_pidinfo\":true}\n");
     close_root(&context);
     return 0;
 }
@@ -530,7 +597,7 @@ static enum CrashBoundary parse_crash_boundary(const char *name) {
     return CRASH_NONE;
 }
 
-static void emit_crash_prefix(enum CrashBoundary boundary) {
+static int emit_crash_prefix(enum CrashBoundary boundary) {
     static const char *const PREFIX[] = {
         "create",
         "preallocate",
@@ -549,14 +616,20 @@ static void emit_crash_prefix(enum CrashBoundary boundary) {
     if (boundary == CRASH_AFTER_DIRECTORY_FSYNC) {
         count = sizeof(PREFIX) / sizeof(PREFIX[0]);
     }
-    (void)putchar('[');
+    if (checked_putchar('[') < 0) {
+        return -1;
+    }
     for (index = 0U; index < count; ++index) {
         if (index != 0U) {
-            (void)putchar(',');
+            if (checked_putchar(',') < 0) {
+                return -1;
+            }
         }
-        emit_json_string(PREFIX[index]);
+        if (emit_json_string(PREFIX[index]) < 0) {
+            return -1;
+        }
     }
-    (void)putchar(']');
+    return checked_putchar(']');
 }
 
 static int command_crash(const char *root, const char *boundary_name) {
@@ -594,11 +667,17 @@ static int command_crash(const char *root, const char *boundary_name) {
         close_root(&context);
         return EXIT_REQUIRED_SYSCALL;
     }
-    (void)printf("{\"crash_boundary\":");
-    emit_json_string(boundary_name);
-    (void)printf(",\"child_exit_status\":%d,\"authorized_prefix\":", CRASH_EXIT_STATUS);
-    emit_crash_prefix(boundary);
-    (void)printf("}\n");
+    if (checked_printf("{\"crash_boundary\":") < 0 ||
+        emit_json_string(boundary_name) < 0 ||
+        checked_printf(
+            ",\"child_exit_status\":%d,\"authorized_prefix\":",
+            CRASH_EXIT_STATUS
+        ) < 0 ||
+        emit_crash_prefix(boundary) < 0 || checked_printf("}\n") < 0 ||
+        finish_json_output() < 0) {
+        close_root(&context);
+        return EXIT_REQUIRED_SYSCALL;
+    }
     close_root(&context);
     return 0;
 }
@@ -679,7 +758,6 @@ static int prove_lock_lifecycle(int directory_fd, const char *name) {
             read_exactly_one(child_release[0]) < 0) {
             _exit(EXIT_REQUIRED_SYSCALL);
         }
-        (void)close(held_fd);
         _exit(0);
     }
 
@@ -727,9 +805,11 @@ static int command_lock(const char *root, const char *name, const char *field) {
     if (status != 0) {
         return status;
     }
-    (void)printf("{\"");
-    (void)printf("%s", field);
-    (void)printf("\":true}\n");
+    if (checked_printf("{\"") < 0 || checked_printf("%s", field) < 0 ||
+        checked_printf("\":true,\"process_exit_release\":true}\n") < 0 ||
+        finish_json_output() < 0) {
+        return EXIT_REQUIRED_SYSCALL;
+    }
     return 0;
 }
 
@@ -760,7 +840,10 @@ static int command_owner_record_create(const char *root) {
     if (status != 0) {
         return status;
     }
-    (void)printf("{\"owner_record_create\":true}\n");
+    if (checked_printf("{\"owner_record_create\":true}\n") < 0 ||
+        finish_json_output() < 0) {
+        return EXIT_REQUIRED_SYSCALL;
+    }
     return 0;
 }
 
@@ -799,7 +882,10 @@ static int command_owner_record_replace(const char *root) {
         return EXIT_REQUIRED_SYSCALL;
     }
     close_root(&context);
-    (void)printf("{\"owner_record_replace\":true}\n");
+    if (checked_printf("{\"owner_record_replace\":true}\n") < 0 ||
+        finish_json_output() < 0) {
+        return EXIT_REQUIRED_SYSCALL;
+    }
     return 0;
 }
 
@@ -828,11 +914,17 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     if (status == EXIT_INVOCATION) {
-        emit_error("invocation");
+        if (emit_error("invocation") < 0) {
+            return EXIT_REQUIRED_SYSCALL;
+        }
     } else if (status == EXIT_UNSUPPORTED) {
-        emit_error("unsupported");
+        if (emit_error("unsupported") < 0) {
+            return EXIT_REQUIRED_SYSCALL;
+        }
     } else {
-        emit_error("required_syscall");
+        if (emit_error("required_syscall") < 0) {
+            return EXIT_REQUIRED_SYSCALL;
+        }
         status = EXIT_REQUIRED_SYSCALL;
     }
     return status;

@@ -38,7 +38,10 @@ def test_canonical_bsd_lock_is_exclusive_and_released_at_process_exit(
 
     assert completed.returncode == 0
     assert completed.stderr == ""
-    assert json.loads(completed.stdout) == {subcommand: True}
+    assert json.loads(completed.stdout) == {
+        subcommand: True,
+        "process_exit_release": True,
+    }
 
 
 @pytest.mark.parametrize("subcommand", ["owner_record_create", "owner_record_replace"])
@@ -57,3 +60,6 @@ def test_owner_record_sequences_preserve_private_mode(
     assert completed.stderr == ""
     assert json.loads(completed.stdout) == {subcommand: True}
     assert stat.S_IMODE((runtime_root / "owner.record").stat().st_mode) == 0o600
+    if subcommand == "owner_record_replace":
+        assert (runtime_root / "owner.record").read_bytes() == b"owner-record-replace"
+        assert not (runtime_root / ".owner.record.tmp").exists()

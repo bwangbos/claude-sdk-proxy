@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -26,6 +27,34 @@ _REQUIRED_BOOLEAN_FIELDS: Final = (
     "unlinkat",
     "fsync_directory",
     "proc_pidinfo",
+)
+_CANONICAL_MOUNT_FLAGS: Final = frozenset(
+    {
+        "async",
+        "automounted",
+        "cprotect",
+        "defwrite",
+        "dontbrowse",
+        "dovolfs",
+        "exported",
+        "ignore_ownership",
+        "journaled",
+        "local",
+        "multilabel",
+        "noatime",
+        "nodev",
+        "noexec",
+        "nosuid",
+        "nouserxattr",
+        "quarantine",
+        "quota",
+        "rdonly",
+        "rootfs",
+        "snapshot",
+        "strictatime",
+        "synchronous",
+        "union",
+    }
 )
 
 
@@ -92,9 +121,40 @@ class _Fstore(ctypes.Structure):
     ]
 
 
+@dataclass(frozen=True)
+class _RuntimeRootIdentity:
+    """No-follow identity used to detect runtime-root replacement races."""
+
+    st_dev: int
+    st_ino: int
+    st_uid: int
+    mode: int
+
+
 def darwin_probe_path() -> Path:
     """Return the fixed native probe path without accepting an ambient override."""
     return Path(__file__).resolve().parents[2] / "build" / "bin" / "darwin-probe"
+
+
+def _runtime_root_identity(root: Path) -> _RuntimeRootIdentity:
+    """Read the private runtime-root identity without following a symlink."""
+    try:
+        metadata = root.lstat()
+    except OSError as error:
+        raise PlatformProbeError("runtime root identity cannot be inspected") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise PlatformUnsupported("Darwin platform tuple is unsupported")
+    return _RuntimeRootIdentity(
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino,
+        st_uid=metadata.st_uid,
+        mode=stat.S_IMODE(metadata.st_mode),
+    )
 
 
 def _require_exact_int(value: object, field: str) -> int:
@@ -115,14 +175,20 @@ def _require_nonempty_string(value: object, field: str) -> str:
     return value
 
 
-def _require_mount_flags(value: object) -> tuple[str, ...]:
+def _require_mount_flags(value: object, is_local: bool) -> tuple[str, ...]:
     if not isinstance(value, list) or any(
         not isinstance(flag, str) or not flag for flag in value
     ):
         raise PlatformProbeError("invalid mount_flags evidence")
     flags = tuple(cast(list[str], value))
-    if flags != tuple(sorted(flags)) or len(set(flags)) != len(flags):
+    if (
+        flags != tuple(sorted(flags))
+        or len(set(flags)) != len(flags)
+        or not set(flags).issubset(_CANONICAL_MOUNT_FLAGS)
+    ):
         raise PlatformProbeError("mount flags are not canonical")
+    if ("local" in flags) != is_local:
+        raise PlatformProbeError("mount flags do not match local mount state")
     return flags
 
 
@@ -152,7 +218,7 @@ def _parse_platform_evidence(
     is_local = _require_exact_bool(payload["is_local"], "is_local")
     mount_device = _require_nonempty_string(payload["mount_device"], "mount_device")
     mount_fsid = _require_nonempty_string(payload["mount_fsid"], "mount_fsid")
-    mount_flags = _require_mount_flags(payload["mount_flags"])
+    mount_flags = _require_mount_flags(payload["mount_flags"], is_local)
     observed_st_dev = _require_exact_int(
         payload["runtime_root_st_dev"], "runtime_root_st_dev"
     )
@@ -194,6 +260,7 @@ def _parse_platform_evidence(
 
 def require_supported_platform(root: Path) -> PlatformEvidence:
     """Run the real native probe and reject every non-supported evidence tuple."""
+    initial_root = _runtime_root_identity(root)
     probe = darwin_probe_path()
     if not probe.is_file() or not os.access(probe, os.X_OK):
         raise PlatformProbeError("Darwin probe executable is unavailable")
@@ -221,7 +288,9 @@ def require_supported_platform(root: Path) -> PlatformEvidence:
         raise PlatformProbeError("Darwin probe emitted invalid JSON") from error
     if not isinstance(decoded, dict):
         raise PlatformProbeError("Darwin probe emitted a non-object JSON value")
-    return _parse_platform_evidence(decoded, root.stat().st_dev)
+    if _runtime_root_identity(root) != initial_root:
+        raise PlatformUnsupported("Darwin platform tuple is unsupported")
+    return _parse_platform_evidence(decoded, initial_root.st_dev)
 
 
 def preallocate(fd: int, length: int) -> None:

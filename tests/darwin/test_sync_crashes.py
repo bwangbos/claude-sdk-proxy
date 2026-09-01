@@ -21,14 +21,29 @@ def runtime_root(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("boundary", "authorized_prefix"),
+    ("boundary", "authorized_prefix", "current_exists", "renamed_exists"),
     [
-        ("after_create", []),
-        ("after_preallocate", []),
-        ("after_append", []),
-        ("after_fullfsync", ["create", "preallocate", "append", "fullfsync"]),
-        ("after_renameat", ["create", "preallocate", "append", "fullfsync"]),
-        ("after_unlinkat", ["create", "preallocate", "append", "fullfsync"]),
+        ("after_create", [], True, False),
+        ("after_preallocate", [], True, False),
+        ("after_append", [], True, False),
+        (
+            "after_fullfsync",
+            ["create", "preallocate", "append", "fullfsync"],
+            True,
+            False,
+        ),
+        (
+            "after_renameat",
+            ["create", "preallocate", "append", "fullfsync"],
+            False,
+            True,
+        ),
+        (
+            "after_unlinkat",
+            ["create", "preallocate", "append", "fullfsync"],
+            False,
+            False,
+        ),
         (
             "after_directory_fsync",
             [
@@ -40,11 +55,17 @@ def runtime_root(tmp_path: Path) -> Path:
                 "unlinkat",
                 "directory_fsync",
             ],
+            False,
+            False,
         ),
     ],
 )
 def test_process_crash_reports_only_the_completed_sync_prefix(
-    runtime_root: Path, boundary: str, authorized_prefix: list[str]
+    runtime_root: Path,
+    boundary: str,
+    authorized_prefix: list[str],
+    current_exists: bool,
+    renamed_exists: bool,
 ) -> None:
     """Unsynced visibility is never treated as reboot or power-loss evidence."""
     completed = subprocess.run(
@@ -62,3 +83,5 @@ def test_process_crash_reports_only_the_completed_sync_prefix(
         "child_exit_status": 91,
         "authorized_prefix": authorized_prefix,
     }
+    assert (runtime_root / ".darwin-probe-crash-current").exists() is current_exists
+    assert (runtime_root / ".darwin-probe-crash-renamed").exists() is renamed_exists
