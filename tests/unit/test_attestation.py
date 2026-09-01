@@ -572,6 +572,40 @@ class _BlockingCloseStream:
         self.stream.close()
 
 
+class _ReentrantCloseResource:
+    def __init__(self, resource: Any, owner: Any, *, catch_recursive: bool) -> None:
+        self.resource = resource
+        self.owner = owner
+        self.catch_recursive = catch_recursive
+        self.reenter = True
+        self.in_callback = False
+        self.close_count = 0
+        self.recursive_errors: list[AttestationError] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.resource, name)
+
+    @property
+    def closed(self) -> bool:
+        return self.resource.closed
+
+    def close(self) -> None:
+        self.close_count += 1
+        if self.reenter:
+            if self.in_callback:
+                raise AssertionError("recursive cleanup repeated resource close")
+            self.in_callback = True
+            try:
+                implementation._cleanup_version_probe_owner(self.owner)
+            except AttestationError as error:
+                self.recursive_errors.append(error)
+                if not self.catch_recursive:
+                    raise
+            finally:
+                self.in_callback = False
+        self.resource.close()
+
+
 @pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
 def test_selector_construction_failure_cleans_captured_version_owner(
     tmp_path: Path,
@@ -926,6 +960,155 @@ def test_concurrent_reaped_cleanup_retries_are_serialized(
         assert sum(outcome is None for outcome in outcomes) == 1
         assert sum(isinstance(outcome, AttestationError) for outcome in outcomes) == 1
         assert owner.leader_pid not in implementation._RETAINED_VERSION_PROBES
+
+
+@pytest.mark.parametrize("callback", ["termination", "wait"])
+@pytest.mark.parametrize("catch_recursive", [False, True])
+def test_live_cleanup_rejects_same_thread_reentry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    callback: str,
+    catch_recursive: bool,
+) -> None:
+    body = "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do /bin/sleep 1; done\n"
+    cli_body = body if callback == "termination" else None
+    with _launch_inputs(tmp_path, cli_body=cli_body) as inputs:
+        if callback == "termination":
+            effective = build_child_environment(
+                inputs.source, inputs.environment_config
+            )
+            owner = implementation._spawn_and_register_version_probe(
+                inputs.descriptors.real_cli, effective
+            )
+        else:
+            owner = _spawn_finished_version_probe(inputs)
+
+        callback_count = 0
+        recursive_errors: list[AttestationError] = []
+        if callback == "termination":
+            original_callback = implementation.os.killpg
+
+            def reentrant_callback(pgid: int, signal_number: int) -> None:
+                nonlocal callback_count
+                callback_count += 1
+                if callback_count > 1:
+                    raise AssertionError("recursive cleanup repeated group signaling")
+                try:
+                    implementation._cleanup_version_probe_owner(owner)
+                except AttestationError as error:
+                    recursive_errors.append(error)
+                    if not catch_recursive:
+                        raise
+                original_callback(pgid, signal_number)
+
+            monkeypatch.setattr(implementation.os, "killpg", reentrant_callback)
+        else:
+            original_callback = owner.process.wait
+
+            def reentrant_callback(*args: object, **kwargs: object) -> int:
+                nonlocal callback_count
+                callback_count += 1
+                if callback_count > 1:
+                    raise AssertionError("recursive cleanup repeated leader wait")
+                try:
+                    implementation._cleanup_version_probe_owner(owner)
+                except AttestationError as error:
+                    recursive_errors.append(error)
+                    if not catch_recursive:
+                        raise
+                return original_callback(*args, **kwargs)
+
+            monkeypatch.setattr(owner.process, "wait", reentrant_callback)
+
+        try:
+            if catch_recursive:
+                implementation._cleanup_version_probe_owner(owner)
+                assert owner.leader_pid not in implementation._RETAINED_VERSION_PROBES
+            else:
+                with pytest.raises(AttestationError, match="already in progress"):
+                    implementation._cleanup_version_probe_owner(owner)
+                assert implementation._RETAINED_VERSION_PROBES == {
+                    owner.leader_pid: owner
+                }
+                assert owner.cleanup_in_progress is False
+            assert callback_count == 1
+            assert len(recursive_errors) == 1
+        finally:
+            if callback == "termination":
+                monkeypatch.setattr(implementation.os, "killpg", original_callback)
+            else:
+                monkeypatch.setattr(owner.process, "wait", original_callback)
+            if implementation._RETAINED_VERSION_PROBES:
+                implementation._cleanup_version_probe_owner(owner)
+
+
+@pytest.mark.parametrize("resource_name", ["selector", "stdout", "stderr"])
+@pytest.mark.parametrize("catch_recursive", [False, True])
+def test_reaped_cleanup_rejects_same_thread_reentry(
+    tmp_path: Path,
+    resource_name: str,
+    catch_recursive: bool,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        owner = _spawn_finished_version_probe(inputs)
+        implementation._reap_version_probe_leader(owner)
+        if resource_name == "selector":
+            resource = implementation.selectors.DefaultSelector()
+            wrapped = _ReentrantCloseResource(
+                resource, owner, catch_recursive=catch_recursive
+            )
+            owner.selector = wrapped
+        else:
+            resource = getattr(owner.process, resource_name)
+            assert resource is not None
+            wrapped = _ReentrantCloseResource(
+                resource, owner, catch_recursive=catch_recursive
+            )
+            setattr(owner.process, resource_name, wrapped)
+
+        try:
+            if catch_recursive:
+                implementation._cleanup_version_probe_owner(owner)
+                assert owner.leader_pid not in implementation._RETAINED_VERSION_PROBES
+            else:
+                with pytest.raises(AttestationError, match="already in progress"):
+                    implementation._cleanup_version_probe_owner(owner)
+                assert implementation._RETAINED_VERSION_PROBES == {
+                    owner.leader_pid: owner
+                }
+                assert owner.cleanup_in_progress is False
+                if resource_name == "selector":
+                    assert owner.selector is wrapped
+                else:
+                    assert not resource.closed
+            assert wrapped.close_count == 1
+            assert len(wrapped.recursive_errors) == 1
+        finally:
+            if implementation._RETAINED_VERSION_PROBES:
+                wrapped.reenter = False
+                implementation._cleanup_version_probe_owner(owner)
+
+
+@pytest.mark.parametrize("tampered", [None, 0, 1, "yes"])
+def test_cleanup_guard_tampering_fails_before_action(
+    tmp_path: Path,
+    tampered: object,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        owner = _spawn_finished_version_probe(inputs)
+        owner.cleanup_in_progress = tampered
+        try:
+            with pytest.raises(AttestationError, match="owner state"):
+                implementation._cleanup_version_probe_owner(owner)
+            assert implementation._RETAINED_VERSION_PROBES == {
+                owner.leader_pid: owner
+            }
+            assert owner.process.returncode is None
+            assert not owner.process.stdout.closed
+            assert not owner.process.stderr.closed
+        finally:
+            owner.cleanup_in_progress = False
+            implementation._cleanup_version_probe_owner(owner)
 
 
 def test_prepare_binds_workdir_to_task5_instance(tmp_path: Path) -> None:
