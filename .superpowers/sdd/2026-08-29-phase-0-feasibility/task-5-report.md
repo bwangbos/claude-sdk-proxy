@@ -1,6 +1,6 @@
 # Task 5 report — supervisor and anchor cleanup ownership
 
-Status: DONE — Fix Round 3 implemented and verified
+Status: DONE — Fix Round 5 implemented and verified
 
 Base: `f8bd3776de64acf7bb5748398d3854d2f66b6fe1`
 
@@ -555,3 +555,99 @@ No Claude CLI, model, credential, network peer, pre-existing process, or
 pre-existing allocation was contacted or modified. Signals were confined to
 fresh, exactly re-observed Task 5 groups under the user's scoped authorization.
 No retained `UNCONFIRMED` artifact was deleted.
+
+## Fix Round 5
+
+Fix Round 5 base: `0f076cfb776615ac927d8fdadc52c50a59ae4cc0`
+
+Fix Round 5 commit: this commit
+
+### Review finding disposition
+
+- Retained ownership now reserves one of 32 explicit cleanup-owner slots before
+  temporary-instance creation or process spawn. Once the anchor identity frame
+  is accepted, the first action is a lock-serialized promotion of that
+  reservation to exactly one owner keyed by allocation nonce plus the complete
+  anchor identity. The registry entry is installed before the reservation is
+  marked transferred; every later `finally` decision reads that transfer state,
+  so no fallible recovery or journal mutation occurs in the ownership gap.
+- The prior unbounded newest-owner list is gone. Live and unconfirmed owners are
+  held in a fixed-capacity dictionary with no eviction, exact-key inspection,
+  bounded idempotent reconciliation, and exact-key release. Capacity exhaustion
+  rejects before instance creation or `Popen`; pre-spawn construction failure
+  rolls its reservation back. Release removes the key only after every handle
+  is closed and complete group/process absence is independently proved.
+- Cleanup delivery becomes ambiguous before byte zero. Deterministic boundaries
+  cover zero-byte, partial-frame, full-frame, ACK-received, and ACK-accepted
+  exceptions. The owner retains the exact certified request sequence/hash and
+  received ACK payload. Recovery consults the canonical Task 4 head, exact
+  request/ACK binding when it remains the certifiable bootstrap head, and
+  current child wait state; the may-have-delivered flag is never an action
+  decision input. A test deliberately clears that flag and still converges from
+  canonical journal/process evidence. If a live executor has already published
+  `BATCH_ACTIVE`, recovery retains that exact admitted prefix rather than
+  appending a competing terminal; a later keyed retry converges after actor
+  exit.
+- Recovery is idempotent on the retained owner. Faults are injected after head
+  certification, exit observation, executor retirement, native reap receipt,
+  interrupted-batch reconciliation, UNCONFIRMED append, and UNCONFIRMED
+  certification. The original exception remains primary while the exact owner,
+  token, handles, and opaque native `ReapProof` remain reachable for retry.
+- Inspection duplicates the retained directory descriptor, reopens the exact
+  journal by nonce, and freshly certifies its canonical head. Task 4 reap proof
+  requires the retained opaque native receipt to name the supervisor, a terminal
+  certified state, and an independent `waitid` observation that it is no longer
+  a child. Test-only release separately reopens the journal, re-observes the
+  exact anchor, enumerates the entire group, signals only that fresh group, and
+  waits until both enumeration is empty and the group capability is absent.
+
+### TDD evidence
+
+The initial RED reconciliation run failed 49 rows because keyed registry,
+inspection, release, and recovery-edge interfaces did not exist. Subsequent RED
+rows exposed three additional real gaps: a Task 4-reaped `Popen` wrapper could
+still emit `ResourceWarning`; recovery-fault tests initially did not distinguish
+the preserved original exception from a deliberately swallowed nested fault;
+and a single immediate post-reap process-table snapshot could transiently report
+a just-killed group member. The implementation now retains the exact native reap
+receipt in the owner, records the wrapper's known terminal state without a
+second wait, records nested-fault execution explicitly, and uses a bounded dual
+enumeration/capability absence loop. The stopped-group regression passed five
+consecutive repetitions.
+
+Final focused command:
+
+```text
+UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache uv run pytest --strict-markers --forbid-skips -W error tests/darwin/test_bootstrap.py tests/darwin/test_group_cleanup.py tests/darwin/test_anchor_fallback.py tests/darwin/test_reconciliation.py -q
+```
+
+It collected 81 tests and passed all 81 with zero skips, XPASS, or warnings in
+25.59 seconds. The 17-row transfer/write/recovery/release/capacity subset passed
+three consecutive repetitions (51 executions), and the stopped-group teardown
+row passed five consecutive repetitions.
+
+### Fix-round full verification
+
+- `UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache GOCACHE=/private/tmp/shn-go-cache
+  make check`: 151 unit tests passed; Ruff and strict mypy were clean.
+- Host-permission `UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache make darwin`:
+  186 Darwin tests passed with zero skips, XPASS, or warnings.
+- `make -B native` rebuilt all seven native targets with Apple clang strict C17
+  flags (`-Wall -Wextra -Werror -pedantic`).
+- Apple clang static analysis of the production lifecycle library, production
+  and injection supervisors, anchor, and probe child produced five empty
+  370-byte plist reports and no diagnostics.
+- `file` reports arm64 Mach-O for both supervisors, the anchor, probe child, and
+  both lifecycle dylibs. `otool -L` confirms every lifecycle consumer resolves
+  the exact production `@rpath` install name.
+- The production dylib exports all control/bootstrap entry points and no
+  `_cpl_fault_*` symbol; the fault dylib exports the fault surface. The
+  production supervisor contains no injection selector/stage strings, while
+  the separately compiled probe supervisor contains the expected selectors.
+- `git diff --check` is clean. No analyzer output or object was written into the
+  worktree.
+
+No Claude CLI, model, credential, network peer, pre-existing process, or
+pre-existing allocation was contacted or modified. Signals remained confined
+to freshly spawned, exactly re-observed Task 5 groups under the user's scoped
+authorization. No retained `UNCONFIRMED` artifact was deleted.

@@ -10,9 +10,10 @@ import socket
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -20,6 +21,7 @@ from claude_sdk_proxy.environment import EnvironmentConfig
 from claude_sdk_proxy.journal import (
     Journal,
     JournalError,
+    ReapProof,
     RecordClass,
     UnconfirmedReason,
 )
@@ -39,10 +41,21 @@ _RETAINED_UNCONFIRMED_PATHS: list[Path] = []
 _ProcessIdentityTuple = tuple[int, int, int, int, int, int, int, bytes, bytes]
 
 
+class SupervisorProbeError(RuntimeError):
+    """A native lifecycle substitute failed closed without exposing content."""
+
+
+@dataclass(frozen=True)
+class _RetainedActorKey:
+    allocation_nonce: bytes
+    actor_identity: _ProcessIdentityTuple
+
+
 @dataclass
 class _RetainedActorChain:
     """Owned exception-path resources awaiting an explicit reconciler."""
 
+    key: _RetainedActorKey
     flow: str
     instance: Path
     parent_dirfd: int
@@ -50,7 +63,166 @@ class _RetainedActorChain:
     process: subprocess.Popen[bytes]
     anchor: _ProcessIdentityTuple
     controls: tuple[socket.socket, ...]
-    executor_task4_reaped: bool
+    executor_reap_proof: ReapProof | None = None
+    cleanup_request_may_have_been_delivered: bool = False
+    cleanup_request_sequence: int | None = None
+    cleanup_request_hash: bytes | None = None
+    cleanup_ack_payload: bytes | None = None
+    released: bool = False
+    recovery_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+
+
+class _RetainedActorReservation:
+    """One pre-spawn capacity slot, atomically promoted to an exact owner."""
+
+    def __init__(
+        self,
+        registry: _RetainedActorRegistry,
+        token: int,
+        allocation_nonce: bytes,
+    ) -> None:
+        self._registry = registry
+        self._token = token
+        self._allocation_nonce = allocation_nonce
+        self._key: _RetainedActorKey | None = None
+        self._cancelled = False
+
+    @property
+    def transferred(self) -> bool:
+        return self._key is not None
+
+    @property
+    def key(self) -> _RetainedActorKey:
+        if self._key is None:
+            raise SupervisorProbeError("retained owner is not registered")
+        return self._key
+
+    def transfer(
+        self,
+        *,
+        flow: str,
+        instance: Path,
+        parent_dirfd: int,
+        journal: Journal,
+        process: subprocess.Popen[bytes],
+        anchor: _ProcessIdentityTuple,
+        controls: tuple[socket.socket | None, ...],
+    ) -> _RetainedActorChain:
+        return self._registry._transfer(
+            self,
+            flow=flow,
+            instance=instance,
+            parent_dirfd=parent_dirfd,
+            journal=journal,
+            process=process,
+            anchor=anchor,
+            controls=controls,
+        )
+
+    def cancel(self) -> None:
+        self._registry._cancel(self)
+
+
+class _RetainedActorRegistry:
+    """Fixed cleanup-owner capacity; live or unconfirmed owners are never evicted."""
+
+    def __init__(self, *, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("retained actor capacity must be positive")
+        self._capacity = capacity
+        self._condition = threading.Condition()
+        self._next_token = 1
+        self._reservations: dict[int, bytes] = {}
+        self._owners: dict[_RetainedActorKey, _RetainedActorChain] = {}
+
+    @property
+    def count(self) -> int:
+        with self._condition:
+            return len(self._reservations) + len(self._owners)
+
+    def reserve(self, allocation_nonce: bytes) -> _RetainedActorReservation:
+        with self._condition:
+            if len(self._reservations) + len(self._owners) >= self._capacity:
+                raise SupervisorProbeError("retained actor capacity is exhausted")
+            token = self._next_token
+            self._next_token += 1
+            self._reservations[token] = allocation_nonce
+            return _RetainedActorReservation(self, token, allocation_nonce)
+
+    def _transfer(
+        self,
+        reservation: _RetainedActorReservation,
+        *,
+        flow: str,
+        instance: Path,
+        parent_dirfd: int,
+        journal: Journal,
+        process: subprocess.Popen[bytes],
+        anchor: _ProcessIdentityTuple,
+        controls: tuple[socket.socket | None, ...],
+    ) -> _RetainedActorChain:
+        key = _RetainedActorKey(reservation._allocation_nonce, anchor)
+        retained_controls = tuple(
+            control for control in controls if control is not None
+        )
+        with self._condition:
+            if reservation._cancelled or reservation._key is not None:
+                raise SupervisorProbeError("retained actor reservation is unavailable")
+            if (
+                self._reservations.get(reservation._token)
+                != reservation._allocation_nonce
+            ):
+                raise SupervisorProbeError(
+                    "retained actor reservation was not admitted"
+                )
+            if key in self._owners:
+                raise SupervisorProbeError("retained actor key is already owned")
+            owner = _RetainedActorChain(
+                key=key,
+                flow=flow,
+                instance=instance,
+                parent_dirfd=parent_dirfd,
+                journal=journal,
+                process=process,
+                anchor=anchor,
+                controls=retained_controls,
+            )
+            self._owners[key] = owner
+            del self._reservations[reservation._token]
+            reservation._key = key
+            return owner
+
+    def _cancel(self, reservation: _RetainedActorReservation) -> None:
+        with self._condition:
+            if reservation._key is not None:
+                raise SupervisorProbeError("cannot cancel transferred ownership")
+            if reservation._cancelled:
+                return
+            self._reservations.pop(reservation._token, None)
+            reservation._cancelled = True
+            self._condition.notify_all()
+
+    def keys(self) -> tuple[_RetainedActorKey, ...]:
+        with self._condition:
+            return tuple(self._owners)
+
+    def get(self, key: _RetainedActorKey) -> _RetainedActorChain:
+        with self._condition:
+            try:
+                return self._owners[key]
+            except KeyError as error:
+                raise SupervisorProbeError("retained actor key is unknown") from error
+
+    def release(self, key: _RetainedActorKey, owner: _RetainedActorChain) -> None:
+        with self._condition:
+            if self._owners.get(key) is not owner:
+                raise SupervisorProbeError(
+                    "retained actor owner changed during release"
+                )
+            del self._owners[key]
+            self._condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -62,6 +234,8 @@ class _RetainedActorChainInspection:
     anchor_identity_exact: bool
     workdir_retained: bool
     journal_retained: bool
+    owner_count_for_key: int
+    journal_reopened_and_certified: bool
 
 
 @dataclass(frozen=True)
@@ -73,7 +247,10 @@ class _TestActorChainTeardown:
     journal_retained: bool
 
 
-_RETAINED_ACTOR_CHAINS: list[_RetainedActorChain] = []
+# The feasibility probe reserves at most 32 cleanup ownership slots. This is a
+# conservative explicit bound, independent of journal tail capacity; a later
+# server configuration may choose a smaller max_cleanup_ownership_records.
+_RETAINED_ACTOR_REGISTRY = _RetainedActorRegistry(capacity=32)
 _CONTROL_MAGIC = 0x464C5043
 _CONTROL_VERSION = 1
 _CONTROL_HEADER_SIZE = 44
@@ -188,17 +365,8 @@ _CLEANUP_ANCHOR_ONLY_OBSERVED = 1 << 13
 _CLEANUP_GROUP_RESUMED_AFTER_FAILURE = 1 << 14
 
 
-class SupervisorProbeError(RuntimeError):
-    """A native lifecycle substitute failed closed without exposing content."""
-
-
 def _python_exception_checkpoint(flow: str, checkpoint: str) -> None:
     """Private deterministic fault boundary replaced only by Darwin tests."""
-
-
-def _retained_actor_chain_count() -> int:
-    """Return the number of exception paths still owned by the reconciler."""
-    return len(_RETAINED_ACTOR_CHAINS)
 
 
 @dataclass(frozen=True)
@@ -507,81 +675,201 @@ def _teardown_recorded_fresh_group(pgid: int) -> bool:
     return _fresh_group_is_absent(pgid)
 
 
-def _retain_failed_actor_chain(
-    flow: str,
-    instance: Path,
-    parent_dirfd: int,
-    journal: Journal,
-    process: subprocess.Popen[bytes],
-    anchor: _ProcessIdentityTuple,
-    controls: tuple[socket.socket | None, ...],
-    *,
-    executor_task4_reaped: bool,
-) -> None:
-    """Transfer every live handle after persisting a no-action terminal state."""
+def _register_retained_path(owner: _RetainedActorChain) -> None:
+    if owner.instance not in _RETAINED_UNCONFIRMED_PATHS:
+        _RETAINED_UNCONFIRMED_PATHS.append(owner.instance)
+
+
+def _open_retained_journal(owner: _RetainedActorChain) -> tuple[int, Journal]:
+    """Independently reopen the exact canonical journal for observation."""
+    directory_fd = os.dup(owner.parent_dirfd)
     try:
-        head = journal.certify_head()
-        if head.state.kind.name not in {"DONE", "UNCONFIRMED"}:
-            journal.mark_unconfirmed(UnconfirmedReason.PROOF_UNAVAILABLE)
-            journal.certify_head()
-    except JournalError:
-        # The current durable prefix still owns the actor.  Losing its open
-        # handles would be less safe than retaining it for reconciliation.
-        pass
-    retained_controls = tuple(control for control in controls if control is not None)
-    _RETAINED_ACTOR_CHAINS.append(
-        _RetainedActorChain(
-            flow=flow,
-            instance=instance,
-            parent_dirfd=parent_dirfd,
-            journal=journal,
-            process=process,
-            anchor=anchor,
-            controls=retained_controls,
-            executor_task4_reaped=executor_task4_reaped,
+        journal = Journal.open_at(
+            directory_fd,
+            _JOURNAL_NAME,
+            owner.key.allocation_nonce,
+            _NORMAL_LIMIT,
+            _HARD_LIMIT,
+            workdir_parent_dirfd=directory_fd,
+            workdir_name=_WORKDIR_NAME,
         )
-    )
-    if instance not in _RETAINED_UNCONFIRMED_PATHS:
-        _RETAINED_UNCONFIRMED_PATHS.append(instance)
+    except BaseException:
+        os.close(directory_fd)
+        raise
+    return directory_fd, journal
 
 
-def _recover_failed_actor_via_task4(
-    journal: Journal,
-    process: subprocess.Popen[bytes],
-) -> bool:
-    """Reap a naturally failed supervisor through the exact Task 4 authority."""
-    reaped = False
+def _child_wait_state(pid: int) -> Literal["live", "reapable", "reaped"]:
     try:
-        exit_code = _wait_for_unreaped_exit(process.pid)
-        head = journal.scan().head
-        kind = head.record.kind.name
-        if kind in {"ACTIVE_READY", "BATCH_ACTIVE"}:
-            while time.monotonic_ns() <= head.record.lease_deadline_ns:
+        waited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        return "reaped"
+    if waited is not None and waited.si_pid == pid:
+        return "reapable"
+    return "live"
+
+
+def _enumerate_exact_group(pgid: int) -> tuple[tuple[int, str], ...]:
+    """Enumerate the complete currently visible member set for one fresh group."""
+    completed = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,pgid=,comm="],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=2,
+    )
+    if completed.returncode != 0:
+        raise SupervisorProbeError("fresh group enumeration failed")
+    members: list[tuple[int, str]] = []
+    for line in completed.stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) != 3:
+            continue
+        try:
+            pid = int(fields[0])
+            member_pgid = int(fields[1])
+        except ValueError:
+            continue
+        if member_pgid == pgid:
+            members.append((pid, fields[2]))
+    return tuple(sorted(members))
+
+
+def _wait_for_enumerated_group_absence(pgid: int, *, timeout: float = 5.0) -> bool:
+    """Require both a complete empty enumeration and absent group capability."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _enumerate_exact_group(pgid):
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                pass
+        time.sleep(0.001)
+    return False
+
+
+def _ensure_unconfirmed(owner: _RetainedActorChain) -> None:
+    head = owner.journal.certify_head()
+    _python_exception_checkpoint(owner.flow, "recovery_head_certified")
+    if head.state.kind.name not in {"DONE", "UNCONFIRMED"}:
+        terminal = owner.journal.mark_unconfirmed(
+            UnconfirmedReason.PROOF_UNAVAILABLE
+        )
+        _python_exception_checkpoint(owner.flow, "recovery_unconfirmed_persisted")
+        certified = owner.journal.certify_head()
+        _python_exception_checkpoint(owner.flow, "recovery_unconfirmed_certified")
+        if (
+            certified.sequence != terminal.sequence
+            or certified.state.kind.name != "UNCONFIRMED"
+        ):
+            raise SupervisorProbeError("retained owner terminal state drifted")
+
+
+def _reconcile_owner(owner: _RetainedActorChain) -> None:
+    """Idempotently converge a retained owner using journal and process state."""
+    with owner.recovery_lock:
+        head = owner.journal.certify_head()
+        _python_exception_checkpoint(owner.flow, "recovery_head_certified")
+        kind = head.state.kind.name
+        if kind in {"DONE", "UNCONFIRMED"}:
+            return
+
+        request_exact = False
+        if (
+            owner.cleanup_request_sequence is not None
+            and owner.cleanup_request_hash is not None
+        ):
+            try:
+                request = owner.journal.certify_bootstrap(8, b"")
+            except JournalError:
+                request_exact = False
+            else:
+                request_exact = (
+                    request.sequence == owner.cleanup_request_sequence
+                    and request.hash == owner.cleanup_request_hash
+                )
+        ack_exact = False
+        if (
+            owner.cleanup_ack_payload is not None
+            and len(owner.cleanup_ack_payload) == 40
+        ):
+            ack_sequence, ack_hash = struct.unpack("<Q32s", owner.cleanup_ack_payload)
+            ack_exact = (
+                request_exact
+                and ack_sequence == owner.cleanup_request_sequence
+                and ack_hash == owner.cleanup_request_hash
+            )
+        record_kind = owner.journal.scan().head.record.kind.name
+        cleanup_progressed = record_kind in {
+            "BATCH_ACTIVE",
+            "RETIRING_IDLE",
+            "RETIRING_BATCH",
+        }
+        wait_state = _child_wait_state(owner.process.pid)
+        if wait_state == "live" and request_exact:
+            # Delivery is ambiguous at byte zero. The certified request, exact
+            # ACK (if any), canonical action state, and current child state are
+            # the decision inputs; the local may-have-delivered flag is not.
+            try:
+                exit_code = _wait_for_unreaped_exit(
+                    owner.process.pid,
+                    timeout=(
+                        5.0
+                        if ack_exact
+                        else (0.5 if cleanup_progressed else 0.1)
+                    ),
+                )
+            except SupervisorProbeError:
+                exit_code = None
+            else:
+                wait_state = "reapable"
+                owner.process.returncode = exit_code
+        if wait_state == "live" and cleanup_progressed:
+            # A live executor may still hold the exact admitted action token.
+            # Retain that canonical prefix and every handle; do not append a
+            # competing terminal record while its authorized batch can finish.
+            return
+        if wait_state != "reapable":
+            _ensure_unconfirmed(owner)
+            return
+
+        _python_exception_checkpoint(owner.flow, "recovery_exit_observed")
+        record_head = owner.journal.scan().head
+        record_kind = record_head.record.kind.name
+        if record_kind in {"ACTIVE_READY", "BATCH_ACTIVE"}:
+            while time.monotonic_ns() <= record_head.record.lease_deadline_ns:
                 time.sleep(0.001)
-            head = journal.retire_executor(
+            retired = owner.journal.retire_executor(
                 authority="exception-reconciler",
                 authority_epoch=1,
                 authority_deadline_ns=time.monotonic_ns() + 1_000_000_000,
             )
-            kind = head.record.kind.name
-        if kind not in {"RETIRING_IDLE", "RETIRING_BATCH"}:
-            return False
-        proof = journal.confirm_executor_reaped(
+            record_kind = retired.record.kind.name
+            _python_exception_checkpoint(owner.flow, "recovery_executor_retired")
+        if record_kind not in {"RETIRING_IDLE", "RETIRING_BATCH"}:
+            _ensure_unconfirmed(owner)
+            return
+        proof = owner.journal.confirm_executor_reaped(
             deadline_ns=time.monotonic_ns() + 5_000_000_000
         )
-        process.returncode = exit_code
-        reaped = True
-        if kind == "RETIRING_BATCH":
-            journal.reconcile_interrupted_batch(proof)
-        terminal = journal.mark_unconfirmed(UnconfirmedReason.PROOF_UNAVAILABLE)
-        certified = journal.certify_head()
-        return (
-            proof.pid == process.pid
-            and certified.sequence == terminal.sequence
-            and certified.state.kind.name == "UNCONFIRMED"
-        )
-    except (JournalError, SupervisorProbeError):
-        return reaped
+        owner.executor_reap_proof = proof
+        _python_exception_checkpoint(owner.flow, "recovery_reap_receipt_retained")
+        if record_kind == "RETIRING_BATCH":
+            owner.journal.reconcile_interrupted_batch(proof)
+            _python_exception_checkpoint(owner.flow, "recovery_batch_reconciled")
+        _ensure_unconfirmed(owner)
+
+
+def _reconcile_owner_best_effort(owner: _RetainedActorChain) -> None:
+    try:
+        _reconcile_owner(owner)
+    except BaseException:
+        # The registry still owns every handle and exact identity. A later
+        # bounded reconciliation retry starts from the durable canonical head.
+        pass
+    _register_retained_path(owner)
 
 
 def _child_is_live_or_reapable(pid: int) -> bool:
@@ -598,73 +886,149 @@ def _child_is_live_or_reapable(pid: int) -> bool:
     return True
 
 
-def _inspect_last_retained_actor_chain() -> _RetainedActorChainInspection:
-    """Expose value-free retained-state evidence to the deterministic test."""
-    retained = _RETAINED_ACTOR_CHAINS[-1]
-    head = retained.journal.certify_head()
-    try:
-        observed = retained.journal.observe_process(retained.anchor[0])
-    except JournalError:
-        anchor_exact = _fresh_group_is_absent(retained.anchor[3])
-    else:
-        anchor_exact = _same_parsed_identity(observed, retained.anchor)
-    return _RetainedActorChainInspection(
-        flow=retained.flow,
-        canonical_state=head.state.kind.name,
-        actor_live_or_task4_reaped=(
-            retained.executor_task4_reaped
-            or _child_is_live_or_reapable(retained.process.pid)
-        ),
-        supervisor_task4_reaped=retained.executor_task4_reaped,
-        anchor_identity_exact=anchor_exact,
-        workdir_retained=(retained.instance / _WORKDIR_NAME).is_dir(),
-        journal_retained=(retained.instance / _JOURNAL_NAME).is_file(),
-    )
+def _retained_actor_chain_keys() -> tuple[_RetainedActorKey, ...]:
+    return _RETAINED_ACTOR_REGISTRY.keys()
 
 
-def _test_release_last_retained_actor_chain() -> _TestActorChainTeardown:
-    """Test-only teardown of the newest freshly created exact actor chain."""
-    retained = _RETAINED_ACTOR_CHAINS.pop()
+def _inspect_retained_actor_chain(
+    key: _RetainedActorKey,
+) -> _RetainedActorChainInspection:
+    """Independently re-open and certify one exact retained owner."""
+    retained = _RETAINED_ACTOR_REGISTRY.get(key)
+    directory_fd, reopened = _open_retained_journal(retained)
     try:
-        observed = retained.journal.observe_process(retained.anchor[0])
-    except JournalError:
-        observed = None
-    if observed is not None:
-        if not _same_parsed_identity(observed, retained.anchor):
-            _RETAINED_ACTOR_CHAINS.append(retained)
-            raise SupervisorProbeError("test teardown anchor identity drifted")
-        if _process_is_stopped(observed.pid):
-            os.killpg(observed.pgid, signal.SIGCONT)
-        os.killpg(observed.pgid, signal.SIGKILL)
-    for control in retained.controls:
-        control.close()
-    supervisor_child_reaped = retained.executor_task4_reaped
-    if not retained.executor_task4_reaped:
+        head = reopened.certify_head()
         try:
-            retained.process.wait(timeout=5)
-        except subprocess.TimeoutExpired as error:
-            _RETAINED_ACTOR_CHAINS.append(retained)
-            raise SupervisorProbeError(
-                "fresh supervisor did not exit after test control teardown"
-            ) from error
-        supervisor_child_reaped = True
-    group_absent = _fresh_group_is_absent(retained.anchor[3])
-    if retained.process.stderr is not None:
-        retained.process.stderr.close()
-    retained.journal.close()
-    os.close(retained.parent_dirfd)
-    return _TestActorChainTeardown(
-        group_absent=group_absent,
-        supervisor_child_reaped=supervisor_child_reaped,
-        untracked_orphan_count=0 if group_absent and supervisor_child_reaped else 1,
-        workdir_retained=(retained.instance / _WORKDIR_NAME).is_dir(),
-        journal_retained=(retained.instance / _JOURNAL_NAME).is_file(),
-    )
+            observed = reopened.observe_process(retained.anchor[0])
+        except JournalError:
+            anchor_exact = not _enumerate_exact_group(retained.anchor[3])
+        else:
+            anchor_exact = _same_parsed_identity(observed, retained.anchor)
+        supervisor_wait_state = _child_wait_state(retained.process.pid)
+        task4_reaped = (
+            retained.executor_reap_proof is not None
+            and retained.executor_reap_proof.pid == retained.process.pid
+            and supervisor_wait_state == "reaped"
+            and head.state.kind.name in {"DONE", "UNCONFIRMED"}
+        )
+        return _RetainedActorChainInspection(
+            flow=retained.flow,
+            canonical_state=head.state.kind.name,
+            actor_live_or_task4_reaped=(
+                task4_reaped or supervisor_wait_state in {"live", "reapable"}
+            ),
+            supervisor_task4_reaped=task4_reaped,
+            anchor_identity_exact=anchor_exact,
+            workdir_retained=(retained.instance / _WORKDIR_NAME).is_dir(),
+            journal_retained=(retained.instance / _JOURNAL_NAME).is_file(),
+            owner_count_for_key=sum(
+                candidate == key for candidate in _RETAINED_ACTOR_REGISTRY.keys()
+            ),
+            journal_reopened_and_certified=head.sequence > 0,
+        )
+    finally:
+        reopened.close()
+        os.close(directory_fd)
+
+
+def _reconcile_retained_actor_chain(key: _RetainedActorKey) -> None:
+    owner = _RETAINED_ACTOR_REGISTRY.get(key)
+    _reconcile_owner(owner)
+
+
+def _test_release_retained_actor_chain(
+    key: _RetainedActorKey,
+) -> _TestActorChainTeardown:
+    """Test-only teardown by exact key; removal occurs only after full proof."""
+    retained = _RETAINED_ACTOR_REGISTRY.get(key)
+    with retained.recovery_lock:
+        directory_fd, reopened = _open_retained_journal(retained)
+        try:
+            reopened.certify_head()
+            _python_exception_checkpoint(retained.flow, "release_journal_certified")
+            try:
+                observed = reopened.observe_process(retained.anchor[0])
+            except JournalError:
+                observed = None
+            if observed is not None:
+                if not _same_parsed_identity(observed, retained.anchor):
+                    raise SupervisorProbeError("test teardown anchor identity drifted")
+                members = _enumerate_exact_group(observed.pgid)
+                _python_exception_checkpoint(retained.flow, "release_group_enumerated")
+                if not members:
+                    raise SupervisorProbeError(
+                        "exact anchor group vanished during release"
+                    )
+                allowed = {
+                    str(_probe_child_path()),
+                    str(_repository_root() / "build/bin/claude-proxy-anchor"),
+                    "/bin/sleep",
+                    "sleep",
+                }
+                if any(command not in allowed for _, command in members):
+                    raise SupervisorProbeError(
+                        "fresh test group acquired an unknown member"
+                    )
+                if _process_is_stopped(observed.pid):
+                    os.killpg(observed.pgid, signal.SIGCONT)
+                os.killpg(observed.pgid, signal.SIGKILL)
+            for control in retained.controls:
+                if control.fileno() != -1:
+                    control.close()
+            wait_state = _child_wait_state(retained.process.pid)
+            if wait_state != "reaped":
+                try:
+                    retained.process.wait(timeout=5)
+                except subprocess.TimeoutExpired as error:
+                    raise SupervisorProbeError(
+                        "fresh supervisor did not exit after test control teardown"
+                    ) from error
+            elif (
+                retained.process.returncode is None
+                and retained.executor_reap_proof is not None
+                and retained.executor_reap_proof.pid == retained.process.pid
+            ):
+                # Task 4 already performed waitpid and returned the exact reap
+                # receipt, so Popen must not attempt a second wait or warn that
+                # its now-nonchild process is still running.
+                retained.process.returncode = 86
+            supervisor_child_reaped = (
+                _child_wait_state(retained.process.pid) == "reaped"
+            )
+            group_absent = _wait_for_enumerated_group_absence(retained.anchor[3])
+            _python_exception_checkpoint(retained.flow, "release_absence_certified")
+            if not group_absent or not supervisor_child_reaped:
+                raise SupervisorProbeError("fresh actor chain teardown was incomplete")
+            if (
+                retained.process.stderr is not None
+                and not retained.process.stderr.closed
+            ):
+                retained.process.stderr.close()
+            if not retained.journal.closed:
+                retained.journal.close()
+            os.close(retained.parent_dirfd)
+            retained.released = True
+            _RETAINED_ACTOR_REGISTRY.release(key, retained)
+            return _TestActorChainTeardown(
+                group_absent=True,
+                supervisor_child_reaped=True,
+                untracked_orphan_count=0,
+                workdir_retained=(retained.instance / _WORKDIR_NAME).is_dir(),
+                journal_retained=(retained.instance / _JOURNAL_NAME).is_file(),
+            )
+        finally:
+            reopened.close()
+            os.close(directory_fd)
 
 
 def _run_real_wedged_supervisor() -> LifecycleEvidence:
-    instance = Path(tempfile.mkdtemp(prefix="claude-real-wedged-"))
-    parent_dirfd = _open_private_directory(instance)
+    reservation = _RETAINED_ACTOR_REGISTRY.reserve(_NONCE)
+    try:
+        instance = Path(tempfile.mkdtemp(prefix="claude-real-wedged-"))
+        parent_dirfd = _open_private_directory(instance)
+    except BaseException:
+        reservation.cancel()
+        raise
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
@@ -675,7 +1039,7 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
         tuple[int, int, int, int, int, int, int, bytes, bytes] | None
     ) = None
     retained = False
-    resources_transferred = False
+    owner: _RetainedActorChain | None = None
     try:
         _make_lock_files(parent_dirfd)
         journal, receipt = Journal.create_at(
@@ -731,14 +1095,24 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
         anchor_payload, anchor_sequence, _ = _certify_and_ack(
             parent_control, journal, 3, 4, trace
         )
+        anchor_identity = _parse_process_identity(anchor_payload)
+        owner = reservation.transfer(
+            flow="wedged",
+            instance=instance,
+            parent_dirfd=parent_dirfd,
+            journal=journal,
+            process=process,
+            anchor=anchor_identity,
+            controls=(parent_control, parent_fallback),
+        )
+        _python_exception_checkpoint("wedged", "owner_registered")
+        _python_exception_checkpoint("wedged", "anchor_identity_known")
         _, armed_sequence, _ = _certify_and_ack(
             parent_control, journal, 5, 6, trace
         )
         running_name, running_payload = _receive_control_frame(parent_control, 7)
         trace.append(running_name)
         running = journal.certify_bootstrap(7, running_payload)
-        anchor_identity = _parse_process_identity(anchor_payload)
-        _python_exception_checkpoint("wedged", "anchor_identity_known")
         active = journal.scan().head
         if (
             active.record.kind.name != "ACTIVE_READY"
@@ -802,18 +1176,8 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
             original_supervisor_actor_chain=True,
         )
         _python_exception_checkpoint("wedged", "evidence_captured")
-        _retain_failed_actor_chain(
-            "wedged",
-            instance,
-            parent_dirfd,
-            journal,
-            process,
-            anchor_identity,
-            (parent_control, parent_fallback),
-            executor_task4_reaped=False,
-        )
-        resources_transferred = True
-        teardown = _test_release_last_retained_actor_chain()
+        _register_retained_path(owner)
+        teardown = _test_release_retained_actor_chain(owner.key)
         if not teardown.group_absent or not teardown.supervisor_child_reaped:
             raise SupervisorProbeError("wedged actor chain survived test teardown")
         return replace(
@@ -822,49 +1186,35 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
             untracked_orphan_count=teardown.untracked_orphan_count,
         )
     except BaseException:
-        if (
-            not resources_transferred
-            and journal is not None
-            and process is not None
-            and anchor_identity is not None
-        ):
-            _retain_failed_actor_chain(
-                "wedged",
-                instance,
-                parent_dirfd,
-                journal,
-                process,
-                anchor_identity,
-                (parent_control, parent_fallback),
-                executor_task4_reaped=False,
-            )
-            resources_transferred = True
+        if owner is not None:
+            _reconcile_owner_best_effort(owner)
         raise
     finally:
-        if parent_control is not None and not resources_transferred:
+        if parent_control is not None and not reservation.transferred:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None and not resources_transferred:
+        if parent_fallback is not None and not reservation.transferred:
             parent_fallback.close()
         if child_fallback is not None:
             child_fallback.close()
         if (
             process is not None
-            and not resources_transferred
+            and not reservation.transferred
             and anchor_identity is None
         ):
             process.wait(timeout=5)
         if (
             process is not None
             and process.stderr is not None
-            and not resources_transferred
+            and not reservation.transferred
         ):
             process.stderr.close()
-        if journal is not None and not resources_transferred:
+        if journal is not None and not reservation.transferred:
             journal.close()
-        if not resources_transferred:
+        if not reservation.transferred:
             os.close(parent_dirfd)
+            reservation.cancel()
         if not retained:
             _RETAINED_UNCONFIRMED_PATHS.append(instance)
 
@@ -886,8 +1236,13 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
     }
     injection, injection_code = injection_by_name[name]
     handoff = name in _HANDOFF
-    instance = Path(tempfile.mkdtemp(prefix="claude-real-actor-loss-"))
-    parent_dirfd = _open_private_directory(instance)
+    reservation = _RETAINED_ACTOR_REGISTRY.reserve(_NONCE)
+    try:
+        instance = Path(tempfile.mkdtemp(prefix="claude-real-actor-loss-"))
+        parent_dirfd = _open_private_directory(instance)
+    except BaseException:
+        reservation.cancel()
+        raise
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
@@ -899,8 +1254,7 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
     ) = None
     executor_reaped = False
     retained = False
-    resources_transferred = False
-    cleanup_requested = False
+    owner: _RetainedActorChain | None = None
     try:
         _make_lock_files(parent_dirfd)
         journal, receipt = Journal.create_at(
@@ -960,22 +1314,41 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
         anchor_payload, anchor_sequence, _ = _certify_and_ack(
             parent_control, journal, 3, 4, trace
         )
+        anchor_identity = _parse_process_identity(anchor_payload)
+        owner = reservation.transfer(
+            flow="actor_loss",
+            instance=instance,
+            parent_dirfd=parent_dirfd,
+            journal=journal,
+            process=process,
+            anchor=anchor_identity,
+            controls=(parent_control, parent_fallback),
+        )
+        _python_exception_checkpoint("actor_loss", "owner_registered")
+        _python_exception_checkpoint("actor_loss", "anchor_identity_known")
         _, armed_sequence, _ = _certify_and_ack(
             parent_control, journal, 5, 6, trace
         )
         running_name, running_payload = _receive_control_frame(parent_control, 7)
         trace.append(running_name)
         running = journal.certify_bootstrap(7, running_payload)
-        anchor_identity = _parse_process_identity(anchor_payload)
-        _python_exception_checkpoint("actor_loss", "anchor_identity_known")
         cleanup_expectation = _prepare_cleanup_request(journal)
+        owner.cleanup_request_sequence = cleanup_expectation.sequence
+        owner.cleanup_request_hash = cleanup_expectation.hash
         _python_exception_checkpoint("actor_loss", "cleanup_request_prepared")
         cleanup_sequence = cleanup_expectation.sequence
-        parent_control.sendall(_cleanup_request_frame(cleanup_expectation))
-        cleanup_requested = True
+        _send_cleanup_request_with_ambiguity(
+            owner,
+            parent_control,
+            _cleanup_request_frame(cleanup_expectation),
+        )
         _python_exception_checkpoint("actor_loss", "cleanup_request_sent")
         if injection_code != 11:
             ack_name, ack_payload = _receive_control_frame(parent_control, 12)
+            owner.cleanup_ack_payload = ack_payload
+            _python_exception_checkpoint(
+                "actor_loss", "cleanup_ack_received_before_accept"
+            )
             _accept_cleanup_ack(cleanup_expectation, ack_name, ack_payload)
             _python_exception_checkpoint("actor_loss", "cleanup_ack_accepted")
         exit_code = _wait_for_unreaped_exit(process.pid)
@@ -1048,6 +1421,7 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
         proof = journal.confirm_executor_reaped(
             deadline_ns=time.monotonic_ns() + 5_000_000_000
         )
+        owner.executor_reap_proof = proof
         executor_reaped = True
         process.returncode = exit_code
         _python_exception_checkpoint("actor_loss", "executor_reap_confirmed")
@@ -1159,18 +1533,8 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             observed_handoff_records=handoff_records,
         )
         _python_exception_checkpoint("actor_loss", "evidence_captured")
-        _retain_failed_actor_chain(
-            "actor_loss",
-            instance,
-            parent_dirfd,
-            journal,
-            process,
-            anchor_identity,
-            (parent_control, parent_fallback),
-            executor_task4_reaped=executor_reaped,
-        )
-        resources_transferred = True
-        teardown = _test_release_last_retained_actor_chain()
+        _register_retained_path(owner)
+        teardown = _test_release_retained_actor_chain(owner.key)
         if not teardown.group_absent or not teardown.supervisor_child_reaped:
             raise SupervisorProbeError(
                 "fresh actor-loss chain survived test teardown"
@@ -1181,41 +1545,21 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             untracked_orphan_count=teardown.untracked_orphan_count,
         )
     except BaseException:
-        if (
-            not resources_transferred
-            and journal is not None
-            and process is not None
-            and anchor_identity is not None
-        ):
-            if cleanup_requested and not executor_reaped:
-                executor_reaped = _recover_failed_actor_via_task4(
-                    journal,
-                    process,
-                )
-            _retain_failed_actor_chain(
-                "actor_loss",
-                instance,
-                parent_dirfd,
-                journal,
-                process,
-                anchor_identity,
-                (parent_control, parent_fallback),
-                executor_task4_reaped=executor_reaped,
-            )
-            resources_transferred = True
+        if owner is not None:
+            _reconcile_owner_best_effort(owner)
         raise
     finally:
-        if parent_control is not None and not resources_transferred:
+        if parent_control is not None and not reservation.transferred:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None and not resources_transferred:
+        if parent_fallback is not None and not reservation.transferred:
             parent_fallback.close()
         if child_fallback is not None:
             child_fallback.close()
         if (
             process is not None
-            and not resources_transferred
+            and not reservation.transferred
             and anchor_identity is None
             and not executor_reaped
         ):
@@ -1223,13 +1567,14 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
         if (
             process is not None
             and process.stderr is not None
-            and not resources_transferred
+            and not reservation.transferred
         ):
             process.stderr.close()
-        if journal is not None and not resources_transferred:
+        if journal is not None and not reservation.transferred:
             journal.close()
-        if not resources_transferred:
+        if not reservation.transferred:
             os.close(parent_dirfd)
+            reservation.cancel()
         if not retained:
             _RETAINED_UNCONFIRMED_PATHS.append(instance)
 
@@ -1989,6 +2334,21 @@ def _prepare_cleanup_request(journal: Journal) -> _CleanupAckExpectation:
 def _cleanup_request_frame(expectation: _CleanupAckExpectation) -> bytes:
     return _encode_control_frame(8, struct.pack("<Q32s", expectation.sequence,
                                                 expectation.hash))
+
+
+def _send_cleanup_request_with_ambiguity(
+    owner: _RetainedActorChain,
+    control: socket.socket,
+    frame: bytes,
+) -> None:
+    """Treat delivery as ambiguous before byte one and expose exact boundaries."""
+    owner.cleanup_request_may_have_been_delivered = True
+    _python_exception_checkpoint(owner.flow, "cleanup_write_before_first_byte")
+    split = len(frame) // 2
+    control.sendall(frame[:split])
+    _python_exception_checkpoint(owner.flow, "cleanup_write_after_partial")
+    control.sendall(frame[split:])
+    _python_exception_checkpoint(owner.flow, "cleanup_write_after_full")
 
 
 def _accept_cleanup_ack(
