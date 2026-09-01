@@ -11,6 +11,8 @@ from typing import Final, Self
 HASH_SIZE: Final = 32
 ID_SIZE: Final = 32
 REASON_SIZE: Final = 64
+WORKDIR_NAME_SIZE: Final = 64
+MAX_BATCH_DESCRIPTORS: Final = 4
 
 STEP_PROCESS_ABSENT: Final = 1 << 0
 STEP_EXECUTOR_REAPED: Final = 1 << 1
@@ -52,6 +54,34 @@ class BatchOutcome(IntEnum):
     NONE = 0
     COMPLETED = 1
     INTERRUPTED = 2
+
+
+class BatchDescriptorKind(IntEnum):
+    PROCESS_ABSENT = 1
+    REAP_PROCESS = 2
+    REMOVE_WORKDIR = 3
+    TERMINAL_CHECKS = 4
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    start_ns: int
+    uid: int
+    pgid: int
+    sid: int
+    flags: int
+    executable_dev: int
+    executable_ino: int
+    boot_id: bytes
+    executable_hash: bytes
+
+
+@dataclass(frozen=True)
+class BatchDescriptor:
+    kind: BatchDescriptorKind
+    required_steps: int
+    target: ProcessIdentity | None = None
 
 
 class IllegalTransition(RuntimeError):
@@ -104,6 +134,15 @@ class State:
     boot_id: bytes = bytes(HASH_SIZE)
     executable_hash: bytes = bytes(HASH_SIZE)
     batch_outcome: BatchOutcome = BatchOutcome.NONE
+    descriptor_count: int = 0
+    normal_limit: int = 0
+    hard_limit: int = 0
+    workdir_parent_dev: int = 0
+    workdir_parent_ino: int = 0
+    workdir_dev: int = 0
+    workdir_ino: int = 0
+    workdir_bound: bool = False
+    no_dependent_artifact: bool = False
     candidate: str = ""
     executor: str = ""
     prior_actor: str = ""
@@ -111,6 +150,8 @@ class State:
     exact_batch: str = ""
     inherited_batch: str = ""
     reason: str = ""
+    workdir_name: str = ""
+    descriptors: tuple[BatchDescriptor, ...] = ()
 
     @classmethod
     def no_generation(cls) -> Self:
@@ -254,6 +295,15 @@ class Record:
     boot_id: bytes = bytes(HASH_SIZE)
     executable_hash: bytes = bytes(HASH_SIZE)
     batch_outcome: BatchOutcome = BatchOutcome.NONE
+    descriptor_count: int = 0
+    normal_limit: int = 0
+    hard_limit: int = 0
+    workdir_parent_dev: int = 0
+    workdir_parent_ino: int = 0
+    workdir_dev: int = 0
+    workdir_ino: int = 0
+    workdir_bound: bool = False
+    no_dependent_artifact: bool = False
     parent: bytes | None = None
     candidate: str = ""
     executor: str = ""
@@ -262,6 +312,8 @@ class Record:
     exact_batch: str = ""
     inherited_batch: str = ""
     reason: str = ""
+    workdir_name: str = ""
+    descriptors: tuple[BatchDescriptor, ...] = ()
 
     @classmethod
     def prepared(
@@ -435,6 +487,29 @@ class Record:
         return ctypes.string_at(ctypes.byref(native), ctypes.sizeof(native))
 
 
+class _CProcessIdentity(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_int64),
+        ("start_ns", ctypes.c_uint64),
+        ("uid", ctypes.c_uint32),
+        ("pgid", ctypes.c_int32),
+        ("sid", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+        ("executable_dev", ctypes.c_uint64),
+        ("executable_ino", ctypes.c_uint64),
+        ("boot_id", ctypes.c_uint8 * HASH_SIZE),
+        ("executable_hash", ctypes.c_uint8 * HASH_SIZE),
+    ]
+
+
+class _CBatchDescriptor(ctypes.Structure):
+    _fields_ = [
+        ("kind", ctypes.c_uint32),
+        ("required_steps", ctypes.c_uint32),
+        ("target", _CProcessIdentity),
+    ]
+
+
 class _CState(ctypes.Structure):
     _fields_ = [
         ("kind", ctypes.c_uint32),
@@ -454,7 +529,15 @@ class _CState(ctypes.Structure):
         ("executable_dev", ctypes.c_uint64),
         ("executable_ino", ctypes.c_uint64),
         ("batch_outcome", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
+        ("descriptor_count", ctypes.c_uint32),
+        ("normal_limit", ctypes.c_uint64),
+        ("hard_limit", ctypes.c_uint64),
+        ("workdir_parent_dev", ctypes.c_uint64),
+        ("workdir_parent_ino", ctypes.c_uint64),
+        ("workdir_dev", ctypes.c_uint64),
+        ("workdir_ino", ctypes.c_uint64),
+        ("workdir_bound", ctypes.c_uint32),
+        ("no_dependent_artifact", ctypes.c_uint32),
         ("boot_id", ctypes.c_uint8 * HASH_SIZE),
         ("executable_hash", ctypes.c_uint8 * HASH_SIZE),
         ("candidate", ctypes.c_uint8 * ID_SIZE),
@@ -464,6 +547,8 @@ class _CState(ctypes.Structure):
         ("exact_batch", ctypes.c_uint8 * ID_SIZE),
         ("inherited_batch", ctypes.c_uint8 * ID_SIZE),
         ("reason", ctypes.c_uint8 * REASON_SIZE),
+        ("workdir_name", ctypes.c_uint8 * WORKDIR_NAME_SIZE),
+        ("descriptors", _CBatchDescriptor * MAX_BATCH_DESCRIPTORS),
     ]
 
 
@@ -485,6 +570,16 @@ class _CRecord(ctypes.Structure):
         ("process_identity_flags", ctypes.c_uint32),
         ("executable_dev", ctypes.c_uint64),
         ("executable_ino", ctypes.c_uint64),
+        ("descriptor_count", ctypes.c_uint32),
+        ("workdir_bound", ctypes.c_uint32),
+        ("normal_limit", ctypes.c_uint64),
+        ("hard_limit", ctypes.c_uint64),
+        ("workdir_parent_dev", ctypes.c_uint64),
+        ("workdir_parent_ino", ctypes.c_uint64),
+        ("workdir_dev", ctypes.c_uint64),
+        ("workdir_ino", ctypes.c_uint64),
+        ("no_dependent_artifact", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
         ("parent_hash", ctypes.c_uint8 * HASH_SIZE),
         ("boot_id", ctypes.c_uint8 * HASH_SIZE),
         ("executable_hash", ctypes.c_uint8 * HASH_SIZE),
@@ -495,12 +590,63 @@ class _CRecord(ctypes.Structure):
         ("exact_batch", ctypes.c_uint8 * ID_SIZE),
         ("inherited_batch", ctypes.c_uint8 * ID_SIZE),
         ("reason", ctypes.c_uint8 * REASON_SIZE),
+        ("workdir_name", ctypes.c_uint8 * WORKDIR_NAME_SIZE),
+        ("descriptors", _CBatchDescriptor * MAX_BATCH_DESCRIPTORS),
     ]
 
 
 def _set_bytes(target: ctypes.Array[ctypes.c_uint8], value: bytes) -> None:
     if value:
         ctypes.memmove(target, value, len(value))
+
+
+def _identity_to_c(identity: ProcessIdentity | None) -> _CProcessIdentity:
+    native = _CProcessIdentity()
+    if identity is None:
+        return native
+    native.pid = identity.pid
+    native.start_ns = identity.start_ns
+    native.uid = identity.uid
+    native.pgid = identity.pgid
+    native.sid = identity.sid
+    native.flags = identity.flags
+    native.executable_dev = identity.executable_dev
+    native.executable_ino = identity.executable_ino
+    _set_bytes(native.boot_id, _checked_parent(identity.boot_id))
+    _set_bytes(native.executable_hash, _checked_parent(identity.executable_hash))
+    return native
+
+
+def _identity_from_c(native: _CProcessIdentity) -> ProcessIdentity:
+    return ProcessIdentity(
+        pid=native.pid,
+        start_ns=native.start_ns,
+        uid=native.uid,
+        pgid=native.pgid,
+        sid=native.sid,
+        flags=native.flags,
+        executable_dev=native.executable_dev,
+        executable_ino=native.executable_ino,
+        boot_id=bytes(native.boot_id),
+        executable_hash=bytes(native.executable_hash),
+    )
+
+
+def _descriptor_to_c(descriptor: BatchDescriptor) -> _CBatchDescriptor:
+    native = _CBatchDescriptor()
+    native.kind = descriptor.kind
+    native.required_steps = descriptor.required_steps
+    native.target = _identity_to_c(descriptor.target)
+    return native
+
+
+def _descriptor_from_c(native: _CBatchDescriptor) -> BatchDescriptor:
+    target = _identity_from_c(native.target)
+    return BatchDescriptor(
+        kind=BatchDescriptorKind(native.kind),
+        required_steps=native.required_steps,
+        target=None if target.pid == 0 else target,
+    )
 
 
 def _state_to_c(state: State) -> _CState:
@@ -522,6 +668,15 @@ def _state_to_c(state: State) -> _CState:
     native.executable_dev = state.executable_dev
     native.executable_ino = state.executable_ino
     native.batch_outcome = state.batch_outcome
+    native.descriptor_count = state.descriptor_count
+    native.normal_limit = state.normal_limit
+    native.hard_limit = state.hard_limit
+    native.workdir_parent_dev = state.workdir_parent_dev
+    native.workdir_parent_ino = state.workdir_parent_ino
+    native.workdir_dev = state.workdir_dev
+    native.workdir_ino = state.workdir_ino
+    native.workdir_bound = state.workdir_bound
+    native.no_dependent_artifact = state.no_dependent_artifact
     _set_bytes(native.boot_id, _checked_parent(state.boot_id))
     _set_bytes(native.executable_hash, _checked_parent(state.executable_hash))
     _set_bytes(native.candidate, _checked_text(state.candidate, ID_SIZE, "candidate"))
@@ -540,6 +695,14 @@ def _state_to_c(state: State) -> _CState:
         _checked_text(state.inherited_batch, ID_SIZE, "inherited_batch"),
     )
     _set_bytes(native.reason, _checked_text(state.reason, REASON_SIZE, "reason"))
+    _set_bytes(
+        native.workdir_name,
+        _checked_text(state.workdir_name, WORKDIR_NAME_SIZE, "workdir_name"),
+    )
+    if len(state.descriptors) > MAX_BATCH_DESCRIPTORS:
+        raise ValueError("too many batch descriptors")
+    for index, descriptor in enumerate(state.descriptors):
+        native.descriptors[index] = _descriptor_to_c(descriptor)
     return native
 
 
@@ -561,6 +724,15 @@ def _record_to_c(record: Record) -> _CRecord:
     native.process_identity_flags = record.process_identity_flags
     native.executable_dev = record.executable_dev
     native.executable_ino = record.executable_ino
+    native.descriptor_count = record.descriptor_count
+    native.workdir_bound = record.workdir_bound
+    native.normal_limit = record.normal_limit
+    native.hard_limit = record.hard_limit
+    native.workdir_parent_dev = record.workdir_parent_dev
+    native.workdir_parent_ino = record.workdir_parent_ino
+    native.workdir_dev = record.workdir_dev
+    native.workdir_ino = record.workdir_ino
+    native.no_dependent_artifact = record.no_dependent_artifact
     _set_bytes(native.parent_hash, _checked_parent(record.parent))
     _set_bytes(native.boot_id, _checked_parent(record.boot_id))
     _set_bytes(native.executable_hash, _checked_parent(record.executable_hash))
@@ -586,6 +758,14 @@ def _record_to_c(record: Record) -> _CRecord:
         _checked_text(record.inherited_batch, ID_SIZE, "inherited_batch"),
     )
     _set_bytes(native.reason, _checked_text(record.reason, REASON_SIZE, "reason"))
+    _set_bytes(
+        native.workdir_name,
+        _checked_text(record.workdir_name, WORKDIR_NAME_SIZE, "workdir_name"),
+    )
+    if len(record.descriptors) > MAX_BATCH_DESCRIPTORS:
+        raise ValueError("too many batch descriptors")
+    for index, descriptor in enumerate(record.descriptors):
+        native.descriptors[index] = _descriptor_to_c(descriptor)
     return native
 
 
@@ -614,6 +794,15 @@ def _state_from_c(native: _CState) -> State:
         boot_id=bytes(native.boot_id),
         executable_hash=bytes(native.executable_hash),
         batch_outcome=BatchOutcome(native.batch_outcome),
+        descriptor_count=native.descriptor_count,
+        normal_limit=native.normal_limit,
+        hard_limit=native.hard_limit,
+        workdir_parent_dev=native.workdir_parent_dev,
+        workdir_parent_ino=native.workdir_parent_ino,
+        workdir_dev=native.workdir_dev,
+        workdir_ino=native.workdir_ino,
+        workdir_bound=bool(native.workdir_bound),
+        no_dependent_artifact=bool(native.no_dependent_artifact),
         candidate=_decode_text(native.candidate),
         executor=_decode_text(native.executor),
         prior_actor=_decode_text(native.prior_actor),
@@ -621,6 +810,11 @@ def _state_from_c(native: _CState) -> State:
         exact_batch=_decode_text(native.exact_batch),
         inherited_batch=_decode_text(native.inherited_batch),
         reason=_decode_text(native.reason),
+        workdir_name=_decode_text(native.workdir_name),
+        descriptors=tuple(
+            _descriptor_from_c(native.descriptors[index])
+            for index in range(native.descriptor_count)
+        ),
     )
 
 

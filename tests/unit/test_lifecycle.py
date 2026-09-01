@@ -164,10 +164,15 @@ def test_active_without_admitted_batch_retires_idle() -> None:
             authority="reconciler-1",
             authority_epoch=1,
             deadline_ns=800,
+            exact_batch="fabricated-batch",
+            batch_outcome=BatchOutcome.COMPLETED,
         ),
     )
 
     assert retired.kind is StateKind.RETIRING_IDLE
+    assert retired.exact_batch == ""
+    assert retired.inherited_batch == ""
+    assert retired.batch_outcome is BatchOutcome.NONE
 
 
 def test_retiring_batch_preserves_only_admitted_batch() -> None:
@@ -299,6 +304,35 @@ def test_retiring_idle_hands_off_to_exact_next_generation() -> None:
             retired,
             Record.prepared(4, "helper-3", claim_deadline_ns=900),
         )
+
+
+def test_completed_retiring_batch_is_not_inherited_by_successor() -> None:
+    retiring = State.retiring_batch(
+        2,
+        "batch-1",
+        prior_executor="executor-1",
+        authority="reconciler-1",
+        authority_epoch=1,
+        deadline_ns=800,
+    )
+    idle = Lifecycle.apply(
+        retiring,
+        Record.batch_done(
+            2,
+            "batch-1",
+            executor="executor-1",
+            lease_deadline_ns=500,
+            completed_steps=0,
+            batch_outcome=BatchOutcome.COMPLETED,
+        ),
+    )
+
+    prepared = Lifecycle.apply(
+        idle,
+        Record.prepared(3, "helper-2", claim_deadline_ns=900),
+    )
+
+    assert prepared.inherited_batch == ""
 
 
 def test_done_requires_all_terminal_steps_and_no_admitted_batch() -> None:

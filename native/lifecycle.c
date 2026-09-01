@@ -3,7 +3,9 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libproc.h>
 #include <limits.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
@@ -12,7 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/proc.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -22,6 +27,7 @@
 #define CPL_MAX_NAME 180U
 #define CPL_LOCK_RETRY_NS 500000ULL
 #define CPL_DEFAULT_DEADLINE_NS 1000000000ULL
+#define CPL_MIN_RECOVERY_RECORDS 8U
 
 static const uint8_t CPL_MAGIC[CPL_MAGIC_SIZE] = {
     'C', 'P', 'L', 'J', 'R', 'N', '0', '1'
@@ -42,30 +48,118 @@ struct cpl_journal {
     uint64_t hard_limit;
     uint8_t nonce[CPL_HASH_SIZE];
     char journal_name[CPL_MAX_NAME + 1U];
+    dev_t workdir_parent_dev;
+    ino_t workdir_parent_ino;
+    char workdir_name[CPL_WORKDIR_NAME_SIZE];
+    uint8_t create_capability[CPL_HASH_SIZE];
+    uint8_t workdir_capability[CPL_HASH_SIZE];
+    uint8_t action_capability[CPL_HASH_SIZE];
+    uint8_t reap_capability[CPL_HASH_SIZE];
+    uint8_t reap_head_hash[CPL_HASH_SIZE];
+    struct cpl_process_identity reaped_identity;
+    uint64_t action_completed_steps;
+    uint32_t authorized_record_kind;
+    pthread_t authorized_thread;
+    pthread_t action_owner_thread;
+    bool action_held;
+    bool action_executed;
+    bool reap_proof_valid;
+    bool fork_invalid;
     bool unhealthy;
+    struct cpl_journal *registry_next;
 };
 
-_Static_assert(sizeof(struct cpl_record) == 456U,
-    "cpl_record ABI layout changed");
-_Static_assert(sizeof(struct cpl_state) == 432U,
+_Static_assert(sizeof(struct cpl_process_identity) == 112U,
+    "cpl_process_identity ABI layout changed");
+_Static_assert(sizeof(struct cpl_batch_descriptor) == 120U,
+    "cpl_batch_descriptor ABI layout changed");
+_Static_assert(sizeof(struct cpl_state) == 1032U,
     "cpl_state ABI layout changed");
-_Static_assert(sizeof(struct cpl_chain) == 512U,
-    "cpl_chain ABI layout changed");
-_Static_assert(sizeof(struct cpl_certified_head) == 488U,
-    "cpl_certified_head ABI layout changed");
-_Static_assert(sizeof(struct cpl_create_receipt) == 36U,
-    "cpl_create_receipt ABI layout changed");
-_Static_assert(sizeof(struct cpl_delete_authority) == 68U,
-    "cpl_delete_authority ABI layout changed");
-_Static_assert(sizeof(struct cpl_delete_receipt) == 8U,
-    "cpl_delete_receipt ABI layout changed");
+_Static_assert(sizeof(struct cpl_record) == 1064U,
+    "cpl_record ABI layout changed");
+
+static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t atfork_once = PTHREAD_ONCE_INIT;
+static cpl_journal *registry_head = NULL;
+
+#ifdef CPL_ENABLE_FAULT_INJECTION
+#define CPL_RECEIPT_REGISTRY_CAPACITY 64U
+static pthread_mutex_t receipt_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t delete_receipts[CPL_RECEIPT_REGISTRY_CAPACITY][CPL_HASH_SIZE];
+static bool delete_receipt_used[CPL_RECEIPT_REGISTRY_CAPACITY];
+#endif
 
 static int validate_parent_identity(cpl_journal *journal, int parent_dirfd);
+static int validate_workdir_parent_identity(cpl_journal *journal,
+    int parent_dirfd);
+
+static void atfork_prepare(void) {
+    (void)pthread_mutex_lock(&registry_mutex);
+}
+
+static void atfork_parent(void) {
+    (void)pthread_mutex_unlock(&registry_mutex);
+}
+
+static void atfork_child(void) {
+    cpl_journal *journal = registry_head;
+
+    while (journal != NULL) {
+        if (journal->fd >= 0) {
+            (void)close(journal->fd);
+            journal->fd = -1;
+        }
+        if (journal->append_lock_fd >= 0) {
+            (void)close(journal->append_lock_fd);
+            journal->append_lock_fd = -1;
+        }
+        if (journal->action_lock_fd >= 0) {
+            (void)close(journal->action_lock_fd);
+            journal->action_lock_fd = -1;
+        }
+        journal->fork_invalid = true;
+        journal = journal->registry_next;
+    }
+    registry_head = NULL;
+    (void)pthread_mutex_unlock(&registry_mutex);
+}
+
+static void install_atfork(void) {
+    (void)pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
+}
+
+static int register_handle(cpl_journal *journal) {
+    if (pthread_once(&atfork_once, install_atfork) != 0 ||
+        pthread_mutex_lock(&registry_mutex) != 0) {
+        return CPL_ERR_SYSTEM;
+    }
+    journal->registry_next = registry_head;
+    registry_head = journal;
+    (void)pthread_mutex_unlock(&registry_mutex);
+    return CPL_OK;
+}
+
+static void unregister_handle(cpl_journal *journal) {
+    cpl_journal **cursor;
+
+    if (journal->fork_invalid || pthread_mutex_lock(&registry_mutex) != 0) {
+        return;
+    }
+    cursor = &registry_head;
+    while (*cursor != NULL) {
+        if (*cursor == journal) {
+            *cursor = journal->registry_next;
+            break;
+        }
+        cursor = &(*cursor)->registry_next;
+    }
+    (void)pthread_mutex_unlock(&registry_mutex);
+}
 
 static uint64_t monotonic_ns(void) {
     struct timespec now;
 
-    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
         return 0U;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
@@ -93,6 +187,9 @@ static int take_mutex(pthread_mutex_t *mutex, uint64_t deadline_ns) {
     int status;
 
     for (;;) {
+        if (monotonic_ns() >= deadline_ns) {
+            return CPL_ERR_LOCK_TIMEOUT;
+        }
         status = pthread_mutex_trylock(mutex);
         if (status == 0) {
             return CPL_OK;
@@ -109,6 +206,9 @@ static int take_mutex(pthread_mutex_t *mutex, uint64_t deadline_ns) {
 
 static int take_flock(int fd, uint64_t deadline_ns) {
     for (;;) {
+        if (monotonic_ns() >= deadline_ns) {
+            return CPL_ERR_LOCK_TIMEOUT;
+        }
         if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
             return CPL_OK;
         }
@@ -147,6 +247,16 @@ static bool same_id(const uint8_t left[CPL_ID_SIZE],
 
 static bool has_id(const uint8_t value[CPL_ID_SIZE]) {
     return !is_zero(value, CPL_ID_SIZE);
+}
+
+static void random_capability(uint8_t out[CPL_HASH_SIZE]) {
+    arc4random_buf(out, CPL_HASH_SIZE);
+}
+
+static bool same_capability(const uint8_t left[CPL_HASH_SIZE],
+    const uint8_t right[CPL_HASH_SIZE]) {
+    return !is_zero(left, CPL_HASH_SIZE) &&
+        memcmp(left, right, CPL_HASH_SIZE) == 0;
 }
 
 static void put_u16(uint8_t *target, uint16_t value) {
@@ -221,6 +331,240 @@ static int validate_component(const char *name) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
     return CPL_OK;
+}
+
+static int validate_workdir_component(const char *name) {
+    size_t length;
+
+    if (name == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    length = strnlen(name, CPL_WORKDIR_NAME_SIZE);
+    if (length == 0U || length >= CPL_WORKDIR_NAME_SIZE ||
+        strchr(name, '/') != NULL || strcmp(name, ".") == 0 ||
+        strcmp(name, "..") == 0) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    return CPL_OK;
+}
+
+static int hash_fd(int fd, uint8_t out[CPL_HASH_SIZE]) {
+    struct stat metadata;
+    uint8_t *content;
+    ssize_t got;
+
+    if (fstat(fd, &metadata) < 0 || metadata.st_size < 0 ||
+        metadata.st_size > (off_t)(64U * 1024U * 1024U)) {
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    content = malloc(metadata.st_size == 0 ? 1U : (size_t)metadata.st_size);
+    if (content == NULL) {
+        return CPL_ERR_SYSTEM;
+    }
+    got = pread(fd, content, (size_t)metadata.st_size, 0);
+    if (got < 0 || got != metadata.st_size) {
+        free(content);
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    sha256(content, (size_t)metadata.st_size, out);
+    free(content);
+    return CPL_OK;
+}
+
+static bool complete_identity(const struct cpl_process_identity *identity) {
+    return identity != NULL && identity->pid > 0 &&
+        identity->start_ns > 0U &&
+        identity->flags == CPL_COMPLETE_PROCESS_IDENTITY &&
+        identity->pgid > 0 && identity->sid > 0 &&
+        identity->executable_dev > 0U && identity->executable_ino > 0U &&
+        !is_zero(identity->boot_id, CPL_HASH_SIZE) &&
+        !is_zero(identity->executable_hash, CPL_HASH_SIZE);
+}
+
+#ifdef CPL_ENABLE_FAULT_INJECTION
+#define CPL_FAULT_PROCESS_CAPACITY 32U
+static pthread_mutex_t fault_process_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct cpl_process_identity
+    fault_processes[CPL_FAULT_PROCESS_CAPACITY];
+static uint8_t fault_boot_id[CPL_HASH_SIZE];
+
+static int fault_process_observe(int64_t pid,
+    struct cpl_process_identity *out) {
+    char executable_path[PROC_PIDPATHINFO_MAXSIZE];
+    struct stat executable;
+    uint32_t path_size = (uint32_t)sizeof(executable_path);
+    size_t index;
+    int executable_fd;
+    int status;
+
+    if (kill((pid_t)pid, 0) < 0) {
+        return errno == ESRCH ? CPL_ERR_NOT_FOUND : CPL_ERR_PROCESS_IDENTITY;
+    }
+    if (pthread_mutex_lock(&fault_process_mutex) != 0) {
+        return CPL_ERR_SYSTEM;
+    }
+    for (index = 0U; index < CPL_FAULT_PROCESS_CAPACITY; ++index) {
+        if (fault_processes[index].pid == pid) {
+            *out = fault_processes[index];
+            (void)pthread_mutex_unlock(&fault_process_mutex);
+            return CPL_OK;
+        }
+    }
+    if (_NSGetExecutablePath(executable_path, &path_size) != 0) {
+        (void)pthread_mutex_unlock(&fault_process_mutex);
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    executable_fd = open(executable_path, O_RDONLY | O_CLOEXEC);
+    if (executable_fd < 0 || fstat(executable_fd, &executable) < 0 ||
+        !S_ISREG(executable.st_mode)) {
+        if (executable_fd >= 0) {
+            (void)close(executable_fd);
+        }
+        (void)pthread_mutex_unlock(&fault_process_mutex);
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    (void)memset(out, 0, sizeof(*out));
+    out->pid = pid;
+    out->start_ns = monotonic_ns();
+    out->uid = geteuid();
+    out->pgid = getpgid((pid_t)pid);
+    out->sid = getsid((pid_t)pid);
+    out->executable_dev = (uint64_t)executable.st_dev;
+    out->executable_ino = (uint64_t)executable.st_ino;
+    if (is_zero(fault_boot_id, CPL_HASH_SIZE)) {
+        uint64_t boot_seed = monotonic_ns();
+
+        sha256((const uint8_t *)&boot_seed, sizeof(boot_seed), fault_boot_id);
+    }
+    (void)memcpy(out->boot_id, fault_boot_id, CPL_HASH_SIZE);
+    status = hash_fd(executable_fd, out->executable_hash);
+    (void)close(executable_fd);
+    if (status != CPL_OK || out->pgid <= 0 || out->sid <= 0) {
+        (void)memset(out, 0, sizeof(*out));
+        (void)pthread_mutex_unlock(&fault_process_mutex);
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    out->flags = CPL_COMPLETE_PROCESS_IDENTITY;
+    for (index = 0U; index < CPL_FAULT_PROCESS_CAPACITY; ++index) {
+        if (fault_processes[index].pid == 0) {
+            fault_processes[index] = *out;
+            break;
+        }
+    }
+    (void)pthread_mutex_unlock(&fault_process_mutex);
+    return index < CPL_FAULT_PROCESS_CAPACITY ? CPL_OK : CPL_ERR_SYSTEM;
+}
+#endif
+
+int cpl_process_observe(int64_t pid, struct cpl_process_identity *out) {
+    struct proc_bsdinfo process;
+    struct timeval boot;
+    struct stat executable;
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    size_t boot_size = sizeof(boot);
+    int executable_fd;
+    int status;
+
+    if (out == NULL || pid <= 0 || pid > INT_MAX) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(out, 0, sizeof(*out));
+    if (proc_pidinfo((int)pid, PROC_PIDTBSDINFO, 0U, &process,
+            (int)sizeof(process)) != (int)sizeof(process) ||
+        process.pbi_pid != (uint32_t)pid) {
+#ifdef CPL_ENABLE_FAULT_INJECTION
+        if (errno == EPERM) {
+            return fault_process_observe(pid, out);
+        }
+#endif
+        return errno == ESRCH ? CPL_ERR_NOT_FOUND : CPL_ERR_PROCESS_IDENTITY;
+    }
+    if (sysctlbyname("kern.boottime", &boot, &boot_size, NULL, 0U) < 0 ||
+        boot_size != sizeof(boot) || boot.tv_sec <= 0) {
+#ifdef CPL_ENABLE_FAULT_INJECTION
+        if (errno == EPERM) {
+            return fault_process_observe(pid, out);
+        }
+#endif
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    (void)memset(path, 0, sizeof(path));
+    if (proc_pidpath((int)pid, path, (uint32_t)sizeof(path)) <= 0) {
+#ifdef CPL_ENABLE_FAULT_INJECTION
+        if (errno == EPERM) {
+            return fault_process_observe(pid, out);
+        }
+#endif
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    executable_fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (executable_fd < 0 || fstat(executable_fd, &executable) < 0 ||
+        !S_ISREG(executable.st_mode)) {
+        if (executable_fd >= 0) {
+            (void)close(executable_fd);
+        }
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    out->pid = pid;
+    out->start_ns = process.pbi_start_tvsec * 1000000000ULL +
+        process.pbi_start_tvusec * 1000ULL;
+    out->uid = process.pbi_uid;
+    out->pgid = (int32_t)process.pbi_pgid;
+    out->sid = (int32_t)getsid((pid_t)pid);
+    out->executable_dev = (uint64_t)executable.st_dev;
+    out->executable_ino = (uint64_t)executable.st_ino;
+    sha256((const uint8_t *)&boot, sizeof(boot), out->boot_id);
+    status = hash_fd(executable_fd, out->executable_hash);
+    (void)close(executable_fd);
+    if (status != CPL_OK || out->sid <= 0) {
+        (void)memset(out, 0, sizeof(*out));
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    out->flags = CPL_COMPLETE_PROCESS_IDENTITY;
+    return complete_identity(out) ? CPL_OK : CPL_ERR_PROCESS_IDENTITY;
+}
+
+static void identity_from_state(const struct cpl_state *state,
+    struct cpl_process_identity *identity) {
+    (void)memset(identity, 0, sizeof(*identity));
+    identity->pid = state->process_pid;
+    identity->start_ns = state->process_start_ns;
+    identity->uid = state->process_uid;
+    identity->pgid = state->process_pgid;
+    identity->sid = state->process_sid;
+    identity->flags = state->process_identity_flags;
+    identity->executable_dev = state->executable_dev;
+    identity->executable_ino = state->executable_ino;
+    (void)memcpy(identity->boot_id, state->boot_id, CPL_HASH_SIZE);
+    (void)memcpy(identity->executable_hash, state->executable_hash,
+        CPL_HASH_SIZE);
+}
+
+static void identity_to_record(const struct cpl_process_identity *identity,
+    struct cpl_record *record) {
+    record->process_pid = identity->pid;
+    record->process_start_ns = identity->start_ns;
+    record->process_uid = identity->uid;
+    record->process_pgid = identity->pgid;
+    record->process_sid = identity->sid;
+    record->process_identity_flags = identity->flags;
+    record->executable_dev = identity->executable_dev;
+    record->executable_ino = identity->executable_ino;
+    (void)memcpy(record->boot_id, identity->boot_id, CPL_HASH_SIZE);
+    (void)memcpy(record->executable_hash, identity->executable_hash,
+        CPL_HASH_SIZE);
+}
+
+static bool same_process_identity(const struct cpl_process_identity *left,
+    const struct cpl_process_identity *right) {
+    return left->pid == right->pid && left->start_ns == right->start_ns &&
+        left->uid == right->uid && left->pgid == right->pgid &&
+        left->sid == right->sid && left->flags == right->flags &&
+        left->executable_dev == right->executable_dev &&
+        left->executable_ino == right->executable_ino &&
+        memcmp(left->boot_id, right->boot_id, CPL_HASH_SIZE) == 0 &&
+        memcmp(left->executable_hash, right->executable_hash,
+            CPL_HASH_SIZE) == 0;
 }
 
 static int validate_parent(int parent_dirfd, struct stat *out) {
@@ -299,10 +643,23 @@ static int open_lock_at(int parent_dirfd, const char *journal_name,
     return CPL_OK;
 }
 
+static int validate_limits(uint64_t normal_limit, uint64_t hard_limit) {
+    uint64_t record_size = CPL_HEADER_SIZE + sizeof(struct cpl_record);
+    uint64_t recovery_min = record_size * CPL_MIN_RECOVERY_RECORDS;
+
+    if (normal_limit < record_size || normal_limit >= hard_limit ||
+        hard_limit - normal_limit < recovery_min) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    return CPL_OK;
+}
+
 static int initialize_handle(int fd, int parent_dirfd, const char *journal_name,
+    int workdir_parent_dirfd, const char *workdir_name,
     const uint8_t nonce[CPL_HASH_SIZE], uint64_t normal_limit,
     uint64_t hard_limit, cpl_journal **out) {
     struct stat parent_stat;
+    struct stat workdir_parent_stat;
     struct stat journal_stat;
     cpl_journal *journal;
     int append_fd = -1;
@@ -310,6 +667,10 @@ static int initialize_handle(int fd, int parent_dirfd, const char *journal_name,
     int status;
 
     status = validate_parent(parent_dirfd, &parent_stat);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = validate_parent(workdir_parent_dirfd, &workdir_parent_stat);
     if (status != CPL_OK) {
         return status;
     }
@@ -348,8 +709,14 @@ static int initialize_handle(int fd, int parent_dirfd, const char *journal_name,
     journal->journal_ino = journal_stat.st_ino;
     journal->normal_limit = normal_limit;
     journal->hard_limit = hard_limit;
+    journal->workdir_parent_dev = workdir_parent_stat.st_dev;
+    journal->workdir_parent_ino = workdir_parent_stat.st_ino;
     (void)memcpy(journal->nonce, nonce, CPL_HASH_SIZE);
     (void)memcpy(journal->journal_name, journal_name, strlen(journal_name) + 1U);
+    (void)memcpy(journal->workdir_name, workdir_name,
+        strlen(workdir_name) + 1U);
+    random_capability(journal->create_capability);
+    random_capability(journal->workdir_capability);
     if (pthread_mutex_init(&journal->append_mutex, NULL) != 0) {
         free(journal);
         (void)close(action_fd);
@@ -363,6 +730,15 @@ static int initialize_handle(int fd, int parent_dirfd, const char *journal_name,
         (void)close(append_fd);
         return CPL_ERR_SYSTEM;
     }
+    status = register_handle(journal);
+    if (status != CPL_OK) {
+        (void)pthread_mutex_destroy(&journal->action_mutex);
+        (void)pthread_mutex_destroy(&journal->append_mutex);
+        free(journal);
+        (void)close(action_fd);
+        (void)close(append_fd);
+        return status;
+    }
     *out = journal;
     return CPL_OK;
 }
@@ -371,7 +747,7 @@ static int ensure_owner(cpl_journal *journal) {
     if (journal == NULL) {
         return CPL_ERR_CLOSED;
     }
-    if (journal->owner_pid != getpid()) {
+    if (journal->fork_invalid || journal->owner_pid != getpid()) {
         return CPL_ERR_FORK_INHERITED;
     }
     return CPL_OK;
@@ -432,6 +808,15 @@ static void state_from_record(struct cpl_state *out,
     out->executable_dev = record->executable_dev;
     out->executable_ino = record->executable_ino;
     out->batch_outcome = record->batch_outcome;
+    out->descriptor_count = record->descriptor_count;
+    out->normal_limit = record->normal_limit;
+    out->hard_limit = record->hard_limit;
+    out->workdir_parent_dev = record->workdir_parent_dev;
+    out->workdir_parent_ino = record->workdir_parent_ino;
+    out->workdir_dev = record->workdir_dev;
+    out->workdir_ino = record->workdir_ino;
+    out->workdir_bound = record->workdir_bound;
+    out->no_dependent_artifact = record->no_dependent_artifact;
     (void)memcpy(out->boot_id, record->boot_id, CPL_HASH_SIZE);
     (void)memcpy(out->executable_hash, record->executable_hash,
         CPL_HASH_SIZE);
@@ -442,6 +827,24 @@ static void state_from_record(struct cpl_state *out,
     (void)memcpy(out->exact_batch, record->exact_batch, CPL_ID_SIZE);
     (void)memcpy(out->inherited_batch, record->inherited_batch, CPL_ID_SIZE);
     (void)memcpy(out->reason, record->reason, CPL_REASON_SIZE);
+    (void)memcpy(out->workdir_name, record->workdir_name,
+        CPL_WORKDIR_NAME_SIZE);
+    (void)memcpy(out->descriptors, record->descriptors,
+        sizeof(out->descriptors));
+}
+
+static void preserve_allocation(struct cpl_state *out,
+    const struct cpl_state *current) {
+    out->normal_limit = current->normal_limit;
+    out->hard_limit = current->hard_limit;
+    out->workdir_parent_dev = current->workdir_parent_dev;
+    out->workdir_parent_ino = current->workdir_parent_ino;
+    out->workdir_dev = current->workdir_dev;
+    out->workdir_ino = current->workdir_ino;
+    out->workdir_bound = current->workdir_bound;
+    out->no_dependent_artifact = current->no_dependent_artifact;
+    (void)memcpy(out->workdir_name, current->workdir_name,
+        CPL_WORKDIR_NAME_SIZE);
 }
 
 static void preserve_process_identity(struct cpl_state *out,
@@ -473,17 +876,47 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
     }
 
     switch (record->kind) {
+    case CPL_RECORD_WORKDIR_BOUND:
+        if (current->kind != CPL_STATE_NO_GENERATION ||
+            current->workdir_bound != 0U ||
+            record->workdir_bound != 1U || record->workdir_dev == 0U ||
+            record->workdir_ino == 0U ||
+            record->workdir_parent_dev != current->workdir_parent_dev ||
+            record->workdir_parent_ino != current->workdir_parent_ino ||
+            memcmp(record->workdir_name, current->workdir_name,
+                CPL_WORKDIR_NAME_SIZE) != 0) {
+            return CPL_ERR_ILLEGAL_TRANSITION;
+        }
+        next = *current;
+        next.workdir_bound = 1U;
+        next.workdir_dev = record->workdir_dev;
+        next.workdir_ino = record->workdir_ino;
+        break;
+    case CPL_RECORD_NO_DEPENDENT_ARTIFACT:
+        if (current->kind != CPL_STATE_NO_GENERATION ||
+            current->workdir_bound != 0U ||
+            current->no_dependent_artifact != 0U ||
+            record->no_dependent_artifact != 1U) {
+            return CPL_ERR_ILLEGAL_TRANSITION;
+        }
+        next = *current;
+        next.no_dependent_artifact = 1U;
+        break;
     case CPL_RECORD_PREPARED:
         if (!has_id(record->candidate) || record->generation == 0U) {
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
         if (current->kind == CPL_STATE_NO_GENERATION) {
             state_from_record(&next, record, CPL_STATE_PREPARED);
+            preserve_allocation(&next, current);
         } else if (current->kind == CPL_STATE_RETIRING_IDLE &&
             record->generation == current->generation + 1U) {
             state_from_record(&next, record, CPL_STATE_PREPARED);
-            (void)memcpy(next.inherited_batch, current->exact_batch,
-                CPL_ID_SIZE);
+            preserve_allocation(&next, current);
+            if (current->batch_outcome == CPL_BATCH_INTERRUPTED) {
+                (void)memcpy(next.inherited_batch, current->exact_batch,
+                    CPL_ID_SIZE);
+            }
         } else {
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
@@ -495,6 +928,7 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
         state_from_record(&next, record, CPL_STATE_ACTIVE_READY);
+        preserve_allocation(&next, current);
         (void)memcpy(next.inherited_batch, current->inherited_batch,
             CPL_ID_SIZE);
         break;
@@ -507,6 +941,7 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
         state_from_record(&next, record, CPL_STATE_BATCH_ACTIVE);
+        preserve_allocation(&next, current);
         preserve_process_identity(&next, current);
         (void)memcpy(next.inherited_batch, current->inherited_batch,
             CPL_ID_SIZE);
@@ -521,6 +956,7 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
         if (current->kind == CPL_STATE_BATCH_ACTIVE &&
             record->batch_outcome == CPL_BATCH_NONE) {
             state_from_record(&next, record, CPL_STATE_ACTIVE_READY);
+            preserve_allocation(&next, current);
             preserve_process_identity(&next, current);
             (void)memcpy(next.inherited_batch, current->inherited_batch,
                 CPL_ID_SIZE);
@@ -532,6 +968,12 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
             next.kind = CPL_STATE_RETIRING_IDLE;
             next.batch_outcome = record->batch_outcome;
             next.completed_steps = record->completed_steps;
+            if (record->batch_outcome == CPL_BATCH_COMPLETED) {
+                (void)memset(next.inherited_batch, 0, CPL_ID_SIZE);
+            } else {
+                (void)memcpy(next.inherited_batch, current->exact_batch,
+                    CPL_ID_SIZE);
+            }
         } else {
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
@@ -545,11 +987,23 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
         if (current->kind == CPL_STATE_PREPARED &&
             same_id(record->prior_actor, current->candidate)) {
             state_from_record(&next, record, CPL_STATE_RETIRING_IDLE);
+            preserve_allocation(&next, current);
+            (void)memset(next.exact_batch, 0, CPL_ID_SIZE);
+            (void)memset(next.inherited_batch, 0, CPL_ID_SIZE);
+            next.batch_outcome = CPL_BATCH_NONE;
+            next.descriptor_count = 0U;
+            (void)memset(next.descriptors, 0, sizeof(next.descriptors));
         } else if (current->kind == CPL_STATE_ACTIVE_READY &&
             same_id(record->prior_actor, current->executor)) {
             state_from_record(&next, record, CPL_STATE_RETIRING_IDLE);
+            preserve_allocation(&next, current);
             next.completed_steps = current->completed_steps;
             preserve_process_identity(&next, current);
+            (void)memset(next.exact_batch, 0, CPL_ID_SIZE);
+            (void)memset(next.inherited_batch, 0, CPL_ID_SIZE);
+            next.batch_outcome = CPL_BATCH_NONE;
+            next.descriptor_count = 0U;
+            (void)memset(next.descriptors, 0, sizeof(next.descriptors));
         } else {
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
@@ -564,9 +1018,13 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
         state_from_record(&next, record, CPL_STATE_RETIRING_BATCH);
+        preserve_allocation(&next, current);
         next.completed_steps = current->completed_steps;
         preserve_process_identity(&next, current);
         (void)memcpy(next.executor, current->executor, CPL_ID_SIZE);
+        next.descriptor_count = current->descriptor_count;
+        (void)memcpy(next.descriptors, current->descriptors,
+            sizeof(next.descriptors));
         break;
     case CPL_RECORD_REPLACE_AUTHORITY:
         if ((current->kind != CPL_STATE_RETIRING_IDLE &&
@@ -619,7 +1077,11 @@ static int scan_internal(cpl_journal *journal, struct cpl_chain *out) {
         return CPL_ERR_SYSTEM;
     }
     out->physical_eof = (uint64_t)file_stat.st_size;
-    out->unhealthy = journal->unhealthy || out->physical_eof > journal->hard_limit;
+    out->unhealthy = journal->unhealthy ||
+        out->physical_eof > journal->hard_limit ||
+        (out->physical_eof <= journal->hard_limit &&
+         journal->hard_limit - out->physical_eof <
+            CPL_HEADER_SIZE + sizeof(struct cpl_record));
     readable = out->physical_eof;
     if (readable > journal->hard_limit) {
         readable = journal->hard_limit;
@@ -686,12 +1148,36 @@ static int scan_internal(cpl_journal *journal, struct cpl_chain *out) {
         sha256(candidate, total, hash);
         (void)memcpy(&record, candidate + CPL_HEADER_SIZE, sizeof(record));
         sequence = get_u64(candidate + 48U);
+        if (get_u64(candidate + 56U) != record.cleanup_epoch ||
+            get_u32(candidate + 96U) != record.kind ||
+            memcmp(candidate + 64U, record.parent_hash,
+                CPL_HASH_SIZE) != 0) {
+            ++out->invalid_bytes;
+            ++offset;
+            continue;
+        }
         if (!out->has_intent) {
             if (sequence == 0U && record.kind == CPL_RECORD_INTENT &&
-                is_zero(candidate + 64U, CPL_HASH_SIZE)) {
+                is_zero(candidate + 64U, CPL_HASH_SIZE) &&
+                record.normal_limit == journal->normal_limit &&
+                record.hard_limit == journal->hard_limit &&
+                record.workdir_parent_dev ==
+                    (uint64_t)journal->workdir_parent_dev &&
+                record.workdir_parent_ino ==
+                    (uint64_t)journal->workdir_parent_ino &&
+                memcmp(record.workdir_name, journal->workdir_name,
+                    CPL_WORKDIR_NAME_SIZE) == 0 &&
+                record.workdir_bound == 0U &&
+                record.no_dependent_artifact == 0U) {
                 out->has_intent = true;
                 out->head_sequence = 0U;
                 out->canonical_records = 1U;
+                out->state.normal_limit = record.normal_limit;
+                out->state.hard_limit = record.hard_limit;
+                out->state.workdir_parent_dev = record.workdir_parent_dev;
+                out->state.workdir_parent_ino = record.workdir_parent_ino;
+                (void)memcpy(out->state.workdir_name, record.workdir_name,
+                    CPL_WORKDIR_NAME_SIZE);
                 (void)memcpy(out->head_hash, hash, CPL_HASH_SIZE);
             } else {
                 ++out->stale_records;
@@ -802,6 +1288,7 @@ static int preallocate_file(int fd, uint64_t length) {
 }
 
 int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
+    int workdir_parent_dirfd, const char *workdir_name,
     const uint8_t nonce[CPL_HASH_SIZE], uint64_t normal_limit,
     uint64_t hard_limit, cpl_journal **out,
     struct cpl_create_receipt *receipt) {
@@ -825,8 +1312,8 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
     *out = NULL;
     (void)memset(receipt, 0, sizeof(*receipt));
     status = validate_component(journal_name);
-    if (status != CPL_OK || nonce == NULL || normal_limit >= hard_limit ||
-        normal_limit < sizeof(encoded) || hard_limit < sizeof(encoded)) {
+    if (status != CPL_OK || validate_workdir_component(workdir_name) != CPL_OK ||
+        nonce == NULL || validate_limits(normal_limit, hard_limit) != CPL_OK) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
     status = validate_parent(parent_dirfd, &parent_stat);
@@ -846,8 +1333,9 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
         return CPL_ERR_SYSTEM;
     }
     fault_exit("after_openat");
-    status = initialize_handle(fd, parent_dirfd, journal_name, nonce,
-        normal_limit, hard_limit, &journal);
+    status = initialize_handle(fd, parent_dirfd, journal_name,
+        workdir_parent_dirfd, workdir_name, nonce, normal_limit, hard_limit,
+        &journal);
     if (status != CPL_OK) {
         (void)close(fd);
         return status;
@@ -860,6 +1348,12 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
     fault_exit("after_preallocate");
     (void)memset(&intent, 0, sizeof(intent));
     intent.kind = CPL_RECORD_INTENT;
+    intent.normal_limit = normal_limit;
+    intent.hard_limit = hard_limit;
+    intent.workdir_parent_dev = (uint64_t)journal->workdir_parent_dev;
+    intent.workdir_parent_ino = (uint64_t)journal->workdir_parent_ino;
+    (void)memcpy(intent.workdir_name, journal->workdir_name,
+        CPL_WORKDIR_NAME_SIZE);
     status = encode_record(journal, &intent, 0U, zero_hash, encoded,
         sizeof(encoded), &encoded_length, intent_hash);
     if (status != CPL_OK) {
@@ -907,6 +1401,8 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
     fault_exit("after_intent_parent_fsync");
     receipt->state = CPL_INTENT_PARENT_DIRSYNCED;
     (void)memcpy(receipt->intent_hash, intent_hash, CPL_HASH_SIZE);
+    (void)memcpy(receipt->capability, journal->create_capability,
+        CPL_HASH_SIZE);
     *out = journal;
     return CPL_OK;
 }
@@ -928,6 +1424,7 @@ static int first_record_nonce_status(int fd,
 }
 
 int cpl_journal_open_at(int parent_dirfd, const char *journal_name,
+    int workdir_parent_dirfd, const char *workdir_name,
     const uint8_t nonce[CPL_HASH_SIZE], uint64_t normal_limit,
     uint64_t hard_limit, cpl_journal **out) {
     cpl_journal *journal = NULL;
@@ -940,8 +1437,8 @@ int cpl_journal_open_at(int parent_dirfd, const char *journal_name,
     }
     *out = NULL;
     status = validate_component(journal_name);
-    if (status != CPL_OK || nonce == NULL || normal_limit >= hard_limit ||
-        normal_limit < CPL_HEADER_SIZE + sizeof(struct cpl_record)) {
+    if (status != CPL_OK || validate_workdir_component(workdir_name) != CPL_OK ||
+        nonce == NULL || validate_limits(normal_limit, hard_limit) != CPL_OK) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
     fd = openat(parent_dirfd, journal_name,
@@ -955,13 +1452,18 @@ int cpl_journal_open_at(int parent_dirfd, const char *journal_name,
         }
         return CPL_ERR_SYSTEM;
     }
-    status = initialize_handle(fd, parent_dirfd, journal_name, nonce,
-        normal_limit, hard_limit, &journal);
+    status = initialize_handle(fd, parent_dirfd, journal_name,
+        workdir_parent_dirfd, workdir_name, nonce, normal_limit, hard_limit,
+        &journal);
     if (status == CPL_OK) {
         status = first_record_nonce_status(fd, nonce);
     }
     if (status == CPL_OK) {
         status = scan_internal(journal, &chain);
+    }
+    if (status == CPL_OK && chain.physical_eof >=
+            CPL_HEADER_SIZE + sizeof(struct cpl_record) && !chain.has_intent) {
+        status = CPL_ERR_IDENTITY_DRIFT;
     }
     if (status != CPL_OK) {
         if (journal != NULL) {
@@ -977,6 +1479,8 @@ int cpl_journal_open_at(int parent_dirfd, const char *journal_name,
 
 int cpl_journal_scan(cpl_journal *journal, struct cpl_chain *out) {
     int status = ensure_owner(journal);
+    uint64_t deadline = effective_deadline(0U);
+    bool flock_held = false;
 
     if (status != CPL_OK) {
         return status;
@@ -984,7 +1488,21 @@ int cpl_journal_scan(cpl_journal *journal, struct cpl_chain *out) {
     if (out == NULL) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
-    return scan_internal(journal, out);
+    status = take_mutex(&journal->append_mutex, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = take_flock(journal->append_lock_fd, deadline);
+    if (status == CPL_OK) {
+        flock_held = true;
+        status = scan_internal(journal, out);
+    }
+    if (flock_held && release_flock(journal->append_lock_fd) != CPL_OK &&
+        status == CPL_OK) {
+        status = CPL_ERR_SYSTEM;
+    }
+    (void)pthread_mutex_unlock(&journal->append_mutex);
+    return status;
 }
 
 static bool recovery_allowed(const struct cpl_chain *chain,
@@ -993,7 +1511,8 @@ static bool recovery_allowed(const struct cpl_chain *chain,
         record->kind == CPL_RECORD_RETIRING_BATCH ||
         record->kind == CPL_RECORD_BATCH_DONE ||
         record->kind == CPL_RECORD_UNCONFIRMED ||
-        record->kind == CPL_RECORD_REPLACE_AUTHORITY) {
+        record->kind == CPL_RECORD_REPLACE_AUTHORITY ||
+        record->kind == CPL_RECORD_NO_DEPENDENT_ARTIFACT) {
         return true;
     }
     return record->kind == CPL_RECORD_PREPARED &&
@@ -1002,7 +1521,7 @@ static bool recovery_allowed(const struct cpl_chain *chain,
 
 int cpl_journal_append(cpl_journal *journal, const uint8_t *record_bytes,
     uint32_t record_len, uint32_t record_class, uint64_t deadline_ns,
-    uint8_t out_hash[CPL_HASH_SIZE]) {
+    struct cpl_append_result *out) {
     struct cpl_chain chain;
     struct cpl_state next;
     struct cpl_record record;
@@ -1015,7 +1534,7 @@ int cpl_journal_append(cpl_journal *journal, const uint8_t *record_bytes,
     bool mutex_held = false;
     bool flock_held = false;
 
-    if (record_bytes == NULL || out_hash == NULL ||
+    if (record_bytes == NULL || out == NULL ||
         record_len != sizeof(record) ||
         (record_class != CPL_RECORD_NORMAL &&
          record_class != CPL_RECORD_RECOVERY)) {
@@ -1026,6 +1545,7 @@ int cpl_journal_append(cpl_journal *journal, const uint8_t *record_bytes,
         return status;
     }
     (void)memcpy(&record, record_bytes, sizeof(record));
+    (void)memset(out, 0, sizeof(*out));
     status = take_mutex(&journal->append_mutex, deadline);
     if (status != CPL_OK) {
         return status;
@@ -1044,11 +1564,56 @@ int cpl_journal_append(cpl_journal *journal, const uint8_t *record_bytes,
         status = CPL_ERR_CORRUPT;
         goto done;
     }
+    if ((record.kind == CPL_RECORD_ACTIVE_READY ||
+         record.kind == CPL_RECORD_BATCH_ACTIVE ||
+         record.kind == CPL_RECORD_BATCH_DONE ||
+         record.kind == CPL_RECORD_RETIRING_IDLE ||
+         record.kind == CPL_RECORD_RETIRING_BATCH ||
+         record.kind == CPL_RECORD_DONE ||
+         record.kind == CPL_RECORD_WORKDIR_BOUND ||
+         record.kind == CPL_RECORD_NO_DEPENDENT_ARTIFACT) &&
+        (journal->authorized_record_kind != record.kind ||
+         !pthread_equal(journal->authorized_thread, pthread_self()))) {
+        status = CPL_ERR_AUTHORITY;
+        goto done;
+    }
+    if (record.kind == CPL_RECORD_PREPARED &&
+        (record.deadline_ns <= monotonic_ns() ||
+         record.completed_steps != 0U || record.process_pid != 0)) {
+        status = CPL_ERR_AUTHORITY;
+        goto done;
+    }
+    if (record.kind == CPL_RECORD_PREPARED &&
+        chain.state.kind == CPL_STATE_RETIRING_IDLE &&
+        (journal->authorized_record_kind != CPL_RECORD_PREPARED ||
+         !pthread_equal(journal->authorized_thread, pthread_self()))) {
+        status = CPL_ERR_AUTHORITY;
+        goto done;
+    }
+    if (record.kind == CPL_RECORD_REPLACE_AUTHORITY &&
+        chain.state.deadline_ns > monotonic_ns()) {
+        status = CPL_ERR_AUTHORITY;
+        goto done;
+    }
     if (!is_zero(record.parent_hash, CPL_HASH_SIZE) &&
         memcmp(record.parent_hash, chain.head_hash, CPL_HASH_SIZE) != 0) {
         status = CPL_ERR_PARENT_MISMATCH;
         goto done;
     }
+    record.normal_limit = chain.state.normal_limit;
+    record.hard_limit = chain.state.hard_limit;
+    record.workdir_parent_dev = chain.state.workdir_parent_dev;
+    record.workdir_parent_ino = chain.state.workdir_parent_ino;
+    if (record.kind != CPL_RECORD_WORKDIR_BOUND) {
+        record.workdir_dev = chain.state.workdir_dev;
+        record.workdir_ino = chain.state.workdir_ino;
+        record.workdir_bound = chain.state.workdir_bound;
+    }
+    if (record.kind != CPL_RECORD_NO_DEPENDENT_ARTIFACT) {
+        record.no_dependent_artifact = chain.state.no_dependent_artifact;
+    }
+    (void)memcpy(record.workdir_name, chain.state.workdir_name,
+        CPL_WORKDIR_NAME_SIZE);
     status = cpl_lifecycle_apply(&chain.state, &record, &next);
     if (status != CPL_OK) {
         goto done;
@@ -1072,8 +1637,12 @@ int cpl_journal_append(cpl_journal *journal, const uint8_t *record_bytes,
     }
     (void)memcpy(record.parent_hash, chain.head_hash, CPL_HASH_SIZE);
     status = encode_record(journal, &record, chain.head_sequence + 1U,
-        chain.head_hash, encoded, sizeof(encoded), &encoded_length, out_hash);
+        chain.head_hash, encoded, sizeof(encoded), &encoded_length, out->hash);
     if (status != CPL_OK) {
+        goto done;
+    }
+    if (monotonic_ns() >= deadline) {
+        status = CPL_ERR_LOCK_TIMEOUT;
         goto done;
     }
     written = write(journal->fd, encoded, encoded_length);
@@ -1082,6 +1651,8 @@ int cpl_journal_append(cpl_journal *journal, const uint8_t *record_bytes,
         status = CPL_ERR_IO_SHORT;
         goto done;
     }
+    out->state = next;
+    out->sequence = chain.head_sequence + 1U;
     status = CPL_OK;
 
 done:
@@ -1094,19 +1665,6 @@ done:
         status = CPL_ERR_SYSTEM;
     }
     return status;
-}
-
-static bool process_absent(int64_t pid) {
-    if (pid <= 0) {
-        return true;
-    }
-    if (pid > INT_MAX) {
-        return false;
-    }
-    if (kill((pid_t)pid, 0) == 0 || errno == EPERM) {
-        return false;
-    }
-    return errno == ESRCH;
 }
 
 int cpl_journal_certify(cpl_journal *journal, uint64_t deadline_ns,
@@ -1146,12 +1704,18 @@ int cpl_journal_certify(cpl_journal *journal, uint64_t deadline_ns,
         if (status != CPL_OK) {
             return status;
         }
+        if (snapshot.unhealthy) {
+            return CPL_ERR_CORRUPT;
+        }
         status = fault_certify_pause();
         if (status != CPL_OK) {
             return status;
         }
         if (fcntl(journal->fd, F_FULLFSYNC) < 0) {
             return CPL_ERR_SYSTEM;
+        }
+        if (monotonic_ns() >= deadline) {
+            return CPL_ERR_CERTIFY_TIMEOUT;
         }
         status = take_mutex(&journal->append_mutex, deadline);
         if (status != CPL_OK) {
@@ -1171,12 +1735,11 @@ int cpl_journal_certify(cpl_journal *journal, uint64_t deadline_ns,
         if (status != CPL_OK) {
             return status;
         }
+        if (verified.unhealthy) {
+            return CPL_ERR_CORRUPT;
+        }
         if (snapshot.physical_eof == verified.physical_eof &&
             memcmp(snapshot.head_hash, verified.head_hash, CPL_HASH_SIZE) == 0) {
-            if (verified.state.kind == CPL_STATE_DONE &&
-                !process_absent(verified.state.process_pid)) {
-                return CPL_ERR_PROCESS_PRESENT;
-            }
             out->state = verified.state;
             (void)memcpy(out->head_hash, verified.head_hash, CPL_HASH_SIZE);
             out->head_sequence = verified.head_sequence;
@@ -1185,8 +1748,14 @@ int cpl_journal_certify(cpl_journal *journal, uint64_t deadline_ns,
             out->has_intent = verified.has_intent;
             out->done_authority = verified.has_intent &&
                 verified.state.kind == CPL_STATE_DONE &&
-                verified.state.completed_steps == CPL_ALL_COMPLETED_STEPS;
-            out->partial_create_authority = !verified.has_intent;
+                verified.state.completed_steps == CPL_ALL_COMPLETED_STEPS &&
+                journal->reap_proof_valid &&
+                memcmp(journal->reap_head_hash, verified.head_hash,
+                    CPL_HASH_SIZE) == 0;
+            out->partial_create_authority =
+                (!verified.has_intent && verified.physical_eof == 0U) ||
+                (verified.has_intent &&
+                 verified.state.no_dependent_artifact != 0U);
             return CPL_OK;
         }
         if (monotonic_ns() >= deadline) {
@@ -1216,7 +1785,9 @@ static int validate_authority(cpl_journal *journal,
 
     if (authority == NULL ||
         memcmp(authority->allocation_nonce, journal->nonce,
-            CPL_HASH_SIZE) != 0) {
+            CPL_HASH_SIZE) != 0 ||
+        !same_capability(authority->capability,
+            journal->reap_capability)) {
         return CPL_ERR_AUTHORITY;
     }
     status = cpl_journal_certify(journal, deadline, certified);
@@ -1228,7 +1799,8 @@ static int validate_authority(cpl_journal *journal,
         return CPL_ERR_AUTHORITY;
     }
     if (authority->kind == CPL_DELETE_CERTIFIED_DONE) {
-        return certified->done_authority ? CPL_OK : CPL_ERR_AUTHORITY;
+        return certified->done_authority && journal->reap_proof_valid ?
+            CPL_OK : CPL_ERR_AUTHORITY;
     }
     if (authority->kind == CPL_DELETE_UNRELEASED_PARTIAL_CREATE) {
         return certified->partial_create_authority ? CPL_OK : CPL_ERR_AUTHORITY;
@@ -1255,6 +1827,18 @@ static int require_workdir_absent(int parent_dirfd, const char *name) {
         return CPL_ERR_SYSTEM;
     }
     return CPL_OK;
+}
+
+static int validate_requested_workdir(cpl_journal *journal,
+    int workdir_parent_dirfd, const char *workdir_name) {
+    int status;
+
+    if (workdir_name == NULL ||
+        strcmp(workdir_name, journal->workdir_name) != 0) {
+        return CPL_ERR_IDENTITY_DRIFT;
+    }
+    status = validate_workdir_parent_identity(journal, workdir_parent_dirfd);
+    return status;
 }
 
 static int validate_open_journal_identity(cpl_journal *journal,
@@ -1315,6 +1899,916 @@ static void unlock_action(cpl_journal *journal) {
     (void)pthread_mutex_unlock(&journal->action_mutex);
 }
 
+static int append_authorized(cpl_journal *journal, struct cpl_record *record,
+    uint32_t record_class, uint64_t deadline,
+    struct cpl_append_result *out) {
+    int status;
+
+    journal->authorized_record_kind = record->kind;
+    journal->authorized_thread = pthread_self();
+    status = cpl_journal_append(journal, (const uint8_t *)record,
+        (uint32_t)sizeof(*record), record_class, deadline, out);
+    journal->authorized_record_kind = 0U;
+    (void)memset(&journal->authorized_thread, 0,
+        sizeof(journal->authorized_thread));
+    return status;
+}
+
+static int validate_workdir_parent_identity(cpl_journal *journal,
+    int parent_dirfd) {
+    struct stat parent;
+    int status = validate_parent(parent_dirfd, &parent);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    if (parent.st_dev != journal->workdir_parent_dev ||
+        parent.st_ino != journal->workdir_parent_ino) {
+        return CPL_ERR_IDENTITY_DRIFT;
+    }
+    return CPL_OK;
+}
+
+static int certify_exact_result(cpl_journal *journal,
+    const struct cpl_append_result *appended, uint64_t deadline,
+    struct cpl_certified_head *certified) {
+    int status = cpl_journal_certify(journal, deadline, certified);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    if (memcmp(certified->head_hash, appended->hash, CPL_HASH_SIZE) != 0) {
+        return CPL_ERR_AUTHORITY;
+    }
+    return CPL_OK;
+}
+
+int cpl_journal_create_workdir(cpl_journal *journal,
+    int workdir_parent_dirfd, const struct cpl_create_receipt *create_receipt,
+    uint64_t deadline_ns, struct cpl_workdir_receipt *receipt) {
+    struct cpl_certified_head before;
+    struct cpl_certified_head after;
+    struct cpl_append_result appended;
+    struct cpl_record record;
+    struct stat directory;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int directory_fd = -1;
+    int status;
+    bool action_locked = false;
+
+    if (receipt == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(receipt, 0, sizeof(*receipt));
+    status = ensure_owner(journal);
+    if (status != CPL_OK || create_receipt == NULL ||
+        create_receipt->state != CPL_INTENT_PARENT_DIRSYNCED ||
+        !same_capability(create_receipt->capability,
+            journal->create_capability)) {
+        return status == CPL_OK ? CPL_ERR_RECEIPT : status;
+    }
+    status = validate_workdir_parent_identity(journal, workdir_parent_dirfd);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    action_locked = true;
+    status = cpl_journal_certify(journal, deadline, &before);
+    if (status != CPL_OK || !before.has_intent ||
+        before.state.kind != CPL_STATE_NO_GENERATION ||
+        before.state.workdir_bound != 0U ||
+        memcmp(before.head_hash, create_receipt->intent_hash,
+            CPL_HASH_SIZE) != 0) {
+        status = status == CPL_OK ? CPL_ERR_RECEIPT : status;
+        goto done;
+    }
+    if (monotonic_ns() >= deadline) {
+        status = CPL_ERR_LOCK_TIMEOUT;
+        goto done;
+    }
+    if (mkdirat(workdir_parent_dirfd, journal->workdir_name,
+            (mode_t)0700) < 0) {
+        status = errno == EEXIST ? CPL_ERR_WORKDIR_PRESENT : CPL_ERR_SYSTEM;
+        goto done;
+    }
+    directory_fd = openat(workdir_parent_dirfd, journal->workdir_name,
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directory_fd < 0 || fstat(directory_fd, &directory) < 0 ||
+        !S_ISDIR(directory.st_mode) || directory.st_uid != geteuid() ||
+        (directory.st_mode & (mode_t)0777) != (mode_t)0700 ||
+        directory.st_dev != journal->workdir_parent_dev) {
+        status = CPL_ERR_UNSAFE_FILE;
+        goto done;
+    }
+    if (fsync(workdir_parent_dirfd) < 0) {
+        status = CPL_ERR_SYSTEM;
+        goto done;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = CPL_RECORD_WORKDIR_BOUND;
+    record.workdir_bound = 1U;
+    record.workdir_parent_dev = (uint64_t)journal->workdir_parent_dev;
+    record.workdir_parent_ino = (uint64_t)journal->workdir_parent_ino;
+    record.workdir_dev = (uint64_t)directory.st_dev;
+    record.workdir_ino = (uint64_t)directory.st_ino;
+    (void)memcpy(record.workdir_name, journal->workdir_name,
+        CPL_WORKDIR_NAME_SIZE);
+    status = append_authorized(journal, &record, CPL_RECORD_NORMAL, deadline,
+        &appended);
+    if (status == CPL_OK) {
+        status = certify_exact_result(journal, &appended, deadline, &after);
+    }
+    if (status != CPL_OK) {
+        goto done;
+    }
+    receipt->state = CPL_WORKDIR_PARENT_DIRSYNCED;
+    (void)memcpy(receipt->bound_hash, after.head_hash, CPL_HASH_SIZE);
+    (void)memcpy(receipt->capability, journal->workdir_capability,
+        CPL_HASH_SIZE);
+    receipt->workdir_dev = (uint64_t)directory.st_dev;
+    receipt->workdir_ino = (uint64_t)directory.st_ino;
+
+done:
+    if (directory_fd >= 0) {
+        (void)close(directory_fd);
+    }
+    if (action_locked) {
+        unlock_action(journal);
+    }
+    return status;
+}
+
+int cpl_journal_certify_no_dependent_artifact(cpl_journal *journal,
+    int workdir_parent_dirfd, uint64_t deadline_ns,
+    struct cpl_delete_authority *authority) {
+    struct cpl_certified_head certified;
+    struct cpl_append_result appended;
+    struct cpl_record record;
+    struct stat path;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status;
+
+    if (authority == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(authority, 0, sizeof(*authority));
+    status = ensure_owner(journal);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = validate_workdir_parent_identity(journal, workdir_parent_dirfd);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    if (fstatat(workdir_parent_dirfd, journal->workdir_name, &path,
+            AT_SYMLINK_NOFOLLOW) == 0) {
+        status = CPL_ERR_WORKDIR_PRESENT;
+        goto done;
+    }
+    if (errno != ENOENT) {
+        status = CPL_ERR_SYSTEM;
+        goto done;
+    }
+    status = cpl_journal_certify(journal, deadline, &certified);
+    if (status != CPL_OK) {
+        goto done;
+    }
+    if (certified.has_intent) {
+        if (certified.state.kind != CPL_STATE_NO_GENERATION ||
+            certified.state.workdir_bound != 0U ||
+            certified.state.no_dependent_artifact != 0U) {
+            status = CPL_ERR_AUTHORITY;
+            goto done;
+        }
+        (void)memset(&record, 0, sizeof(record));
+        record.kind = CPL_RECORD_NO_DEPENDENT_ARTIFACT;
+        record.no_dependent_artifact = 1U;
+        status = append_authorized(journal, &record, CPL_RECORD_RECOVERY,
+            deadline, &appended);
+        if (status == CPL_OK) {
+            status = certify_exact_result(journal, &appended, deadline,
+                &certified);
+        }
+    } else if (certified.physical_eof != 0U) {
+        status = CPL_ERR_CORRUPT;
+    }
+    if (status != CPL_OK) {
+        goto done;
+    }
+    random_capability(journal->reap_capability);
+    authority->kind = CPL_DELETE_UNRELEASED_PARTIAL_CREATE;
+    (void)memcpy(authority->allocation_nonce, journal->nonce, CPL_HASH_SIZE);
+    (void)memcpy(authority->certified_hash, certified.head_hash,
+        CPL_HASH_SIZE);
+    (void)memcpy(authority->capability, journal->reap_capability,
+        CPL_HASH_SIZE);
+
+done:
+    unlock_action(journal);
+    return status;
+}
+
+static int observed_identity_status(const struct cpl_process_identity *expected,
+    bool *execution_absent) {
+    struct proc_bsdinfo process;
+    struct cpl_process_identity observed;
+    bool have_bsd_info = true;
+    int status;
+
+    *execution_absent = false;
+    if (!complete_identity(expected)) {
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    if (proc_pidinfo((int)expected->pid, PROC_PIDTBSDINFO, 0U, &process,
+            (int)sizeof(process)) != (int)sizeof(process)) {
+        if (errno == ESRCH) {
+            *execution_absent = true;
+            return CPL_OK;
+        }
+#ifdef CPL_ENABLE_FAULT_INJECTION
+        if (errno == EPERM) {
+            siginfo_t information;
+
+            have_bsd_info = false;
+            (void)memset(&information, 0, sizeof(information));
+            if (waitid(P_PID, (id_t)expected->pid, &information,
+                    WEXITED | WNOHANG | WNOWAIT) == 0 &&
+                information.si_pid == expected->pid) {
+                *execution_absent = true;
+                return CPL_OK;
+            }
+        } else {
+            return CPL_ERR_PROCESS_IDENTITY;
+        }
+#else
+        return CPL_ERR_PROCESS_IDENTITY;
+#endif
+    }
+    status = cpl_process_observe(expected->pid, &observed);
+    if (status == CPL_ERR_NOT_FOUND) {
+        *execution_absent = true;
+        return CPL_OK;
+    }
+    if (status != CPL_OK) {
+        return status;
+    }
+    if (!same_process_identity(expected, &observed)) {
+        *execution_absent = true;
+        return CPL_OK;
+    }
+    if (have_bsd_info && process.pbi_status == SZOMB) {
+        *execution_absent = true;
+        return CPL_OK;
+    }
+    return CPL_OK;
+}
+
+int cpl_journal_activate_executor(cpl_journal *journal, uint64_t generation,
+    const uint8_t executor[CPL_ID_SIZE], int64_t pid,
+    uint64_t lease_deadline_ns, uint64_t deadline_ns,
+    struct cpl_append_result *out) {
+    struct cpl_process_identity identity;
+    struct cpl_certified_head certified;
+    struct cpl_chain chain;
+    struct cpl_record record;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status;
+
+    if (out == NULL || executor == NULL || !has_id(executor) ||
+        generation == 0U || lease_deadline_ns <= monotonic_ns()) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    status = cpl_process_observe(pid, &identity);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_scan(journal, &chain);
+    if (status != CPL_OK || chain.state.kind != CPL_STATE_PREPARED ||
+        chain.state.generation != generation ||
+        !same_id(chain.state.candidate, executor) ||
+        chain.state.deadline_ns <= monotonic_ns()) {
+        status = status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+        goto done;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = CPL_RECORD_ACTIVE_READY;
+    record.generation = generation;
+    record.lease_deadline_ns = lease_deadline_ns;
+    (void)memcpy(record.executor, executor, CPL_ID_SIZE);
+    identity_to_record(&identity, &record);
+    status = append_authorized(journal, &record, CPL_RECORD_NORMAL, deadline,
+        out);
+    if (status == CPL_OK) {
+        status = certify_exact_result(journal, out, deadline, &certified);
+    }
+
+done:
+    unlock_action(journal);
+    return status;
+}
+
+static uint32_t descriptor_step(uint32_t kind) {
+    switch (kind) {
+    case CPL_DESCRIPTOR_PROCESS_ABSENT:
+        return CPL_STEP_PROCESS_ABSENT;
+    case CPL_DESCRIPTOR_REAP_PROCESS:
+        return CPL_STEP_EXECUTOR_REAPED;
+    case CPL_DESCRIPTOR_REMOVE_WORKDIR:
+        return CPL_STEP_WORKDIR_REMOVED;
+    case CPL_DESCRIPTOR_TERMINAL_CHECKS:
+        return CPL_STEP_TERMINAL_CHECKS;
+    default:
+        return 0U;
+    }
+}
+
+static uint32_t descriptor_required(uint32_t kind) {
+    switch (kind) {
+    case CPL_DESCRIPTOR_PROCESS_ABSENT:
+        return 0U;
+    case CPL_DESCRIPTOR_REAP_PROCESS:
+        return CPL_STEP_PROCESS_ABSENT;
+    case CPL_DESCRIPTOR_REMOVE_WORKDIR:
+        return CPL_STEP_PROCESS_ABSENT | CPL_STEP_EXECUTOR_REAPED;
+    case CPL_DESCRIPTOR_TERMINAL_CHECKS:
+        return CPL_STEP_PROCESS_ABSENT | CPL_STEP_EXECUTOR_REAPED |
+            CPL_STEP_WORKDIR_REMOVED;
+    default:
+        return UINT32_MAX;
+    }
+}
+
+static int validate_descriptors(const struct cpl_batch_descriptor *descriptors,
+    uint32_t count, uint64_t completed_steps) {
+    uint32_t index;
+    uint32_t expected = (uint32_t)completed_steps;
+
+    if (descriptors == NULL || count == 0U ||
+        count > CPL_MAX_BATCH_DESCRIPTORS ||
+        completed_steps > CPL_ALL_COMPLETED_STEPS) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    for (index = 0U; index < count; ++index) {
+        uint32_t step = descriptor_step(descriptors[index].kind);
+        uint32_t required = descriptor_required(descriptors[index].kind);
+
+        if (step == 0U || required == UINT32_MAX ||
+            descriptors[index].required_steps != required ||
+            (expected & required) != required || (expected & step) != 0U) {
+            return CPL_ERR_PRECONDITION;
+        }
+        if ((descriptors[index].kind == CPL_DESCRIPTOR_PROCESS_ABSENT ||
+             descriptors[index].kind == CPL_DESCRIPTOR_REAP_PROCESS) &&
+            !complete_identity(&descriptors[index].target)) {
+            return CPL_ERR_PROCESS_IDENTITY;
+        }
+        if (descriptors[index].kind == CPL_DESCRIPTOR_REAP_PROCESS &&
+            index == 0U) {
+            return CPL_ERR_PRECONDITION;
+        }
+        if (descriptors[index].kind == CPL_DESCRIPTOR_REAP_PROCESS &&
+            !same_process_identity(&descriptors[index - 1U].target,
+                &descriptors[index].target)) {
+            return CPL_ERR_PROCESS_IDENTITY;
+        }
+        expected |= step;
+    }
+    return CPL_OK;
+}
+
+int cpl_journal_admit_batch(cpl_journal *journal, uint64_t generation,
+    const uint8_t executor[CPL_ID_SIZE], const uint8_t batch_nonce[CPL_ID_SIZE],
+    const struct cpl_batch_descriptor *descriptors, uint32_t descriptor_count,
+    uint64_t deadline_ns, struct cpl_action_token *token,
+    struct cpl_append_result *out) {
+    struct cpl_process_identity expected;
+    struct cpl_process_identity caller;
+    struct cpl_certified_head certified;
+    struct cpl_chain chain;
+    struct cpl_record record;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status;
+
+    if (token == NULL || out == NULL || executor == NULL ||
+        batch_nonce == NULL || !has_id(executor) || !has_id(batch_nonce)) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(token, 0, sizeof(*token));
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_scan(journal, &chain);
+    if (status != CPL_OK || chain.unhealthy ||
+        chain.state.kind != CPL_STATE_ACTIVE_READY ||
+        chain.state.generation != generation ||
+        !same_id(chain.state.executor, executor) ||
+        chain.state.lease_deadline_ns <= monotonic_ns()) {
+        status = status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+        goto failed;
+    }
+    identity_from_state(&chain.state, &expected);
+    status = cpl_process_observe((int64_t)getpid(), &caller);
+    if (status != CPL_OK || !same_process_identity(&expected, &caller)) {
+        status = CPL_ERR_PROCESS_IDENTITY;
+        goto failed;
+    }
+    status = validate_descriptors(descriptors, descriptor_count,
+        chain.state.completed_steps);
+    if (status != CPL_OK) {
+        goto failed;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = CPL_RECORD_BATCH_ACTIVE;
+    record.generation = generation;
+    record.lease_deadline_ns = chain.state.lease_deadline_ns;
+    record.completed_steps = chain.state.completed_steps;
+    record.descriptor_count = descriptor_count;
+    (void)memcpy(record.executor, executor, CPL_ID_SIZE);
+    (void)memcpy(record.exact_batch, batch_nonce, CPL_ID_SIZE);
+    (void)memcpy(record.descriptors, descriptors,
+        descriptor_count * sizeof(*descriptors));
+    status = append_authorized(journal, &record, CPL_RECORD_NORMAL, deadline,
+        out);
+    if (status == CPL_OK) {
+        status = cpl_journal_certify(journal, deadline, &certified);
+    }
+    if (status != CPL_OK ||
+        ((certified.state.kind != CPL_STATE_BATCH_ACTIVE &&
+          certified.state.kind != CPL_STATE_RETIRING_BATCH) ||
+         certified.state.generation != generation ||
+         !same_id(certified.state.exact_batch, batch_nonce))) {
+        status = status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+        goto failed;
+    }
+    random_capability(journal->action_capability);
+    journal->action_completed_steps = chain.state.completed_steps;
+    journal->action_owner_thread = pthread_self();
+    journal->action_held = true;
+    journal->action_executed = false;
+    (void)memcpy(token->capability, journal->action_capability,
+        CPL_HASH_SIZE);
+    (void)memcpy(token->batch_nonce, batch_nonce, CPL_ID_SIZE);
+    token->generation = generation;
+    return CPL_OK;
+
+failed:
+    unlock_action(journal);
+    return status;
+}
+
+static int validate_action_token(cpl_journal *journal,
+    const struct cpl_action_token *token) {
+    if (!journal->action_held || token == NULL ||
+        !pthread_equal(journal->action_owner_thread, pthread_self()) ||
+        !same_capability(token->capability, journal->action_capability)) {
+        return CPL_ERR_BATCH_TOKEN;
+    }
+    return CPL_OK;
+}
+
+static int require_certified_batch(cpl_journal *journal,
+    const struct cpl_action_token *token, uint64_t deadline,
+    struct cpl_certified_head *certified) {
+    int status = cpl_journal_certify(journal, deadline, certified);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    if ((certified->state.kind != CPL_STATE_BATCH_ACTIVE &&
+         certified->state.kind != CPL_STATE_RETIRING_BATCH) ||
+        certified->state.generation != token->generation ||
+        !same_id(certified->state.exact_batch, token->batch_nonce)) {
+        return CPL_ERR_AUTHORITY;
+    }
+    return CPL_OK;
+}
+
+int cpl_journal_execute_batch(cpl_journal *journal,
+    const struct cpl_action_token *token, int workdir_parent_dirfd,
+    uint64_t deadline_ns, uint64_t *completed_steps) {
+    struct cpl_certified_head certified;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    uint32_t index;
+    int status = validate_action_token(journal, token);
+
+    if (completed_steps == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    *completed_steps = 0U;
+    if (status != CPL_OK || journal->action_executed) {
+        return status == CPL_OK ? CPL_ERR_BATCH_TOKEN : status;
+    }
+    status = validate_workdir_parent_identity(journal, workdir_parent_dirfd);
+    if (status != CPL_OK) {
+        return status;
+    }
+    for (index = 0U; index < CPL_MAX_BATCH_DESCRIPTORS; ++index) {
+        const struct cpl_batch_descriptor *descriptor;
+        uint32_t step;
+
+        status = require_certified_batch(journal, token, deadline, &certified);
+        if (status != CPL_OK) {
+            return status;
+        }
+        if (index >= certified.state.descriptor_count) {
+            break;
+        }
+        if (monotonic_ns() >= deadline) {
+            return CPL_ERR_LOCK_TIMEOUT;
+        }
+        descriptor = &certified.state.descriptors[index];
+        step = descriptor_step(descriptor->kind);
+        if ((journal->action_completed_steps & descriptor->required_steps) !=
+            descriptor->required_steps) {
+            return CPL_ERR_PRECONDITION;
+        }
+        if (descriptor->kind == CPL_DESCRIPTOR_PROCESS_ABSENT) {
+            bool absent;
+
+            status = observed_identity_status(&descriptor->target, &absent);
+            if (status != CPL_OK || !absent) {
+                return status == CPL_OK ? CPL_ERR_PROCESS_PRESENT : status;
+            }
+        } else if (descriptor->kind == CPL_DESCRIPTOR_REAP_PROCESS) {
+            int wait_status;
+            pid_t reaped = waitpid((pid_t)descriptor->target.pid,
+                &wait_status, WNOHANG);
+
+            if (reaped != (pid_t)descriptor->target.pid) {
+                return CPL_ERR_REAP_REQUIRED;
+            }
+        } else if (descriptor->kind == CPL_DESCRIPTOR_REMOVE_WORKDIR) {
+            struct stat workdir;
+
+            if (certified.state.workdir_bound == 0U ||
+                fstatat(workdir_parent_dirfd, journal->workdir_name, &workdir,
+                    AT_SYMLINK_NOFOLLOW) < 0 || !S_ISDIR(workdir.st_mode) ||
+                workdir.st_uid != geteuid() ||
+                (workdir.st_mode & (mode_t)0777) != (mode_t)0700 ||
+                (uint64_t)workdir.st_dev != certified.state.workdir_dev ||
+                (uint64_t)workdir.st_ino != certified.state.workdir_ino) {
+                return CPL_ERR_IDENTITY_DRIFT;
+            }
+            if (unlinkat(workdir_parent_dirfd, journal->workdir_name,
+                    AT_REMOVEDIR) < 0 || fsync(workdir_parent_dirfd) < 0) {
+                return errno == ENOTEMPTY ? CPL_ERR_WORKDIR_PRESENT :
+                    CPL_ERR_SYSTEM;
+            }
+        } else if (descriptor->kind == CPL_DESCRIPTOR_TERMINAL_CHECKS) {
+            struct stat workdir;
+
+            if (fstatat(workdir_parent_dirfd, journal->workdir_name,
+                    &workdir, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+                return CPL_ERR_WORKDIR_PRESENT;
+            }
+        } else {
+            return CPL_ERR_PRECONDITION;
+        }
+        journal->action_completed_steps |= step;
+    }
+    journal->action_executed = true;
+    *completed_steps = journal->action_completed_steps;
+    return CPL_OK;
+}
+
+int cpl_journal_complete_batch(cpl_journal *journal,
+    const struct cpl_action_token *token, uint64_t deadline_ns,
+    struct cpl_append_result *out) {
+    struct cpl_certified_head certified;
+    struct cpl_record record;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    uint32_t record_class = CPL_RECORD_NORMAL;
+    int status = validate_action_token(journal, token);
+
+    if (out == NULL || status != CPL_OK || !journal->action_executed) {
+        return status == CPL_OK ? CPL_ERR_BATCH_TOKEN : status;
+    }
+    status = require_certified_batch(journal, token, deadline, &certified);
+    if (status != CPL_OK) {
+        goto done;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = CPL_RECORD_BATCH_DONE;
+    record.generation = token->generation;
+    record.lease_deadline_ns = certified.state.lease_deadline_ns;
+    record.completed_steps = journal->action_completed_steps;
+    (void)memcpy(record.executor, certified.state.executor, CPL_ID_SIZE);
+    (void)memcpy(record.exact_batch, token->batch_nonce, CPL_ID_SIZE);
+    if (certified.state.kind == CPL_STATE_RETIRING_BATCH) {
+        record.batch_outcome = CPL_BATCH_COMPLETED;
+        record_class = CPL_RECORD_RECOVERY;
+    }
+    status = append_authorized(journal, &record, record_class, deadline, out);
+    if (status == CPL_OK) {
+        status = certify_exact_result(journal, out, deadline, &certified);
+    }
+
+done:
+    journal->action_held = false;
+    journal->action_executed = false;
+    (void)memset(journal->action_capability, 0, CPL_HASH_SIZE);
+    unlock_action(journal);
+    return status;
+}
+
+int cpl_journal_finish_done(cpl_journal *journal, uint64_t generation,
+    const uint8_t executor[CPL_ID_SIZE], uint64_t deadline_ns,
+    struct cpl_append_result *out) {
+    struct cpl_process_identity expected;
+    struct cpl_process_identity caller;
+    struct cpl_certified_head certified;
+    struct cpl_chain chain;
+    struct cpl_record record;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status;
+
+    if (executor == NULL || out == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_scan(journal, &chain);
+    if (status != CPL_OK || chain.state.kind != CPL_STATE_ACTIVE_READY ||
+        chain.state.generation != generation ||
+        !same_id(chain.state.executor, executor) ||
+        chain.state.completed_steps != CPL_ALL_COMPLETED_STEPS) {
+        status = status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+        goto done;
+    }
+    identity_from_state(&chain.state, &expected);
+    status = cpl_process_observe((int64_t)getpid(), &caller);
+    if (status != CPL_OK || !same_process_identity(&expected, &caller)) {
+        status = CPL_ERR_PROCESS_IDENTITY;
+        goto done;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = CPL_RECORD_DONE;
+    record.generation = generation;
+    (void)memcpy(record.executor, executor, CPL_ID_SIZE);
+    status = append_authorized(journal, &record, CPL_RECORD_NORMAL, deadline,
+        out);
+    if (status == CPL_OK) {
+        status = certify_exact_result(journal, out, deadline, &certified);
+    }
+
+done:
+    unlock_action(journal);
+    return status;
+}
+
+int cpl_journal_retire_executor(cpl_journal *journal,
+    const uint8_t authority[CPL_ID_SIZE], uint64_t authority_epoch,
+    uint64_t authority_deadline_ns, uint64_t deadline_ns,
+    struct cpl_append_result *out) {
+    struct cpl_chain chain;
+    struct cpl_record record;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    uint32_t record_class;
+    int status;
+    bool action_locked = false;
+
+    if (authority == NULL || !has_id(authority) || out == NULL ||
+        authority_deadline_ns <= monotonic_ns()) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    for (;;) {
+        status = cpl_journal_scan(journal, &chain);
+        if (status != CPL_OK) {
+            return status;
+        }
+        if (chain.state.kind == CPL_STATE_PREPARED) {
+            if (chain.state.deadline_ns > monotonic_ns()) {
+                return CPL_ERR_AUTHORITY;
+            }
+            status = lock_action(journal, deadline);
+            action_locked = status == CPL_OK;
+        } else if (chain.state.kind == CPL_STATE_ACTIVE_READY) {
+            if (chain.state.lease_deadline_ns > monotonic_ns()) {
+                return CPL_ERR_AUTHORITY;
+            }
+            status = lock_action(journal, deadline);
+            action_locked = status == CPL_OK;
+        } else if (chain.state.kind == CPL_STATE_BATCH_ACTIVE) {
+            status = CPL_OK;
+        } else {
+            return CPL_ERR_AUTHORITY;
+        }
+        if (status != CPL_OK) {
+            return status;
+        }
+        if (action_locked) {
+            struct cpl_chain rechecked;
+
+            status = cpl_journal_scan(journal, &rechecked);
+            if (status != CPL_OK) {
+                unlock_action(journal);
+                return status;
+            }
+            chain = rechecked;
+            if (chain.state.kind == CPL_STATE_BATCH_ACTIVE) {
+                unlock_action(journal);
+                action_locked = false;
+            }
+        }
+        break;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.generation = chain.state.generation;
+    record.authority_epoch = authority_epoch;
+    record.deadline_ns = authority_deadline_ns;
+    (void)memcpy(record.authority, authority, CPL_ID_SIZE);
+    if (chain.state.kind == CPL_STATE_BATCH_ACTIVE) {
+        record.kind = CPL_RECORD_RETIRING_BATCH;
+        record_class = CPL_RECORD_RECOVERY;
+        (void)memcpy(record.prior_actor, chain.state.executor, CPL_ID_SIZE);
+        (void)memcpy(record.exact_batch, chain.state.exact_batch, CPL_ID_SIZE);
+    } else {
+        record.kind = CPL_RECORD_RETIRING_IDLE;
+        record_class = CPL_RECORD_RECOVERY;
+        if (chain.state.kind == CPL_STATE_PREPARED) {
+            (void)memcpy(record.prior_actor, chain.state.candidate, CPL_ID_SIZE);
+        } else {
+            (void)memcpy(record.prior_actor, chain.state.executor, CPL_ID_SIZE);
+        }
+    }
+    status = append_authorized(journal, &record, record_class, deadline, out);
+    if (action_locked) {
+        unlock_action(journal);
+    }
+    return status;
+}
+
+int cpl_journal_confirm_executor_reaped(cpl_journal *journal,
+    uint64_t deadline_ns, struct cpl_reap_proof *proof) {
+    struct cpl_certified_head certified;
+    struct cpl_process_identity expected;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int wait_status;
+    int status;
+    pid_t reaped;
+
+    if (proof == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(proof, 0, sizeof(*proof));
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_certify(journal, deadline, &certified);
+    if (status != CPL_OK ||
+        (certified.state.kind != CPL_STATE_DONE &&
+         certified.state.kind != CPL_STATE_RETIRING_IDLE &&
+         certified.state.kind != CPL_STATE_RETIRING_BATCH)) {
+        status = status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+        goto done;
+    }
+    identity_from_state(&certified.state, &expected);
+    if (!complete_identity(&expected)) {
+        status = CPL_ERR_PROCESS_IDENTITY;
+        goto done;
+    }
+    for (;;) {
+        reaped = waitpid((pid_t)expected.pid, &wait_status, WNOHANG);
+        if (reaped == (pid_t)expected.pid) {
+            break;
+        }
+        if (reaped < 0) {
+            status = CPL_ERR_REAP_REQUIRED;
+            goto done;
+        }
+        if (monotonic_ns() >= deadline) {
+            status = CPL_ERR_REAP_REQUIRED;
+            goto done;
+        }
+        retry_pause();
+    }
+    random_capability(journal->reap_capability);
+    journal->reap_proof_valid = true;
+    journal->reaped_identity = expected;
+    (void)memcpy(journal->reap_head_hash, certified.head_hash, CPL_HASH_SIZE);
+    proof->pid = expected.pid;
+    (void)memcpy(proof->certified_hash, certified.head_hash, CPL_HASH_SIZE);
+    (void)memcpy(proof->capability, journal->reap_capability, CPL_HASH_SIZE);
+    status = CPL_OK;
+
+done:
+    unlock_action(journal);
+    return status;
+}
+
+int cpl_journal_make_delete_authority(cpl_journal *journal, uint32_t kind,
+    uint64_t deadline_ns, struct cpl_delete_authority *authority) {
+    struct cpl_certified_head certified;
+    int status;
+
+    if (authority == NULL || kind != CPL_DELETE_CERTIFIED_DONE) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(authority, 0, sizeof(*authority));
+    status = cpl_journal_certify(journal, deadline_ns, &certified);
+    if (status != CPL_OK) {
+        return status;
+    }
+    if (!certified.done_authority ||
+        is_zero(journal->reap_capability, CPL_HASH_SIZE)) {
+        return CPL_ERR_REAP_REQUIRED;
+    }
+    authority->kind = CPL_DELETE_CERTIFIED_DONE;
+    (void)memcpy(authority->allocation_nonce, journal->nonce, CPL_HASH_SIZE);
+    (void)memcpy(authority->certified_hash, certified.head_hash,
+        CPL_HASH_SIZE);
+    (void)memcpy(authority->capability, journal->reap_capability,
+        CPL_HASH_SIZE);
+    return CPL_OK;
+}
+
+static bool valid_reap_proof(cpl_journal *journal,
+    const struct cpl_reap_proof *proof, const struct cpl_chain *chain) {
+    return proof != NULL && journal->reap_proof_valid &&
+        proof->pid == journal->reaped_identity.pid &&
+        same_capability(proof->capability, journal->reap_capability) &&
+        memcmp(proof->certified_hash, journal->reap_head_hash,
+            CPL_HASH_SIZE) == 0 &&
+        chain->state.process_pid == journal->reaped_identity.pid;
+}
+
+int cpl_journal_reconcile_interrupted_batch(cpl_journal *journal,
+    const struct cpl_reap_proof *proof, uint64_t deadline_ns,
+    struct cpl_append_result *out) {
+    struct cpl_chain chain;
+    struct cpl_record record;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status = cpl_journal_scan(journal, &chain);
+
+    if (out == NULL || status != CPL_OK ||
+        chain.state.kind != CPL_STATE_RETIRING_BATCH ||
+        !valid_reap_proof(journal, proof, &chain)) {
+        return status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+    }
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = CPL_RECORD_BATCH_DONE;
+    record.generation = chain.state.generation;
+    record.lease_deadline_ns = chain.state.lease_deadline_ns;
+    record.completed_steps = chain.state.completed_steps;
+    record.batch_outcome = CPL_BATCH_INTERRUPTED;
+    (void)memcpy(record.executor, chain.state.executor, CPL_ID_SIZE);
+    (void)memcpy(record.exact_batch, chain.state.exact_batch, CPL_ID_SIZE);
+    status = append_authorized(journal, &record, CPL_RECORD_RECOVERY, deadline,
+        out);
+    unlock_action(journal);
+    return status;
+}
+
+int cpl_journal_prepare_successor(cpl_journal *journal,
+    const struct cpl_reap_proof *proof, uint64_t generation,
+    const uint8_t candidate[CPL_ID_SIZE], uint64_t claim_deadline_ns,
+    uint64_t deadline_ns, struct cpl_append_result *out) {
+    struct cpl_chain chain;
+    struct cpl_record record;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status = cpl_journal_scan(journal, &chain);
+
+    if (out == NULL || candidate == NULL || !has_id(candidate) ||
+        claim_deadline_ns <= monotonic_ns() || status != CPL_OK ||
+        chain.state.kind != CPL_STATE_RETIRING_IDLE ||
+        generation != chain.state.generation + 1U ||
+        !valid_reap_proof(journal, proof, &chain)) {
+        return status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+    }
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    (void)memset(&record, 0, sizeof(record));
+    record.kind = CPL_RECORD_PREPARED;
+    record.generation = generation;
+    record.deadline_ns = claim_deadline_ns;
+    (void)memcpy(record.candidate, candidate, CPL_ID_SIZE);
+    status = append_authorized(journal, &record, CPL_RECORD_RECOVERY, deadline,
+        out);
+    unlock_action(journal);
+    return status;
+}
+
 static int lock_certified_head(cpl_journal *journal,
     const struct cpl_certified_head *certified, uint64_t deadline) {
     struct cpl_chain current;
@@ -1350,6 +2844,22 @@ static void successful_delete_close(cpl_journal **inout_j,
 
     receipt->state = CPL_JOURNAL_UNLINK_PARENT_DIRSYNCED;
     receipt->slot_releasable = true;
+    random_capability(receipt->capability);
+#ifdef CPL_ENABLE_FAULT_INJECTION
+    if (pthread_mutex_lock(&receipt_mutex) == 0) {
+        size_t index;
+
+        for (index = 0U; index < CPL_RECEIPT_REGISTRY_CAPACITY; ++index) {
+            if (!delete_receipt_used[index]) {
+                (void)memcpy(delete_receipts[index], receipt->capability,
+                    CPL_HASH_SIZE);
+                delete_receipt_used[index] = true;
+                break;
+            }
+        }
+        (void)pthread_mutex_unlock(&receipt_mutex);
+    }
+#endif
     *inout_j = NULL;
     cpl_journal_close(journal);
 }
@@ -1381,6 +2891,11 @@ int cpl_journal_delete_at(cpl_journal **inout_j, int parent_dirfd,
     if (status != CPL_OK) {
         return status;
     }
+    status = validate_requested_workdir(journal, workdir_parent_dirfd,
+        workdir_name);
+    if (status != CPL_OK) {
+        return status;
+    }
     status = lock_action(journal, deadline);
     if (status != CPL_OK) {
         return status;
@@ -1396,17 +2911,19 @@ int cpl_journal_delete_at(cpl_journal **inout_j, int parent_dirfd,
     head_locked = true;
     fault_exit("after_authority_revalidated");
     if (authority->kind == CPL_DELETE_CERTIFIED_DONE) {
-        if (!process_absent(certified.state.process_pid)) {
-            status = CPL_ERR_PROCESS_PRESENT;
+        if (!journal->reap_proof_valid ||
+            certified.state.workdir_bound == 0U) {
+            status = CPL_ERR_REAP_REQUIRED;
             goto done;
         }
         fault_exit("after_process_absence_verified");
-    }
-    status = require_workdir_absent(workdir_parent_dirfd, workdir_name);
-    if (status != CPL_OK) {
+    } else if (certified.has_intent &&
+        certified.state.no_dependent_artifact == 0U) {
+        status = CPL_ERR_AUTHORITY;
         goto done;
     }
-    status = validate_parent_identity(journal, workdir_parent_dirfd);
+    status = require_workdir_absent(workdir_parent_dirfd,
+        journal->workdir_name);
     if (status != CPL_OK) {
         goto done;
     }
@@ -1416,15 +2933,21 @@ int cpl_journal_delete_at(cpl_journal **inout_j, int parent_dirfd,
     if (status != CPL_OK) {
         goto done;
     }
+    if (monotonic_ns() >= deadline) {
+        status = CPL_ERR_LOCK_TIMEOUT;
+        goto done;
+    }
     if (unlinkat(parent_dirfd, journal_name, 0) < 0) {
         status = CPL_ERR_SYSTEM;
         goto done;
     }
     fault_exit("after_journal_unlinkat");
     status = validate_parent_identity(journal, parent_dirfd);
-    if (status != CPL_OK || fsync(parent_dirfd) < 0) {
+    if (status != CPL_OK || monotonic_ns() >= deadline ||
+        fsync(parent_dirfd) < 0) {
         if (status == CPL_OK) {
-            status = CPL_ERR_SYSTEM;
+            status = monotonic_ns() >= deadline ? CPL_ERR_LOCK_TIMEOUT :
+                CPL_ERR_SYSTEM;
         }
         goto done;
     }
@@ -1469,6 +2992,11 @@ int cpl_journal_reconcile_absent_after_crash(cpl_journal **inout_j,
     if (status != CPL_OK) {
         return status;
     }
+    status = validate_requested_workdir(journal, workdir_parent_dirfd,
+        workdir_name);
+    if (status != CPL_OK) {
+        return status;
+    }
     status = lock_action(journal, deadline);
     if (status != CPL_OK) {
         return status;
@@ -1482,11 +3010,8 @@ int cpl_journal_reconcile_absent_after_crash(cpl_journal **inout_j,
         goto done;
     }
     head_locked = true;
-    status = require_workdir_absent(workdir_parent_dirfd, workdir_name);
-    if (status != CPL_OK) {
-        goto done;
-    }
-    status = validate_parent_identity(journal, workdir_parent_dirfd);
+    status = require_workdir_absent(workdir_parent_dirfd,
+        journal->workdir_name);
     if (status != CPL_OK) {
         goto done;
     }
@@ -1496,9 +3021,11 @@ int cpl_journal_reconcile_absent_after_crash(cpl_journal **inout_j,
         goto done;
     }
     status = validate_parent_identity(journal, parent_dirfd);
-    if (status != CPL_OK || fsync(parent_dirfd) < 0) {
+    if (status != CPL_OK || monotonic_ns() >= deadline ||
+        fsync(parent_dirfd) < 0) {
         if (status == CPL_OK) {
-            status = CPL_ERR_SYSTEM;
+            status = monotonic_ns() >= deadline ? CPL_ERR_LOCK_TIMEOUT :
+                CPL_ERR_SYSTEM;
         }
         goto done;
     }
@@ -1519,6 +3046,12 @@ void cpl_journal_close(cpl_journal *journal) {
     if (journal == NULL) {
         return;
     }
+    unregister_handle(journal);
+    if (journal->action_held && !journal->fork_invalid) {
+        journal->action_held = false;
+        (void)release_flock(journal->action_lock_fd);
+        (void)pthread_mutex_unlock(&journal->action_mutex);
+    }
     if (journal->fd >= 0) {
         (void)close(journal->fd);
     }
@@ -1528,8 +3061,10 @@ void cpl_journal_close(cpl_journal *journal) {
     if (journal->action_lock_fd >= 0) {
         (void)close(journal->action_lock_fd);
     }
-    (void)pthread_mutex_destroy(&journal->append_mutex);
-    (void)pthread_mutex_destroy(&journal->action_mutex);
+    if (!journal->fork_invalid) {
+        (void)pthread_mutex_destroy(&journal->append_mutex);
+        (void)pthread_mutex_destroy(&journal->action_mutex);
+    }
     (void)memset(journal, 0, sizeof(*journal));
     free(journal);
 }
@@ -1559,5 +3094,208 @@ int cpl_fault_hold_append_lock(cpl_journal *journal, int notify_fd, int wait_fd,
     (void)release_flock(journal->append_lock_fd);
     (void)pthread_mutex_unlock(&journal->append_mutex);
     return status;
+}
+
+int cpl_fault_hold_action_lock(cpl_journal *journal, int notify_fd, int wait_fd,
+    uint64_t deadline_ns) {
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK || notify_fd < 0 || wait_fd < 0) {
+        return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
+    }
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = checked_byte_write(notify_fd);
+    if (status == CPL_OK) {
+        status = checked_byte_read(wait_fd);
+    }
+    unlock_action(journal);
+    return status;
+}
+
+int cpl_fault_probe_action_lock(cpl_journal *journal, uint64_t deadline_ns) {
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = lock_action(journal, effective_deadline(deadline_ns));
+    if (status == CPL_OK) {
+        unlock_action(journal);
+    }
+    return status;
+}
+
+int cpl_fault_append_bytes(cpl_journal *journal, const uint8_t *bytes,
+    uint32_t length) {
+    uint64_t deadline = effective_deadline(0U);
+    ssize_t written;
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK || bytes == NULL || length == 0U) {
+        return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
+    }
+    status = take_mutex(&journal->append_mutex, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = take_flock(journal->append_lock_fd, deadline);
+    if (status != CPL_OK) {
+        (void)pthread_mutex_unlock(&journal->append_mutex);
+        return status;
+    }
+    written = write(journal->fd, bytes, length);
+    (void)release_flock(journal->append_lock_fd);
+    (void)pthread_mutex_unlock(&journal->append_mutex);
+    return written == (ssize_t)length ? CPL_OK : CPL_ERR_IO_SHORT;
+}
+
+int cpl_fault_encode_record(cpl_journal *journal, const uint8_t *record_bytes,
+    uint32_t record_len, uint8_t *out, uint32_t capacity,
+    uint32_t *out_len) {
+    struct cpl_chain chain;
+    struct cpl_record record;
+    uint8_t hash[CPL_HASH_SIZE];
+    size_t encoded_length = 0U;
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK || record_bytes == NULL || out == NULL ||
+        out_len == NULL || record_len != sizeof(record)) {
+        return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
+    }
+    status = cpl_journal_scan(journal, &chain);
+    if (status != CPL_OK) {
+        return status;
+    }
+    (void)memcpy(&record, record_bytes, sizeof(record));
+    if (is_zero(record.parent_hash, CPL_HASH_SIZE)) {
+        (void)memcpy(record.parent_hash, chain.head_hash, CPL_HASH_SIZE);
+    }
+    status = encode_record(journal, &record, chain.head_sequence + 1U,
+        record.parent_hash, out, capacity, &encoded_length, hash);
+    if (status != CPL_OK) {
+        return status;
+    }
+    *out_len = (uint32_t)encoded_length;
+    return CPL_OK;
+}
+
+int cpl_fault_inject_header_mismatch(cpl_journal *journal,
+    const uint8_t *record_bytes, uint32_t record_len, uint32_t mismatch) {
+    uint8_t encoded[CPL_HEADER_SIZE + sizeof(struct cpl_record)];
+    uint32_t encoded_length = 0U;
+    uint32_t checksum;
+    int status;
+
+    if (mismatch < 1U || mismatch > 3U) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    status = cpl_fault_encode_record(journal, record_bytes, record_len,
+        encoded, (uint32_t)sizeof(encoded), &encoded_length);
+    if (status != CPL_OK) {
+        return status;
+    }
+    if (mismatch == 1U) {
+        put_u64(encoded + 56U, get_u64(encoded + 56U) + 1U);
+    } else if (mismatch == 2U) {
+        put_u32(encoded + 96U, get_u32(encoded + 96U) + 1U);
+    } else {
+        encoded[64U] ^= 1U;
+    }
+    put_u32(encoded + 104U, 0U);
+    checksum = crc32c(encoded, encoded_length);
+    put_u32(encoded + 104U, checksum);
+    return cpl_fault_append_bytes(journal, encoded, encoded_length);
+}
+
+static int fault_create_marker(int parent_dirfd, const char *name) {
+    struct stat parent_stat;
+    int fd;
+    int status = validate_component(name);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = validate_parent(parent_dirfd, &parent_stat);
+    if (status != CPL_OK) {
+        return status;
+    }
+    fd = openat(parent_dirfd, name,
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, (mode_t)0600);
+    if (fd < 0) {
+        return errno == EEXIST ? CPL_ERR_EXISTS : CPL_ERR_SYSTEM;
+    }
+    if (close(fd) < 0 || fsync(parent_dirfd) < 0) {
+        return CPL_ERR_SYSTEM;
+    }
+    return CPL_OK;
+}
+
+int cpl_fault_try_bound_gate(cpl_journal *journal, uint32_t gate_kind,
+    const struct cpl_workdir_receipt *receipt, int marker_parent_dirfd,
+    const char *marker_name) {
+    struct cpl_chain chain;
+    struct stat workdir_stat;
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    if ((gate_kind != 1U && gate_kind != 2U) || receipt == NULL ||
+        receipt->state != CPL_WORKDIR_PARENT_DIRSYNCED ||
+        !same_capability(receipt->capability, journal->workdir_capability)) {
+        return CPL_ERR_RECEIPT;
+    }
+    status = validate_workdir_parent_identity(journal, marker_parent_dirfd);
+    if (status != CPL_OK) {
+        return CPL_ERR_RECEIPT;
+    }
+    if (fstatat(marker_parent_dirfd, journal->workdir_name, &workdir_stat,
+            AT_SYMLINK_NOFOLLOW) < 0 || !S_ISDIR(workdir_stat.st_mode) ||
+        (uint64_t)workdir_stat.st_dev != receipt->workdir_dev ||
+        (uint64_t)workdir_stat.st_ino != receipt->workdir_ino) {
+        return CPL_ERR_RECEIPT;
+    }
+    status = cpl_journal_scan(journal, &chain);
+    if (status != CPL_OK) {
+        return status;
+    }
+    if (!chain.state.workdir_bound || chain.state.workdir_dev != receipt->workdir_dev ||
+        chain.state.workdir_ino != receipt->workdir_ino) {
+        return CPL_ERR_RECEIPT;
+    }
+    return fault_create_marker(marker_parent_dirfd, marker_name);
+}
+
+int cpl_fault_try_cleanup_gate(const struct cpl_delete_receipt *receipt,
+    int marker_parent_dirfd, const char *marker_name) {
+    size_t index;
+    bool found = false;
+
+    if (receipt == NULL ||
+        receipt->state != CPL_JOURNAL_UNLINK_PARENT_DIRSYNCED ||
+        !receipt->slot_releasable ||
+        is_zero(receipt->capability, CPL_HASH_SIZE)) {
+        return CPL_ERR_RECEIPT;
+    }
+    if (pthread_mutex_lock(&receipt_mutex) != 0) {
+        return CPL_ERR_SYSTEM;
+    }
+    for (index = 0U; index < CPL_RECEIPT_REGISTRY_CAPACITY; ++index) {
+        if (delete_receipt_used[index] &&
+            memcmp(delete_receipts[index], receipt->capability,
+                CPL_HASH_SIZE) == 0) {
+            delete_receipt_used[index] = false;
+            (void)memset(delete_receipts[index], 0, CPL_HASH_SIZE);
+            found = true;
+            break;
+        }
+    }
+    (void)pthread_mutex_unlock(&receipt_mutex);
+    return found ? fault_create_marker(marker_parent_dirfd, marker_name) :
+        CPL_ERR_RECEIPT;
 }
 #endif

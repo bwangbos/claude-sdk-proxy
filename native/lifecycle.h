@@ -11,6 +11,8 @@ extern "C" {
 #define CPL_HASH_SIZE 32U
 #define CPL_ID_SIZE 32U
 #define CPL_REASON_SIZE 64U
+#define CPL_WORKDIR_NAME_SIZE 64U
+#define CPL_MAX_BATCH_DESCRIPTORS 4U
 
 typedef struct cpl_journal cpl_journal;
 
@@ -40,12 +42,19 @@ enum cpl_error {
     CPL_ERR_CLOSED = 22,
     CPL_ERR_IO_SHORT = 23,
     CPL_ERR_UNSUPPORTED = 24,
+    CPL_ERR_PROCESS_IDENTITY = 25,
+    CPL_ERR_ACTION_LOCK = 26,
+    CPL_ERR_BATCH_TOKEN = 27,
+    CPL_ERR_PRECONDITION = 28,
+    CPL_ERR_REAP_REQUIRED = 29,
+    CPL_ERR_RECEIPT = 30,
 };
 
 enum cpl_storage_state {
     CPL_STORAGE_NONE = 0,
     CPL_INTENT_PARENT_DIRSYNCED = 1,
     CPL_JOURNAL_UNLINK_PARENT_DIRSYNCED = 2,
+    CPL_WORKDIR_PARENT_DIRSYNCED = 3,
 };
 
 enum cpl_delete_authority_kind {
@@ -80,6 +89,8 @@ enum cpl_record_kind {
     CPL_RECORD_REPLACE_AUTHORITY = 8,
     CPL_RECORD_DONE = 9,
     CPL_RECORD_UNCONFIRMED = 10,
+    CPL_RECORD_WORKDIR_BOUND = 11,
+    CPL_RECORD_NO_DEPENDENT_ARTIFACT = 12,
 };
 
 enum cpl_batch_outcome {
@@ -99,6 +110,45 @@ enum cpl_completed_step {
     (CPL_STEP_PROCESS_ABSENT | CPL_STEP_EXECUTOR_REAPED |                     \
      CPL_STEP_WORKDIR_REMOVED | CPL_STEP_TERMINAL_CHECKS)
 
+enum cpl_process_identity_flag {
+    CPL_ID_BOOT = 1U << 0,
+    CPL_ID_START = 1U << 1,
+    CPL_ID_UID = 1U << 2,
+    CPL_ID_GROUP_SESSION = 1U << 3,
+    CPL_ID_EXECUTABLE_INODE = 1U << 4,
+    CPL_ID_EXECUTABLE_HASH = 1U << 5,
+};
+
+#define CPL_COMPLETE_PROCESS_IDENTITY                                         \
+    (CPL_ID_BOOT | CPL_ID_START | CPL_ID_UID | CPL_ID_GROUP_SESSION |         \
+     CPL_ID_EXECUTABLE_INODE | CPL_ID_EXECUTABLE_HASH)
+
+enum cpl_batch_descriptor_kind {
+    CPL_DESCRIPTOR_PROCESS_ABSENT = 1,
+    CPL_DESCRIPTOR_REAP_PROCESS = 2,
+    CPL_DESCRIPTOR_REMOVE_WORKDIR = 3,
+    CPL_DESCRIPTOR_TERMINAL_CHECKS = 4,
+};
+
+struct cpl_process_identity {
+    int64_t pid;
+    uint64_t start_ns;
+    uint32_t uid;
+    int32_t pgid;
+    int32_t sid;
+    uint32_t flags;
+    uint64_t executable_dev;
+    uint64_t executable_ino;
+    uint8_t boot_id[CPL_HASH_SIZE];
+    uint8_t executable_hash[CPL_HASH_SIZE];
+};
+
+struct cpl_batch_descriptor {
+    uint32_t kind;
+    uint32_t required_steps;
+    struct cpl_process_identity target;
+};
+
 struct cpl_state {
     uint32_t kind;
     uint32_t retained_kind;
@@ -117,7 +167,15 @@ struct cpl_state {
     uint64_t executable_dev;
     uint64_t executable_ino;
     uint32_t batch_outcome;
-    uint32_t reserved;
+    uint32_t descriptor_count;
+    uint64_t normal_limit;
+    uint64_t hard_limit;
+    uint64_t workdir_parent_dev;
+    uint64_t workdir_parent_ino;
+    uint64_t workdir_dev;
+    uint64_t workdir_ino;
+    uint32_t workdir_bound;
+    uint32_t no_dependent_artifact;
     uint8_t boot_id[CPL_HASH_SIZE];
     uint8_t executable_hash[CPL_HASH_SIZE];
     uint8_t candidate[CPL_ID_SIZE];
@@ -127,6 +185,8 @@ struct cpl_state {
     uint8_t exact_batch[CPL_ID_SIZE];
     uint8_t inherited_batch[CPL_ID_SIZE];
     uint8_t reason[CPL_REASON_SIZE];
+    uint8_t workdir_name[CPL_WORKDIR_NAME_SIZE];
+    struct cpl_batch_descriptor descriptors[CPL_MAX_BATCH_DESCRIPTORS];
 };
 
 struct cpl_record {
@@ -146,6 +206,16 @@ struct cpl_record {
     uint32_t process_identity_flags;
     uint64_t executable_dev;
     uint64_t executable_ino;
+    uint32_t descriptor_count;
+    uint32_t workdir_bound;
+    uint64_t normal_limit;
+    uint64_t hard_limit;
+    uint64_t workdir_parent_dev;
+    uint64_t workdir_parent_ino;
+    uint64_t workdir_dev;
+    uint64_t workdir_ino;
+    uint32_t no_dependent_artifact;
+    uint32_t reserved;
     uint8_t parent_hash[CPL_HASH_SIZE];
     uint8_t boot_id[CPL_HASH_SIZE];
     uint8_t executable_hash[CPL_HASH_SIZE];
@@ -156,6 +226,8 @@ struct cpl_record {
     uint8_t exact_batch[CPL_ID_SIZE];
     uint8_t inherited_batch[CPL_ID_SIZE];
     uint8_t reason[CPL_REASON_SIZE];
+    uint8_t workdir_name[CPL_WORKDIR_NAME_SIZE];
+    struct cpl_batch_descriptor descriptors[CPL_MAX_BATCH_DESCRIPTORS];
 };
 
 struct cpl_chain {
@@ -183,37 +255,109 @@ struct cpl_certified_head {
     uint8_t reserved;
 };
 
+struct cpl_append_result {
+    struct cpl_state state;
+    uint8_t hash[CPL_HASH_SIZE];
+    uint64_t sequence;
+};
+
 struct cpl_create_receipt {
     enum cpl_storage_state state;
     uint8_t intent_hash[CPL_HASH_SIZE];
+    uint8_t capability[CPL_HASH_SIZE];
+};
+
+struct cpl_workdir_receipt {
+    enum cpl_storage_state state;
+    uint8_t bound_hash[CPL_HASH_SIZE];
+    uint8_t capability[CPL_HASH_SIZE];
+    uint64_t workdir_dev;
+    uint64_t workdir_ino;
 };
 
 struct cpl_delete_authority {
     enum cpl_delete_authority_kind kind;
     uint8_t allocation_nonce[CPL_HASH_SIZE];
     uint8_t certified_hash[CPL_HASH_SIZE];
+    uint8_t capability[CPL_HASH_SIZE];
 };
 
 struct cpl_delete_receipt {
     enum cpl_storage_state state;
     bool slot_releasable;
+    uint8_t reserved[3];
+    uint8_t capability[CPL_HASH_SIZE];
+};
+
+struct cpl_action_token {
+    uint8_t capability[CPL_HASH_SIZE];
+    uint8_t batch_nonce[CPL_ID_SIZE];
+    uint64_t generation;
+};
+
+struct cpl_reap_proof {
+    int64_t pid;
+    uint8_t certified_hash[CPL_HASH_SIZE];
+    uint8_t capability[CPL_HASH_SIZE];
 };
 
 int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
+    int workdir_parent_dirfd, const char *workdir_name,
     const uint8_t nonce[CPL_HASH_SIZE], uint64_t normal_limit,
     uint64_t hard_limit, cpl_journal **out,
     struct cpl_create_receipt *receipt);
 int cpl_journal_open_at(int parent_dirfd, const char *journal_name,
+    int workdir_parent_dirfd, const char *workdir_name,
     const uint8_t nonce[CPL_HASH_SIZE], uint64_t normal_limit,
     uint64_t hard_limit, cpl_journal **out);
 int cpl_journal_append(cpl_journal *j, const uint8_t *record,
     uint32_t record_len, uint32_t record_class, uint64_t deadline_ns,
-    uint8_t out_hash[CPL_HASH_SIZE]);
+    struct cpl_append_result *out);
 int cpl_journal_scan(cpl_journal *j, struct cpl_chain *out);
 int cpl_journal_certify(cpl_journal *j, uint64_t deadline_ns,
     struct cpl_certified_head *out);
 int cpl_lifecycle_apply(const struct cpl_state *current,
     const struct cpl_record *record, struct cpl_state *out);
+int cpl_journal_create_workdir(cpl_journal *j,
+    int workdir_parent_dirfd, const struct cpl_create_receipt *create_receipt,
+    uint64_t deadline_ns, struct cpl_workdir_receipt *receipt);
+int cpl_journal_certify_no_dependent_artifact(cpl_journal *j,
+    int workdir_parent_dirfd, uint64_t deadline_ns,
+    struct cpl_delete_authority *authority);
+int cpl_journal_make_delete_authority(cpl_journal *j, uint32_t kind,
+    uint64_t deadline_ns, struct cpl_delete_authority *authority);
+int cpl_process_observe(int64_t pid, struct cpl_process_identity *out);
+int cpl_journal_activate_executor(cpl_journal *j, uint64_t generation,
+    const uint8_t executor[CPL_ID_SIZE], int64_t pid,
+    uint64_t lease_deadline_ns, uint64_t deadline_ns,
+    struct cpl_append_result *out);
+int cpl_journal_admit_batch(cpl_journal *j, uint64_t generation,
+    const uint8_t executor[CPL_ID_SIZE], const uint8_t batch_nonce[CPL_ID_SIZE],
+    const struct cpl_batch_descriptor *descriptors, uint32_t descriptor_count,
+    uint64_t deadline_ns, struct cpl_action_token *token,
+    struct cpl_append_result *out);
+int cpl_journal_execute_batch(cpl_journal *j,
+    const struct cpl_action_token *token, int workdir_parent_dirfd,
+    uint64_t deadline_ns, uint64_t *completed_steps);
+int cpl_journal_complete_batch(cpl_journal *j,
+    const struct cpl_action_token *token, uint64_t deadline_ns,
+    struct cpl_append_result *out);
+int cpl_journal_finish_done(cpl_journal *j, uint64_t generation,
+    const uint8_t executor[CPL_ID_SIZE], uint64_t deadline_ns,
+    struct cpl_append_result *out);
+int cpl_journal_retire_executor(cpl_journal *j,
+    const uint8_t authority[CPL_ID_SIZE], uint64_t authority_epoch,
+    uint64_t authority_deadline_ns, uint64_t deadline_ns,
+    struct cpl_append_result *out);
+int cpl_journal_confirm_executor_reaped(cpl_journal *j,
+    uint64_t deadline_ns, struct cpl_reap_proof *proof);
+int cpl_journal_reconcile_interrupted_batch(cpl_journal *j,
+    const struct cpl_reap_proof *proof, uint64_t deadline_ns,
+    struct cpl_append_result *out);
+int cpl_journal_prepare_successor(cpl_journal *j,
+    const struct cpl_reap_proof *proof, uint64_t generation,
+    const uint8_t candidate[CPL_ID_SIZE], uint64_t claim_deadline_ns,
+    uint64_t deadline_ns, struct cpl_append_result *out);
 int cpl_journal_delete_at(cpl_journal **inout_j, int parent_dirfd,
     const char *journal_name, int workdir_parent_dirfd,
     const char *workdir_name, const struct cpl_delete_authority *authority,
@@ -227,7 +371,22 @@ void cpl_journal_close(cpl_journal *j);
 #ifdef CPL_ENABLE_FAULT_INJECTION
 int cpl_fault_hold_append_lock(cpl_journal *j, int notify_fd, int wait_fd,
     uint64_t deadline_ns);
+int cpl_fault_hold_action_lock(cpl_journal *j, int notify_fd, int wait_fd,
+    uint64_t deadline_ns);
+int cpl_fault_probe_action_lock(cpl_journal *j, uint64_t deadline_ns);
 int cpl_fault_configure_certify_pause(int notify_fd, int wait_fd);
+int cpl_fault_append_bytes(cpl_journal *j, const uint8_t *bytes,
+    uint32_t length);
+int cpl_fault_encode_record(cpl_journal *j, const uint8_t *record,
+    uint32_t record_len, uint8_t *out, uint32_t capacity,
+    uint32_t *out_len);
+int cpl_fault_inject_header_mismatch(cpl_journal *j,
+    const uint8_t *record, uint32_t record_len, uint32_t mismatch);
+int cpl_fault_try_bound_gate(cpl_journal *j, uint32_t gate_kind,
+    const struct cpl_workdir_receipt *receipt, int marker_parent_dirfd,
+    const char *marker_name);
+int cpl_fault_try_cleanup_gate(const struct cpl_delete_receipt *receipt,
+    int marker_parent_dirfd, const char *marker_name);
 #endif
 
 #ifdef __cplusplus

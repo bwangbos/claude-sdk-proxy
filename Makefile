@@ -19,10 +19,10 @@ build/bin/darwin-probe: native/darwin_probe.c | build/bin
 	$(CLANG) $(C17_FLAGS) -isysroot $(SDKROOT) $< -o $@ -lproc
 
 build/lib/libclaude_proxy_lifecycle.dylib: native/lifecycle.c native/lifecycle.h | build/lib
-	$(CLANG) $(C17_FLAGS) -isysroot $(SDKROOT) -dynamiclib -pthread native/lifecycle.c -o $@
+	$(CLANG) $(C17_FLAGS) -isysroot $(SDKROOT) -dynamiclib -pthread native/lifecycle.c -o $@ -lproc
 
 build/lib/libclaude_proxy_lifecycle_fault.dylib: native/lifecycle.c native/lifecycle.h | build/lib
-	$(CLANG) $(C17_FLAGS) -isysroot $(SDKROOT) -dynamiclib -pthread -DCPL_ENABLE_FAULT_INJECTION native/lifecycle.c -o $@
+	$(CLANG) $(C17_FLAGS) -isysroot $(SDKROOT) -dynamiclib -pthread -DCPL_ENABLE_FAULT_INJECTION native/lifecycle.c -o $@ -lproc
 
 unit:
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/unit

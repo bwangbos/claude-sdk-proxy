@@ -1,31 +1,36 @@
-"""Typed ctypes ownership wrapper for the native bounded lifecycle journal."""
+"""Typed sole-owner wrapper for the authoritative native lifecycle journal."""
 
 from __future__ import annotations
 
 import ctypes
-import os
-import struct
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from typing import Final, Self
+from typing import Any, Final, Self
 
 from claude_sdk_proxy.lifecycle import (
     HASH_SIZE,
+    ID_SIZE,
+    BatchDescriptor,
+    BatchDescriptorKind,
+    ProcessIdentity,
     Record,
     State,
-    _CRecord,
+    _CBatchDescriptor,
+    _CProcessIdentity,
     _CState,
+    _descriptor_to_c,
+    _identity_from_c,
+    _record_to_c,
     _state_from_c,
 )
 
-_HEADER_FORMAT: Final = "<8sHHI32sQQ32sIII"
-_HEADER_SIZE: Final = struct.calcsize(_HEADER_FORMAT)
-_MAGIC: Final = b"CPLJRN01"
-_FORMAT_VERSION: Final = 1
 _DEFAULT_OPERATION_NS: Final = 1_000_000_000
+_AUTHORITY_TOKEN = object()
+_RECEIPT_TOKEN = object()
+_BATCH_TOKEN = object()
 
 
 class JournalErrorCode(IntEnum):
@@ -53,6 +58,12 @@ class JournalErrorCode(IntEnum):
     CLOSED = 22
     IO_SHORT = 23
     UNSUPPORTED = 24
+    PROCESS_IDENTITY = 25
+    ACTION_LOCK = 26
+    BATCH_TOKEN = 27
+    PRECONDITION = 28
+    REAP_REQUIRED = 29
+    RECEIPT = 30
 
 
 class JournalError(RuntimeError):
@@ -72,11 +83,22 @@ class RecordClass(IntEnum):
 class JournalCreateReceipt:
     intent_parent_dirsynced: bool
     intent_hash: bytes = field(default=b"", compare=False, repr=False)
+    _capability: bytes = field(default=b"", compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class JournalWorkdirReceipt:
+    workdir_parent_dirsynced: bool
+    bound_hash: bytes = field(default=b"", compare=False, repr=False)
+    workdir_dev: int = field(default=0, compare=False, repr=False)
+    workdir_ino: int = field(default=0, compare=False, repr=False)
+    _capability: bytes = field(default=b"", compare=False, repr=False)
 
 
 @dataclass(frozen=True)
 class JournalDeleteReceipt:
     journal_unlink_parent_dirsynced: bool
+    _capability: bytes = field(default=b"", compare=False, repr=False)
 
     @property
     def slot_releasable(self) -> bool:
@@ -111,11 +133,15 @@ class CertifiedHead:
     attempts: int
 
 
-_AUTHORITY_TOKEN = object()
+@dataclass(frozen=True)
+class ReapProof:
+    pid: int
+    _certified_hash: bytes = field(default=b"", compare=False, repr=False)
+    _capability: bytes = field(default=b"", compare=False, repr=False)
 
 
 class _DeletionAuthority:
-    __slots__ = ("_allocation_nonce", "_certified_hash", "_kind")
+    __slots__ = ("_allocation_nonce", "_capability", "_certified_hash", "_kind")
 
     def __init__(
         self,
@@ -123,6 +149,7 @@ class _DeletionAuthority:
         kind: int,
         allocation_nonce: bytes,
         certified_hash: bytes,
+        capability: bytes,
     ) -> None:
         if token is not _AUTHORITY_TOKEN:
             raise TypeError(
@@ -131,6 +158,7 @@ class _DeletionAuthority:
         self._kind = kind
         self._allocation_nonce = allocation_nonce
         self._certified_hash = certified_hash
+        self._capability = capability
 
     def _fabricate_for_test(
         self,
@@ -138,33 +166,44 @@ class _DeletionAuthority:
         kind: int | None = None,
         allocation_nonce: bytes | None = None,
         certified_hash: bytes | None = None,
+        capability: bytes | None = None,
     ) -> _DeletionAuthority:
-        authority_type: type[_DeletionAuthority]
         selected_kind = self._kind if kind is None else kind
-        if selected_kind == 1:
-            authority_type = CertifiedDone
-        else:
-            authority_type = UnreleasedPartialCreate
+        authority_type = (
+            CertifiedDone if selected_kind == 1 else UnreleasedPartialCreate
+        )
         return authority_type(
             _AUTHORITY_TOKEN,
             selected_kind,
             self._allocation_nonce if allocation_nonce is None else allocation_nonce,
             self._certified_hash if certified_hash is None else certified_hash,
+            self._capability if capability is None else capability,
         )
 
 
 class CertifiedDone(_DeletionAuthority):
-    """Opaque proof that native certification observed the exact durable DONE head."""
+    """Opaque native authority for an exact, reaped, durable DONE head."""
 
 
 class UnreleasedPartialCreate(_DeletionAuthority):
-    """Opaque native reconciliation proof for a create without complete INTENT."""
+    """Opaque native authority for a create with no dependent artifacts."""
 
 
 class _CCreateReceipt(ctypes.Structure):
     _fields_ = [
         ("state", ctypes.c_int),
         ("intent_hash", ctypes.c_uint8 * HASH_SIZE),
+        ("capability", ctypes.c_uint8 * HASH_SIZE),
+    ]
+
+
+class _CWorkdirReceipt(ctypes.Structure):
+    _fields_ = [
+        ("state", ctypes.c_int),
+        ("bound_hash", ctypes.c_uint8 * HASH_SIZE),
+        ("capability", ctypes.c_uint8 * HASH_SIZE),
+        ("workdir_dev", ctypes.c_uint64),
+        ("workdir_ino", ctypes.c_uint64),
     ]
 
 
@@ -173,11 +212,41 @@ class _CDeleteAuthority(ctypes.Structure):
         ("kind", ctypes.c_int),
         ("allocation_nonce", ctypes.c_uint8 * HASH_SIZE),
         ("certified_hash", ctypes.c_uint8 * HASH_SIZE),
+        ("capability", ctypes.c_uint8 * HASH_SIZE),
     ]
 
 
 class _CDeleteReceipt(ctypes.Structure):
-    _fields_ = [("state", ctypes.c_int), ("slot_releasable", ctypes.c_bool)]
+    _fields_ = [
+        ("state", ctypes.c_int),
+        ("slot_releasable", ctypes.c_bool),
+        ("reserved", ctypes.c_uint8 * 3),
+        ("capability", ctypes.c_uint8 * HASH_SIZE),
+    ]
+
+
+class _CAppendResult(ctypes.Structure):
+    _fields_ = [
+        ("state", _CState),
+        ("hash", ctypes.c_uint8 * HASH_SIZE),
+        ("sequence", ctypes.c_uint64),
+    ]
+
+
+class _CActionToken(ctypes.Structure):
+    _fields_ = [
+        ("capability", ctypes.c_uint8 * HASH_SIZE),
+        ("batch_nonce", ctypes.c_uint8 * ID_SIZE),
+        ("generation", ctypes.c_uint64),
+    ]
+
+
+class _CReapProof(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_int64),
+        ("certified_hash", ctypes.c_uint8 * HASH_SIZE),
+        ("capability", ctypes.c_uint8 * HASH_SIZE),
+    ]
 
 
 class _CChain(ctypes.Structure):
@@ -218,7 +287,7 @@ def _default_library_path() -> Path:
 
 def _set_bytes(target: ctypes.Array[ctypes.c_uint8], value: bytes) -> None:
     if len(value) != len(target):
-        raise ValueError("native fixed-size value has the wrong length")
+        raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
     ctypes.memmove(target, value, len(value))
 
 
@@ -240,12 +309,40 @@ def _deadline(value: int | None) -> int:
     return time.monotonic_ns() + _DEFAULT_OPERATION_NS
 
 
+def _component_bytes(name: str) -> bytes:
+    if not isinstance(name, str) or "\0" in name:
+        raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
+    return name.encode("utf-8")
+
+
+def _fixed_id(value: str) -> ctypes.Array[ctypes.c_uint8]:
+    encoded = _component_bytes(value)
+    if len(encoded) >= ID_SIZE:
+        raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
+    result = (ctypes.c_uint8 * ID_SIZE)()
+    ctypes.memmove(result, encoded, len(encoded))
+    return result
+
+
+def _checked_nonce(nonce: bytes) -> ctypes.Array[ctypes.c_uint8]:
+    if not isinstance(nonce, bytes) or len(nonce) != HASH_SIZE:
+        raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
+    return (ctypes.c_uint8 * HASH_SIZE).from_buffer_copy(nonce)
+
+
+def _canonical(native: _CAppendResult) -> CanonicalRecord:
+    return CanonicalRecord(
+        bytes(native.hash), native.sequence, _state_from_c(native.state)
+    )
+
+
 def _load_library(path: Path) -> ctypes.CDLL:
     library = ctypes.CDLL(str(path), use_errno=True)
     handle_pointer = ctypes.POINTER(ctypes.c_void_p)
     byte_pointer = ctypes.POINTER(ctypes.c_uint8)
-
     library.cpl_journal_create_at.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
         ctypes.c_int,
         ctypes.c_char_p,
         byte_pointer,
@@ -256,6 +353,8 @@ def _load_library(path: Path) -> ctypes.CDLL:
     ]
     library.cpl_journal_create_at.restype = ctypes.c_int
     library.cpl_journal_open_at.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
         ctypes.c_int,
         ctypes.c_char_p,
         byte_pointer,
@@ -270,13 +369,10 @@ def _load_library(path: Path) -> ctypes.CDLL:
         ctypes.c_uint32,
         ctypes.c_uint32,
         ctypes.c_uint64,
-        byte_pointer,
+        ctypes.POINTER(_CAppendResult),
     ]
     library.cpl_journal_append.restype = ctypes.c_int
-    library.cpl_journal_scan.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(_CChain),
-    ]
+    library.cpl_journal_scan.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CChain)]
     library.cpl_journal_scan.restype = ctypes.c_int
     library.cpl_journal_certify.argtypes = [
         ctypes.c_void_p,
@@ -284,6 +380,110 @@ def _load_library(path: Path) -> ctypes.CDLL:
         ctypes.POINTER(_CCertifiedHead),
     ]
     library.cpl_journal_certify.restype = ctypes.c_int
+    library.cpl_journal_create_workdir.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(_CCreateReceipt),
+        ctypes.c_uint64,
+        ctypes.POINTER(_CWorkdirReceipt),
+    ]
+    library.cpl_journal_create_workdir.restype = ctypes.c_int
+    library.cpl_journal_certify_no_dependent_artifact.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CDeleteAuthority),
+    ]
+    library.cpl_journal_certify_no_dependent_artifact.restype = ctypes.c_int
+    library.cpl_journal_make_delete_authority.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CDeleteAuthority),
+    ]
+    library.cpl_journal_make_delete_authority.restype = ctypes.c_int
+    library.cpl_process_observe.argtypes = [
+        ctypes.c_int64,
+        ctypes.POINTER(_CProcessIdentity),
+    ]
+    library.cpl_process_observe.restype = ctypes.c_int
+    library.cpl_journal_activate_executor.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        byte_pointer,
+        ctypes.c_int64,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CAppendResult),
+    ]
+    library.cpl_journal_activate_executor.restype = ctypes.c_int
+    library.cpl_journal_admit_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        byte_pointer,
+        byte_pointer,
+        ctypes.POINTER(_CBatchDescriptor),
+        ctypes.c_uint32,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CActionToken),
+        ctypes.POINTER(_CAppendResult),
+    ]
+    library.cpl_journal_admit_batch.restype = ctypes.c_int
+    library.cpl_journal_execute_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_CActionToken),
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    library.cpl_journal_execute_batch.restype = ctypes.c_int
+    library.cpl_journal_complete_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_CActionToken),
+        ctypes.c_uint64,
+        ctypes.POINTER(_CAppendResult),
+    ]
+    library.cpl_journal_complete_batch.restype = ctypes.c_int
+    library.cpl_journal_finish_done.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        byte_pointer,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CAppendResult),
+    ]
+    library.cpl_journal_finish_done.restype = ctypes.c_int
+    library.cpl_journal_retire_executor.argtypes = [
+        ctypes.c_void_p,
+        byte_pointer,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CAppendResult),
+    ]
+    library.cpl_journal_retire_executor.restype = ctypes.c_int
+    library.cpl_journal_confirm_executor_reaped.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CReapProof),
+    ]
+    library.cpl_journal_confirm_executor_reaped.restype = ctypes.c_int
+    library.cpl_journal_reconcile_interrupted_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_CReapProof),
+        ctypes.c_uint64,
+        ctypes.POINTER(_CAppendResult),
+    ]
+    library.cpl_journal_reconcile_interrupted_batch.restype = ctypes.c_int
+    library.cpl_journal_prepare_successor.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_CReapProof),
+        ctypes.c_uint64,
+        byte_pointer,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CAppendResult),
+    ]
+    library.cpl_journal_prepare_successor.restype = ctypes.c_int
     library.cpl_journal_delete_at.argtypes = [
         handle_pointer,
         ctypes.c_int,
@@ -295,35 +495,63 @@ def _load_library(path: Path) -> ctypes.CDLL:
         ctypes.POINTER(_CDeleteReceipt),
     ]
     library.cpl_journal_delete_at.restype = ctypes.c_int
-    library.cpl_journal_reconcile_absent_after_crash.argtypes = (
-        library.cpl_journal_delete_at.argtypes
-    )
+    library.cpl_journal_reconcile_absent_after_crash.argtypes = [
+        handle_pointer,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.POINTER(_CDeleteAuthority),
+        ctypes.c_uint64,
+        ctypes.POINTER(_CDeleteReceipt),
+    ]
     library.cpl_journal_reconcile_absent_after_crash.restype = ctypes.c_int
     library.cpl_journal_close.argtypes = [ctypes.c_void_p]
     library.cpl_journal_close.restype = None
     return library
 
 
-def _component_bytes(name: str) -> bytes:
-    if not isinstance(name, str) or "\0" in name:
-        raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
-    return name.encode("utf-8")
+class AdmittedBatch:
+    """A native action-lock capability; only its admitting thread may use it."""
 
+    __slots__ = ("_journal", "_token")
 
-def _checked_nonce(nonce: bytes) -> ctypes.Array[ctypes.c_uint8]:
-    if not isinstance(nonce, bytes) or len(nonce) != HASH_SIZE:
-        raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
-    return (ctypes.c_uint8 * HASH_SIZE).from_buffer_copy(nonce)
+    def __init__(self, token: object, journal: Journal, native: _CActionToken) -> None:
+        if token is not _BATCH_TOKEN:
+            raise TypeError("batch capabilities are created by native admission")
+        self._journal = journal
+        self._token = native
 
+    def execute(self, deadline_ns: int | None = None) -> int:
+        self._journal._require_open()
+        completed = ctypes.c_uint64()
+        _raise_status(
+            int(
+                self._journal._library.cpl_journal_execute_batch(
+                    self._journal._handle,
+                    ctypes.byref(self._token),
+                    self._journal._workdir_parent_dirfd,
+                    _deadline(deadline_ns),
+                    ctypes.byref(completed),
+                )
+            )
+        )
+        return completed.value
 
-def _crc32c(data: bytes) -> int:
-    crc = 0xFFFFFFFF
-    for value in data:
-        crc ^= value
-        for _ in range(8):
-            mask = -(crc & 1) & 0xFFFFFFFF
-            crc = (crc >> 1) ^ (0x82F63B78 & mask)
-    return (~crc) & 0xFFFFFFFF
+    def complete(self, deadline_ns: int | None = None) -> CanonicalRecord:
+        self._journal._require_open()
+        output = _CAppendResult()
+        _raise_status(
+            int(
+                self._journal._library.cpl_journal_complete_batch(
+                    self._journal._handle,
+                    ctypes.byref(self._token),
+                    _deadline(deadline_ns),
+                    ctypes.byref(output),
+                )
+            )
+        )
+        return _canonical(output)
 
 
 class Journal:
@@ -407,19 +635,26 @@ class Journal:
         normal_limit: int,
         hard_limit: int,
         *,
-        workdir_parent_dirfd: int | None = None,
-        workdir_name: str | None = None,
+        workdir_parent_dirfd: int | None,
+        workdir_name: str | None,
         library_path: Path,
     ) -> tuple[Self, JournalCreateReceipt]:
+        selected_parent = (
+            parent_dirfd if workdir_parent_dirfd is None else workdir_parent_dirfd
+        )
+        selected_name = (
+            journal_name + ".workdir" if workdir_name is None else workdir_name
+        )
         library = _load_library(library_path)
         handle = ctypes.c_void_p()
         receipt = _CCreateReceipt()
-        nonce_array = _checked_nonce(nonce)
         status = int(
             library.cpl_journal_create_at(
                 parent_dirfd,
                 _component_bytes(journal_name),
-                nonce_array,
+                selected_parent,
+                _component_bytes(selected_name),
+                _checked_nonce(nonce),
                 normal_limit,
                 hard_limit,
                 ctypes.byref(handle),
@@ -431,12 +666,6 @@ class Journal:
             if handle.value:
                 library.cpl_journal_close(handle)
             raise JournalError(JournalErrorCode.SYSTEM)
-        selected_workdir_parent = (
-            parent_dirfd if workdir_parent_dirfd is None else workdir_parent_dirfd
-        )
-        selected_workdir_name = (
-            journal_name + ".workdir" if workdir_name is None else workdir_name
-        )
         journal = cls(
             library,
             handle,
@@ -445,12 +674,11 @@ class Journal:
             nonce,
             normal_limit,
             hard_limit,
-            selected_workdir_parent,
-            selected_workdir_name,
+            selected_parent,
+            selected_name,
         )
         return journal, JournalCreateReceipt(
-            intent_parent_dirsynced=True,
-            intent_hash=bytes(receipt.intent_hash),
+            True, bytes(receipt.intent_hash), bytes(receipt.capability)
         )
 
     @classmethod
@@ -509,24 +737,32 @@ class Journal:
         normal_limit: int,
         hard_limit: int,
         *,
-        workdir_parent_dirfd: int | None = None,
-        workdir_name: str | None = None,
+        workdir_parent_dirfd: int | None,
+        workdir_name: str | None,
         library_path: Path,
     ) -> Self:
+        selected_parent = (
+            parent_dirfd if workdir_parent_dirfd is None else workdir_parent_dirfd
+        )
+        selected_name = (
+            journal_name + ".workdir" if workdir_name is None else workdir_name
+        )
         library = _load_library(library_path)
         handle = ctypes.c_void_p()
-        nonce_array = _checked_nonce(nonce)
-        status = int(
-            library.cpl_journal_open_at(
-                parent_dirfd,
-                _component_bytes(journal_name),
-                nonce_array,
-                normal_limit,
-                hard_limit,
-                ctypes.byref(handle),
+        _raise_status(
+            int(
+                library.cpl_journal_open_at(
+                    parent_dirfd,
+                    _component_bytes(journal_name),
+                    selected_parent,
+                    _component_bytes(selected_name),
+                    _checked_nonce(nonce),
+                    normal_limit,
+                    hard_limit,
+                    ctypes.byref(handle),
+                )
             )
         )
-        _raise_status(status)
         if not handle.value:
             raise JournalError(JournalErrorCode.SYSTEM)
         return cls(
@@ -537,8 +773,8 @@ class Journal:
             nonce,
             normal_limit,
             hard_limit,
-            parent_dirfd if workdir_parent_dirfd is None else workdir_parent_dirfd,
-            journal_name + ".workdir" if workdir_name is None else workdir_name,
+            selected_parent,
+            selected_name,
         )
 
     @property
@@ -582,20 +818,18 @@ class Journal:
     def scan(self) -> CanonicalChain:
         self._require_open()
         chain = _CChain()
-        _raise_status(int(self._library.cpl_journal_scan(self._handle, chain)))
+        _raise_status(
+            int(self._library.cpl_journal_scan(self._handle, ctypes.byref(chain)))
+        )
         state = _state_from_c(chain.state)
         return CanonicalChain(
-            head=CanonicalRecord(
-                hash=bytes(chain.head_hash),
-                sequence=chain.head_sequence,
-                record=state,
-            ),
-            physical_eof=chain.physical_eof,
-            canonical_records=chain.canonical_records,
-            invalid_bytes=chain.invalid_bytes,
-            stale_records=chain.stale_records,
-            has_intent=chain.has_intent,
-            unhealthy=chain.unhealthy,
+            CanonicalRecord(bytes(chain.head_hash), chain.head_sequence, state),
+            chain.physical_eof,
+            chain.canonical_records,
+            chain.invalid_bytes,
+            chain.stale_records,
+            chain.has_intent,
+            chain.unhealthy,
         )
 
     def append(
@@ -606,85 +840,137 @@ class Journal:
         deadline_ns: int | None = None,
     ) -> CanonicalRecord:
         self._require_open()
-        encoded = record.encode()
-        payload = (ctypes.c_uint8 * len(encoded)).from_buffer_copy(encoded)
-        output = (ctypes.c_uint8 * HASH_SIZE)()
-        status = int(
-            self._library.cpl_journal_append(
-                self._handle,
-                payload,
-                len(encoded),
-                int(record_class),
-                _deadline(deadline_ns),
-                output,
+        native_record = _record_to_c(record)
+        payload = ctypes.cast(
+            ctypes.byref(native_record), ctypes.POINTER(ctypes.c_uint8)
+        )
+        output = _CAppendResult()
+        _raise_status(
+            int(
+                self._library.cpl_journal_append(
+                    self._handle,
+                    payload,
+                    ctypes.sizeof(native_record),
+                    int(record_class),
+                    _deadline(deadline_ns),
+                    ctypes.byref(output),
+                )
             )
         )
-        _raise_status(status)
-        appended_hash = bytes(output)
-        head = self.scan().head
-        if head.hash != appended_hash:
-            return CanonicalRecord(appended_hash, head.sequence, head.record)
-        return head
+        return _canonical(output)
 
     def certify_head(self, deadline_ns: int | None = None) -> CertifiedHead:
         self._require_open()
-        certified = _CCertifiedHead()
-        _raise_status(
-            int(
-                self._library.cpl_journal_certify(
-                    self._handle,
-                    _deadline(deadline_ns),
-                    certified,
-                )
-            )
-        )
+        native = self._certified_native(deadline_ns)
         return CertifiedHead(
-            hash=bytes(certified.head_hash),
-            sequence=certified.head_sequence,
-            physical_eof=certified.physical_eof,
-            state=_state_from_c(certified.state),
-            has_intent=certified.has_intent,
-            attempts=certified.attempts,
+            bytes(native.head_hash),
+            native.head_sequence,
+            native.physical_eof,
+            _state_from_c(native.state),
+            native.has_intent,
+            native.attempts,
         )
 
     def _certified_native(self, deadline_ns: int | None = None) -> _CCertifiedHead:
-        certified = _CCertifiedHead()
+        native = _CCertifiedHead()
         _raise_status(
             int(
                 self._library.cpl_journal_certify(
-                    self._handle,
-                    _deadline(deadline_ns),
-                    certified,
+                    self._handle, _deadline(deadline_ns), ctypes.byref(native)
                 )
             )
         )
-        return certified
+        return native
+
+    @staticmethod
+    def _create_receipt_to_c(receipt: JournalCreateReceipt) -> _CCreateReceipt:
+        native = _CCreateReceipt()
+        native.state = 1 if receipt.intent_parent_dirsynced else 0
+        _set_bytes(native.intent_hash, receipt.intent_hash)
+        _set_bytes(native.capability, receipt._capability)
+        return native
+
+    def create_workdir(
+        self,
+        receipt: JournalCreateReceipt,
+        deadline_ns: int | None = None,
+    ) -> JournalWorkdirReceipt:
+        self._require_open()
+        if not isinstance(receipt, JournalCreateReceipt):
+            raise TypeError("a native create receipt is required")
+        create_receipt = self._create_receipt_to_c(receipt)
+        native = _CWorkdirReceipt()
+        _raise_status(
+            int(
+                self._library.cpl_journal_create_workdir(
+                    self._handle,
+                    self._workdir_parent_dirfd,
+                    ctypes.byref(create_receipt),
+                    _deadline(deadline_ns),
+                    ctypes.byref(native),
+                )
+            )
+        )
+        if native.state != 3:
+            raise JournalError(JournalErrorCode.SYSTEM)
+        return JournalWorkdirReceipt(
+            True,
+            bytes(native.bound_hash),
+            native.workdir_dev,
+            native.workdir_ino,
+            bytes(native.capability),
+        )
+
+    @staticmethod
+    def _authority_from_c(native: _CDeleteAuthority) -> _DeletionAuthority:
+        authority_type = CertifiedDone if native.kind == 1 else UnreleasedPartialCreate
+        return authority_type(
+            _AUTHORITY_TOKEN,
+            native.kind,
+            bytes(native.allocation_nonce),
+            bytes(native.certified_hash),
+            bytes(native.capability),
+        )
 
     def certify_done(self, deadline_ns: int | None = None) -> CertifiedDone:
         self._require_open()
-        certified = self._certified_native(deadline_ns)
-        if not certified.done_authority:
-            raise JournalError(JournalErrorCode.AUTHORITY)
-        return CertifiedDone(
-            _AUTHORITY_TOKEN,
-            1,
-            self._nonce,
-            bytes(certified.head_hash),
+        native = _CDeleteAuthority()
+        _raise_status(
+            int(
+                self._library.cpl_journal_make_delete_authority(
+                    self._handle, 1, _deadline(deadline_ns), ctypes.byref(native)
+                )
+            )
         )
+        authority = self._authority_from_c(native)
+        assert isinstance(authority, CertifiedDone)
+        return authority
 
-    def certify_unreleased_partial_create(
-        self, deadline_ns: int | None = None
+    def certify_no_dependent_artifacts(
+        self,
+        deadline_ns: int | None = None,
     ) -> UnreleasedPartialCreate:
         self._require_open()
-        certified = self._certified_native(deadline_ns)
-        if not certified.partial_create_authority:
-            raise JournalError(JournalErrorCode.AUTHORITY)
-        return UnreleasedPartialCreate(
-            _AUTHORITY_TOKEN,
-            2,
-            self._nonce,
-            bytes(certified.head_hash),
+        native = _CDeleteAuthority()
+        _raise_status(
+            int(
+                self._library.cpl_journal_certify_no_dependent_artifact(
+                    self._handle,
+                    self._workdir_parent_dirfd,
+                    _deadline(deadline_ns),
+                    ctypes.byref(native),
+                )
+            )
         )
+        authority = self._authority_from_c(native)
+        assert isinstance(authority, UnreleasedPartialCreate)
+        return authority
+
+    def certify_unreleased_partial_create(
+        self,
+        deadline_ns: int | None = None,
+    ) -> UnreleasedPartialCreate:
+        return self.certify_no_dependent_artifacts(deadline_ns)
 
     @staticmethod
     def _authority_to_c(authority: _DeletionAuthority) -> _CDeleteAuthority:
@@ -694,6 +980,7 @@ class Journal:
         native.kind = authority._kind
         _set_bytes(native.allocation_nonce, authority._allocation_nonce)
         _set_bytes(native.certified_hash, authority._certified_hash)
+        _set_bytes(native.capability, authority._capability)
         return native
 
     def _delete_common(
@@ -704,23 +991,24 @@ class Journal:
     ) -> JournalDeleteReceipt:
         self._require_open()
         native_authority = self._authority_to_c(authority)
-        receipt = _CDeleteReceipt()
-        status = int(
-            entry_point(
-                ctypes.byref(self._handle),
-                self._parent_dirfd,
-                _component_bytes(self._journal_name),
-                self._workdir_parent_dirfd,
-                _component_bytes(self._workdir_name),
-                ctypes.byref(native_authority),
-                _deadline(deadline_ns),
-                ctypes.byref(receipt),
+        native = _CDeleteReceipt()
+        _raise_status(
+            int(
+                entry_point(
+                    ctypes.byref(self._handle),
+                    self._parent_dirfd,
+                    _component_bytes(self._journal_name),
+                    self._workdir_parent_dirfd,
+                    _component_bytes(self._workdir_name),
+                    ctypes.byref(native_authority),
+                    _deadline(deadline_ns),
+                    ctypes.byref(native),
+                )
             )
         )
-        _raise_status(status)
-        if self._handle.value or receipt.state != 2 or not receipt.slot_releasable:
+        if self._handle.value or native.state != 2 or not native.slot_releasable:
             raise JournalError(JournalErrorCode.SYSTEM)
-        return JournalDeleteReceipt(journal_unlink_parent_dirsynced=True)
+        return JournalDeleteReceipt(True, bytes(native.capability))
 
     def delete_at(
         self,
@@ -728,9 +1016,7 @@ class Journal:
         deadline_ns: int | None = None,
     ) -> JournalDeleteReceipt:
         return self._delete_common(
-            self._library.cpl_journal_delete_at,
-            authority,
-            deadline_ns,
+            self._library.cpl_journal_delete_at, authority, deadline_ns
         )
 
     def reconcile_absent_after_crash(
@@ -744,57 +1030,278 @@ class Journal:
             deadline_ns,
         )
 
-    def encode_physical_for_test(self, record: Record) -> bytes:
-        return self._physical_from_payload_for_test(record.encode())
+    def observe_process(self, pid: int) -> ProcessIdentity:
+        native = _CProcessIdentity()
+        _raise_status(int(self._library.cpl_process_observe(pid, ctypes.byref(native))))
+        return _identity_from_c(native)
 
-    def _physical_from_payload_for_test(self, payload: bytes) -> bytes:
-        if len(payload) != ctypes.sizeof(_CRecord):
-            raise ValueError("test payload has an invalid size")
-        chain = self.scan()
-        parent_offset = _CRecord.parent_hash.offset
-        parent = payload[parent_offset : parent_offset + HASH_SIZE]
-        if parent == bytes(HASH_SIZE):
-            parent = chain.head.hash
-        sequence = chain.head.sequence + 1
-        if parent != chain.head.hash:
-            sequence = chain.head.sequence
-        cleanup_epoch = struct.unpack_from(
-            "<Q", payload, _CRecord.cleanup_epoch.offset
-        )[0]
-        payload_type = struct.unpack_from("<I", payload, _CRecord.kind.offset)[0]
-        header = struct.pack(
-            _HEADER_FORMAT,
-            _MAGIC,
-            _FORMAT_VERSION,
-            _HEADER_SIZE,
-            _HEADER_SIZE + len(payload),
-            self._nonce,
-            sequence,
-            cleanup_epoch,
-            parent,
-            payload_type,
-            len(payload),
-            0,
+    @staticmethod
+    def process_absent_descriptor(identity: ProcessIdentity) -> BatchDescriptor:
+        return BatchDescriptor(BatchDescriptorKind.PROCESS_ABSENT, 0, identity)
+
+    @staticmethod
+    def reap_process_descriptor(identity: ProcessIdentity) -> BatchDescriptor:
+        return BatchDescriptor(BatchDescriptorKind.REAP_PROCESS, 1, identity)
+
+    @staticmethod
+    def remove_bound_workdir_descriptor() -> BatchDescriptor:
+        return BatchDescriptor(BatchDescriptorKind.REMOVE_WORKDIR, 3)
+
+    @staticmethod
+    def terminal_checks_descriptor() -> BatchDescriptor:
+        return BatchDescriptor(BatchDescriptorKind.TERMINAL_CHECKS, 7)
+
+    def activate_executor(
+        self,
+        generation: int,
+        executor: str,
+        pid: int,
+        *,
+        lease_deadline_ns: int,
+        deadline_ns: int | None = None,
+    ) -> CanonicalRecord:
+        output = _CAppendResult()
+        _raise_status(
+            int(
+                self._library.cpl_journal_activate_executor(
+                    self._handle,
+                    generation,
+                    _fixed_id(executor),
+                    pid,
+                    lease_deadline_ns,
+                    _deadline(deadline_ns),
+                    ctypes.byref(output),
+                )
+            )
         )
-        checksum = _crc32c(header + payload)
-        return header[:-4] + struct.pack("<I", checksum) + payload
+        return _canonical(output)
+
+    def admit_batch(
+        self,
+        generation: int,
+        executor: str,
+        batch_nonce: str,
+        descriptors: Sequence[BatchDescriptor],
+        *,
+        deadline_ns: int | None = None,
+    ) -> AdmittedBatch:
+        if not descriptors:
+            raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
+        array_type = _CBatchDescriptor * len(descriptors)
+        descriptor_array = array_type(*(_descriptor_to_c(item) for item in descriptors))
+        token = _CActionToken()
+        output = _CAppendResult()
+        _raise_status(
+            int(
+                self._library.cpl_journal_admit_batch(
+                    self._handle,
+                    generation,
+                    _fixed_id(executor),
+                    _fixed_id(batch_nonce),
+                    descriptor_array,
+                    len(descriptors),
+                    _deadline(deadline_ns),
+                    ctypes.byref(token),
+                    ctypes.byref(output),
+                )
+            )
+        )
+        return AdmittedBatch(_BATCH_TOKEN, self, token)
+
+    def finish_done(
+        self,
+        generation: int,
+        executor: str,
+        deadline_ns: int | None = None,
+    ) -> CanonicalRecord:
+        output = _CAppendResult()
+        _raise_status(
+            int(
+                self._library.cpl_journal_finish_done(
+                    self._handle,
+                    generation,
+                    _fixed_id(executor),
+                    _deadline(deadline_ns),
+                    ctypes.byref(output),
+                )
+            )
+        )
+        return _canonical(output)
+
+    def retire_executor(
+        self,
+        *,
+        authority: str,
+        authority_epoch: int,
+        authority_deadline_ns: int,
+        deadline_ns: int | None = None,
+    ) -> CanonicalRecord:
+        output = _CAppendResult()
+        _raise_status(
+            int(
+                self._library.cpl_journal_retire_executor(
+                    self._handle,
+                    _fixed_id(authority),
+                    authority_epoch,
+                    authority_deadline_ns,
+                    _deadline(deadline_ns),
+                    ctypes.byref(output),
+                )
+            )
+        )
+        return _canonical(output)
+
+    def confirm_executor_reaped(
+        self,
+        deadline_ns: int | None = None,
+    ) -> ReapProof:
+        native = _CReapProof()
+        _raise_status(
+            int(
+                self._library.cpl_journal_confirm_executor_reaped(
+                    self._handle,
+                    _deadline(deadline_ns),
+                    ctypes.byref(native),
+                )
+            )
+        )
+        return ReapProof(
+            native.pid, bytes(native.certified_hash), bytes(native.capability)
+        )
+
+    @staticmethod
+    def _proof_to_c(proof: ReapProof) -> _CReapProof:
+        if not isinstance(proof, ReapProof):
+            raise TypeError("a native reap proof is required")
+        native = _CReapProof()
+        native.pid = proof.pid
+        _set_bytes(native.certified_hash, proof._certified_hash)
+        _set_bytes(native.capability, proof._capability)
+        return native
+
+    def reconcile_interrupted_batch(
+        self,
+        proof: ReapProof,
+        deadline_ns: int | None = None,
+    ) -> CanonicalRecord:
+        native_proof = self._proof_to_c(proof)
+        output = _CAppendResult()
+        _raise_status(
+            int(
+                self._library.cpl_journal_reconcile_interrupted_batch(
+                    self._handle,
+                    ctypes.byref(native_proof),
+                    _deadline(deadline_ns),
+                    ctypes.byref(output),
+                )
+            )
+        )
+        return _canonical(output)
+
+    def prepare_successor(
+        self,
+        proof: ReapProof,
+        generation: int,
+        candidate: str,
+        *,
+        claim_deadline_ns: int,
+        deadline_ns: int | None = None,
+    ) -> CanonicalRecord:
+        native_proof = self._proof_to_c(proof)
+        output = _CAppendResult()
+        _raise_status(
+            int(
+                self._library.cpl_journal_prepare_successor(
+                    self._handle,
+                    ctypes.byref(native_proof),
+                    generation,
+                    _fixed_id(candidate),
+                    claim_deadline_ns,
+                    _deadline(deadline_ns),
+                    ctypes.byref(output),
+                )
+            )
+        )
+        return _canonical(output)
+
+    def _fault(self, name: str) -> Any:
+        self._require_open()
+        try:
+            return getattr(self._library, name)
+        except AttributeError as error:
+            raise JournalError(JournalErrorCode.UNSUPPORTED) from error
 
     def raw_append_for_test(self, encoded: bytes) -> None:
-        self._require_open()
-        physical = encoded
-        if not encoded.startswith(_MAGIC):
-            if len(encoded) == ctypes.sizeof(_CRecord):
-                physical = self._physical_from_payload_for_test(encoded)
-        fd = os.open(
-            self._journal_name,
-            os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=self._parent_dirfd,
+        function = self._fault("cpl_fault_append_bytes")
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_uint32,
+        ]
+        function.restype = ctypes.c_int
+        payload = (ctypes.c_uint8 * len(encoded)).from_buffer_copy(encoded)
+        _raise_status(int(function(self._handle, payload, len(encoded))))
+
+    def encode_physical_for_test(self, record: Record) -> bytes:
+        function = self._fault("cpl_fault_encode_record")
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        function.restype = ctypes.c_int
+        native_record = _record_to_c(record)
+        payload = ctypes.cast(
+            ctypes.byref(native_record), ctypes.POINTER(ctypes.c_uint8)
         )
+        capacity = ctypes.sizeof(native_record) + 256
+        output = (ctypes.c_uint8 * capacity)()
+        length = ctypes.c_uint32()
+        _raise_status(
+            int(
+                function(
+                    self._handle,
+                    payload,
+                    ctypes.sizeof(native_record),
+                    output,
+                    capacity,
+                    ctypes.byref(length),
+                )
+            )
+        )
+        return bytes(output[: length.value])
+
+    def inject_header_mismatch_for_test(self, record: Record, field: str) -> None:
+        mismatches = {"cleanup_epoch": 1, "payload_type": 2, "duplicate_parent": 3}
         try:
-            if os.write(fd, physical) != len(physical):
-                raise JournalError(JournalErrorCode.IO_SHORT)
-        finally:
-            os.close(fd)
+            mismatch = mismatches[field]
+        except KeyError as error:
+            raise ValueError("unknown mismatch field") from error
+        function = self._fault("cpl_fault_inject_header_mismatch")
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        function.restype = ctypes.c_int
+        native_record = _record_to_c(record)
+        payload = ctypes.cast(
+            ctypes.byref(native_record), ctypes.POINTER(ctypes.c_uint8)
+        )
+        _raise_status(
+            int(
+                function(
+                    self._handle,
+                    payload,
+                    ctypes.sizeof(native_record),
+                    mismatch,
+                )
+            )
+        )
 
     def hold_append_lock_for_test(
         self,
@@ -802,11 +1309,7 @@ class Journal:
         wait_fd: int,
         deadline_ns: int | None = None,
     ) -> None:
-        self._require_open()
-        try:
-            function = self._library.cpl_fault_hold_append_lock
-        except AttributeError as error:
-            raise JournalError(JournalErrorCode.UNSUPPORTED) from error
+        function = self._fault("cpl_fault_hold_append_lock")
         function.argtypes = [
             ctypes.c_void_p,
             ctypes.c_int,
@@ -818,24 +1321,124 @@ class Journal:
             int(function(self._handle, notify_fd, wait_fd, _deadline(deadline_ns)))
         )
 
+    def hold_action_lock_for_test(
+        self,
+        notify_fd: int,
+        wait_fd: int,
+        deadline_ns: int | None = None,
+    ) -> None:
+        function = self._fault("cpl_fault_hold_action_lock")
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+        ]
+        function.restype = ctypes.c_int
+        _raise_status(
+            int(function(self._handle, notify_fd, wait_fd, _deadline(deadline_ns)))
+        )
+
+    def probe_action_lock_for_test(self, deadline_ns: int | None = None) -> None:
+        function = self._fault("cpl_fault_probe_action_lock")
+        function.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        function.restype = ctypes.c_int
+        _raise_status(int(function(self._handle, _deadline(deadline_ns))))
+
     def certify_head_with_pause_for_test(
         self,
         notify_fd: int,
         wait_fd: int,
         deadline_ns: int | None = None,
     ) -> CertifiedHead:
-        self._require_open()
+        function = self._fault("cpl_fault_configure_certify_pause")
+        function.argtypes = [ctypes.c_int, ctypes.c_int]
+        function.restype = ctypes.c_int
+        _raise_status(int(function(notify_fd, wait_fd)))
+        return self.certify_head(deadline_ns)
+
+    def try_gated_marker_for_test(
+        self,
+        gate_kind: str,
+        receipt: JournalWorkdirReceipt | None,
+        marker_parent_dirfd: int,
+        marker_name: str,
+    ) -> bool:
+        gates = {"spawn": 1, "execute": 2}
         try:
-            configure = self._library.cpl_fault_configure_certify_pause
+            kind = gates[gate_kind]
+        except KeyError as error:
+            raise ValueError("unknown gate kind") from error
+        function = self._fault("cpl_fault_try_bound_gate")
+        function.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(_CWorkdirReceipt),
+            ctypes.c_int,
+            ctypes.c_char_p,
+        ]
+        function.restype = ctypes.c_int
+        native = _CWorkdirReceipt()
+        pointer = None
+        if receipt is not None:
+            native.state = 3 if receipt.workdir_parent_dirsynced else 0
+            _set_bytes(native.bound_hash, receipt.bound_hash)
+            _set_bytes(native.capability, receipt._capability)
+            native.workdir_dev = receipt.workdir_dev
+            native.workdir_ino = receipt.workdir_ino
+            pointer = ctypes.byref(native)
+        status = int(
+            function(
+                self._handle,
+                kind,
+                pointer,
+                marker_parent_dirfd,
+                _component_bytes(marker_name),
+            )
+        )
+        if status == JournalErrorCode.RECEIPT:
+            return False
+        _raise_status(status)
+        return True
+
+    @staticmethod
+    def try_cleanup_slot_marker_for_test(
+        library_path: Path,
+        receipt: JournalDeleteReceipt,
+        marker_parent_dirfd: int,
+        marker_name: str,
+    ) -> bool:
+        library = _load_library(library_path)
+        try:
+            function = library.cpl_fault_try_cleanup_gate
         except AttributeError as error:
             raise JournalError(JournalErrorCode.UNSUPPORTED) from error
-        configure.argtypes = [ctypes.c_int, ctypes.c_int]
-        configure.restype = ctypes.c_int
-        _raise_status(int(configure(notify_fd, wait_fd)))
-        return self.certify_head(deadline_ns)
+        function.argtypes = [
+            ctypes.POINTER(_CDeleteReceipt),
+            ctypes.c_int,
+            ctypes.c_char_p,
+        ]
+        function.restype = ctypes.c_int
+        native = _CDeleteReceipt()
+        native.state = 2 if receipt.journal_unlink_parent_dirsynced else 0
+        native.slot_releasable = receipt.slot_releasable
+        if len(receipt._capability) == HASH_SIZE:
+            _set_bytes(native.capability, receipt._capability)
+        status = int(
+            function(
+                ctypes.byref(native),
+                marker_parent_dirfd,
+                _component_bytes(marker_name),
+            )
+        )
+        if status == JournalErrorCode.RECEIPT:
+            return False
+        _raise_status(status)
+        return True
 
 
 __all__ = [
+    "AdmittedBatch",
     "CanonicalChain",
     "CanonicalRecord",
     "CertifiedDone",
@@ -845,6 +1448,8 @@ __all__ = [
     "JournalDeleteReceipt",
     "JournalError",
     "JournalErrorCode",
+    "JournalWorkdirReceipt",
+    "ReapProof",
     "RecordClass",
     "UnreleasedPartialCreate",
 ]

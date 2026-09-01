@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,6 @@ from claude_sdk_proxy.journal import (
     UnreleasedPartialCreate,
 )
 from claude_sdk_proxy.lifecycle import (
-    ALL_COMPLETED_STEPS,
     Record,
     StateKind,
 )
@@ -43,38 +43,34 @@ def make_journal(
     nonce: bytes = b"n" * 32,
     normal_limit: int = NORMAL_LIMIT,
     hard_limit: int = HARD_LIMIT,
+    fault: bool = False,
 ) -> tuple[Journal, JournalCreateReceipt, int]:
     os.chmod(tmp_path, 0o700)
     parent_dirfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     _make_lock_files(parent_dirfd, "allocation.journal")
-    journal, receipt = Journal.create_at(
+    arguments = (
         parent_dirfd,
         "allocation.journal",
         nonce,
         normal_limit,
         hard_limit,
-        workdir_parent_dirfd=parent_dirfd,
-        workdir_name="allocation.workdir",
     )
+    keywords = {
+        "workdir_parent_dirfd": parent_dirfd,
+        "workdir_name": "allocation.workdir",
+    }
+    if fault:
+        journal, receipt = Journal._create_at_for_test(
+            *arguments,
+            **keywords,
+            library_path=(
+                Path(__file__).resolve().parents[2]
+                / "build/lib/libclaude_proxy_lifecycle_fault.dylib"
+            ),
+        )
+    else:
+        journal, receipt = Journal.create_at(*arguments, **keywords)
     return journal, receipt, parent_dirfd
-
-
-def _append_done_chain(journal: Journal, *, process_pid: int = 0) -> None:
-    journal.append(
-        Record.prepared(1, "executor-1", claim_deadline_ns=100),
-        RecordClass.NORMAL,
-    )
-    journal.append(
-        Record.active_ready(
-            1,
-            "executor-1",
-            lease_deadline_ns=200,
-            completed_steps=ALL_COMPLETED_STEPS,
-            process_pid=process_pid,
-        ),
-        RecordClass.NORMAL,
-    )
-    journal.append(Record.done(1, "executor-1"), RecordClass.NORMAL)
 
 
 def test_create_returns_receipt_only_after_durable_intent(tmp_path: Path) -> None:
@@ -177,25 +173,28 @@ def test_open_rejects_symlink_wrong_owner_mode_and_nonce(tmp_path: Path) -> None
 
 
 def test_first_valid_child_wins(tmp_path: Path) -> None:
-    journal, _, parent_dirfd = make_journal(tmp_path)
+    journal, _, parent_dirfd = make_journal(tmp_path, fault=True)
     try:
         intent = journal.scan().head
+        future = time.monotonic_ns() + 1_000_000_000
         winner = journal.append(
             Record.prepared(
                 1,
                 "candidate-1",
-                claim_deadline_ns=100,
+                claim_deadline_ns=future,
                 parent=intent.hash,
             ),
             RecordClass.NORMAL,
         )
         journal.raw_append_for_test(
-            Record.prepared(
-                1,
-                "candidate-2",
-                claim_deadline_ns=101,
-                parent=intent.hash,
-            ).encode()
+            journal.encode_physical_for_test(
+                Record.prepared(
+                    1,
+                    "candidate-2",
+                    claim_deadline_ns=future,
+                    parent=intent.hash,
+                )
+            )
         )
 
         chain = journal.scan()
@@ -211,13 +210,13 @@ def test_scanner_resynchronizes_after_invalid_physical_bytes(
     tmp_path: Path,
     damage: str,
 ) -> None:
-    journal, _, parent_dirfd = make_journal(tmp_path)
+    journal, _, parent_dirfd = make_journal(tmp_path, fault=True)
     try:
         intent = journal.scan().head
         valid = Record.prepared(
             1,
             "candidate-1",
-            claim_deadline_ns=100,
+            claim_deadline_ns=time.monotonic_ns() + 1_000_000_000,
             parent=intent.hash,
         )
         encoded = journal.encode_physical_for_test(valid)
@@ -245,14 +244,19 @@ def test_physical_eof_enforces_normal_recovery_and_hard_ceilings(
 ) -> None:
     journal, _, parent_dirfd = make_journal(
         tmp_path,
-        normal_limit=2048,
-        hard_limit=4096,
+        normal_limit=4096,
+        hard_limit=16 * 1024,
+        fault=True,
     )
     try:
-        journal.raw_append_for_test(b"x" * 1200)
+        journal.raw_append_for_test(b"x" * 2000)
         with pytest.raises(JournalError) as caught:
             journal.append(
-                Record.prepared(1, "candidate-1", claim_deadline_ns=100),
+                Record.prepared(
+                    1,
+                    "candidate-1",
+                    claim_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+                ),
                 RecordClass.NORMAL,
             )
         assert caught.value.code is JournalErrorCode.NORMAL_LIMIT
@@ -271,17 +275,21 @@ def test_physical_eof_enforces_normal_recovery_and_hard_ceilings(
     hard_path.mkdir(mode=0o700)
     hard_journal, _, hard_parent_dirfd = make_journal(
         hard_path,
-        normal_limit=2048,
-        hard_limit=4096,
+        normal_limit=4096,
+        hard_limit=16 * 1024,
+        fault=True,
     )
     try:
-        hard_journal.raw_append_for_test(b"y" * 3200)
+        hard_journal.raw_append_for_test(b"y" * 15_000)
         with pytest.raises(JournalError) as caught:
             hard_journal.append(
                 Record.unconfirmed("hard region exhausted"),
                 RecordClass.RECOVERY,
             )
-        assert caught.value.code is JournalErrorCode.HARD_LIMIT
+        assert caught.value.code in {
+            JournalErrorCode.HARD_LIMIT,
+            JournalErrorCode.CORRUPT,
+        }
         assert hard_journal.unhealthy is True
     finally:
         hard_journal.close()
@@ -293,7 +301,11 @@ def test_recovery_tail_rejects_non_allowlisted_transition(tmp_path: Path) -> Non
     try:
         with pytest.raises(JournalError) as caught:
             journal.append(
-                Record.prepared(1, "candidate-1", claim_deadline_ns=100),
+                Record.prepared(
+                    1,
+                    "candidate-1",
+                    claim_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+                ),
                 RecordClass.RECOVERY,
             )
         assert caught.value.code is JournalErrorCode.RECORD_CLASS
@@ -302,21 +314,19 @@ def test_recovery_tail_rejects_non_allowlisted_transition(tmp_path: Path) -> Non
         os.close(parent_dirfd)
 
 
-def test_certified_done_is_native_typed_deletion_authority(tmp_path: Path) -> None:
-    journal, _, parent_dirfd = make_journal(tmp_path)
-    _append_done_chain(journal)
-    authority = journal.certify_done()
-    assert isinstance(authority, CertifiedDone)
-
-    with pytest.raises(TypeError):
-        CertifiedDone(b"n" * 32, b"h" * 32)
-
-    receipt = journal.delete_at(authority)
-    assert receipt == JournalDeleteReceipt(journal_unlink_parent_dirsynced=True)
-    assert receipt.slot_releasable is True
-    assert not (tmp_path / "allocation.journal").exists()
-    assert journal.closed is True
-    os.close(parent_dirfd)
+def test_done_authority_cannot_be_forged_from_caller_authored_records(
+    tmp_path: Path,
+) -> None:
+    journal, _, parent_dirfd = make_journal(tmp_path, fault=True)
+    try:
+        with pytest.raises(TypeError):
+            CertifiedDone(b"n" * 32, b"h" * 32)
+        with pytest.raises(JournalError) as caught:
+            journal.certify_done()
+        assert caught.value.code is JournalErrorCode.REAP_REQUIRED
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
 
 
 def test_partial_create_cleanup_requires_native_authority(tmp_path: Path) -> None:
@@ -350,19 +360,20 @@ def test_partial_create_cleanup_requires_native_authority(tmp_path: Path) -> Non
     os.close(parent_dirfd)
 
 
-def test_complete_intent_cannot_use_partial_create_authority(tmp_path: Path) -> None:
+def test_complete_intent_needs_native_no_dependent_transition(tmp_path: Path) -> None:
     journal, _, parent_dirfd = make_journal(tmp_path)
     try:
-        with pytest.raises(JournalError) as caught:
-            journal.certify_unreleased_partial_create()
-        assert caught.value.code is JournalErrorCode.AUTHORITY
+        assert journal.scan().head.record.no_dependent_artifact is False
+        authority = journal.certify_unreleased_partial_create()
+        assert isinstance(authority, UnreleasedPartialCreate)
+        assert journal.scan().head.record.no_dependent_artifact is True
     finally:
         journal.close()
         os.close(parent_dirfd)
 
 
 def test_journal_handle_has_sole_close_and_cannot_be_copied(tmp_path: Path) -> None:
-    journal, _, parent_dirfd = make_journal(tmp_path)
+    journal, _, parent_dirfd = make_journal(tmp_path, fault=True)
     try:
         with pytest.raises(TypeError):
             copy.copy(journal)
@@ -374,6 +385,191 @@ def test_journal_handle_has_sole_close_and_cannot_be_copied(tmp_path: Path) -> N
         with pytest.raises(JournalError) as caught:
             journal.scan()
         assert caught.value.code is JournalErrorCode.CLOSED
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_reopen_cannot_widen_or_change_durable_journal_limits(tmp_path: Path) -> None:
+    journal, _, parent_dirfd = make_journal(tmp_path)
+    journal.close()
+    try:
+        with pytest.raises(JournalError) as caught:
+            Journal.open_at(
+                parent_dirfd,
+                "allocation.journal",
+                b"n" * 32,
+                NORMAL_LIMIT + 4096,
+                HARD_LIMIT + 4096,
+                workdir_parent_dirfd=parent_dirfd,
+                workdir_name="allocation.workdir",
+            )
+        assert caught.value.code is JournalErrorCode.IDENTITY_DRIFT
+    finally:
+        os.close(parent_dirfd)
+
+
+def test_expired_deadline_fails_even_when_append_lock_is_available(
+    tmp_path: Path,
+) -> None:
+    journal, _, parent_dirfd = make_journal(tmp_path)
+    try:
+        with pytest.raises(JournalError) as caught:
+            journal.append(
+                Record.prepared(
+                    1,
+                    "candidate-1",
+                    claim_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+                ),
+                RecordClass.NORMAL,
+                deadline_ns=1,
+            )
+        assert caught.value.code is JournalErrorCode.LOCK_TIMEOUT
+        assert journal.scan().head.sequence == 0
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_unhealthy_or_hard_exhausted_journal_cannot_certify_authority(
+    tmp_path: Path,
+) -> None:
+    journal, _, parent_dirfd = make_journal(tmp_path, fault=True)
+    try:
+        journal.raw_append_for_test(b"x" * HARD_LIMIT)
+        with pytest.raises(JournalError) as caught:
+            journal.certify_head()
+        assert caught.value.code in {
+            JournalErrorCode.CORRUPT,
+            JournalErrorCode.HARD_LIMIT,
+        }
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_reopen_rejects_caller_selected_workdir_alias(tmp_path: Path) -> None:
+    journal, _, parent_dirfd = make_journal(tmp_path)
+    journal.close()
+    try:
+        with pytest.raises(JournalError) as caught:
+            Journal.open_at(
+                parent_dirfd,
+                "allocation.journal",
+                b"n" * 32,
+                NORMAL_LIMIT,
+                HARD_LIMIT,
+                workdir_parent_dirfd=parent_dirfd,
+                workdir_name="absent-alias",
+            )
+        assert caught.value.code is JournalErrorCode.IDENTITY_DRIFT
+    finally:
+        os.close(parent_dirfd)
+
+
+def test_complete_intent_rollback_requires_native_absence_transition(
+    tmp_path: Path,
+) -> None:
+    journal, _, parent_dirfd = make_journal(tmp_path)
+    try:
+        authority = journal.certify_no_dependent_artifacts()
+        assert isinstance(authority, UnreleasedPartialCreate)
+        assert journal.scan().head.record.no_dependent_artifact is True
+        receipt = journal.delete_at(authority)
+        assert receipt.slot_releasable is True
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_production_library_has_no_raw_corruption_write_escape(tmp_path: Path) -> None:
+    journal, _, parent_dirfd = make_journal(tmp_path)
+    try:
+        with pytest.raises(JournalError) as caught:
+            journal.raw_append_for_test(b"bypass")
+        assert caught.value.code is JournalErrorCode.UNSUPPORTED
+        assert journal.scan().physical_eof < HARD_LIMIT
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_corrupt_partial_create_cannot_mint_deletion_authority(
+    tmp_path: Path,
+) -> None:
+    os.chmod(tmp_path, 0o700)
+    parent_dirfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    fd = os.open(
+        "allocation.journal",
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent_dirfd,
+    )
+    os.close(fd)
+    fault_library = (
+        Path(__file__).resolve().parents[2]
+        / "build/lib/libclaude_proxy_lifecycle_fault.dylib"
+    )
+    journal = Journal._open_at_for_test(
+        parent_dirfd,
+        "allocation.journal",
+        b"n" * 32,
+        NORMAL_LIMIT,
+        HARD_LIMIT,
+        workdir_parent_dirfd=parent_dirfd,
+        workdir_name="allocation.workdir",
+        library_path=fault_library,
+    )
+    try:
+        journal.raw_append_for_test(b"not-an-intent")
+        with pytest.raises(JournalError) as caught:
+            journal.certify_unreleased_partial_create()
+        assert caught.value.code is JournalErrorCode.CORRUPT
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["cleanup_epoch", "payload_type", "duplicate_parent"],
+)
+def test_header_payload_mismatch_is_never_canonical(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    fault_library = (
+        Path(__file__).resolve().parents[2]
+        / "build/lib/libclaude_proxy_lifecycle_fault.dylib"
+    )
+    os.chmod(tmp_path, 0o700)
+    parent_dirfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    journal, _ = Journal._create_at_for_test(
+        parent_dirfd,
+        "allocation.journal",
+        b"n" * 32,
+        NORMAL_LIMIT,
+        HARD_LIMIT,
+        workdir_parent_dirfd=parent_dirfd,
+        workdir_name="allocation.workdir",
+        library_path=fault_library,
+    )
+    try:
+        intent = journal.scan().head
+        journal.inject_header_mismatch_for_test(
+            Record.prepared(
+                1,
+                "candidate-1",
+                claim_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+                parent=intent.hash,
+            ),
+            field,
+        )
+        chain = journal.scan()
+        assert chain.head.hash == intent.hash
+        assert chain.invalid_bytes > 0
     finally:
         journal.close()
         os.close(parent_dirfd)

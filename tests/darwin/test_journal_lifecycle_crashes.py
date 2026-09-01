@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import select
+import time
 from pathlib import Path
 
 import pytest
 
 from claude_sdk_proxy.journal import (
-    CertifiedDone,
     Journal,
     JournalDeleteReceipt,
     JournalError,
@@ -14,7 +15,7 @@ from claude_sdk_proxy.journal import (
     RecordClass,
     UnreleasedPartialCreate,
 )
-from claude_sdk_proxy.lifecycle import ALL_COMPLETED_STEPS, Record
+from claude_sdk_proxy.lifecycle import Record
 
 NORMAL_LIMIT = 64 * 1024
 HARD_LIMIT = 96 * 1024
@@ -24,13 +25,6 @@ CREATE_POINTS = (
     "after_intent_append",
     "after_journal_fullfsync",
     "after_intent_parent_fsync",
-)
-DONE_DELETE_POINTS = (
-    "after_authority_revalidated",
-    "after_process_absence_verified",
-    "after_workdir_absence_verified",
-    "after_journal_unlinkat",
-    "after_journal_unlink_parent_fsync",
 )
 PARTIAL_DELETE_POINTS = (
     "after_authority_revalidated",
@@ -119,29 +113,6 @@ def _open(
     )
 
 
-def _append_done_chain(
-    journal: Journal,
-    *,
-    process_pid: int = 0,
-    completed_steps: int = ALL_COMPLETED_STEPS,
-) -> None:
-    journal.append(
-        Record.prepared(1, "executor-1", claim_deadline_ns=100),
-        RecordClass.NORMAL,
-    )
-    journal.append(
-        Record.active_ready(
-            1,
-            "executor-1",
-            lease_deadline_ns=200,
-            completed_steps=completed_steps,
-            process_pid=process_pid,
-        ),
-        RecordClass.NORMAL,
-    )
-    journal.append(Record.done(1, "executor-1"), RecordClass.NORMAL)
-
-
 @pytest.mark.parametrize("point", CREATE_POINTS)
 def test_create_crashes_never_authorize_workdir_or_spawn(
     tmp_path: Path,
@@ -171,9 +142,9 @@ def test_create_crashes_never_authorize_workdir_or_spawn(
                 assert isinstance(authority, UnreleasedPartialCreate)
             else:
                 assert chain.has_intent is True
-                with pytest.raises(JournalError) as caught:
-                    reconciled.certify_unreleased_partial_create()
-                assert caught.value.code is JournalErrorCode.AUTHORITY
+                authority = reconciled.certify_unreleased_partial_create()
+                assert isinstance(authority, UnreleasedPartialCreate)
+                assert reconciled.scan().head.record.no_dependent_artifact is True
         finally:
             reconciled.close()
     finally:
@@ -182,46 +153,39 @@ def test_create_crashes_never_authorize_workdir_or_spawn(
 
 def _prepare_delete_case(
     tmp_path: Path,
-    authority_kind: str,
-) -> tuple[int, Journal, CertifiedDone | UnreleasedPartialCreate]:
+    authority_kind: str = "partial",
+) -> tuple[int, Journal, UnreleasedPartialCreate]:
+    assert authority_kind == "partial"
     parent_dirfd = _open_parent(tmp_path)
     _make_lock_files(parent_dirfd, "allocation.journal")
-    if authority_kind == "done":
-        retained = _create(parent_dirfd)
-        _append_done_chain(retained)
-        authority: CertifiedDone | UnreleasedPartialCreate = retained.certify_done()
-    else:
-        fd = os.open(
-            "allocation.journal",
-            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_CLOEXEC,
-            0o600,
-            dir_fd=parent_dirfd,
-        )
-        os.close(fd)
-        retained = _open(parent_dirfd)
-        authority = retained.certify_unreleased_partial_create()
+    fd = os.open(
+        "allocation.journal",
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent_dirfd,
+    )
+    os.close(fd)
+    retained = _open(parent_dirfd)
+    authority = retained.certify_unreleased_partial_create()
     return parent_dirfd, retained, authority
 
 
 @pytest.mark.parametrize(
-    ("authority_kind", "point"),
-    [
-        *(("done", point) for point in DONE_DELETE_POINTS),
-        *(("partial", point) for point in PARTIAL_DELETE_POINTS),
-    ],
+    "point",
+    PARTIAL_DELETE_POINTS,
 )
 def test_delete_crash_releases_slot_only_after_fresh_absent_reconciliation(
     tmp_path: Path,
-    authority_kind: str,
     point: str,
 ) -> None:
-    parent_dirfd, retained, authority = _prepare_delete_case(tmp_path, authority_kind)
+    parent_dirfd, retained, authority = _prepare_delete_case(tmp_path)
     pid = os.fork()
     if pid == 0:
         os.environ["CPL_FAULT_POINT"] = point
         retained.close()
         child = _open(parent_dirfd, library_path=_fault_library())
-        child.delete_at(authority)
+        child_authority = child.certify_unreleased_partial_create()
+        child.delete_at(child_authority)
         os._exit(0)
 
     _, status = os.waitpid(pid, 0)
@@ -240,9 +204,7 @@ def test_delete_crash_releases_slot_only_after_fresh_absent_reconciliation(
             assert retained.closed is False
         else:
             receipt = retained.reconcile_absent_after_crash(authority)
-            assert receipt == JournalDeleteReceipt(
-                journal_unlink_parent_dirsynced=True
-            )
+            assert receipt == JournalDeleteReceipt(journal_unlink_parent_dirsynced=True)
             assert receipt.slot_releasable is True
             assert retained.closed is True
     finally:
@@ -251,9 +213,10 @@ def test_delete_crash_releases_slot_only_after_fresh_absent_reconciliation(
 
 
 def test_reconcile_absent_rejects_fabricated_authority(tmp_path: Path) -> None:
-    parent_dirfd, retained, authority = _prepare_delete_case(tmp_path, "done")
+    parent_dirfd, retained, authority = _prepare_delete_case(tmp_path)
     child = _open(parent_dirfd)
-    child.delete_at(authority)
+    child_authority = child.certify_unreleased_partial_create()
+    child.delete_at(child_authority)
     fabricated = authority._fabricate_for_test(certified_hash=b"x" * 32)
     try:
         with pytest.raises(JournalError) as caught:
@@ -268,7 +231,7 @@ def test_reconcile_absent_rejects_fabricated_authority(tmp_path: Path) -> None:
 def test_delete_rejects_false_done_and_missing_reap_proof(tmp_path: Path) -> None:
     parent_dirfd = _open_parent(tmp_path)
     _make_lock_files(parent_dirfd, "allocation.journal")
-    journal = _create(parent_dirfd)
+    journal = _create(parent_dirfd, library_path=_fault_library())
     try:
         intent = journal.scan().head
         journal.raw_append_for_test(
@@ -279,48 +242,17 @@ def test_delete_rejects_false_done_and_missing_reap_proof(tmp_path: Path) -> Non
         assert journal.scan().head.hash == intent.hash
         with pytest.raises(JournalError) as caught:
             journal.certify_done()
-        assert caught.value.code is JournalErrorCode.AUTHORITY
-
-        journal.append(
-            Record.prepared(1, "executor-1", claim_deadline_ns=100),
-            RecordClass.NORMAL,
-        )
-        journal.append(
-            Record.active_ready(
-                1,
-                "executor-1",
-                lease_deadline_ns=200,
-                completed_steps=ALL_COMPLETED_STEPS & ~2,
-            ),
-            RecordClass.NORMAL,
-        )
-        with pytest.raises(JournalError) as caught:
-            journal.append(Record.done(1, "executor-1"), RecordClass.NORMAL)
-        assert caught.value.code is JournalErrorCode.ILLEGAL_TRANSITION
-    finally:
-        journal.close()
-        os.close(parent_dirfd)
-
-
-def test_certification_rejects_live_recorded_process(tmp_path: Path) -> None:
-    parent_dirfd = _open_parent(tmp_path)
-    _make_lock_files(parent_dirfd, "allocation.journal")
-    journal = _create(parent_dirfd)
-    try:
-        _append_done_chain(journal, process_pid=os.getpid())
-        with pytest.raises(JournalError) as caught:
-            journal.certify_done()
-        assert caught.value.code is JournalErrorCode.PROCESS_PRESENT
+        assert caught.value.code is JournalErrorCode.REAP_REQUIRED
     finally:
         journal.close()
         os.close(parent_dirfd)
 
 
 def test_delete_rejects_wrong_kind_or_wrong_hash_authority(tmp_path: Path) -> None:
-    parent_dirfd, journal, authority = _prepare_delete_case(tmp_path, "done")
+    parent_dirfd, journal, authority = _prepare_delete_case(tmp_path)
     try:
         for fabricated in (
-            authority._fabricate_for_test(kind=2),
+            authority._fabricate_for_test(kind=1),
             authority._fabricate_for_test(certified_hash=b"x" * 32),
             authority._fabricate_for_test(allocation_nonce=b"x" * 32),
         ):
@@ -338,7 +270,7 @@ def test_delete_rejects_present_or_symlinked_workdir(
     tmp_path: Path,
     workdir_kind: str,
 ) -> None:
-    parent_dirfd, journal, authority = _prepare_delete_case(tmp_path, "done")
+    parent_dirfd, journal, authority = _prepare_delete_case(tmp_path)
     workdir = tmp_path / "allocation.workdir"
     if workdir_kind == "symlink":
         workdir.symlink_to("missing-target")
@@ -357,7 +289,7 @@ def test_delete_rejects_present_or_symlinked_workdir(
 
 
 def test_delete_rejects_journal_inode_swap(tmp_path: Path) -> None:
-    parent_dirfd, journal, authority = _prepare_delete_case(tmp_path, "done")
+    parent_dirfd, journal, authority = _prepare_delete_case(tmp_path)
     os.rename(
         tmp_path / "allocation.journal",
         tmp_path / "allocation.journal.original",
@@ -380,7 +312,7 @@ def test_delete_rejects_journal_inode_swap(tmp_path: Path) -> None:
 
 
 def test_delete_and_absent_reconcile_reject_parent_fd_swap(tmp_path: Path) -> None:
-    parent_dirfd, journal, authority = _prepare_delete_case(tmp_path, "done")
+    parent_dirfd, journal, authority = _prepare_delete_case(tmp_path)
     other = tmp_path / "other"
     other.mkdir(mode=0o700)
     swapped = os.open(other, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -394,5 +326,167 @@ def test_delete_and_absent_reconcile_reject_parent_fd_swap(tmp_path: Path) -> No
             journal.reconcile_absent_after_crash(authority)
         assert caught.value.code is JournalErrorCode.IDENTITY_DRIFT
     finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_controlled_create_gate_requires_durable_bound_workdir_receipt(
+    tmp_path: Path,
+) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    journal, create_receipt = Journal._create_at_for_test(
+        parent_dirfd,
+        "allocation.journal",
+        b"n" * 32,
+        NORMAL_LIMIT,
+        HARD_LIMIT,
+        workdir_parent_dirfd=parent_dirfd,
+        workdir_name="allocation.workdir",
+        library_path=_fault_library(),
+    )
+    try:
+        assert (
+            journal.try_gated_marker_for_test(
+                "spawn",
+                None,
+                parent_dirfd,
+                "spawned",
+            )
+            is False
+        )
+        assert not (tmp_path / "spawned").exists()
+
+        bound_receipt = journal.create_workdir(create_receipt)
+        assert (tmp_path / "allocation.workdir").is_dir()
+        assert journal.scan().head.record.workdir_bound is True
+        assert journal.try_gated_marker_for_test(
+            "spawn",
+            bound_receipt,
+            parent_dirfd,
+            "spawned",
+        )
+        assert (tmp_path / "spawned").exists()
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_controlled_cleanup_slot_gate_consumes_only_native_delete_receipt(
+    tmp_path: Path,
+) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    fd = os.open(
+        "allocation.journal",
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent_dirfd,
+    )
+    os.close(fd)
+    journal = _open(parent_dirfd, library_path=_fault_library())
+    try:
+        assert not Journal.try_cleanup_slot_marker_for_test(
+            _fault_library(),
+            JournalDeleteReceipt(journal_unlink_parent_dirsynced=False),
+            parent_dirfd,
+            "slot-released",
+        )
+        assert not (tmp_path / "slot-released").exists()
+        authority = journal.certify_unreleased_partial_create()
+        receipt = journal.delete_at(authority)
+        assert Journal.try_cleanup_slot_marker_for_test(
+            _fault_library(),
+            receipt,
+            parent_dirfd,
+            "slot-released",
+        )
+        assert (tmp_path / "slot-released").exists()
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_real_executor_identity_batches_reap_and_done_authority(
+    tmp_path: Path,
+) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    journal, create_receipt = Journal._create_at_for_test(
+        parent_dirfd,
+        "allocation.journal",
+        b"n" * 32,
+        NORMAL_LIMIT,
+        HARD_LIMIT,
+        workdir_parent_dirfd=parent_dirfd,
+        workdir_name="allocation.workdir",
+        library_path=_fault_library(),
+    )
+    bound = journal.create_workdir(create_receipt)
+    assert bound.workdir_parent_dirsynced is True
+    future = time.monotonic_ns() + 5_000_000_000
+    journal.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=future),
+        RecordClass.NORMAL,
+    )
+    ready_read, ready_write = os.pipe()
+    executor_pid = os.fork()
+    if executor_pid == 0:
+        os.close(ready_read)
+        journal.close()
+        executor = _open(parent_dirfd, library_path=_fault_library())
+        executor.activate_executor(
+            1,
+            "executor-1",
+            os.getpid(),
+            lease_deadline_ns=future,
+        )
+        target_pid = os.fork()
+        if target_pid == 0:
+            time.sleep(30)
+            os._exit(0)
+        target = executor.observe_process(target_pid)
+        os.kill(target_pid, 9)
+        batch = executor.admit_batch(
+            1,
+            "executor-1",
+            "cleanup-1",
+            [
+                executor.process_absent_descriptor(target),
+                executor.reap_process_descriptor(target),
+                executor.remove_bound_workdir_descriptor(),
+                executor.terminal_checks_descriptor(),
+            ],
+        )
+        batch.execute()
+        batch.complete()
+        executor.finish_done(1, "executor-1")
+        os.write(ready_write, b"1")
+        os.close(ready_write)
+        executor.close()
+        os._exit(0)
+
+    os.close(ready_write)
+    try:
+        readable, _, _ = select.select([ready_read], [], [], 5.0)
+        assert readable == [ready_read]
+        assert os.read(ready_read, 1) == b"1"
+        proof = journal.confirm_executor_reaped(deadline_ns=future)
+        assert proof.pid == executor_pid
+        authority = journal.certify_done()
+        receipt = journal.delete_at(authority)
+        assert receipt.slot_releasable is True
+        assert not (tmp_path / "allocation.workdir").exists()
+        assert not (tmp_path / "allocation.journal").exists()
+    finally:
+        os.close(ready_read)
+        try:
+            os.kill(executor_pid, 9)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(executor_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
         journal.close()
         os.close(parent_dirfd)

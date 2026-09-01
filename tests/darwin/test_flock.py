@@ -21,6 +21,10 @@ NORMAL_LIMIT = 32 * 1024
 HARD_LIMIT = 48 * 1024
 
 
+def _future() -> int:
+    return time.monotonic_ns() + 5_000_000_000
+
+
 def _fault_library() -> Path:
     return (
         Path(__file__).resolve().parents[2]
@@ -110,7 +114,7 @@ def test_same_handle_tasks_share_one_mutex(tmp_path: Path) -> None:
     try:
         with pytest.raises(JournalError) as caught:
             journal.append(
-                Record.prepared(1, "candidate-1", claim_deadline_ns=100),
+                Record.prepared(1, "candidate-1", claim_deadline_ns=_future()),
                 RecordClass.NORMAL,
                 deadline_ns=time.monotonic_ns() + 20_000_000,
             )
@@ -132,7 +136,7 @@ def test_separate_opens_contend_on_bsd_flock(tmp_path: Path) -> None:
     try:
         with pytest.raises(JournalError) as caught:
             contender.append(
-                Record.prepared(1, "candidate-1", claim_deadline_ns=100),
+                Record.prepared(1, "candidate-1", claim_deadline_ns=_future()),
                 RecordClass.NORMAL,
                 deadline_ns=time.monotonic_ns() + 20_000_000,
             )
@@ -142,7 +146,7 @@ def test_separate_opens_contend_on_bsd_flock(tmp_path: Path) -> None:
         thread.join(timeout=2)
         assert errors == []
         contender.append(
-            Record.prepared(1, "candidate-1", claim_deadline_ns=100),
+            Record.prepared(1, "candidate-1", claim_deadline_ns=_future()),
             RecordClass.NORMAL,
         )
     finally:
@@ -168,7 +172,7 @@ def test_closing_unrelated_fd_does_not_release_library_lock(tmp_path: Path) -> N
         os.close(unrelated)
         with pytest.raises(JournalError) as caught:
             contender.append(
-                Record.prepared(1, "candidate-1", claim_deadline_ns=100),
+                Record.prepared(1, "candidate-1", claim_deadline_ns=_future()),
                 RecordClass.NORMAL,
                 deadline_ns=time.monotonic_ns() + 20_000_000,
             )
@@ -261,7 +265,7 @@ def test_process_exit_releases_append_lock(tmp_path: Path) -> None:
         assert os.read(notified_read, 1) == b"1"
         with pytest.raises(JournalError) as caught:
             contender.append(
-                Record.prepared(1, "candidate-1", claim_deadline_ns=100),
+                Record.prepared(1, "candidate-1", claim_deadline_ns=_future()),
                 RecordClass.NORMAL,
                 deadline_ns=time.monotonic_ns() + 20_000_000,
             )
@@ -271,10 +275,114 @@ def test_process_exit_releases_append_lock(tmp_path: Path) -> None:
         assert os.waitstatus_to_exitcode(status) == -9
         os.close(release_write)
         contender.append(
-            Record.prepared(1, "candidate-1", claim_deadline_ns=100),
+            Record.prepared(1, "candidate-1", claim_deadline_ns=_future()),
             RecordClass.NORMAL,
         )
     finally:
         os.close(notified_read)
+        contender.close()
+        os.close(parent_dirfd)
+
+
+def test_atfork_child_closes_every_inherited_journal_and_lock_fd(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path)
+    protected = {
+        (
+            os.stat(name, dir_fd=parent_dirfd, follow_symlinks=False).st_dev,
+            os.stat(name, dir_fd=parent_dirfd, follow_symlinks=False).st_ino,
+        )
+        for name in (
+            "allocation.journal",
+            "allocation.journal.append.lock",
+            "allocation.journal.action.lock",
+        )
+    }
+    observed_read, observed_write = os.pipe()
+    release_read, release_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(observed_read)
+        os.close(release_write)
+        inherited = 0
+        for entry in os.listdir("/dev/fd"):
+            try:
+                metadata = os.fstat(int(entry))
+            except OSError, ValueError:
+                continue
+            if (metadata.st_dev, metadata.st_ino) in protected:
+                inherited += 1
+        os.write(observed_write, str(inherited).encode("ascii"))
+        os.read(release_read, 1)
+        os._exit(0)
+
+    os.close(observed_write)
+    os.close(release_read)
+    try:
+        assert os.read(observed_read, 16) == b"0"
+    finally:
+        os.write(release_write, b"1")
+        os.close(release_write)
+        os.close(observed_read)
+        os.waitpid(pid, 0)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_public_scan_waits_for_append_admission(tmp_path: Path) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    lock_thread = threading.Thread(
+        target=journal.hold_append_lock_for_test,
+        args=(notified_write, release_read),
+    )
+    result: list[object] = []
+    scan_thread = threading.Thread(target=lambda: result.append(journal.scan()))
+    lock_thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        scan_thread.start()
+        time.sleep(0.03)
+        assert scan_thread.is_alive()
+        assert result == []
+    finally:
+        os.write(release_write, b"1")
+        lock_thread.join(timeout=2)
+        scan_thread.join(timeout=2)
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_executor_death_releases_destructive_action_lock(tmp_path: Path) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    journal.close()
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(notified_read)
+        os.close(release_write)
+        child = _open_second(parent_dirfd)
+        child.hold_action_lock_for_test(notified_write, release_read)
+        os._exit(0)
+
+    os.close(notified_write)
+    os.close(release_read)
+    contender = _open_second(parent_dirfd)
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        os.kill(pid, 9)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == -9
+        contender.probe_action_lock_for_test()
+    finally:
+        os.close(notified_read)
+        os.close(release_write)
         contender.close()
         os.close(parent_dirfd)
