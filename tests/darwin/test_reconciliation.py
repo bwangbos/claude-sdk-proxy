@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import gc
+import os
+import signal
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -337,6 +341,7 @@ def test_retained_registry_is_fixed_capacity_and_releases_by_key(
     monkeypatch.setattr(supervisor_probe, "_RETAINED_ACTOR_REGISTRY", registry)
 
     spawned = False
+    instance_created = False
 
     def forbidden_spawn(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
         del args, kwargs
@@ -345,9 +350,18 @@ def test_retained_registry_is_fixed_capacity_and_releases_by_key(
         raise AssertionError("capacity rejection occurred after spawn")
 
     monkeypatch.setattr(supervisor_probe.subprocess, "Popen", forbidden_spawn)
+
+    def forbidden_instance(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        nonlocal instance_created
+        instance_created = True
+        raise AssertionError("capacity rejection occurred after instance creation")
+
+    monkeypatch.setattr(supervisor_probe.tempfile, "mkdtemp", forbidden_instance)
     with pytest.raises(supervisor_probe.SupervisorProbeError, match="capacity"):
         run_lifecycle_scenario("wedged_supervisor")
     assert spawned is False
+    assert instance_created is False
     reservation.cancel()
     assert registry.count == 0
 
@@ -366,6 +380,161 @@ def test_pre_spawn_instance_failure_rolls_back_capacity(
     with pytest.raises(OSError, match="injected instance failure"):
         run_lifecycle_scenario("wedged_supervisor")
     assert registry.count == 0
+
+
+def test_reservation_is_the_atomic_owner_truth_across_return_handoff(
+    tmp_path: Path,
+) -> None:
+    """Every transfer line leaves either RESERVED or one reachable exact owner."""
+    transfer_code = supervisor_probe._RetainedActorRegistry._transfer.__code__
+    baseline_lines: list[int] = []
+
+    def exercise(
+        *, inject_at: int | None = None
+    ) -> tuple[
+        supervisor_probe._RetainedActorRegistry,
+        supervisor_probe._RetainedActorReservation,
+        _InjectedPythonFailure | None,
+    ]:
+        registry = supervisor_probe._RetainedActorRegistry(capacity=1)
+        reservation = registry.reserve(bytes.fromhex("02" * 32))
+        line_event = 0
+
+        def trace(frame: object, event: str, arg: object) -> object:
+            del arg
+            nonlocal line_event
+            if getattr(frame, "f_code", None) is transfer_code and event == "line":
+                line_event += 1
+                if inject_at is None:
+                    baseline_lines.append(getattr(frame, "f_lineno"))
+                elif line_event == inject_at:
+                    raise _InjectedPythonFailure(f"transfer-line-{inject_at}")
+            return trace
+
+        sys.settrace(trace)
+        injected: _InjectedPythonFailure | None = None
+        try:
+            try:
+                registry._transfer(
+                    reservation,
+                    flow="atomic-test",
+                    instance=tmp_path,
+                    parent_dirfd=-1,
+                    journal=object(),  # type: ignore[arg-type]
+                    process=object(),  # type: ignore[arg-type]
+                    anchor=(1, 1, 1, 1, 1, 1, 1, b"a" * 32, b"b" * 32),
+                    controls=(),
+                )
+            except _InjectedPythonFailure as error:
+                injected = error
+        finally:
+            sys.settrace(None)
+        return registry, reservation, injected
+
+    baseline_registry, baseline_reservation, baseline_error = exercise()
+    assert baseline_error is None
+    baseline_owner = baseline_reservation.owner
+    assert baseline_owner is not None
+    baseline_registry.release(baseline_owner.key, baseline_owner)
+
+    for line_event in range(1, len(baseline_lines) + 1):
+        registry, reservation, injected = exercise(inject_at=line_event)
+        assert isinstance(injected, _InjectedPythonFailure)
+        assert str(injected) == f"transfer-line-{line_event}"
+        owner = reservation.owner
+        if owner is None:
+            reservation.cancel_if_reserved()
+        else:
+            assert registry.get(owner.key) is owner
+            assert reservation.owns_resources
+            registry.release(owner.key, owner)
+        assert registry.count == 0
+
+
+def test_outermost_capacity_cancel_precedes_fallible_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cleanup exception cannot strand a pre-spawn capacity reservation."""
+    registry = supervisor_probe._RetainedActorRegistry(capacity=1)
+    monkeypatch.setattr(supervisor_probe, "_RETAINED_ACTOR_REGISTRY", registry)
+
+    def fail_lock_creation(parent_dirfd: int) -> None:
+        del parent_dirfd
+        raise RuntimeError("injected construction failure")
+
+    real_close = supervisor_probe.os.close
+
+    def fail_close(fd: int) -> None:
+        real_close(fd)
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr(supervisor_probe, "_make_lock_files", fail_lock_creation)
+    monkeypatch.setattr(supervisor_probe.os, "close", fail_close)
+    with pytest.raises(OSError, match="injected cleanup failure"):
+        run_lifecycle_scenario("wedged_supervisor")
+    assert registry.count == 0
+
+
+def test_production_keyed_release_requires_proofs_and_retries_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capacity is reusable only after terminal, group, reap, and close proofs."""
+    before = set(supervisor_probe._retained_actor_chain_keys())
+
+    def inject(flow: str, checkpoint: str) -> None:
+        if flow == "actor_loss" and checkpoint == "executor_reap_confirmed":
+            raise _InjectedPythonFailure(checkpoint)
+
+    monkeypatch.setattr(supervisor_probe, "_python_exception_checkpoint", inject)
+    with pytest.raises(_InjectedPythonFailure, match="executor_reap_confirmed"):
+        run_lifecycle_scenario("cleanup_fail_after_admission")
+    key = _only_new_retained_key(before)
+    owner = supervisor_probe._RETAINED_ACTOR_REGISTRY.get(key)
+
+    monkeypatch.setattr(
+        supervisor_probe,
+        "_python_exception_checkpoint",
+        lambda flow, checkpoint: None,
+    )
+    assert supervisor_probe._reconcile_and_release_retained_actor_chain(key) is False
+    assert key in supervisor_probe._retained_actor_chain_keys()
+    before_absence = supervisor_probe._inspect_retained_actor_chain(key)
+    assert before_absence.supervisor_task4_reaped
+    assert before_absence.retained_child_state == "reaped"
+    assert before_absence.exact_group_member_count > 0
+    assert before_absence.group_capability_absent is False
+
+    observed = owner.journal.observe_process(owner.anchor[0])
+    if supervisor_probe._process_is_stopped(observed.pid):
+        os.killpg(observed.pgid, signal.SIGCONT)
+    os.killpg(observed.pgid, signal.SIGKILL)
+    assert supervisor_probe._wait_for_enumerated_group_absence(observed.pgid)
+
+    for helper_name in (
+        "_close_retained_control",
+        "_close_retained_stderr",
+        "_close_retained_journal",
+        "_close_retained_parent_fd",
+    ):
+        original_close = getattr(supervisor_probe, helper_name)
+        failed = False
+
+        def fail_once(resource: object) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                original_close(resource)
+                raise OSError(f"injected {helper_name} failure")
+            original_close(resource)
+
+        monkeypatch.setattr(supervisor_probe, helper_name, fail_once)
+        with pytest.raises(OSError, match=helper_name):
+            supervisor_probe._reconcile_and_release_retained_actor_chain(key)
+        assert key in supervisor_probe._retained_actor_chain_keys()
+        monkeypatch.setattr(supervisor_probe, helper_name, original_close)
+
+    assert supervisor_probe._reconcile_and_release_retained_actor_chain(key)
+    assert key not in supervisor_probe._retained_actor_chain_keys()
 
 
 @pytest.mark.parametrize(

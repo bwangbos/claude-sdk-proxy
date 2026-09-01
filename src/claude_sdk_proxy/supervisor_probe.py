@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import os
 import signal
@@ -59,6 +60,8 @@ class _RetainedActorChain:
     flow: str
     instance: Path
     parent_dirfd: int
+    parent_dev: int
+    parent_ino: int
     journal: Journal
     process: subprocess.Popen[bytes]
     anchor: _ProcessIdentityTuple
@@ -68,6 +71,7 @@ class _RetainedActorChain:
     cleanup_request_sequence: int | None = None
     cleanup_request_hash: bytes | None = None
     cleanup_ack_payload: bytes | None = None
+    release_certification: _RetainedReleaseCertification | None = None
     released: bool = False
     recovery_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
@@ -82,22 +86,27 @@ class _RetainedActorReservation:
         registry: _RetainedActorRegistry,
         token: int,
         allocation_nonce: bytes,
+        entry: _RetainedActorEntry,
     ) -> None:
         self._registry = registry
         self._token = token
         self._allocation_nonce = allocation_nonce
-        self._key: _RetainedActorKey | None = None
-        self._cancelled = False
+        self._entry = entry
 
     @property
-    def transferred(self) -> bool:
-        return self._key is not None
+    def owns_resources(self) -> bool:
+        return self.owner is not None
+
+    @property
+    def owner(self) -> _RetainedActorChain | None:
+        return self._registry._owner_for(self)
 
     @property
     def key(self) -> _RetainedActorKey:
-        if self._key is None:
+        owner = self.owner
+        if owner is None:
             raise SupervisorProbeError("retained owner is not registered")
-        return self._key
+        return owner.key
 
     def transfer(
         self,
@@ -124,6 +133,23 @@ class _RetainedActorReservation:
     def cancel(self) -> None:
         self._registry._cancel(self)
 
+    def cancel_if_reserved(self) -> None:
+        """Non-throwingly release capacity only while no owner is published."""
+        self._registry._cancel_if_reserved(self)
+
+
+@dataclass
+class _RetainedActorEntry:
+    allocation_nonce: bytes
+    owner: _RetainedActorChain | None = None
+
+
+@dataclass(frozen=True)
+class _RetainedReleaseCertification:
+    sequence: int
+    head_hash: bytes
+    reap_proof: ReapProof
+
 
 class _RetainedActorRegistry:
     """Fixed cleanup-owner capacity; live or unconfirmed owners are never evicted."""
@@ -134,22 +160,39 @@ class _RetainedActorRegistry:
         self._capacity = capacity
         self._condition = threading.Condition()
         self._next_token = 1
-        self._reservations: dict[int, bytes] = {}
-        self._owners: dict[_RetainedActorKey, _RetainedActorChain] = {}
+        self._entries: dict[int, _RetainedActorEntry] = {}
 
     @property
     def count(self) -> int:
         with self._condition:
-            return len(self._reservations) + len(self._owners)
+            return len(self._entries)
 
     def reserve(self, allocation_nonce: bytes) -> _RetainedActorReservation:
         with self._condition:
-            if len(self._reservations) + len(self._owners) >= self._capacity:
+            if len(self._entries) >= self._capacity:
                 raise SupervisorProbeError("retained actor capacity is exhausted")
             token = self._next_token
             self._next_token += 1
-            self._reservations[token] = allocation_nonce
-            return _RetainedActorReservation(self, token, allocation_nonce)
+            entry = _RetainedActorEntry(allocation_nonce)
+            self._entries[token] = entry
+            return _RetainedActorReservation(self, token, allocation_nonce, entry)
+
+    def _entry_for(
+        self, reservation: _RetainedActorReservation
+    ) -> _RetainedActorEntry | None:
+        entry = self._entries.get(reservation._token)
+        if (
+            entry is not reservation._entry
+            or entry.allocation_nonce != reservation._allocation_nonce
+        ):
+            return None
+        return entry
+
+    def _owner_for(
+        self, reservation: _RetainedActorReservation
+    ) -> _RetainedActorChain | None:
+        with self._condition:
+            return reservation._entry.owner
 
     def _transfer(
         self,
@@ -167,62 +210,79 @@ class _RetainedActorRegistry:
         retained_controls = tuple(
             control for control in controls if control is not None
         )
+        parent_identity = (
+            os.fstat(parent_dirfd) if parent_dirfd >= 0 else None
+        )
+        owner = _RetainedActorChain(
+            key=key,
+            flow=flow,
+            instance=instance,
+            parent_dirfd=parent_dirfd,
+            parent_dev=0 if parent_identity is None else parent_identity.st_dev,
+            parent_ino=0 if parent_identity is None else parent_identity.st_ino,
+            journal=journal,
+            process=process,
+            anchor=anchor,
+            controls=retained_controls,
+        )
         with self._condition:
-            if reservation._cancelled or reservation._key is not None:
-                raise SupervisorProbeError("retained actor reservation is unavailable")
-            if (
-                self._reservations.get(reservation._token)
-                != reservation._allocation_nonce
-            ):
+            entry = self._entry_for(reservation)
+            if entry is None:
                 raise SupervisorProbeError(
                     "retained actor reservation was not admitted"
                 )
-            if key in self._owners:
+            if entry.owner is not None:
+                raise SupervisorProbeError("retained actor reservation is unavailable")
+            if any(
+                candidate.owner is not None and candidate.owner.key == key
+                for candidate in self._entries.values()
+            ):
                 raise SupervisorProbeError("retained actor key is already owned")
-            owner = _RetainedActorChain(
-                key=key,
-                flow=flow,
-                instance=instance,
-                parent_dirfd=parent_dirfd,
-                journal=journal,
-                process=process,
-                anchor=anchor,
-                controls=retained_controls,
-            )
-            self._owners[key] = owner
-            del self._reservations[reservation._token]
-            reservation._key = key
+            # This single assignment is the RESERVED -> OWNED publication.
+            # The fixed registry entry is the only state consulted by unwind.
+            entry.owner = owner
             return owner
 
     def _cancel(self, reservation: _RetainedActorReservation) -> None:
         with self._condition:
-            if reservation._key is not None:
-                raise SupervisorProbeError("cannot cancel transferred ownership")
-            if reservation._cancelled:
+            entry = self._entry_for(reservation)
+            if entry is None:
                 return
-            self._reservations.pop(reservation._token, None)
-            reservation._cancelled = True
+            if entry.owner is not None:
+                raise SupervisorProbeError("cannot cancel transferred ownership")
+            del self._entries[reservation._token]
             self._condition.notify_all()
+
+    def _cancel_if_reserved(self, reservation: _RetainedActorReservation) -> None:
+        with self._condition:
+            entry = self._entry_for(reservation)
+            if entry is not None and entry.owner is None:
+                del self._entries[reservation._token]
+                self._condition.notify_all()
 
     def keys(self) -> tuple[_RetainedActorKey, ...]:
         with self._condition:
-            return tuple(self._owners)
+            return tuple(
+                entry.owner.key
+                for entry in self._entries.values()
+                if entry.owner is not None
+            )
 
     def get(self, key: _RetainedActorKey) -> _RetainedActorChain:
         with self._condition:
-            try:
-                return self._owners[key]
-            except KeyError as error:
-                raise SupervisorProbeError("retained actor key is unknown") from error
+            for entry in self._entries.values():
+                if entry.owner is not None and entry.owner.key == key:
+                    return entry.owner
+            raise SupervisorProbeError("retained actor key is unknown")
 
     def release(self, key: _RetainedActorKey, owner: _RetainedActorChain) -> None:
         with self._condition:
-            if self._owners.get(key) is not owner:
-                raise SupervisorProbeError(
-                    "retained actor owner changed during release"
-                )
-            del self._owners[key]
-            self._condition.notify_all()
+            for token, entry in self._entries.items():
+                if entry.owner is owner and owner.key == key:
+                    del self._entries[token]
+                    self._condition.notify_all()
+                    return
+            raise SupervisorProbeError("retained actor owner changed during release")
 
 
 @dataclass(frozen=True)
@@ -236,6 +296,9 @@ class _RetainedActorChainInspection:
     journal_retained: bool
     owner_count_for_key: int
     journal_reopened_and_certified: bool
+    exact_group_member_count: int
+    group_capability_absent: bool
+    retained_child_state: Literal["live", "reapable", "reaped"]
 
 
 @dataclass(frozen=True)
@@ -740,14 +803,59 @@ def _wait_for_enumerated_group_absence(pgid: int, *, timeout: float = 5.0) -> bo
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not _enumerate_exact_group(pgid):
-            try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
+            if _group_capability_absent(pgid):
                 return True
-            except PermissionError:
-                pass
         time.sleep(0.001)
     return False
+
+
+def _group_capability_absent(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def _same_reap_proof(left: ReapProof, right: ReapProof) -> bool:
+    return (
+        left.pid == right.pid
+        and left._certified_hash == right._certified_hash
+        and left._capability == right._capability
+    )
+
+
+def _close_retained_control(control: socket.socket) -> None:
+    control.close()
+
+
+def _close_retained_stderr(stderr: object) -> None:
+    close = getattr(stderr, "close")
+    close()
+
+
+def _close_retained_journal(journal: Journal) -> None:
+    journal.close()
+
+
+def _close_retained_parent_fd(parent_dirfd: int) -> None:
+    os.close(parent_dirfd)
+
+
+def _refresh_retained_parent_fd_state(owner: _RetainedActorChain) -> None:
+    if owner.parent_dirfd < 0:
+        return
+    try:
+        identity = os.fstat(owner.parent_dirfd)
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise
+        owner.parent_dirfd = -1
+        return
+    if identity.st_dev != owner.parent_dev or identity.st_ino != owner.parent_ino:
+        raise SupervisorProbeError("retained parent descriptor identity drifted")
 
 
 def _ensure_unconfirmed(owner: _RetainedActorChain) -> None:
@@ -831,14 +939,17 @@ def _reconcile_owner(owner: _RetainedActorChain) -> None:
             # Retain that canonical prefix and every handle; do not append a
             # competing terminal record while its authorized batch can finish.
             return
-        if wait_state != "reapable":
+        if wait_state not in {"reapable", "reaped"}:
             _ensure_unconfirmed(owner)
             return
 
         _python_exception_checkpoint(owner.flow, "recovery_exit_observed")
         record_head = owner.journal.scan().head
         record_kind = record_head.record.kind.name
-        if record_kind in {"ACTIVE_READY", "BATCH_ACTIVE"}:
+        if wait_state == "reapable" and record_kind in {
+            "ACTIVE_READY",
+            "BATCH_ACTIVE",
+        }:
             while time.monotonic_ns() <= record_head.record.lease_deadline_ns:
                 time.sleep(0.001)
             retired = owner.journal.retire_executor(
@@ -849,7 +960,8 @@ def _reconcile_owner(owner: _RetainedActorChain) -> None:
             record_kind = retired.record.kind.name
             _python_exception_checkpoint(owner.flow, "recovery_executor_retired")
         if record_kind not in {"RETIRING_IDLE", "RETIRING_BATCH"}:
-            _ensure_unconfirmed(owner)
+            if record_kind != "BATCH_ACTIVE":
+                _ensure_unconfirmed(owner)
             return
         proof = owner.journal.confirm_executor_reaped(
             deadline_ns=time.monotonic_ns() + 5_000_000_000
@@ -905,8 +1017,21 @@ def _inspect_retained_actor_chain(
         else:
             anchor_exact = _same_parsed_identity(observed, retained.anchor)
         supervisor_wait_state = _child_wait_state(retained.process.pid)
+        members = _enumerate_exact_group(retained.anchor[3])
+        group_capability_absent = _group_capability_absent(retained.anchor[3])
+        receipt_exact = False
+        if retained.executor_reap_proof is not None:
+            try:
+                recovered_proof = retained.journal.recover_executor_reap_proof()
+            except JournalError:
+                receipt_exact = False
+            else:
+                receipt_exact = _same_reap_proof(
+                    recovered_proof, retained.executor_reap_proof
+                )
         task4_reaped = (
-            retained.executor_reap_proof is not None
+            receipt_exact
+            and retained.executor_reap_proof is not None
             and retained.executor_reap_proof.pid == retained.process.pid
             and supervisor_wait_state == "reaped"
             and head.state.kind.name in {"DONE", "UNCONFIRMED"}
@@ -925,6 +1050,9 @@ def _inspect_retained_actor_chain(
                 candidate == key for candidate in _RETAINED_ACTOR_REGISTRY.keys()
             ),
             journal_reopened_and_certified=head.sequence > 0,
+            exact_group_member_count=len(members),
+            group_capability_absent=group_capability_absent,
+            retained_child_state=supervisor_wait_state,
         )
     finally:
         reopened.close()
@@ -934,6 +1062,67 @@ def _inspect_retained_actor_chain(
 def _reconcile_retained_actor_chain(key: _RetainedActorKey) -> None:
     owner = _RETAINED_ACTOR_REGISTRY.get(key)
     _reconcile_owner(owner)
+
+
+def _reconcile_and_release_retained_actor_chain(key: _RetainedActorKey) -> bool:
+    """Production keyed release after independently renewed terminal proofs."""
+    owner = _RETAINED_ACTOR_REGISTRY.get(key)
+    if not owner.journal.closed:
+        _reconcile_owner(owner)
+    with owner.recovery_lock:
+        _refresh_retained_parent_fd_state(owner)
+        if not owner.journal.closed:
+            directory_fd, reopened = _open_retained_journal(owner)
+            try:
+                certified = reopened.certify_head()
+                members = _enumerate_exact_group(owner.anchor[3])
+                group_capability_absent = _group_capability_absent(owner.anchor[3])
+                child_state = _child_wait_state(owner.process.pid)
+                if (
+                    certified.state.kind.name not in {"DONE", "UNCONFIRMED"}
+                    or members
+                    or not group_capability_absent
+                    or child_state != "reaped"
+                    or owner.executor_reap_proof is None
+                ):
+                    return False
+                recovered_proof = owner.journal.recover_executor_reap_proof()
+                if not _same_reap_proof(
+                    recovered_proof, owner.executor_reap_proof
+                ):
+                    return False
+                owner.release_certification = _RetainedReleaseCertification(
+                    certified.sequence, certified.hash, recovered_proof
+                )
+            finally:
+                reopened.close()
+                os.close(directory_fd)
+        elif owner.release_certification is None:
+            raise SupervisorProbeError(
+                "retained owner journal closed without release certification"
+            )
+
+        for control in owner.controls:
+            if control.fileno() != -1:
+                _close_retained_control(control)
+        if owner.process.stderr is not None and not owner.process.stderr.closed:
+            _close_retained_stderr(owner.process.stderr)
+        if not owner.journal.closed:
+            _close_retained_journal(owner.journal)
+        if owner.parent_dirfd >= 0:
+            _close_retained_parent_fd(owner.parent_dirfd)
+            owner.parent_dirfd = -1
+        if (
+            any(control.fileno() != -1 for control in owner.controls)
+            or (owner.process.stderr is not None and not owner.process.stderr.closed)
+            or not owner.journal.closed
+            or owner.parent_dirfd >= 0
+        ):
+            raise SupervisorProbeError("retained owner handles did not close")
+        owner.process.returncode = 86
+        owner.released = True
+        _RETAINED_ACTOR_REGISTRY.release(key, owner)
+        return True
 
 
 def _test_release_retained_actor_chain(
@@ -996,8 +1185,16 @@ def _test_release_retained_actor_chain(
                 _child_wait_state(retained.process.pid) == "reaped"
             )
             group_absent = _wait_for_enumerated_group_absence(retained.anchor[3])
+            remaining_members = _enumerate_exact_group(retained.anchor[3])
+            group_capability_absent = _group_capability_absent(retained.anchor[3])
+            untracked_orphan_count = len(remaining_members)
             _python_exception_checkpoint(retained.flow, "release_absence_certified")
-            if not group_absent or not supervisor_child_reaped:
+            if (
+                not group_absent
+                or remaining_members
+                or not group_capability_absent
+                or not supervisor_child_reaped
+            ):
                 raise SupervisorProbeError("fresh actor chain teardown was incomplete")
             if (
                 retained.process.stderr is not None
@@ -1007,12 +1204,13 @@ def _test_release_retained_actor_chain(
             if not retained.journal.closed:
                 retained.journal.close()
             os.close(retained.parent_dirfd)
+            retained.parent_dirfd = -1
             retained.released = True
             _RETAINED_ACTOR_REGISTRY.release(key, retained)
             return _TestActorChainTeardown(
                 group_absent=True,
                 supervisor_child_reaped=True,
-                untracked_orphan_count=0,
+                untracked_orphan_count=untracked_orphan_count,
                 workdir_retained=(retained.instance / _WORKDIR_NAME).is_dir(),
                 journal_retained=(retained.instance / _JOURNAL_NAME).is_file(),
             )
@@ -1027,7 +1225,7 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
         instance = Path(tempfile.mkdtemp(prefix="claude-real-wedged-"))
         parent_dirfd = _open_private_directory(instance)
     except BaseException:
-        reservation.cancel()
+        reservation.cancel_if_reserved()
         raise
     journal: Journal | None = None
     parent_control: socket.socket | None = None
@@ -1186,35 +1384,38 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
             untracked_orphan_count=teardown.untracked_orphan_count,
         )
     except BaseException:
-        if owner is not None:
-            _reconcile_owner_best_effort(owner)
+        retained_owner = reservation.owner
+        if retained_owner is not None:
+            _reconcile_owner_best_effort(retained_owner)
         raise
     finally:
-        if parent_control is not None and not reservation.transferred:
+        retained_owner = reservation.owner
+        reservation.cancel_if_reserved()
+        locally_owned = retained_owner is None
+        if parent_control is not None and locally_owned:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None and not reservation.transferred:
+        if parent_fallback is not None and locally_owned:
             parent_fallback.close()
         if child_fallback is not None:
             child_fallback.close()
         if (
             process is not None
-            and not reservation.transferred
+            and locally_owned
             and anchor_identity is None
         ):
             process.wait(timeout=5)
         if (
             process is not None
             and process.stderr is not None
-            and not reservation.transferred
+            and locally_owned
         ):
             process.stderr.close()
-        if journal is not None and not reservation.transferred:
+        if journal is not None and locally_owned:
             journal.close()
-        if not reservation.transferred:
+        if locally_owned:
             os.close(parent_dirfd)
-            reservation.cancel()
         if not retained:
             _RETAINED_UNCONFIRMED_PATHS.append(instance)
 
@@ -1241,7 +1442,7 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
         instance = Path(tempfile.mkdtemp(prefix="claude-real-actor-loss-"))
         parent_dirfd = _open_private_directory(instance)
     except BaseException:
-        reservation.cancel()
+        reservation.cancel_if_reserved()
         raise
     journal: Journal | None = None
     parent_control: socket.socket | None = None
@@ -1545,21 +1746,25 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             untracked_orphan_count=teardown.untracked_orphan_count,
         )
     except BaseException:
-        if owner is not None:
-            _reconcile_owner_best_effort(owner)
+        retained_owner = reservation.owner
+        if retained_owner is not None:
+            _reconcile_owner_best_effort(retained_owner)
         raise
     finally:
-        if parent_control is not None and not reservation.transferred:
+        retained_owner = reservation.owner
+        reservation.cancel_if_reserved()
+        locally_owned = retained_owner is None
+        if parent_control is not None and locally_owned:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None and not reservation.transferred:
+        if parent_fallback is not None and locally_owned:
             parent_fallback.close()
         if child_fallback is not None:
             child_fallback.close()
         if (
             process is not None
-            and not reservation.transferred
+            and locally_owned
             and anchor_identity is None
             and not executor_reaped
         ):
@@ -1567,14 +1772,13 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
         if (
             process is not None
             and process.stderr is not None
-            and not reservation.transferred
+            and locally_owned
         ):
             process.stderr.close()
-        if journal is not None and not reservation.transferred:
+        if journal is not None and locally_owned:
             journal.close()
-        if not reservation.transferred:
+        if locally_owned:
             os.close(parent_dirfd)
-            reservation.cancel()
         if not retained:
             _RETAINED_UNCONFIRMED_PATHS.append(instance)
 
@@ -2604,7 +2808,14 @@ def _run_real_identity_rejection(name: str) -> LifecycleEvidence:
         )
         if not teardown_absent:
             teardown_absent = _teardown_recorded_fresh_group(anchor_identity[3])
-        if not teardown_absent:
+        remaining_members = _enumerate_exact_group(anchor_identity[3])
+        group_capability_absent = _group_capability_absent(anchor_identity[3])
+        untracked_orphan_count = len(remaining_members)
+        if (
+            not teardown_absent
+            or remaining_members
+            or not group_capability_absent
+        ):
             raise SupervisorProbeError("identity test group survived teardown")
         retain_path = True
         _RETAINED_UNCONFIRMED_PATHS.append(instance)
@@ -2656,7 +2867,7 @@ def _run_real_identity_rejection(name: str) -> LifecycleEvidence:
             unexpected_group_member_count=unexpected_member_count,
             production_recovery_signal_count=0,
             test_teardown_group_absent=teardown_absent,
-            untracked_orphan_count=0,
+            untracked_orphan_count=untracked_orphan_count,
         )
     finally:
         if parent_control is not None:

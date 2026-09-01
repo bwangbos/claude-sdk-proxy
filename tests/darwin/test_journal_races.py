@@ -1440,6 +1440,164 @@ def test_executor_death_interrupts_only_the_admitted_batch(tmp_path: Path) -> No
         os.close(parent_dirfd)
 
 
+def test_unconfirmed_cannot_overwrite_batch_admitted_after_stale_scan(
+    tmp_path: Path,
+) -> None:
+    """A stale recovery scan cannot terminalize a newly admitted exact batch."""
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    recovery = _open(parent_dirfd, fault=True)
+    target_pid = os.fork()
+    if target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    try:
+        _activate_executor_for_admission(journal)
+        target = journal.observe_process(target_pid)
+        os.kill(target_pid, 9)
+
+        stale = recovery.scan().head
+        assert stale.record.kind is StateKind.ACTIVE_READY
+        admitted = journal.admit_batch(
+            1,
+            "executor-1",
+            "admission-after-stale-scan",
+            [journal.process_absent_descriptor(target)],
+        )
+
+        with pytest.raises(JournalError) as caught:
+            recovery.mark_unconfirmed(
+                journal_module.UnconfirmedReason.PROOF_UNAVAILABLE,
+                deadline_ns=time.monotonic_ns() + 50_000_000,
+            )
+        assert caught.value.code is JournalErrorCode.LOCK_TIMEOUT
+        assert recovery.scan().head.record.kind is StateKind.BATCH_ACTIVE
+
+        assert admitted.execute() == 1
+        completed = admitted.complete()
+        assert completed.record.kind is StateKind.ACTIVE_READY
+        terminal = recovery.mark_unconfirmed(
+            journal_module.UnconfirmedReason.PROOF_UNAVAILABLE,
+            deadline_ns=_future(),
+        )
+        assert terminal.record.kind is StateKind.UNCONFIRMED
+    finally:
+        _reap_target(target_pid)
+        recovery.close()
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_unconfirmed_rejects_stranded_batch_at_final_serialized_boundary(
+    tmp_path: Path,
+) -> None:
+    """Canonical batch authority survives after its local token is abandoned."""
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    recovery = _open(parent_dirfd, fault=True)
+    target_pid = os.fork()
+    if target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    try:
+        _activate_executor_for_admission(journal)
+        target = journal.observe_process(target_pid)
+        os.kill(target_pid, 9)
+        admitted = journal.admit_batch(
+            1,
+            "executor-1",
+            "stranded-batch",
+            [journal.process_absent_descriptor(target)],
+        )
+        admitted.abandon()
+
+        with pytest.raises(JournalError) as caught:
+            recovery.mark_unconfirmed(
+                journal_module.UnconfirmedReason.PROOF_UNAVAILABLE,
+                deadline_ns=_future(),
+            )
+        assert caught.value.code is JournalErrorCode.AUTHORITY
+        head = recovery.scan().head
+        assert head.record.kind is StateKind.BATCH_ACTIVE
+        assert head.record.exact_batch == "stranded-batch"
+    finally:
+        _reap_target(target_pid)
+        recovery.close()
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_executor_reap_receipt_is_recoverable_after_native_success_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Python exception after native waitpid cannot destroy the opaque receipt."""
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    executor_pid = os.fork()
+    if executor_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    try:
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+            RecordClass.NORMAL,
+        )
+        lease = time.monotonic_ns() + 40_000_000
+        journal.activate_executor(
+            1,
+            "executor-1",
+            executor_pid,
+            lease_deadline_ns=lease,
+        )
+        os.kill(executor_pid, 9)
+        while time.monotonic_ns() <= lease:
+            time.sleep(0.001)
+        journal.retire_executor(
+            authority="reconciler-1",
+            authority_epoch=1,
+            authority_deadline_ns=_future(),
+        )
+
+        native_confirm = journal._library.cpl_journal_confirm_executor_reaped
+        native_receipt: list[tuple[int, bytes, bytes]] = []
+
+        def lose_python_handoff(*args: object) -> int:
+            status = int(native_confirm(*args))
+            assert status == 0
+            pointer = args[-1]
+            proof = journal_module.ctypes.cast(
+                pointer, journal_module.ctypes.POINTER(journal_module._CReapProof)
+            ).contents
+            native_receipt.append(
+                (proof.pid, bytes(proof.certified_hash), bytes(proof.capability))
+            )
+            raise RuntimeError("injected after native reap success")
+
+        monkeypatch.setattr(
+            journal._library,
+            "cpl_journal_confirm_executor_reaped",
+            lose_python_handoff,
+        )
+        with pytest.raises(RuntimeError, match="after native reap success"):
+            journal.confirm_executor_reaped(deadline_ns=_future())
+        monkeypatch.setattr(
+            journal._library,
+            "cpl_journal_confirm_executor_reaped",
+            native_confirm,
+        )
+
+        recovered = journal.confirm_executor_reaped(deadline_ns=_future())
+        assert native_receipt == [
+            (recovered.pid, recovered._certified_hash, recovered._capability)
+        ]
+        with pytest.raises(ChildProcessError):
+            os.waitid(
+                os.P_PID, executor_pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+            )
+    finally:
+        _reap_target(executor_pid)
+        journal.close()
+        os.close(parent_dirfd)
+
+
 def test_caller_authored_process_and_batch_proof_is_rejected(tmp_path: Path) -> None:
     journal, parent_dirfd = _make_journal(tmp_path, fault=True)
     future = time.monotonic_ns() + 5_000_000_000

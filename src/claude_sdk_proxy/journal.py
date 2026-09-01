@@ -577,6 +577,12 @@ def _load_library(path: Path) -> ctypes.CDLL:
         ctypes.POINTER(_CReapProof),
     ]
     library.cpl_journal_confirm_executor_reaped.restype = ctypes.c_int
+    library.cpl_journal_recover_executor_reap_proof.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CReapProof),
+    ]
+    library.cpl_journal_recover_executor_reap_proof.restype = ctypes.c_int
     library.cpl_journal_reconcile_interrupted_batch.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(_CReapProof),
@@ -1557,6 +1563,22 @@ class Journal:
         _raise_status(
             self._native_call(
                 self._library.cpl_journal_confirm_executor_reaped,
+                _deadline(deadline_ns),
+                ctypes.byref(native),
+            )
+        )
+        return ReapProof(
+            native.pid, bytes(native.certified_hash), bytes(native.capability)
+        )
+
+    def recover_executor_reap_proof(
+        self,
+        deadline_ns: int | None = None,
+    ) -> ReapProof:
+        native = _CReapProof()
+        _raise_status(
+            self._native_call(
+                self._library.cpl_journal_recover_executor_reap_proof,
                 _deadline(deadline_ns),
                 ctypes.byref(native),
             )

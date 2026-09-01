@@ -2840,8 +2840,10 @@ int cpl_journal_mark_unconfirmed(cpl_journal *journal, uint32_t reason_code,
     static const char normal_exhausted[] = "normal region exhausted";
     static const char identity_unavailable[] = "identity unavailable";
     const char *reason;
+    struct cpl_certified_head certified;
     struct cpl_record record;
     uint64_t deadline = effective_deadline(deadline_ns);
+    int status;
 
     if (out == NULL) {
         return CPL_ERR_INVALID_ARGUMENT;
@@ -2865,8 +2867,27 @@ int cpl_journal_mark_unconfirmed(cpl_journal *journal, uint32_t reason_code,
     if (monotonic_ns() >= deadline) {
         return CPL_ERR_LOCK_TIMEOUT;
     }
-    return append_authorized(journal, &record, CPL_RECORD_RECOVERY, deadline,
-        out);
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_certify(journal, deadline, &certified);
+    if (status != CPL_OK) {
+        goto done;
+    }
+    if (certified.state.kind == CPL_STATE_BATCH_ACTIVE ||
+        certified.state.kind == CPL_STATE_RETIRING_BATCH ||
+        journal->action_held) {
+        status = CPL_ERR_AUTHORITY;
+        goto done;
+    }
+    status = monotonic_ns() >= deadline ? CPL_ERR_LOCK_TIMEOUT :
+        append_authorized(journal, &record, CPL_RECORD_RECOVERY, deadline,
+            out);
+
+done:
+    unlock_action(journal);
+    return status;
 }
 
 static int validate_workdir_parent_identity(cpl_journal *journal,
@@ -3872,16 +3893,33 @@ int cpl_journal_confirm_executor_reaped(cpl_journal *journal,
         return status;
     }
     status = cpl_journal_certify(journal, deadline, &certified);
-    if (status != CPL_OK ||
-        (certified.state.kind != CPL_STATE_DONE &&
-         certified.state.kind != CPL_STATE_RETIRING_IDLE &&
-         certified.state.kind != CPL_STATE_RETIRING_BATCH)) {
-        status = status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+    if (status != CPL_OK) {
         goto done;
     }
     identity_from_state(&certified.state, &expected);
     if (!complete_identity(&expected)) {
         status = CPL_ERR_PROCESS_IDENTITY;
+        goto done;
+    }
+    if (journal->reap_proof_valid) {
+        if (!same_process_identity(&expected, &journal->reaped_identity) ||
+            is_zero(journal->reap_capability, CPL_HASH_SIZE) ||
+            is_zero(journal->reap_head_hash, CPL_HASH_SIZE)) {
+            status = CPL_ERR_AUTHORITY;
+            goto done;
+        }
+        proof->pid = journal->reaped_identity.pid;
+        (void)memcpy(proof->certified_hash, journal->reap_head_hash,
+            CPL_HASH_SIZE);
+        (void)memcpy(proof->capability, journal->reap_capability,
+            CPL_HASH_SIZE);
+        status = CPL_OK;
+        goto done;
+    }
+    if (certified.state.kind != CPL_STATE_DONE &&
+        certified.state.kind != CPL_STATE_RETIRING_IDLE &&
+        certified.state.kind != CPL_STATE_RETIRING_BATCH) {
+        status = CPL_ERR_AUTHORITY;
         goto done;
     }
     for (;;) {
@@ -3909,6 +3947,42 @@ int cpl_journal_confirm_executor_reaped(cpl_journal *journal,
     status = CPL_OK;
 
 done:
+    unlock_action(journal);
+    return status;
+}
+
+int cpl_journal_recover_executor_reap_proof(cpl_journal *journal,
+    uint64_t deadline_ns, struct cpl_reap_proof *proof) {
+    struct cpl_certified_head certified;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status;
+
+    if (proof == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(proof, 0, sizeof(*proof));
+    status = lock_action(journal, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_certify(journal, deadline, &certified);
+    if (status != CPL_OK) {
+        goto recover_done;
+    }
+    if (!journal->reap_proof_valid ||
+        !complete_identity(&journal->reaped_identity) ||
+        is_zero(journal->reap_capability, CPL_HASH_SIZE) ||
+        is_zero(journal->reap_head_hash, CPL_HASH_SIZE)) {
+        status = CPL_ERR_REAP_REQUIRED;
+        goto recover_done;
+    }
+    proof->pid = journal->reaped_identity.pid;
+    (void)memcpy(proof->certified_hash, journal->reap_head_hash,
+        CPL_HASH_SIZE);
+    (void)memcpy(proof->capability, journal->reap_capability, CPL_HASH_SIZE);
+    status = CPL_OK;
+
+recover_done:
     unlock_action(journal);
     return status;
 }

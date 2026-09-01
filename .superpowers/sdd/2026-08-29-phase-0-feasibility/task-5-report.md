@@ -651,3 +651,110 @@ No Claude CLI, model, credential, network peer, pre-existing process, or
 pre-existing allocation was contacted or modified. Signals remained confined
 to freshly spawned, exactly re-observed Task 5 groups under the user's scoped
 authorization. No retained `UNCONFIRMED` artifact was deleted.
+
+## Remediation cycle 1
+
+Remediation base: `5553980a92a9a35d5eed6f9d7f083afc151ce4a7`
+
+Remediation commit: this commit
+
+### Breaker-finding disposition
+
+- Atomic retained ownership is now one fixed registry-entry transition. The
+  owner is fully constructed before publication, and the single
+  `entry.owner = owner` assignment is the whole `RESERVED -> OWNED` handoff.
+  `except` and `finally` query that same entry, including after keyed release;
+  they no longer depend on a caller assignment or a separately written
+  transferred flag. A trace-injection test raises at every executed line of
+  `_transfer` and proves each boundary leaves either a cancellable reservation
+  or exactly one reachable keyed owner, never local cleanup after publication.
+- `cpl_journal_mark_unconfirmed` now acquires the native action authority,
+  freshly certifies the canonical head under that serialization, and rejects
+  `BATCH_ACTIVE` and `RETIRING_BATCH` before the append boundary. A stale
+  Python recovery scan followed by a real admission cannot overwrite the exact
+  batch; retry converges only after batch completion. An abandoned local token
+  also leaves the canonical exact batch intact and returns native `AUTHORITY`.
+- Executor reap proof survives the native-call/Python-object handoff. Native
+  confirmation first retains the exact random capability, certified hash, and
+  identity in the journal handle and idempotently returns that same receipt on
+  retry without another `waitpid`. The new read-only
+  `cpl_journal_recover_executor_reap_proof` entry point reissues that retained
+  opaque receipt after a successor transition; it cannot mint a receipt and
+  existing native consumers still reject it against the wrong generation.
+- Retained-owner inspection now duplicates the directory descriptor, reopens
+  and certifies the exact nonce-bound journal, completely enumerates the exact
+  group, probes group-capability absence, records the retained child as live,
+  reapable, or reaped, and compares the stored Python receipt with the native
+  recovered receipt. Teardown and identity-rejection evidence compute
+  `untracked_orphan_count` from a final complete enumeration; no literal zero
+  remains.
+- Capacity cancellation is the first non-throwing state transition in both
+  outer cleanup paths. A full registry rejects before `mkdtemp` or `Popen`, and
+  a fallible pre-spawn cleanup cannot strand its reservation. Production keyed
+  reconcile-and-release returns false until a freshly certified terminal head,
+  empty exact-group enumeration, absent group capability, independently reaped
+  retained child, and exact native reap receipt all agree. It keeps the key
+  through injected control, stderr, journal, and directory-FD close failures;
+  a retained release certification makes late partial-close retry safe, and
+  the slot is removed only after every handle reports closed. The injections
+  raise after the underlying close succeeds; retry observes socket/stream/
+  journal closure directly and revalidates a raw directory FD by its retained
+  device/inode, treating `EBADF` as the completed close rather than touching a
+  possibly reused descriptor.
+
+### TDD and mutation evidence
+
+The first focused RED run produced the intended failures for four authority
+breaks: `mark_unconfirmed` overwrote a freshly admitted batch, a second reap
+confirmation returned `REAP_REQUIRED` after native success, the reservation
+had no registry-queryable owner after caller handoff, and fallible pre-spawn
+cleanup left registry count 1. The production-release row initially could not
+reach its assertion in the sandbox because Darwin process inspection was
+denied; the host run then exposed an invalid immutable-socket patch seam. After
+moving injection to the production close boundary, the row exposed the real
+already-reaped reconciliation gap and verified retry across every handle class.
+
+The first broad GREEN run found two more real boundary defects. Normal test
+release removed the registry key before the outer `finally`, causing a local
+double close; retaining the reservation's exact registry-entry reference fixed
+that without restoring a second ownership flag. Successor-prepared and
+successor-active exceptions could no longer revalidate the prior executor's
+receipt against the new generation; the native read-only receipt recovery API
+now proves that exact historical reap without weakening generation checks.
+
+A deliberate mutation removed only the final native
+`BATCH_ACTIVE`/`RETIRING_BATCH` rejection. The stranded-batch regression failed
+because `UNCONFIRMED` was appended. Restoring the guard made the same test pass,
+proving the test covers the final serialized boundary rather than merely the
+action-lock wait.
+
+### Final verification
+
+- Focused Task 5 plus action-race command: 119 passed, zero skipped, XPASS, or
+  warnings in 33.42 seconds.
+- `UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache
+  GOCACHE=/private/tmp/shn-go-cache make check`: 151 unit tests passed; Ruff and
+  strict mypy were clean.
+- Host `UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache make darwin`: 192
+  Darwin tests passed, zero skipped and zero XPASS, in 30.86 seconds.
+- Three bounded repetitions of the 16-row ownership-transfer,
+  recovery-failure, keyed-release, stale-scan, stranded-batch, and reap-handoff
+  subset passed all 48 executions.
+- `make -B native` rebuilt all seven native targets with Apple clang strict C17
+  flags. Apple clang static analysis of production/fault lifecycle,
+  production/injection supervisor, anchor, and probe child emitted six empty
+  370-byte plist reports with no diagnostics.
+- All executables and dylibs are arm64 Mach-O. Every lifecycle consumer resolves
+  `@rpath/libclaude_proxy_lifecycle.dylib`; production exports the mark,
+  confirm, and read-only reap-recovery entry points and no `_cpl_fault_*`
+  symbol. The fault dylib retains the fault surface. Production supervisor
+  strings contain no Task 5 injection selector or injection-stage name.
+- Existing compile-time C ABI assertions and Python ctypes size assertions pass.
+  `git diff --check` is clean, and no analyzer plist or object file is present
+  in the worktree.
+
+No Claude CLI, model, credential, network peer, pre-existing process, or
+pre-existing allocation was contacted or modified. Signals were limited to
+freshly spawned, exactly re-observed Task 5 groups, and removals were limited to
+Task 4-verified temporary `allocation.workdir` paths under the user's explicit
+authorization.

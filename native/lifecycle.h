@@ -529,6 +529,8 @@ int cpl_journal_mark_unconfirmed(cpl_journal *j, uint32_t reason_code,
     uint64_t deadline_ns, struct cpl_append_result *out);
 int cpl_journal_confirm_executor_reaped(cpl_journal *j,
     uint64_t deadline_ns, struct cpl_reap_proof *proof);
+int cpl_journal_recover_executor_reap_proof(cpl_journal *j,
+    uint64_t deadline_ns, struct cpl_reap_proof *proof);
 int cpl_journal_reconcile_interrupted_batch(cpl_journal *j,
     const struct cpl_reap_proof *proof, uint64_t deadline_ns,
     struct cpl_append_result *out);
