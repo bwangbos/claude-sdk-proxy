@@ -7,8 +7,8 @@ import hashlib
 import json
 import os
 import pickle
-import shutil
 import shlex
+import shutil
 import socket
 import struct
 import threading
@@ -611,8 +611,11 @@ def test_cleanup_result_requires_complete_normal_task5_evidence() -> None:
         )
 
 
-def test_authenticated_armed_frame_requires_anchor_same_incarnation(
+@pytest.mark.parametrize("observation_mode", ["nonexistent", "mismatched"])
+def test_authenticated_armed_frame_requires_fresh_exact_os_observations(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observation_mode: str,
 ) -> None:
     with _launch_inputs(tmp_path) as inputs:
         parent, peer = socket.socketpair()
@@ -634,6 +637,13 @@ def test_authenticated_armed_frame_requires_anchor_same_incarnation(
             + bytes.fromhex(cli.sha256)
             + bytes.fromhex(cli.path_sha256)
         )
+        if observation_mode == "mismatched":
+            observed_anchor = implementation._parse_process_identity(anchor)
+            monkeypatch.setattr(
+                Journal,
+                "observe_process",
+                lambda _journal, _pid: observed_anchor,
+            )
 
         def publish_authenticated_frames() -> None:
             try:
@@ -665,6 +675,79 @@ def test_authenticated_armed_frame_requires_anchor_same_incarnation(
                     False,
                     100,
                 )
+        finally:
+            parent.close()
+            publisher.join(timeout=2)
+        assert not publisher.is_alive()
+
+
+def test_authenticated_distinct_anchor_and_armed_member_are_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        parent, peer = socket.socketpair()
+        parent.settimeout(2)
+        peer.settimeout(2)
+        supervisor = _identity_payload(100, pgid=100, sid=100)
+        anchor = _identity_payload(200, pgid=200, sid=200)
+        cli = inputs.manifest.cli_executable
+        armed_member = _identity_payload(
+            201,
+            pgid=200,
+            sid=200,
+            executable_dev=cli.st_dev,
+            executable_ino=cli.st_ino,
+            executable_hash=bytes.fromhex(cli.sha256),
+        )
+        armed = (
+            armed_member
+            + struct.pack("<QQ", cli.st_dev, cli.st_ino)
+            + bytes.fromhex(cli.sha256)
+            + bytes.fromhex(cli.path_sha256)
+        )
+        observations = {
+            200: implementation._parse_process_identity(anchor),
+            201: implementation._parse_process_identity(armed_member),
+        }
+        monkeypatch.setattr(
+            Journal,
+            "observe_process",
+            lambda _journal, pid: observations[pid],
+        )
+
+        def publish_authenticated_frames() -> None:
+            try:
+                for message_type, payload, ack_type in (
+                    (1, supervisor, 2),
+                    (3, anchor, 4),
+                    (5, armed, 6),
+                    (7, armed_member, None),
+                ):
+                    inputs.journal.append_bootstrap(message_type, payload)
+                    peer.sendall(
+                        implementation._encode_control_frame(
+                            message_type, _NONCE, payload
+                        )
+                    )
+                    if ack_type is not None:
+                        implementation._receive_control_frame(peer, _NONCE, ack_type)
+            finally:
+                peer.close()
+
+        publisher = threading.Thread(target=publish_authenticated_frames)
+        publisher.start()
+        try:
+            receipt = implementation._perform_handshake(
+                parent,
+                inputs.journal,
+                _NONCE,
+                cli,
+                False,
+                100,
+            )
+            assert receipt.control_trace == implementation._EXPECTED_TRACE
+            assert observations[200].pid != observations[201].pid
         finally:
             parent.close()
             publisher.join(timeout=2)
@@ -835,17 +918,18 @@ def _finish_native_handshake(
     armed_payload, armed_head = implementation._certify_identity(
         control, journal, nonce, 5
     )
-    assert implementation._same_incarnation(
-        implementation._parse_process_identity(anchor_payload),
-        implementation._parse_process_identity(armed_payload[:112]),
+    assert (
+        implementation._parse_process_identity(anchor_payload).pid
+        != implementation._parse_process_identity(armed_payload[:112]).pid
     )
     control.sendall(implementation._encode_control_frame(6, nonce))
     running_payload, running_head = implementation._certify_identity(
         control, journal, nonce, 7
     )
-    assert implementation._parse_process_identity(running_payload).executable_hash.hex() == (
-        cli.sha256
-    )
+    running_hash = implementation._parse_process_identity(
+        running_payload
+    ).executable_hash.hex()
+    assert running_hash == cli.sha256
     return implementation.SupervisorHandshakeReceipt._create(
         implementation._RECEIPT_TOKEN,
         sequences=(

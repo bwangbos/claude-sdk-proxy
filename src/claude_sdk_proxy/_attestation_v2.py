@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import re
+import selectors
+import signal
 import socket
 import stat
 import struct
@@ -19,7 +21,7 @@ from enum import StrEnum
 from pathlib import Path
 from subprocess import DEVNULL, PIPE
 from types import MappingProxyType
-from typing import IO, Any, Never, SupportsIndex
+from typing import IO, Any, Literal, Never, SupportsIndex
 
 import anyio
 from claude_agent_sdk import (
@@ -35,7 +37,7 @@ from claude_sdk_proxy.environment import (
     environment_fingerprint,
 )
 from claude_sdk_proxy.isolation import IsolationConfig, build_agent_options
-from claude_sdk_proxy.journal import BootstrapHead, Journal
+from claude_sdk_proxy.journal import BootstrapHead, Journal, UnconfirmedReason
 
 ATTESTATION_MANIFEST_SCHEMA = "claude_sdk_proxy.child_attestation_manifest"
 EXPECTED_SDK_VERSION = "0.2.148"
@@ -64,6 +66,8 @@ _SUPERVISOR_CONFIG_VERSION = 1
 _INITIALIZE_MAX_BYTES = 4096
 _REQUEST_ID = re.compile(r"req_[1-9][0-9]*_[0-9a-f]{8}\Z")
 _VERSION_STDOUT = b"2.1.251 (Claude Code)\n"
+_VERSION_OUTPUT_LIMIT = 256
+_VERSION_PROBE_TIMEOUT_SECONDS = 5.0
 _CONTROL_NAMES = {
     1: "SUPERVISOR_IDENTITY",
     2: "IDENTITY_ACK",
@@ -321,24 +325,124 @@ def _snapshot_cli(path: Path) -> CliExecutableIdentity:
     )
 
 
-def _measure_cli(path: Path, environment: Mapping[str, str]) -> CliExecutableIdentity:
-    before = _snapshot_cli(path)
+def _terminate_version_probe(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
     try:
-        completed = subprocess.run(
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=0.25)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired as error:
+        raise AttestationError("CLI version probe could not be reaped") from error
+
+
+def _run_bounded_version_probe(
+    path: Path, environment: Mapping[str, str]
+) -> tuple[int, bytes, bytes]:
+    try:
+        process = subprocess.Popen(
             [str(path), "--version"],
-            capture_output=True,
-            check=False,
+            stdin=DEVNULL,
+            stdout=PIPE,
+            stderr=PIPE,
             env=dict(environment),
-            timeout=5,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise AttestationError("CLI version measurement failed or timed out") from error
-    after = _snapshot_cli(path)
+    except OSError as error:
+        raise AttestationError("CLI version measurement failed") from error
+    if process.stdout is None or process.stderr is None:
+        _terminate_version_probe(process)
+        raise AttestationError("CLI version probe pipes are unavailable")
+
+    streams = (process.stdout, process.stderr)
+    outputs = {
+        process.stdout.fileno(): bytearray(),
+        process.stderr.fileno(): bytearray(),
+    }
+    selector = selectors.DefaultSelector()
+    deadline = time.monotonic() + _VERSION_PROBE_TIMEOUT_SECONDS
+    try:
+        for stream in streams:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream.fileno(), selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AttestationError("CLI version measurement timed out")
+            events = selector.select(remaining)
+            if not events:
+                raise AttestationError("CLI version measurement timed out")
+            for key, _mask in events:
+                try:
+                    chunk = os.read(key.fd, 4096)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                output = outputs[key.fd]
+                output.extend(chunk)
+                if len(output) > _VERSION_OUTPUT_LIMIT:
+                    raise AttestationError("CLI version probe exceeded output bound")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AttestationError("CLI version measurement timed out")
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as error:
+            raise AttestationError("CLI version measurement timed out") from error
+        return (
+            returncode,
+            bytes(outputs[process.stdout.fileno()]),
+            bytes(outputs[process.stderr.fileno()]),
+        )
+    except BaseException:
+        _terminate_version_probe(process)
+        raise
+    finally:
+        selector.close()
+        for stream in streams:
+            stream.close()
+
+
+def _measure_cli(
+    path: Path,
+    environment: Mapping[str, str],
+    manifest_identity: CliExecutableIdentity,
+) -> CliExecutableIdentity:
+    before = _snapshot_cli(path)
+    if before != manifest_identity:
+        raise AttestationError("CLI executable does not match manifest identity")
+    probe_error: AttestationError | None = None
+    result: tuple[int, bytes, bytes] | None = None
+    try:
+        result = _run_bounded_version_probe(path, environment)
+    except AttestationError as error:
+        probe_error = error
+    try:
+        after = _snapshot_cli(path)
+    except AttestationError as error:
+        raise AttestationError("CLI changed during measurement") from error
     if before != after:
         raise AttestationError("CLI changed during measurement")
-    if completed.returncode != 0:
+    if probe_error is not None:
+        raise probe_error
+    assert result is not None
+    returncode, stdout, stderr = result
+    if returncode != 0:
         raise AttestationError("CLI version probe did not succeed")
-    if completed.stdout != _VERSION_STDOUT or completed.stderr:
+    if stdout != _VERSION_STDOUT or stderr:
         raise AttestationError("CLI version does not match pinned 2.1.251")
     return before
 
@@ -620,9 +724,9 @@ def prepare_supervisor_launch(
     fingerprint = environment_fingerprint(effective)
     if fingerprint != manifest.environment_fingerprint:
         raise AttestationError("effective child environment fingerprint changed")
-    measured_cli = _measure_cli(descriptors.real_cli, effective)
-    if measured_cli != manifest.cli_executable:
-        raise AttestationError("CLI executable does not match manifest identity")
+    measured_cli = _measure_cli(
+        descriptors.real_cli, effective, manifest.cli_executable
+    )
     forbidden = set(BOOTSTRAP_DESCRIPTOR_NAMES) | {"LOCAL_PROXY_NETWORK_PROXY"}
     if set(effective) & forbidden:
         raise AttestationError("real CLI environment contains ambient bootstrap state")
@@ -768,6 +872,30 @@ def _same_incarnation(left: _ProcessIdentity, right: _ProcessIdentity) -> bool:
     )
 
 
+def _observed_identity_matches(claimed: _ProcessIdentity, observed: object) -> bool:
+    try:
+        current = _ProcessIdentity(
+            pid=observed.pid,  # type: ignore[attr-defined]
+            start_ns=observed.start_ns,  # type: ignore[attr-defined]
+            uid=observed.uid,  # type: ignore[attr-defined]
+            pgid=observed.pgid,  # type: ignore[attr-defined]
+            sid=observed.sid,  # type: ignore[attr-defined]
+            flags=observed.flags,  # type: ignore[attr-defined]
+            executable_dev=observed.executable_dev,  # type: ignore[attr-defined]
+            executable_ino=observed.executable_ino,  # type: ignore[attr-defined]
+            boot_id=observed.boot_id,  # type: ignore[attr-defined]
+            executable_hash=observed.executable_hash,  # type: ignore[attr-defined]
+        )
+    except AttributeError, TypeError, ValueError:
+        return False
+    return (
+        _same_incarnation(claimed, current)
+        and claimed.executable_dev == current.executable_dev
+        and claimed.executable_ino == current.executable_ino
+        and claimed.executable_hash == current.executable_hash
+    )
+
+
 class SupervisorHandshakeReceipt:
     """Opaque receipt minted only after the actual Task 5 runtime handshake."""
 
@@ -776,6 +904,7 @@ class SupervisorHandshakeReceipt:
         "_canonical_control_sequences",
         "_canonical_control_types",
         "_control_trace",
+        "_fingerprint",
         "_identity_ack_hash",
         "_identity_ack_sequence",
         "_network_proxy_enabled",
@@ -785,6 +914,7 @@ class SupervisorHandshakeReceipt:
     _canonical_control_sequences: tuple[int, ...]
     _canonical_control_types: tuple[str, ...]
     _control_trace: tuple[str, ...]
+    _fingerprint: str
     _identity_ack_hash: bytes
     _identity_ack_sequence: int
     _network_proxy_enabled: bool
@@ -822,43 +952,87 @@ class SupervisorHandshakeReceipt:
         object.__setattr__(value, "_identity_ack_sequence", ack_sequence)
         object.__setattr__(value, "_identity_ack_hash", ack_hash)
         object.__setattr__(value, "_network_proxy_enabled", network_proxy_enabled)
+        object.__setattr__(value, "_fingerprint", value._current_fingerprint())
+        value._validate()
         return value
+
+    def _current_fingerprint(self) -> str:
+        return _digest(
+            b"claude-sdk-proxy:supervisor-handshake-receipt:v1",
+            {
+                "control_trace": self._control_trace,
+                "canonical_control_types": self._canonical_control_types,
+                "canonical_control_sequences": self._canonical_control_sequences,
+                "canonical_control_hashes": tuple(
+                    value.hex() for value in self._canonical_control_hashes
+                ),
+                "identity_ack_sequence": self._identity_ack_sequence,
+                "identity_ack_hash": self._identity_ack_hash.hex(),
+                "network_proxy_enabled": self._network_proxy_enabled,
+                "authorizes_authentication": False,
+            },
+        )
+
+    def _validate(self) -> None:
+        try:
+            token = self._token
+            fingerprint = self._fingerprint
+            current = self._current_fingerprint()
+        except (AttributeError, TypeError, ValueError) as error:
+            raise AttestationError("handshake receipt is invalid") from error
+        if token is not _RECEIPT_TOKEN or fingerprint != current:
+            raise AttestationError("handshake receipt is invalid")
 
     @property
     def control_trace(self) -> tuple[str, ...]:
+        self._validate()
         return self._control_trace
 
     @property
     def canonical_control_types(self) -> tuple[str, ...]:
+        self._validate()
         return self._canonical_control_types
 
     @property
     def canonical_control_sequences(self) -> tuple[int, ...]:
+        self._validate()
         return self._canonical_control_sequences
 
     @property
     def canonical_control_hashes(self) -> tuple[bytes, ...]:
+        self._validate()
         return self._canonical_control_hashes
 
     @property
     def identity_ack_sequence(self) -> int:
+        self._validate()
         return self._identity_ack_sequence
 
     @property
     def identity_ack_hash(self) -> bytes:
+        self._validate()
         return self._identity_ack_hash
 
     @property
     def network_proxy_enabled(self) -> bool:
+        self._validate()
         return self._network_proxy_enabled
 
+    @property
+    def authorizes_authentication(self) -> Literal[False]:
+        self._validate()
+        return False
+
     def __copy__(self) -> Never:
+        self._validate()
         raise AttestationError("handshake receipt cannot be copied")
 
     def __deepcopy__(self, _memo: object) -> Never:
+        self._validate()
         raise AttestationError("handshake receipt cannot be copied")
 
     def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        self._validate()
         raise AttestationError("handshake receipt cannot be pickled")
 
 
@@ -916,8 +1090,15 @@ def _perform_handshake(
     expected_dev, expected_ino = struct.unpack_from("<QQ", armed_payload, 112)
     expected_hash = armed_payload[128:160]
     expected_path_hash = armed_payload[160:192]
+    try:
+        observed_anchor = journal.observe_process(anchor.pid)
+        observed_armed = journal.observe_process(armed_member.pid)
+    except Exception as error:
+        raise AttestationError("Task 5 armed CLI identity is invalid") from error
     if (
-        (armed_member.pgid, armed_member.sid) != (anchor.pgid, anchor.sid)
+        not _observed_identity_matches(anchor, observed_anchor)
+        or not _observed_identity_matches(armed_member, observed_armed)
+        or (armed_member.pgid, armed_member.sid) != (anchor.pgid, anchor.sid)
         or expected_dev != cli_identity.st_dev
         or expected_ino != cli_identity.st_ino
         or expected_hash.hex() != cli_identity.sha256
@@ -1082,10 +1263,6 @@ class _OwnedSupervisorProcess:
             env=dict(environment),
             pass_fds=inherited_fds,
         )
-        if process.stdin is None or process.stdout is None:
-            process.kill()
-            process.wait(timeout=5)
-            raise AttestationError("supervisor pipes are unavailable")
         self._popen = process
         self._stdin: IO[bytes] | None = process.stdin
         self._stdout: IO[bytes] | None = process.stdout
@@ -1097,6 +1274,10 @@ class _OwnedSupervisorProcess:
     @property
     def returncode(self) -> int | None:
         return self._popen.returncode
+
+    @property
+    def pipes_available(self) -> bool:
+        return self._stdin is not None and self._stdout is not None
 
     async def send(self, data: str) -> None:
         stream = self._stdin
@@ -1134,15 +1315,6 @@ class _OwnedSupervisorProcess:
         if stream is not None:
             await anyio.to_thread.run_sync(stream.close, abandon_on_cancel=True)
             self._stdin = None
-
-    async def wait(self) -> int:
-        return await anyio.to_thread.run_sync(self._popen.wait, abandon_on_cancel=True)
-
-    def terminate(self) -> None:
-        self._popen.terminate()
-
-    def kill(self) -> None:
-        self._popen.kill()
 
     def record_confirmed_exit(self, status: int) -> None:
         if self._popen.returncode is not None:
@@ -1186,6 +1358,77 @@ def _observe_successful_unreaped_exit(pid: int) -> None:
     raise AttestationError("supervisor did not become reapable after cleanup")
 
 
+def _observe_unreaped_exit(pid: int) -> int | None:
+    try:
+        observed = os.waitid(
+            os.P_PID,
+            pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except (ChildProcessError, OSError) as error:
+        raise AttestationError("supervisor Task 4 ownership is unavailable") from error
+    if observed is None or observed.si_pid == 0:
+        return None
+    if observed.si_pid != pid:
+        raise AttestationError("supervisor Task 4 ownership changed")
+    if observed.si_code == os.CLD_EXITED:
+        return observed.si_status
+    if observed.si_code in {os.CLD_KILLED, os.CLD_DUMPED}:
+        return -observed.si_status
+    raise AttestationError("supervisor exit state is not terminal")
+
+
+def _reconcile_failed_handshake_exit(
+    journal: Journal, process: _OwnedSupervisorProcess
+) -> bool:
+    """Reap only through the authoritative Task 4 transition, never Popen."""
+    head = journal.scan().head
+    kind = head.record.kind.name
+    proof = None
+    if process.returncode is None:
+        exit_status = _observe_unreaped_exit(process.pid)
+        if exit_status is None:
+            return False
+        if kind in {"ACTIVE_READY", "BATCH_ACTIVE"}:
+            if time.monotonic_ns() <= head.record.lease_deadline_ns:
+                return False
+            retired = journal.retire_executor(
+                authority="task6-handshake-reconciler",
+                authority_epoch=1,
+                authority_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+                deadline_ns=time.monotonic_ns() + 1_000_000_000,
+            )
+            kind = retired.record.kind.name
+        if kind not in {"DONE", "RETIRING_IDLE", "RETIRING_BATCH"}:
+            return False
+        proof = journal.confirm_executor_reaped(
+            deadline_ns=time.monotonic_ns() + 1_000_000_000
+        )
+        # Task 4 has consumed the zombie and retained its proof. Record that
+        # fact immediately so a later reconciliation failure never attempts a
+        # second waitid/reap through the Popen facade.
+        process.record_confirmed_exit(exit_status)
+    elif kind in {"RETIRING_IDLE", "RETIRING_BATCH"}:
+        proof = journal.recover_executor_reap_proof(
+            deadline_ns=time.monotonic_ns() + 1_000_000_000
+        )
+    elif kind not in {"DONE", "UNCONFIRMED"}:
+        return False
+    if kind == "RETIRING_BATCH":
+        if proof is None:
+            return False
+        journal.reconcile_interrupted_batch(
+            proof, deadline_ns=time.monotonic_ns() + 1_000_000_000
+        )
+    certified = journal.certify_head(deadline_ns=time.monotonic_ns() + 1_000_000_000)
+    if certified.state.kind.name not in {"DONE", "UNCONFIRMED"}:
+        journal.mark_unconfirmed(
+            UnconfirmedReason.PROOF_UNAVAILABLE,
+            deadline_ns=time.monotonic_ns() + 1_000_000_000,
+        )
+    return True
+
+
 class AttestedSupervisorTransport(Transport):
     """SDK transport with exact env/FD control and an actual Task 5 handshake."""
 
@@ -1212,7 +1455,10 @@ class AttestedSupervisorTransport(Transport):
 
     @property
     def handshake_receipt(self) -> SupervisorHandshakeReceipt | None:
-        return self._handshake_receipt
+        receipt = self._handshake_receipt
+        if receipt is not None:
+            receipt._validate()
+        return receipt
 
     @property
     def cleanup_unconfirmed(self) -> bool:
@@ -1246,6 +1492,9 @@ class AttestedSupervisorTransport(Transport):
                 )
             )
             self._process = process
+            if not process.pipes_available:
+                self._cleanup_unconfirmed = True
+                raise AttestationError("supervisor pipes are unavailable")
             self.launch._child_control.close()
             try:
                 self._handshake_receipt = await anyio.to_thread.run_sync(
@@ -1257,12 +1506,13 @@ class AttestedSupervisorTransport(Transport):
                     self._network_proxy_enabled,
                     process.pid,
                 )
-            except Exception as error:
+            except BaseException as error:
                 self._cleanup_unconfirmed = True
-                self._control.close()
-                raise AttestationError(
-                    "Task 5 supervisor handshake failed closed"
-                ) from error
+                if isinstance(error, Exception):
+                    raise AttestationError(
+                        "Task 5 supervisor handshake failed closed"
+                    ) from error
+                raise
             self._stdin = self._process
             self._stdout = self._process
             self._ready = True
@@ -1331,13 +1581,6 @@ class AttestedSupervisorTransport(Transport):
             if not await self._bounded_stdin_close():
                 raise AttestationError("stdin close timed out; cleanup is unconfirmed")
 
-    async def _bounded_wait(self, seconds: float) -> bool:
-        if self._process is None:
-            return True
-        with anyio.move_on_after(seconds) as scope:
-            await self._process.wait()
-        return not scope.cancel_called and self._process.returncode is not None
-
     async def _bounded_process_aclose(self) -> bool:
         if self._process is None:
             return True
@@ -1345,22 +1588,35 @@ class AttestedSupervisorTransport(Transport):
             await self._process.aclose()
         return not scope.cancel_called
 
-    async def _close_pre_handshake_process(self) -> bool:
+    async def _close_failed_handshake_process(self) -> bool:
         process = self._process
         if process is None:
             return True
-        if process.returncode is None and not await self._bounded_wait(0.25):
-            process.terminate()
-            if not await self._bounded_wait(2):
-                process.kill()
-                if not await self._bounded_wait(2):
-                    return False
-        process_closed = await self._bounded_process_aclose()
-        if process_closed:
-            self._process = None
-            self._stdin = None
-            self._stdout = None
-        return process_closed
+        if not isinstance(process, _OwnedSupervisorProcess):
+            if process.returncode is None:
+                return False
+            process_closed = await self._bounded_process_aclose()
+            if process_closed:
+                self._process = None
+                self._stdin = None
+                self._stdout = None
+            return process_closed
+        try:
+            reconciled = await anyio.to_thread.run_sync(
+                _reconcile_failed_handshake_exit,
+                self._journal,
+                process,
+            )
+        except Exception:
+            return False
+        if not reconciled:
+            return False
+        if not await self._bounded_process_aclose():
+            return False
+        self._process = None
+        self._stdin = None
+        self._stdout = None
+        return False
 
     async def _close_running_process(self) -> bool:
         process = self._process
@@ -1394,18 +1650,27 @@ class AttestedSupervisorTransport(Transport):
         self._stdout = None
         return True
 
-    async def close(self) -> None:
+    async def _close_transition(self) -> None:
         async with self._lock:
             if self._closed and self._process is None:
+                if self._cleanup_unconfirmed:
+                    raise AttestationError("transport cleanup is unconfirmed")
                 return
             self._closed = True
             self._ready = False
             self._discarded += len(self._buffered)
             self._buffered.clear()
             stdin_closed = await self._bounded_stdin_close()
-            if self._handshake_receipt is None:
-                process_closed = await self._close_pre_handshake_process()
+            receipt = self._handshake_receipt
+            if receipt is None:
+                process_closed = await self._close_failed_handshake_process()
             else:
+                try:
+                    receipt._validate()
+                except AttestationError:
+                    # Receipt integrity is consumer-facing evidence; a caller
+                    # mutation cannot be allowed to suppress proven cleanup.
+                    pass
                 process_closed = await self._close_running_process()
             if stdin_closed and process_closed:
                 self._control.close()
@@ -1413,6 +1678,22 @@ class AttestedSupervisorTransport(Transport):
                 return
             self._cleanup_unconfirmed = True
         raise AttestationError("transport cleanup is unconfirmed")
+
+    async def close(self) -> None:
+        failure: AttestationError | None = None
+        with anyio.CancelScope(shield=True):
+            try:
+                await self._close_transition()
+            except AttestationError as error:
+                failure = error
+            except BaseException:
+                self._cleanup_unconfirmed = True
+                raise
+        # Re-deliver any ambient cancellation only after the shielded state
+        # transition has either completed cleanup or retained exact ownership.
+        await anyio.lowlevel.checkpoint()
+        if failure is not None:
+            raise failure
 
 
 def build_attested_sdk_client(
