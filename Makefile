@@ -2,12 +2,18 @@
 
 PYTEST_RELEASE_FLAGS := --strict-markers --forbid-skips -W error
 CLANG := $(shell xcrun --find clang)
+SDKROOT := $(shell xcrun --show-sdk-path)
 C17_FLAGS := -std=c17 -Wall -Wextra -Werror -pedantic
 
 .PHONY: native unit darwin live-core live-tools check
 
-native:
-	printf 'int claude_sdk_proxy_native_smoke;\n' | $(CLANG) $(C17_FLAGS) -fsyntax-only -x c -
+native: build/bin/darwin-probe
+
+build/bin:
+	mkdir -p $@
+
+build/bin/darwin-probe: native/darwin_probe.c | build/bin
+	$(CLANG) $(C17_FLAGS) -isysroot $(SDKROOT) $< -o $@ -lproc
 
 unit:
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/unit
