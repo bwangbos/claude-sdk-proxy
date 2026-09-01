@@ -328,6 +328,11 @@ def _snapshot_cli(path: Path) -> CliExecutableIdentity:
     )
 
 
+class _VersionProbeOwnerState(StrEnum):
+    LIVE_CLEANUP_PENDING = "live_cleanup_pending"
+    REAPED_RESOURCE_CLOSE_PENDING = "reaped_resource_close_pending"
+
+
 @dataclass
 class _VersionProbeOwner:
     """Exact direct-child/group ownership retained until group absence."""
@@ -335,12 +340,52 @@ class _VersionProbeOwner:
     process: subprocess.Popen[bytes]
     leader_pid: int
     pgid: int
+    state: _VersionProbeOwnerState = _VersionProbeOwnerState.LIVE_CLEANUP_PENDING
     selector: selectors.BaseSelector | None = None
 
 
-_VERSION_PROBE_LOCK = threading.Lock()
+_VERSION_PROBE_LOCK = threading.RLock()
 _RETAINED_VERSION_PROBES: dict[int, _VersionProbeOwner] = {}
 _LIBPROC: ctypes.CDLL | None = None
+
+
+def _validate_version_probe_owner(
+    owner: _VersionProbeOwner,
+    *,
+    expected_state: _VersionProbeOwnerState | None = None,
+) -> None:
+    if (
+        not isinstance(owner, _VersionProbeOwner)
+        or owner.leader_pid <= 0
+        or owner.leader_pid != owner.pgid
+        or owner.process.pid != owner.leader_pid
+        or len(_RETAINED_VERSION_PROBES) != 1
+        or _RETAINED_VERSION_PROBES.get(owner.leader_pid) is not owner
+        or not isinstance(owner.state, _VersionProbeOwnerState)
+    ):
+        raise AttestationError("version probe owner state is invalid")
+    if expected_state is not None and owner.state is not expected_state:
+        raise AttestationError("version probe owner state transition is invalid")
+    if (
+        owner.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+        and owner.process.returncode is not None
+    ):
+        raise AttestationError("live version probe owner was reaped unexpectedly")
+    if (
+        owner.state is _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+        and owner.process.returncode is None
+    ):
+        raise AttestationError("reaped version probe owner lacks exit status")
+
+
+def _register_version_probe_owner(owner: _VersionProbeOwner) -> None:
+    with _VERSION_PROBE_LOCK:
+        if _RETAINED_VERSION_PROBES and (
+            _RETAINED_VERSION_PROBES.get(owner.leader_pid) is not owner
+        ):
+            raise AttestationError("version probe owner capacity is exhausted")
+        _RETAINED_VERSION_PROBES[owner.leader_pid] = owner
+        _validate_version_probe_owner(owner)
 
 
 def _libproc() -> ctypes.CDLL:
@@ -383,6 +428,9 @@ def _list_version_probe_group(pgid: int) -> tuple[int, ...]:
 def _version_probe_leader_state(
     owner: _VersionProbeOwner,
 ) -> Literal["live", "reapable"]:
+    _validate_version_probe_owner(
+        owner, expected_state=_VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+    )
     transition_deadline = time.monotonic() + 0.05
     while True:
         try:
@@ -444,44 +492,46 @@ def _signal_version_probe_group(owner: _VersionProbeOwner, signal_number: int) -
 
 
 def _reap_version_probe_leader(owner: _VersionProbeOwner) -> int:
+    _validate_version_probe_owner(
+        owner, expected_state=_VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+    )
     if not _version_probe_group_is_absent(owner):
         raise AttestationError("version probe group absence is unconfirmed")
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
     try:
-        return owner.process.wait(timeout=0.25)
+        returncode = owner.process.wait(timeout=0.25)
     except subprocess.TimeoutExpired as error:
         raise AttestationError("version probe leader could not be reaped") from error
-
-
-def _retain_version_probe(owner: _VersionProbeOwner) -> None:
-    _RETAINED_VERSION_PROBES[owner.leader_pid] = owner
+    else:
+        with _VERSION_PROBE_LOCK:
+            owner.state = _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+            _validate_version_probe_owner(
+                owner,
+                expected_state=(_VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING),
+            )
+        return returncode
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _terminate_version_probe(owner: _VersionProbeOwner) -> None:
-    try:
-        if not _wait_for_version_probe_group_absence(owner, 0):
-            _signal_version_probe_group(owner, signal.SIGTERM)
-        if not _wait_for_version_probe_group_absence(
-            owner, _VERSION_PROBE_TERM_SECONDS
-        ):
-            _signal_version_probe_group(owner, signal.SIGKILL)
-        if not _wait_for_version_probe_group_absence(
-            owner, _VERSION_PROBE_KILL_SECONDS
-        ):
-            raise AttestationError("version probe group cleanup is unconfirmed")
-        _reap_version_probe_leader(owner)
-        _RETAINED_VERSION_PROBES.pop(owner.leader_pid, None)
-    except BaseException:
-        # Retaining the unreaped direct-child Popen object preserves the PID /
-        # PGID reuse sentinel. Future probes fail closed rather than signal a
-        # numeric group whose ownership can no longer be proved.
-        _retain_version_probe(owner)
-        raise
+    _validate_version_probe_owner(owner)
+    if owner.state is _VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING:
+        return
+    if not _wait_for_version_probe_group_absence(owner, 0):
+        _signal_version_probe_group(owner, signal.SIGTERM)
+    if not _wait_for_version_probe_group_absence(owner, _VERSION_PROBE_TERM_SECONDS):
+        _signal_version_probe_group(owner, signal.SIGKILL)
+    if not _wait_for_version_probe_group_absence(owner, _VERSION_PROBE_KILL_SECONDS):
+        raise AttestationError("version probe group cleanup is unconfirmed")
+    _reap_version_probe_leader(owner)
 
 
 def _capture_version_probe_owner(
     process: subprocess.Popen[bytes],
 ) -> _VersionProbeOwner:
     owner = _VersionProbeOwner(process, process.pid, process.pid)
+    _register_version_probe_owner(owner)
     try:
         try:
             current_pgid = os.getpgid(owner.leader_pid)
@@ -498,9 +548,38 @@ def _capture_version_probe_owner(
                     "version probe did not create an isolated session"
                 )
     except BaseException:
-        _retain_version_probe(owner)
+        # Registration is deliberately retained: failed identity validation
+        # grants no signaling authority, but it must still consume capacity and
+        # keep the exact child and pipes strongly owned.
         raise
     return owner
+
+
+def _spawn_and_register_version_probe(
+    path: Path, environment: Mapping[str, str]
+) -> _VersionProbeOwner:
+    # Defer Python's KeyboardInterrupt across the only otherwise-unowned
+    # Popen-return-to-registry window. The isolated probe child intentionally
+    # inherits blocked SIGINT; its bounded cleanup authority is TERM/KILL on
+    # the verified new-session group.
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        try:
+            process = subprocess.Popen(
+                [str(path), "--version"],
+                stdin=DEVNULL,
+                stdout=PIPE,
+                stderr=PIPE,
+                env=dict(environment),
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise AttestationError("CLI version measurement failed") from error
+        return _capture_version_probe_owner(process)
+    finally:
+        # A pending SIGINT may raise here, but capture has already installed the
+        # strong authoritative registry entry before this restoration point.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _finish_version_probe(owner: _VersionProbeOwner, deadline: float) -> int:
@@ -513,9 +592,11 @@ def _finish_version_probe(owner: _VersionProbeOwner, deadline: float) -> int:
     return _reap_version_probe_leader(owner)
 
 
-def _close_version_probe_resources(
-    owner: _VersionProbeOwner, *, preserve_pipes: bool
-) -> None:
+def _close_version_probe_resources(owner: _VersionProbeOwner) -> None:
+    _validate_version_probe_owner(
+        owner,
+        expected_state=_VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING,
+    )
     first_error: BaseException | None = None
     selector = owner.selector
     if selector is not None:
@@ -525,21 +606,42 @@ def _close_version_probe_resources(
             first_error = error
         else:
             owner.selector = None
-    if not preserve_pipes:
+    for stream in (
+        owner.process.stdin,
+        owner.process.stdout,
+        owner.process.stderr,
+    ):
+        if stream is None or stream.closed:
+            continue
+        try:
+            stream.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+    if owner.selector is not None or any(
+        stream is not None and not stream.closed
         for stream in (
             owner.process.stdin,
             owner.process.stdout,
             owner.process.stderr,
-        ):
-            if stream is None or stream.closed:
-                continue
-            try:
-                stream.close()
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
-    if first_error is not None:
-        raise first_error
+        )
+    ):
+        raise AttestationError("version probe resource close is unconfirmed")
+    with _VERSION_PROBE_LOCK:
+        _validate_version_probe_owner(
+            owner,
+            expected_state=_VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING,
+        )
+        del _RETAINED_VERSION_PROBES[owner.leader_pid]
+
+
+def _cleanup_version_probe_owner(owner: _VersionProbeOwner) -> None:
+    _validate_version_probe_owner(owner)
+    if owner.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING:
+        _terminate_version_probe(owner)
+    _close_version_probe_resources(owner)
 
 
 def _run_bounded_version_probe(
@@ -554,18 +656,8 @@ def _run_bounded_version_probe(
 def _run_bounded_version_probe_locked(
     path: Path, environment: Mapping[str, str]
 ) -> tuple[int, bytes, bytes]:
-    try:
-        process = subprocess.Popen(
-            [str(path), "--version"],
-            stdin=DEVNULL,
-            stdout=PIPE,
-            stderr=PIPE,
-            env=dict(environment),
-            start_new_session=True,
-        )
-    except OSError as error:
-        raise AttestationError("CLI version measurement failed") from error
-    owner = _capture_version_probe_owner(process)
+    owner = _spawn_and_register_version_probe(path, environment)
+    process = owner.process
     try:
         if process.stdout is None or process.stderr is None:
             raise AttestationError("CLI version probe pipes are unavailable")
@@ -604,22 +696,8 @@ def _run_bounded_version_probe_locked(
             bytes(outputs[process.stdout.fileno()]),
             bytes(outputs[process.stderr.fileno()]),
         )
-    except BaseException:
-        if owner.process.returncode is None:
-            _terminate_version_probe(owner)
-        raise
     finally:
-        retained = _RETAINED_VERSION_PROBES.get(owner.leader_pid) is owner
-        if retained:
-            try:
-                _close_version_probe_resources(owner, preserve_pipes=True)
-            except BaseException:
-                # The strong retained owner also retains a selector that could
-                # not be closed. Preserve the primary unconfirmed-cleanup
-                # failure and all process pipes for later operator recovery.
-                pass
-        else:
-            _close_version_probe_resources(owner, preserve_pipes=False)
+        _cleanup_version_probe_owner(owner)
 
 
 def _measure_cli(

@@ -653,9 +653,7 @@ def test_interrupt_immediately_after_capture_retains_authoritative_owner(
                 _prepare(inputs)
             assert len(captured) == 1
             owner = captured[0]
-            assert implementation._RETAINED_VERSION_PROBES == {
-                owner.leader_pid: owner
-            }
+            assert implementation._RETAINED_VERSION_PROBES == {owner.leader_pid: owner}
             assert owner.process.returncode is None
             assert not owner.process.stdout.closed
             assert not owner.process.stderr.closed
@@ -705,7 +703,10 @@ def test_post_reap_close_failure_retains_resource_only_owner(
         owner = captured[0]
         assert owner.process.returncode is not None
         assert implementation._RETAINED_VERSION_PROBES == {owner.leader_pid: owner}
-        assert owner.state is implementation._VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+        assert (
+            owner.state
+            is implementation._VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+        )
 
         original_state = owner.state
         owner.state = "tampered"
