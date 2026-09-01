@@ -33,7 +33,6 @@ struct anchor_arguments {
     const char *instance_dir;
     const char *real_cli;
     int control_fd;
-    int fallback_control_fd;
     int cli_index;
 };
 
@@ -114,7 +113,6 @@ static int parse_arguments(int argc, char **argv,
     }
     (void)memset(out, 0, sizeof(*out));
     out->control_fd = -1;
-    out->fallback_control_fd = -1;
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--") == 0) {
             out->cli_index = index + 1;
@@ -133,10 +131,6 @@ static int parse_arguments(int argc, char **argv,
             }
         } else if (strcmp(argv[index], "--real-cli") == 0) {
             out->real_cli = argv[++index];
-        } else if (strcmp(argv[index], "--fallback-control-fd") == 0) {
-            if (parse_fd(argv[++index], &out->fallback_control_fd) < 0) {
-                return -1;
-            }
         } else {
             return -1;
         }
@@ -144,7 +138,8 @@ static int parse_arguments(int argc, char **argv,
     return out->allocation_nonce != NULL && out->instance_dir != NULL &&
         out->instance_dir[0] == '/' && out->real_cli != NULL &&
         out->real_cli[0] == '/' && out->control_fd >= 0 &&
-        out->fallback_control_fd >= 0 &&
+        out->control_fd != CPL_ANCHOR_INTERNAL_CONTROL_FD &&
+        fcntl(CPL_ANCHOR_INTERNAL_CONTROL_FD, F_GETFD) >= 0 &&
         out->cli_index > 0 && out->cli_index < argc ? 0 : -1;
 }
 
@@ -180,7 +175,7 @@ static int certify_anchor_domain(const struct anchor_arguments *arguments,
             (uint32_t)sizeof(identity), control_deadline(), &bootstrap);
     }
     if (status == CPL_OK) {
-        status = cpl_control_frame_write(arguments->control_fd,
+        status = cpl_control_frame_write(CPL_ANCHOR_INTERNAL_CONTROL_FD,
             CPL_CONTROL_ANCHOR_IDENTITY, nonce,
             (const uint8_t *)&identity, (uint32_t)sizeof(identity),
             control_deadline());
@@ -194,7 +189,7 @@ static int certify_anchor_domain(const struct anchor_arguments *arguments,
             &certified);
     }
     if (status == CPL_OK) {
-        status = cpl_control_frame_read(arguments->control_fd, nonce,
+        status = cpl_control_frame_read(CPL_ANCHOR_INTERNAL_CONTROL_FD, nonce,
             control_deadline(), &frame);
     }
     if (status == CPL_OK && frame.type != CPL_CONTROL_ANCHOR_ACK) {
@@ -291,7 +286,7 @@ static int arm_cli(const struct anchor_arguments *arguments) {
             (uint32_t)sizeof(armed), control_deadline(), &bootstrap);
     }
     if (status == CPL_OK) {
-        status = cpl_control_frame_write(arguments->control_fd,
+        status = cpl_control_frame_write(CPL_ANCHOR_INTERNAL_CONTROL_FD,
             CPL_CONTROL_CLI_ARMED, nonce, (const uint8_t *)&armed,
             (uint32_t)sizeof(armed), control_deadline());
     }
@@ -300,7 +295,7 @@ static int arm_cli(const struct anchor_arguments *arguments) {
             false);
     }
     if (status == CPL_OK) {
-        status = cpl_control_frame_read(arguments->control_fd, nonce,
+        status = cpl_control_frame_read(CPL_ANCHOR_INTERNAL_CONTROL_FD, nonce,
             control_deadline(), &frame);
     }
     if (status == CPL_OK && frame.type != CPL_CONTROL_ARMED_ACK) {
@@ -313,11 +308,11 @@ static int arm_cli(const struct anchor_arguments *arguments) {
         cpl_journal_close(journal);
     }
     (void)close(directory_fd);
-    if (status == CPL_OK && fcntl(arguments->control_fd, F_SETFD,
+    if (status == CPL_OK && fcntl(CPL_ANCHOR_INTERNAL_CONTROL_FD, F_SETFD,
             FD_CLOEXEC) < 0) {
         status = CPL_ERR_SYSTEM;
     }
-    if (status == CPL_OK && fcntl(arguments->fallback_control_fd, F_SETFD,
+    if (status == CPL_OK && fcntl(arguments->control_fd, F_SETFD,
             FD_CLOEXEC) < 0) {
         status = CPL_ERR_SYSTEM;
     }
@@ -356,10 +351,10 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
         if (cleanup && term_seen != 0 && child_reaped) {
             return 0;
         }
-        controls[0].fd = internal_lost ? -1 : arguments->control_fd;
+        controls[0].fd = internal_lost ? -1 : CPL_ANCHOR_INTERNAL_CONTROL_FD;
         controls[0].events = POLLIN;
         controls[0].revents = 0;
-        controls[1].fd = arguments->fallback_control_fd;
+        controls[1].fd = internal_lost && running ? arguments->control_fd : -1;
         controls[1].events = POLLIN;
         controls[1].revents = 0;
         if (poll(controls, 2U, 10) < 0) {
@@ -369,13 +364,14 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
             return ANCHOR_FAIL_DEAD_EXIT;
         }
         if ((controls[0].revents & POLLIN) != 0) {
-            int status = cpl_control_frame_read(arguments->control_fd, nonce,
-                control_deadline(), &frame);
+            int status = cpl_control_frame_read(
+                CPL_ANCHOR_INTERNAL_CONTROL_FD, nonce, control_deadline(),
+                &frame);
 
             if (status != CPL_OK && running &&
                 (controls[0].revents & (POLLHUP | POLLERR)) != 0) {
                 internal_lost = true;
-                (void)close(arguments->control_fd);
+                (void)close(CPL_ANCHOR_INTERNAL_CONTROL_FD);
                 continue;
             }
             if (status != CPL_OK ||
@@ -392,7 +388,7 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
         }
         if ((controls[1].revents & POLLIN) != 0) {
             int status = cpl_control_frame_read(
-                arguments->fallback_control_fd, nonce, control_deadline(),
+                arguments->control_fd, nonce, control_deadline(),
                 &frame);
             struct cpl_bootstrap_head certified;
 
@@ -424,7 +420,7 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
         }
         if ((controls[0].revents & (POLLHUP | POLLERR)) != 0 && running) {
             internal_lost = true;
-            (void)close(arguments->control_fd);
+            (void)close(CPL_ANCHOR_INTERNAL_CONTROL_FD);
         }
         if ((controls[1].revents & (POLLHUP | POLLERR)) != 0 && running) {
             for (;;) {
@@ -530,8 +526,8 @@ int main(int argc, char **argv) {
     (void)close(release_pipe[0]);
     free(cli_argv);
     child_status = anchor_control_loop(&arguments, journal, child);
+    (void)close(CPL_ANCHOR_INTERNAL_CONTROL_FD);
     (void)close(arguments.control_fd);
-    (void)close(arguments.fallback_control_fd);
     cpl_journal_close(journal);
     (void)close(directory_fd);
     return child_status;

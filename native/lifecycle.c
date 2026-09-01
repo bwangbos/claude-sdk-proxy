@@ -104,6 +104,9 @@ _Static_assert(sizeof(struct cpl_chain) == CPL_ABI_CHAIN_SIZE,
     "cpl_chain ABI layout changed");
 _Static_assert(sizeof(struct cpl_certified_head) == CPL_ABI_CERTIFIED_HEAD_SIZE,
     "cpl_certified_head ABI layout changed");
+_Static_assert(sizeof(struct cpl_supervisor_config) ==
+    CPL_ABI_SUPERVISOR_CONFIG_SIZE,
+    "cpl_supervisor_config ABI layout changed");
 _Static_assert(sizeof(struct cpl_append_result) == CPL_ABI_APPEND_RESULT_SIZE,
     "cpl_append_result ABI layout changed");
 _Static_assert(sizeof(struct cpl_create_receipt) == CPL_ABI_CREATE_RECEIPT_SIZE,

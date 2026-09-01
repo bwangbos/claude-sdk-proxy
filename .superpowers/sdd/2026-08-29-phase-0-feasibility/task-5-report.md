@@ -924,3 +924,56 @@ No Claude CLI, model, credential, network peer, pre-existing process, or
 pre-existing allocation was contacted or modified. Signals were limited to
 freshly spawned, exactly re-observed Task 5 groups. No retained `UNCONFIRMED`
 artifact was deleted.
+
+## Task 6 integration correction
+
+Integration base: `f6b0b0ce76b114d1ffeb2cf71facb2702bf914e1`
+
+Integration commit: this commit
+
+### Contract correction
+
+- The native shim again reads and removes exactly the four Task 5 bootstrap
+  descriptors: allocation nonce, instance directory, verified real CLI, and
+  the proxy-owned control descriptor. The later ambient anchor-control and
+  network-selector variables were removed from native parsing and every Python
+  launch probe.
+- `IDENTITY_ACK` now carries one fixed 48-byte versioned configuration value.
+  The native supervisor rejects a missing payload, an unknown version, a proxy
+  bit other than zero or one, any nonzero reserved field, or a sequence/hash
+  that does not equal its certified canonical head. Only after that validation
+  does it construct the child environment, so proxy names can enter `envp`
+  only through the authenticated selector.
+- The supervisor creates its own private relay and maps the anchor endpoint to
+  fixed inherited descriptor 198 before `execve`. The exact anchor invocation
+  remains `--allocation-nonce`, `--instance-dir`, `--control-fd`,
+  `--real-cli`, `--`, followed by ordinary CLI argv. The `--control-fd` value
+  is the original authenticated proxy-owned channel, retained by the anchor
+  solely for post-supervisor-loss fallback.
+- The anchor uses only the private relay for identity, arm, running, and normal
+  cleanup control. It does not poll or read the original proxy channel while
+  that relay is live. After authenticated `CLI_RUNNING` and private-relay EOF,
+  it becomes the sole fallback reader. Both control descriptors are marked
+  close-on-exec before the real CLI is released; the real probe child's
+  exhaustive socket-descriptor check proves neither leaks into CLI execution.
+
+### TDD and verification evidence
+
+The focused RED collected 20 tests and ended with 19 failures and one pass.
+Those failures exposed the six-variable bootstrap set, absent authenticated
+configuration validation, separate fallback socket, missing no-reader-race
+proof, and missing descriptor-leak evidence. After the correction, the same
+focused bootstrap/fallback command passed all 20 tests in 2.72 seconds.
+
+The full host-permission Darwin suite passed all 205 tests in 38.71 seconds
+with zero skips or XPASS. Sandbox execution was not counted because macOS
+`libproc` process observation is denied there; the bounded host run was local
+only. `make check` passed 216 unit tests (including the concurrently prepared
+Task 6 unit rows), Ruff, and strict mypy. `make native` rebuilt every touched
+native target with strict C17 warnings-as-errors, compile-time ABI assertions
+include the 48-byte supervisor configuration, and `git diff --check` is clean.
+
+No Claude CLI, model, credential, network peer, pre-existing process, or
+pre-existing allocation was contacted or modified. Signals were limited to
+freshly spawned, exactly re-observed Task 5 probe groups. No live Task 6 gate
+was executed.

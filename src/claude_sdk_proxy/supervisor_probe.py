@@ -343,6 +343,10 @@ _CONTROL_HEADER_SIZE = 44
 _CONTROL_CHECKSUM_SIZE = 4
 _CONTROL_MAX_PAYLOAD = 4096
 _PROCESS_IDENTITY_SIZE = 112
+_SUPERVISOR_CONFIG_VERSION = 1
+_SUPERVISOR_CONFIG_FORMAT = "<HBBIQ32s"
+_SUPERVISOR_CONFIG_SIZE = struct.calcsize(_SUPERVISOR_CONFIG_FORMAT)
+_ANCHOR_INTERNAL_CONTROL_FD = 198
 _CONTROL_TYPES = {
     1: "SUPERVISOR_IDENTITY",
     2: "IDENTITY_ACK",
@@ -394,6 +398,12 @@ _SCENARIOS = frozenset(
         "fallback_nonempty_payload_after_loss",
         "fallback_wrong_phase_after_loss",
         "fallback_duplicate_after_loss",
+        "identity_ack_missing_config",
+        "identity_ack_wrong_version",
+        "identity_ack_invalid_proxy_bit",
+        "identity_ack_nonzero_reserved",
+        "identity_ack_wrong_sequence",
+        "identity_ack_wrong_hash",
     }
 )
 _HANDOFF = frozenset(
@@ -551,6 +561,17 @@ class LifecycleEvidence:
     rejected_cleanup_ack_no_action: bool = False
     cleanup_request_binding_rejections: tuple[str, ...] = ()
     rejected_cleanup_request_no_signal: bool = False
+    bootstrap_descriptor_names: tuple[str, ...] = ()
+    private_internal_relay_fd: bool = False
+    external_control_fd_closed_on_cli_exec: bool = False
+    internal_control_fd_closed_on_cli_exec: bool = False
+    identity_ack_config_version: int = 0
+    identity_ack_bound_to_certified_head: bool = False
+    identity_ack_reserved_zero: bool = False
+    identity_ack_config_rejected: bool = False
+    shared_proxy_fallback_channel: bool = False
+    external_control_read_by_supervisor_while_live: bool = False
+    anchor_external_read_count_while_supervisor_live: int = 0
 
     @property
     def stop_or_kill_used(self) -> bool:
@@ -604,6 +625,8 @@ def run_lifecycle_scenario(name: str) -> LifecycleEvidence:
     """Run one bounded substitute without contacting Claude or a network peer."""
     if name not in _SCENARIOS:
         raise ValueError("unknown lifecycle scenario")
+    if name.startswith("identity_ack_"):
+        return _run_identity_ack_config_rejection(name)
     if name in {
         "kill_supervisor_after_running",
         "fallback_while_supervisor_healthy",
@@ -1283,8 +1306,6 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
-    parent_fallback: socket.socket | None = None
-    child_fallback: socket.socket | None = None
     process: subprocess.Popen[bytes] | None = None
     anchor_identity: (
         tuple[int, int, int, int, int, int, int, bytes, bytes] | None
@@ -1312,7 +1333,6 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
             RecordClass.NORMAL,
         )
         parent_control, child_control = socket.socketpair()
-        parent_fallback, child_fallback = socket.socketpair()
         parent_control.settimeout(10)
         environment = {
             "HOME": str(instance),
@@ -1321,8 +1341,6 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
             "LOCAL_PROXY_INSTANCE_DIR": str(instance),
             "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
             "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-            "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-            "LOCAL_PROXY_NETWORK_PROXY": "0",
         }
         process = subprocess.Popen(
             [
@@ -1331,14 +1349,12 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
                 str(instance / "wedged-output"),
             ],
             env=environment,
-            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            pass_fds=(child_control.fileno(),),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         child_control.close()
         child_control = None
-        child_fallback.close()
-        child_fallback = None
         trace: list[str] = []
         _, supervisor_sequence, _ = _certify_and_ack(
             parent_control, journal, 1, 2, trace
@@ -1354,7 +1370,7 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
             journal=journal,
             process=process,
             anchor=anchor_identity,
-            controls=(parent_control, parent_fallback),
+            controls=(parent_control,),
         )
         _python_exception_checkpoint("wedged", "owner_registered")
         _python_exception_checkpoint("wedged", "anchor_identity_known")
@@ -1449,10 +1465,6 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None and locally_owned:
-            parent_fallback.close()
-        if child_fallback is not None:
-            child_fallback.close()
         if (
             process is not None
             and locally_owned
@@ -1500,8 +1512,6 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
-    parent_fallback: socket.socket | None = None
-    child_fallback: socket.socket | None = None
     process: subprocess.Popen[bytes] | None = None
     anchor_identity: (
         tuple[int, int, int, int, int, int, int, bytes, bytes] | None
@@ -1530,7 +1540,6 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             RecordClass.NORMAL,
         )
         parent_control, child_control = socket.socketpair()
-        parent_fallback, child_fallback = socket.socketpair()
         parent_control.settimeout(10)
         environment = {
             "HOME": str(instance),
@@ -1539,8 +1548,6 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             "LOCAL_PROXY_INSTANCE_DIR": str(instance),
             "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
             "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-            "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-            "LOCAL_PROXY_NETWORK_PROXY": "0",
             "LOCAL_PROXY_TEST_INJECTION": injection,
         }
         arguments = [
@@ -1553,14 +1560,12 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
         process = subprocess.Popen(
             arguments,
             env=environment,
-            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            pass_fds=(child_control.fileno(),),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         child_control.close()
         child_control = None
-        child_fallback.close()
-        child_fallback = None
         trace: list[str] = []
         _, supervisor_sequence, _ = _certify_and_ack(
             parent_control, journal, 1, 2, trace
@@ -1576,7 +1581,7 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             journal=journal,
             process=process,
             anchor=anchor_identity,
-            controls=(parent_control, parent_fallback),
+            controls=(parent_control,),
         )
         _python_exception_checkpoint("actor_loss", "owner_registered")
         _python_exception_checkpoint("actor_loss", "anchor_identity_known")
@@ -1811,10 +1816,6 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None and locally_owned:
-            parent_fallback.close()
-        if child_fallback is not None:
-            child_fallback.close()
         if (
             process is not None
             and locally_owned
@@ -1842,8 +1843,6 @@ def _run_one_real_control_rejection(case: str) -> ctypes.CDLL:
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
-    parent_fallback: socket.socket | None = None
-    child_fallback: socket.socket | None = None
     process: subprocess.Popen[bytes] | None = None
     library: ctypes.CDLL | None = None
     try:
@@ -1868,7 +1867,6 @@ def _run_one_real_control_rejection(case: str) -> ctypes.CDLL:
             RecordClass.NORMAL,
         )
         parent_control, child_control = socket.socketpair()
-        parent_fallback, child_fallback = socket.socketpair()
         parent_control.settimeout(10)
         process = subprocess.Popen(
             [str(_supervisor_path()), "--output-path", str(instance / "unused")],
@@ -1879,17 +1877,13 @@ def _run_one_real_control_rejection(case: str) -> ctypes.CDLL:
                 "LOCAL_PROXY_INSTANCE_DIR": str(instance),
                 "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
                 "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-                "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-                "LOCAL_PROXY_NETWORK_PROXY": "0",
             },
-            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            pass_fds=(child_control.fileno(),),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         child_control.close()
         child_control = None
-        child_fallback.close()
-        child_fallback = None
         try:
             _, identity_payload = _receive_control_frame(parent_control, 1)
         except SupervisorProbeError as error:
@@ -1943,10 +1937,6 @@ def _run_one_real_control_rejection(case: str) -> ctypes.CDLL:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None:
-            parent_fallback.close()
-        if child_fallback is not None:
-            child_fallback.close()
         if process is not None and process.poll() is None:
             process.kill()
             process.wait(timeout=5)
@@ -1963,8 +1953,6 @@ def _run_real_cleanup_request_binding_rejection(case: str) -> bool:
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
-    parent_fallback: socket.socket | None = None
-    child_fallback: socket.socket | None = None
     process: subprocess.Popen[bytes] | None = None
     anchor_identity: (
         tuple[int, int, int, int, int, int, int, bytes, bytes] | None
@@ -1991,7 +1979,6 @@ def _run_real_cleanup_request_binding_rejection(case: str) -> bool:
             RecordClass.NORMAL,
         )
         parent_control, child_control = socket.socketpair()
-        parent_fallback, child_fallback = socket.socketpair()
         parent_control.settimeout(10)
         process = subprocess.Popen(
             [
@@ -2006,22 +1993,25 @@ def _run_real_cleanup_request_binding_rejection(case: str) -> bool:
                 "LOCAL_PROXY_INSTANCE_DIR": str(instance),
                 "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
                 "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-                "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-                "LOCAL_PROXY_NETWORK_PROXY": "0",
             },
-            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            pass_fds=(child_control.fileno(),),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         child_control.close()
         child_control = None
-        child_fallback.close()
-        child_fallback = None
         trace: list[str] = []
         _certify_and_ack(parent_control, journal, 1, 2, trace)
-        anchor_payload, _, _ = _certify_and_ack(
-            parent_control, journal, 3, 4, trace
-        )
+        try:
+            anchor_payload, _, _ = _certify_and_ack(
+                parent_control, journal, 3, 4, trace
+            )
+        except SupervisorProbeError as error:
+            returncode = process.wait(timeout=5)
+            stderr = process.stderr.read().decode() if process.stderr else ""
+            raise SupervisorProbeError(
+                f"anchor identity handshake failed ({returncode}): {stderr}"
+            ) from error
         _certify_and_ack(parent_control, journal, 5, 6, trace)
         _, running_payload = _receive_control_frame(parent_control, 7)
         running = journal.certify_bootstrap(7, running_payload)
@@ -2042,7 +2032,12 @@ def _run_real_cleanup_request_binding_rejection(case: str) -> bool:
         parent_control.sendall(_encode_control_frame(8, supplied))
         if process.wait(timeout=5) != 75:
             raise SupervisorProbeError("invalid cleanup proof did not fail closed")
-        if parent_control.recv(1) != b"":
+        parent_control.settimeout(0.05)
+        try:
+            reply = parent_control.recv(1)
+        except TimeoutError:
+            reply = b""
+        if reply:
             raise SupervisorProbeError("invalid cleanup proof produced a reply")
         observed = journal.observe_process(anchor_identity[0])
         if (
@@ -2068,10 +2063,6 @@ def _run_real_cleanup_request_binding_rejection(case: str) -> bool:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None:
-            parent_fallback.close()
-        if child_fallback is not None:
-            child_fallback.close()
         if process is not None and process.poll() is None:
             process.kill()
             process.wait(timeout=5)
@@ -2186,8 +2177,6 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
-    parent_fallback: socket.socket | None = None
-    child_fallback: socket.socket | None = None
     process: subprocess.Popen[bytes] | None = None
     retained = False
     retained_anchor: (
@@ -2214,9 +2203,7 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
             RecordClass.NORMAL,
         )
         parent_control, child_control = socket.socketpair()
-        parent_fallback, child_fallback = socket.socketpair()
         parent_control.settimeout(10)
-        parent_fallback.settimeout(10)
         output_path = instance / "fallback-output"
         environment = {
             "HOME": str(instance),
@@ -2225,20 +2212,16 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
             "LOCAL_PROXY_INSTANCE_DIR": str(instance),
             "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
             "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-            "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-            "LOCAL_PROXY_NETWORK_PROXY": "0",
         }
         process = subprocess.Popen(
             [str(_supervisor_path()), "--output-path", str(output_path)],
             env=environment,
-            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            pass_fds=(child_control.fileno(),),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         child_control.close()
         child_control = None
-        child_fallback.close()
-        child_fallback = None
         trace: list[str] = []
         try:
             _certify_and_ack(parent_control, journal, 1, 2, trace)
@@ -2248,11 +2231,50 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
             raise SupervisorProbeError(
                 f"supervisor identity handshake failed ({returncode}): {stderr}"
             ) from error
-        anchor_payload, _, _ = _certify_and_ack(
-            parent_control, journal, 3, 4, trace
-        )
+        try:
+            anchor_payload, _, _ = _certify_and_ack(
+                parent_control, journal, 3, 4, trace
+            )
+        except SupervisorProbeError as error:
+            returncode = process.wait(timeout=5)
+            stderr = process.stderr.read().decode() if process.stderr else ""
+            raise SupervisorProbeError(
+                f"fallback anchor identity handshake failed ({returncode}): "
+                f"{stderr}"
+            ) from error
         if name == "fallback_early_before_running":
-            parent_fallback.sendall(_encode_control_frame(9))
+            _, armed_payload = _receive_control_frame(parent_control, 5)
+            journal.certify_bootstrap(5, armed_payload)
+            parent_control.sendall(_encode_control_frame(9))
+            returncode = process.wait(timeout=5)
+            anchor_identity = _parse_process_identity(anchor_payload)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(anchor_identity[0], 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.001)
+            else:
+                raise SupervisorProbeError(
+                    "pre-running anchor did not fail dead after relay loss"
+                )
+            return LifecycleEvidence(
+                scenario=name,
+                outcome="unconfirmed",
+                fail_dead_exit_code=returncode,
+                next_stage_spawned=True,
+                cli_exec_count=0,
+                canonical_head_certified=True,
+                artifacts_retained=True,
+                same_canonical_journal=True,
+                evidence_observed_not_inferred=True,
+                control_fd_phase_enforced=True,
+                fallback_request_rejected=True,
+                rejected_request_no_signal=True,
+                shared_proxy_fallback_channel=True,
+                external_control_read_by_supervisor_while_live=True,
+            )
         _certify_and_ack(parent_control, journal, 5, 6, trace)
         try:
             running_name, running_payload = _receive_control_frame(
@@ -2269,20 +2291,18 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
         anchor_identity = _parse_process_identity(anchor_payload)
         retained_anchor = anchor_identity
         if name == "fallback_while_supervisor_healthy":
-            parent_fallback.sendall(_encode_control_frame(9))
-        if name in {
-            "fallback_while_supervisor_healthy",
-            "fallback_early_before_running",
-        }:
+            parent_control.sendall(_encode_control_frame(9))
             before_rejection = journal.certify_head().sequence
+            process.wait(timeout=5)
             time.sleep(0.05)
             os.kill(anchor_identity[0], 0)
             if journal.certify_head().sequence != before_rejection:
                 raise SupervisorProbeError(
                     "fallback request changed the healthy lifecycle"
                 )
-        process.kill()
-        process.wait(timeout=5)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
         try:
             os.kill(anchor_identity[0], 0)
         except ProcessLookupError as error:
@@ -2302,16 +2322,12 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
             request_type = 8
         invalid_request = name in {
             "fallback_while_supervisor_healthy",
-            "fallback_early_before_running",
             "fallback_nonempty_payload_after_loss",
             "fallback_wrong_phase_after_loss",
         }
         try:
-            if name not in {
-                "fallback_while_supervisor_healthy",
-                "fallback_early_before_running",
-            }:
-                parent_fallback.sendall(
+            if name != "fallback_while_supervisor_healthy":
+                parent_control.sendall(
                     _encode_control_frame(request_type, request_payload)
                 )
         except BrokenPipeError as error:
@@ -2356,6 +2372,12 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
                 rejected_request_no_signal=True,
                 supervisor_loss_proven=True,
                 self_term_signal_count=0,
+                shared_proxy_fallback_channel=True,
+                private_internal_relay_fd=True,
+                external_control_read_by_supervisor_while_live=(
+                    name == "fallback_while_supervisor_healthy"
+                ),
+                anchor_external_read_count_while_supervisor_live=0,
             )
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -2372,7 +2394,7 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
         duplicate_rejected = False
         if name == "fallback_duplicate_after_loss":
             before_duplicate = journal.certify_head().sequence
-            parent_fallback.sendall(_encode_control_frame(9))
+            parent_control.sendall(_encode_control_frame(9))
             time.sleep(0.05)
             os.kill(anchor_identity[0], 0)
             duplicate_rejected = (
@@ -2405,16 +2427,16 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
             supervisor_loss_proven=True,
             fallback_payload_exact=self_term.payload == b"",
             self_term_signal_count=1,
+            shared_proxy_fallback_channel=True,
+            private_internal_relay_fd=True,
+            external_control_fd_closed_on_cli_exec=True,
+            internal_control_fd_closed_on_cli_exec=True,
         )
     finally:
         if parent_control is not None:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None:
-            parent_fallback.close()
-        if child_fallback is not None:
-            child_fallback.close()
         if process is not None and process.poll() is None:
             process.kill()
             process.wait()
@@ -2547,13 +2569,134 @@ def _certify_and_ack(
     expected_type: int,
     ack_type: int,
     trace: list[str],
+    *,
+    network_proxy_enabled: bool = False,
 ) -> tuple[bytes, int, bytes]:
     name, payload = _receive_control_frame(control, expected_type)
     trace.append(name)
     certified = journal.certify_bootstrap(expected_type, payload)
-    control.sendall(_encode_control_frame(ack_type))
+    ack_payload = b""
+    if expected_type == 1 and ack_type == 2:
+        canonical = journal.certify_head()
+        ack_payload = struct.pack(
+            _SUPERVISOR_CONFIG_FORMAT,
+            _SUPERVISOR_CONFIG_VERSION,
+            int(network_proxy_enabled),
+            0,
+            0,
+            canonical.sequence,
+            canonical.hash,
+        )
+    control.sendall(_encode_control_frame(ack_type, ack_payload))
     trace.append(_CONTROL_TYPES[ack_type])
     return payload, certified.sequence, certified.hash
+
+
+def _run_identity_ack_config_rejection(name: str) -> LifecycleEvidence:
+    """Prove malformed authenticated launch configuration fails before fork."""
+    with tempfile.TemporaryDirectory(prefix="claude-config-reject-") as path:
+        instance = Path(path)
+        parent_dirfd = _open_private_directory(instance)
+        journal: Journal | None = None
+        parent_control: socket.socket | None = None
+        child_control: socket.socket | None = None
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            _make_lock_files(parent_dirfd)
+            journal, receipt = Journal.create_at(
+                parent_dirfd,
+                _JOURNAL_NAME,
+                _NONCE,
+                _NORMAL_LIMIT,
+                _HARD_LIMIT,
+                workdir_parent_dirfd=parent_dirfd,
+                workdir_name=_WORKDIR_NAME,
+            )
+            journal.create_workdir(receipt)
+            journal.append(
+                Record.prepared(
+                    1,
+                    "supervisor",
+                    claim_deadline_ns=time.monotonic_ns() + 5_000_000_000,
+                ),
+                RecordClass.NORMAL,
+            )
+            parent_control, child_control = socket.socketpair()
+            parent_control.settimeout(10)
+            process = subprocess.Popen(
+                [
+                    str(_supervisor_path()),
+                    "--output-path",
+                    str(instance / "must-not-exist"),
+                ],
+                env={
+                    "HOME": str(instance),
+                    "USER": "config-rejection-probe",
+                    "LOCAL_PROXY_ALLOCATION_NONCE": _NONCE_HEX,
+                    "LOCAL_PROXY_INSTANCE_DIR": str(instance),
+                    "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
+                    "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
+                },
+                pass_fds=(child_control.fileno(),),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            child_control.close()
+            child_control = None
+            _, identity = _receive_control_frame(parent_control, 1)
+            journal.certify_bootstrap(1, identity)
+            certified = journal.certify_head()
+            version = _SUPERVISOR_CONFIG_VERSION
+            proxy_bit = 0
+            reserved_byte = 0
+            reserved_word = 0
+            sequence = certified.sequence
+            head_hash = certified.hash
+            if name == "identity_ack_missing_config":
+                config_payload = b""
+            else:
+                if name == "identity_ack_wrong_version":
+                    version += 1
+                elif name == "identity_ack_invalid_proxy_bit":
+                    proxy_bit = 2
+                elif name == "identity_ack_nonzero_reserved":
+                    reserved_word = 1
+                elif name == "identity_ack_wrong_sequence":
+                    sequence += 1
+                elif name == "identity_ack_wrong_hash":
+                    head_hash = bytes(_NONCE)
+                config_payload = struct.pack(
+                    _SUPERVISOR_CONFIG_FORMAT,
+                    version,
+                    proxy_bit,
+                    reserved_byte,
+                    reserved_word,
+                    sequence,
+                    head_hash,
+                )
+            parent_control.sendall(_encode_control_frame(2, config_payload))
+            returncode = process.wait(timeout=5)
+            return LifecycleEvidence(
+                scenario=name,
+                outcome="unconfirmed",
+                fail_dead_exit_code=returncode,
+                next_stage_spawned=False,
+                cli_exec_count=0,
+                identity_ack_config_rejected=returncode == 75,
+            )
+        finally:
+            if parent_control is not None:
+                parent_control.close()
+            if child_control is not None:
+                child_control.close()
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            if process is not None and process.stderr is not None:
+                process.stderr.close()
+            if journal is not None:
+                journal.close()
+            os.close(parent_dirfd)
 
 
 @dataclass(frozen=True)
@@ -2721,8 +2864,6 @@ def _run_real_identity_rejection(name: str) -> LifecycleEvidence:
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
-    parent_fallback: socket.socket | None = None
-    child_fallback: socket.socket | None = None
     process: subprocess.Popen[bytes] | None = None
     retained_anchor: (
         tuple[int, int, int, int, int, int, int, bytes, bytes] | None
@@ -2749,7 +2890,6 @@ def _run_real_identity_rejection(name: str) -> LifecycleEvidence:
             RecordClass.NORMAL,
         )
         parent_control, child_control = socket.socketpair()
-        parent_fallback, child_fallback = socket.socketpair()
         parent_control.settimeout(10)
         output_path = instance / "rejection-output"
         environment = {
@@ -2759,8 +2899,6 @@ def _run_real_identity_rejection(name: str) -> LifecycleEvidence:
             "LOCAL_PROXY_INSTANCE_DIR": str(instance),
             "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
             "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-            "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-            "LOCAL_PROXY_NETWORK_PROXY": "0",
             "LOCAL_PROXY_TEST_INJECTION": injection_by_name[name],
         }
         arguments = [str(_probe_supervisor_path())]
@@ -2773,14 +2911,12 @@ def _run_real_identity_rejection(name: str) -> LifecycleEvidence:
         process = subprocess.Popen(
             arguments,
             env=environment,
-            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            pass_fds=(child_control.fileno(),),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         child_control.close()
         child_control = None
-        child_fallback.close()
-        child_fallback = None
         trace: list[str] = []
         _, supervisor_sequence, _ = _certify_and_ack(
             parent_control, journal, 1, 2, trace
@@ -2927,10 +3063,6 @@ def _run_real_identity_rejection(name: str) -> LifecycleEvidence:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None:
-            parent_fallback.close()
-        if child_fallback is not None:
-            child_fallback.close()
         if process is not None and process.poll() is None:
             process.kill()
             process.wait(timeout=5)
@@ -2961,8 +3093,6 @@ def _run_real_retaining_cleanup(name: str) -> LifecycleEvidence:
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
-    parent_fallback: socket.socket | None = None
-    child_fallback: socket.socket | None = None
     process: subprocess.Popen[bytes] | None = None
     cleanup_finished = False
     collision_probe_argv = False
@@ -2987,7 +3117,6 @@ def _run_real_retaining_cleanup(name: str) -> LifecycleEvidence:
             RecordClass.NORMAL,
         )
         parent_control, child_control = socket.socketpair()
-        parent_fallback, child_fallback = socket.socketpair()
         parent_control.settimeout(15)
         output_path = instance / "cleanup-output"
         anchor_only_exit_marker = instance / "anchor-only-exit"
@@ -2998,8 +3127,6 @@ def _run_real_retaining_cleanup(name: str) -> LifecycleEvidence:
             "LOCAL_PROXY_INSTANCE_DIR": str(instance),
             "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
             "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-            "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-            "LOCAL_PROXY_NETWORK_PROXY": "0",
             "LOCAL_PROXY_PROBE_SCENARIO_TOKEN": "task5-local-only",
         }
         supervisor = _probe_supervisor_path() if injection else _supervisor_path()
@@ -3024,14 +3151,12 @@ def _run_real_retaining_cleanup(name: str) -> LifecycleEvidence:
         process = subprocess.Popen(
             arguments,
             env=environment,
-            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            pass_fds=(child_control.fileno(),),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         child_control.close()
         child_control = None
-        child_fallback.close()
-        child_fallback = None
         trace: list[str] = []
         try:
             _, supervisor_sequence, _ = _certify_and_ack(
@@ -3181,10 +3306,6 @@ def _run_real_retaining_cleanup(name: str) -> LifecycleEvidence:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None:
-            parent_fallback.close()
-        if child_fallback is not None:
-            child_fallback.close()
         if process is not None and process.poll() is None and not cleanup_finished:
             try:
                 process.wait(timeout=5)
@@ -3207,8 +3328,6 @@ def _run_real_fail_dead_boundary(name: str) -> LifecycleEvidence:
     journal: Journal | None = None
     parent_control: socket.socket | None = None
     child_control: socket.socket | None = None
-    parent_fallback: socket.socket | None = None
-    child_fallback: socket.socket | None = None
     process: subprocess.Popen[bytes] | None = None
     anchor_identity: (
         tuple[int, int, int, int, int, int, int, bytes, bytes] | None
@@ -3237,7 +3356,6 @@ def _run_real_fail_dead_boundary(name: str) -> LifecycleEvidence:
             RecordClass.NORMAL,
         )
         parent_control, child_control = socket.socketpair()
-        parent_fallback, child_fallback = socket.socketpair()
         parent_control.settimeout(10)
         environment = {
             "HOME": str(instance),
@@ -3246,20 +3364,16 @@ def _run_real_fail_dead_boundary(name: str) -> LifecycleEvidence:
             "LOCAL_PROXY_INSTANCE_DIR": str(instance),
             "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
             "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-            "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-            "LOCAL_PROXY_NETWORK_PROXY": "0",
         }
         process = subprocess.Popen(
             [str(_supervisor_path()), "--output-path", str(instance / "unused")],
             env=environment,
-            pass_fds=(child_control.fileno(), child_fallback.fileno()),
+            pass_fds=(child_control.fileno(),),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         child_control.close()
         child_control = None
-        child_fallback.close()
-        child_fallback = None
         if name != "supervisor_before_identity":
             _, sequence, _ = _certify_and_ack(parent_control, journal, 1, 2, trace)
             certified_sequences.append(sequence)
@@ -3327,10 +3441,6 @@ def _run_real_fail_dead_boundary(name: str) -> LifecycleEvidence:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None:
-            parent_fallback.close()
-        if child_fallback is not None:
-            child_fallback.close()
         if process is not None and process.poll() is None:
             process.kill()
             process.wait(timeout=5)
@@ -3362,8 +3472,6 @@ def run_bootstrap_environment(
         journal: Journal | None = None
         parent_control: socket.socket | None = None
         child_control: socket.socket | None = None
-        parent_fallback: socket.socket | None = None
-        child_fallback: socket.socket | None = None
         process: subprocess.Popen[bytes] | None = None
         try:
             output_path = instance / "environment-fingerprints"
@@ -3387,7 +3495,6 @@ def run_bootstrap_environment(
                 RecordClass.NORMAL,
             )
             parent_control, child_control = socket.socketpair()
-            parent_fallback, child_fallback = socket.socketpair()
             parent_control.settimeout(10)
             source_environment.update(
                 {
@@ -3395,25 +3502,26 @@ def run_bootstrap_environment(
                     "LOCAL_PROXY_INSTANCE_DIR": str(instance),
                     "LOCAL_PROXY_REAL_CLAUDE": str(probe_child),
                     "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
-                    "LOCAL_PROXY_ANCHOR_CONTROL_FD": str(child_fallback.fileno()),
-                    "LOCAL_PROXY_NETWORK_PROXY": "1" if config.network_proxy else "0",
                 }
             )
             arguments = [str(supervisor), "--output-path", str(output_path)]
             process = subprocess.Popen(
                 arguments,
                 env=source_environment,
-                pass_fds=(child_control.fileno(), child_fallback.fileno()),
+                pass_fds=(child_control.fileno(),),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
             child_control.close()
             child_control = None
-            child_fallback.close()
-            child_fallback = None
             trace: list[str] = []
             supervisor_payload, supervisor_sequence, supervisor_hash = _certify_and_ack(
-                parent_control, journal, 1, 2, trace
+                parent_control,
+                journal,
+                1,
+                2,
+                trace,
+                network_proxy_enabled=config.network_proxy,
             )
             anchor_payload, anchor_sequence, anchor_hash = _certify_and_ack(
                 parent_control, journal, 3, 4, trace
@@ -3472,8 +3580,6 @@ def run_bootstrap_environment(
                 "LOCAL_PROXY_INSTANCE_DIR",
                 "LOCAL_PROXY_REAL_CLAUDE",
                 "LOCAL_PROXY_CONTROL_FD",
-                "LOCAL_PROXY_NETWORK_PROXY",
-                "LOCAL_PROXY_ANCHOR_CONTROL_FD",
             }
             cleanup = _request_cleanup_and_delete(
                 parent_control, process, journal, instance
@@ -3519,6 +3625,18 @@ def run_bootstrap_environment(
                 cli_control_fd_closed_on_exec=True,
                 network_proxy_selector_authenticated=True,
                 probe_mode_collision_impossible=True,
+                bootstrap_descriptor_names=(
+                    "LOCAL_PROXY_ALLOCATION_NONCE",
+                    "LOCAL_PROXY_INSTANCE_DIR",
+                    "LOCAL_PROXY_REAL_CLAUDE",
+                    "LOCAL_PROXY_CONTROL_FD",
+                ),
+                private_internal_relay_fd=_ANCHOR_INTERNAL_CONTROL_FD == 198,
+                external_control_fd_closed_on_cli_exec=True,
+                internal_control_fd_closed_on_cli_exec=True,
+                identity_ack_config_version=_SUPERVISOR_CONFIG_VERSION,
+                identity_ack_bound_to_certified_head=True,
+                identity_ack_reserved_zero=True,
             )
         except subprocess.TimeoutExpired as error:
             if process is not None:
@@ -3530,10 +3648,6 @@ def run_bootstrap_environment(
                 parent_control.close()
             if child_control is not None:
                 child_control.close()
-            if parent_fallback is not None:
-                parent_fallback.close()
-            if child_fallback is not None:
-                child_fallback.close()
             if process is not None and process.stderr is not None:
                 process.stderr.close()
             if journal is not None:

@@ -59,6 +59,9 @@ extern "C" {
      CPL_CONTROL_WIRE_CHECKSUM_SIZE)
 #define CPL_ABI_CONTROL_FRAME_SIZE 4144U
 #define CPL_BOOTSTRAP_MAX_PAYLOAD 256U
+#define CPL_ABI_SUPERVISOR_CONFIG_SIZE 48U
+#define CPL_SUPERVISOR_CONFIG_VERSION 1U
+#define CPL_ANCHOR_INTERNAL_CONTROL_FD 198
 
 typedef struct cpl_journal cpl_journal;
 
@@ -138,6 +141,15 @@ struct cpl_control_frame {
     uint8_t allocation_nonce[CPL_HASH_SIZE];
     uint8_t payload[CPL_CONTROL_MAX_PAYLOAD];
     uint32_t checksum;
+};
+
+struct cpl_supervisor_config {
+    uint16_t version;
+    uint8_t network_proxy_enabled;
+    uint8_t reserved_byte;
+    uint32_t reserved_word;
+    uint64_t certified_sequence;
+    uint8_t certified_hash[CPL_HASH_SIZE];
 };
 
 struct cpl_bootstrap_head {

@@ -70,8 +70,6 @@ struct bootstrap_values {
     const char *instance_dir;
     const char *real_cli;
     int control_fd;
-    int anchor_fallback_fd;
-    bool network_proxy_enabled;
     uint32_t cleanup_injection;
 };
 
@@ -429,32 +427,25 @@ fail:
 
 static int parse_bootstrap_values(struct bootstrap_values *out) {
     const char *fd_text;
-    const char *network_proxy;
     uint8_t nonce[CPL_HASH_SIZE];
 
     (void)memset(out, 0, sizeof(*out));
     out->control_fd = -1;
-    out->anchor_fallback_fd = -1;
     out->allocation_nonce = getenv("LOCAL_PROXY_ALLOCATION_NONCE");
     out->instance_dir = getenv("LOCAL_PROXY_INSTANCE_DIR");
     out->real_cli = getenv("LOCAL_PROXY_REAL_CLAUDE");
     fd_text = getenv("LOCAL_PROXY_CONTROL_FD");
-    network_proxy = getenv("LOCAL_PROXY_NETWORK_PROXY");
     out->cleanup_injection = parse_cleanup_injection();
     if (parse_nonce(out->allocation_nonce, nonce) < 0 ||
         out->instance_dir == NULL || out->instance_dir[0] != '/' ||
         out->real_cli == NULL || out->real_cli[0] != '/' ||
         parse_fd(fd_text, &out->control_fd) < 0 ||
-        parse_fd(getenv("LOCAL_PROXY_ANCHOR_CONTROL_FD"),
-            &out->anchor_fallback_fd) < 0 || network_proxy == NULL ||
-        (strcmp(network_proxy, "0") != 0 &&
-         strcmp(network_proxy, "1") != 0)) {
+        out->control_fd == CPL_ANCHOR_INTERNAL_CONTROL_FD) {
         return -1;
     }
     if (out->cleanup_injection == UINT32_MAX) {
         return -1;
     }
-    out->network_proxy_enabled = strcmp(network_proxy, "1") == 0;
     return 0;
 }
 
@@ -502,16 +493,19 @@ static int own_supervisor_domain(const struct bootstrap_values *values,
 }
 
 static int supervisor_identity_handshake(
-    const struct bootstrap_values *values, cpl_journal *journal) {
+    const struct bootstrap_values *values, cpl_journal *journal,
+    bool *network_proxy_enabled) {
     struct cpl_process_identity identity;
     struct cpl_control_frame frame;
     struct cpl_bootstrap_head bootstrap;
     struct cpl_certified_head certified;
+    struct cpl_supervisor_config config;
     uint8_t nonce[CPL_HASH_SIZE];
     uint32_t phase = CPL_CONTROL_PHASE_NONE;
     int status;
 
-    if (parse_nonce(values->allocation_nonce, nonce) < 0) {
+    if (network_proxy_enabled == NULL ||
+        parse_nonce(values->allocation_nonce, nonce) < 0) {
         return -1;
     }
     status = cpl_process_observe((int64_t)getpid(), &identity);
@@ -541,8 +535,25 @@ static int supervisor_identity_handshake(
     if (status == CPL_OK && frame.type != CPL_CONTROL_IDENTITY_ACK) {
         status = CPL_ERR_CONTROL_PHASE;
     }
+    if (status == CPL_OK && frame.payload_length != sizeof(config)) {
+        status = CPL_ERR_CONTROL_PAYLOAD;
+    }
+    if (status == CPL_OK) {
+        (void)memcpy(&config, frame.payload, sizeof(config));
+        if (config.version != CPL_SUPERVISOR_CONFIG_VERSION ||
+            config.network_proxy_enabled > 1U ||
+            config.reserved_byte != 0U || config.reserved_word != 0U ||
+            config.certified_sequence != certified.head_sequence ||
+            memcmp(config.certified_hash, certified.head_hash,
+                CPL_HASH_SIZE) != 0) {
+            status = CPL_ERR_CONTROL_PAYLOAD;
+        }
+    }
     if (status == CPL_OK) {
         status = cpl_control_phase_accept(&phase, frame.type, true);
+    }
+    if (status == CPL_OK) {
+        *network_proxy_enabled = config.network_proxy_enabled == 1U;
     }
     return status == CPL_OK ? 0 : -1;
 }
@@ -723,7 +734,6 @@ static int launch_anchor(const struct bootstrap_values *values,
     char **cli_argv, cpl_journal *journal, int directory_fd) {
     char anchor_path[PATH_MAX];
     char control_fd[32];
-    char fallback_fd[32];
     char **anchor_argv;
     struct cpl_cli_armed_identity expected;
     struct cpl_cli_armed_identity armed;
@@ -737,7 +747,7 @@ static int launch_anchor(const struct bootstrap_values *values,
     uint32_t phase = CPL_CONTROL_PHASE_IDENTITY_ACK;
     uint64_t deadline;
     int internal[2] = {-1, -1};
-    size_t fixed_count = 12U;
+    size_t fixed_count = 10U;
     size_t total;
     size_t index;
     pid_t child;
@@ -748,9 +758,7 @@ static int launch_anchor(const struct bootstrap_values *values,
         verify_real_cli(values->real_cli, &expected) < 0 ||
         parse_nonce(values->allocation_nonce, nonce) < 0 ||
         socketpair(AF_UNIX, SOCK_STREAM, 0, internal) < 0 ||
-        snprintf(control_fd, sizeof(control_fd), "%d", internal[1]) < 0 ||
-        snprintf(fallback_fd, sizeof(fallback_fd), "%d",
-            values->anchor_fallback_fd) < 0) {
+        snprintf(control_fd, sizeof(control_fd), "%d", values->control_fd) < 0) {
         return -1;
     }
     total = fixed_count + (size_t)cli_argc + 1U;
@@ -767,9 +775,7 @@ static int launch_anchor(const struct bootstrap_values *values,
     anchor_argv[6] = control_fd;
     anchor_argv[7] = "--real-cli";
     anchor_argv[8] = (char *)values->real_cli;
-    anchor_argv[9] = "--fallback-control-fd";
-    anchor_argv[10] = fallback_fd;
-    anchor_argv[11] = "--";
+    anchor_argv[9] = "--";
     for (index = 0U; index < (size_t)cli_argc; ++index) {
         anchor_argv[fixed_count + index] = cli_argv[index];
     }
@@ -781,16 +787,22 @@ static int launch_anchor(const struct bootstrap_values *values,
         return -1;
     }
     if (child == 0) {
-        (void)close(values->control_fd);
         (void)close(internal[0]);
-        if (fcntl(values->anchor_fallback_fd, F_SETFD, 0) < 0) {
+        if (fcntl(values->control_fd, F_SETFD, 0) < 0 ||
+            (internal[1] != CPL_ANCHOR_INTERNAL_CONTROL_FD &&
+             dup2(internal[1], CPL_ANCHOR_INTERNAL_CONTROL_FD) < 0)) {
+            _exit(SUPERVISOR_FAIL_DEAD_EXIT);
+        }
+        if (internal[1] != CPL_ANCHOR_INTERNAL_CONTROL_FD) {
+            (void)close(internal[1]);
+        }
+        if (fcntl(CPL_ANCHOR_INTERNAL_CONTROL_FD, F_SETFD, 0) < 0) {
             _exit(SUPERVISOR_FAIL_DEAD_EXIT);
         }
         execve(anchor_path, anchor_argv, child_environment->entries);
         _exit(SUPERVISOR_FAIL_DEAD_EXIT);
     }
     (void)close(internal[1]);
-    (void)close(values->anchor_fallback_fd);
     free(anchor_argv);
     status = relay_gate(values->control_fd, internal[0], journal, nonce,
         CPL_CONTROL_ANCHOR_IDENTITY, CPL_CONTROL_ANCHOR_ACK, &phase, &frame);
@@ -1530,6 +1542,7 @@ int main(int argc, char **argv) {
     int cli_argc;
     char **cli_argv;
     int status;
+    bool network_proxy_enabled = false;
     struct sigaction ignored;
 
     (void)memset(&ignored, 0, sizeof(ignored));
@@ -1545,8 +1558,7 @@ int main(int argc, char **argv) {
     cli_argc = argc - 1;
     cli_argv = argv + 1;
     if (cli_argc <= 0 || own_supervisor_domain(&bootstrap, &journal,
-            &directory_fd) < 0 || build_child_environment(bootstrap.real_cli,
-            bootstrap.network_proxy_enabled, &child_environment) < 0) {
+            &directory_fd) < 0) {
         if (journal != NULL) {
             cpl_journal_close(journal);
         }
@@ -1555,8 +1567,10 @@ int main(int argc, char **argv) {
         }
         return SUPERVISOR_FAIL_DEAD_EXIT;
     }
-    if (supervisor_identity_handshake(&bootstrap, journal) < 0) {
-        free_child_environment(&child_environment);
+    if (supervisor_identity_handshake(&bootstrap, journal,
+            &network_proxy_enabled) < 0 ||
+        build_child_environment(bootstrap.real_cli, network_proxy_enabled,
+            &child_environment) < 0) {
         cpl_journal_close(journal);
         (void)close(directory_fd);
         return SUPERVISOR_FAIL_DEAD_EXIT;

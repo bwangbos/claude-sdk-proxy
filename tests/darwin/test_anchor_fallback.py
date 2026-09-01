@@ -29,6 +29,10 @@ def test_supervisorless_running_anchor_stays_unconfirmed() -> None:
     assert result.same_canonical_journal
     assert result.evidence_observed_not_inferred
     assert result.control_fd_phase_enforced
+    assert result.shared_proxy_fallback_channel
+    assert result.private_internal_relay_fd
+    assert result.external_control_fd_closed_on_cli_exec
+    assert result.internal_control_fd_closed_on_cli_exec
     assert len(retained) == 1
     retained_instance = retained.pop()
     assert (retained_instance / "allocation.journal").is_file()
@@ -70,6 +74,17 @@ def test_invalid_fallback_request_is_rejected_without_a_signal(scenario: str) ->
     assert result.self_term_request_authenticated is False
     assert result.workdir_removed is False
     assert result.unsafe_numeric_signal_count == 0
+    assert result.shared_proxy_fallback_channel
+
+
+def test_anchor_does_not_read_proxy_channel_while_supervisor_is_live() -> None:
+    """The retaining supervisor must be the sole reader before internal EOF."""
+    result = run_lifecycle_scenario("fallback_while_supervisor_healthy")
+
+    assert result.external_control_read_by_supervisor_while_live
+    assert result.anchor_external_read_count_while_supervisor_live == 0
+    assert result.rejected_request_no_signal
+    assert result.self_term_signal_count == 0
 
 
 def test_duplicate_fallback_request_is_ignored_after_one_authenticated_signal() -> None:

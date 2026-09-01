@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from claude_sdk_proxy.environment import (
     EnvironmentConfig,
     build_child_environment,
@@ -42,8 +44,15 @@ def test_native_bootstrap_environment_matches_python_allowlist(tmp_path: Path) -
 
     assert dict(evidence.child_environment_fingerprints) == _fingerprints(expected)
     assert evidence.bootstrap_environment_removed
+    assert evidence.bootstrap_descriptor_names == (
+        "LOCAL_PROXY_ALLOCATION_NONCE",
+        "LOCAL_PROXY_INSTANCE_DIR",
+        "LOCAL_PROXY_REAL_CLAUDE",
+        "LOCAL_PROXY_CONTROL_FD",
+    )
     assert evidence.environment_values_recorded is False
     assert evidence.anchor_invocation_exact
+    assert evidence.private_internal_relay_fd
     assert evidence.cli_exec_count == 1
     assert evidence.control_trace == (
         "SUPERVISOR_IDENTITY",
@@ -65,8 +74,66 @@ def test_native_bootstrap_environment_matches_python_allowlist(tmp_path: Path) -
     assert evidence.canonical_control_sequences == (1, 2, 3, 4)
     assert evidence.post_exec_identity_verified
     assert evidence.cli_control_fd_closed_on_exec
+    assert evidence.external_control_fd_closed_on_cli_exec
+    assert evidence.internal_control_fd_closed_on_cli_exec
     assert evidence.network_proxy_selector_authenticated
+    assert evidence.identity_ack_config_version == 1
+    assert evidence.identity_ack_bound_to_certified_head
+    assert evidence.identity_ack_reserved_zero
     assert evidence.probe_mode_collision_impossible
+
+
+def test_network_proxy_selection_is_authenticated_before_environment_build(
+    tmp_path: Path,
+) -> None:
+    """Changing the ACK bit must be the only way proxy names enter CLI envp."""
+    cli_dir = Path(__file__).resolve().parents[2] / "build/bin"
+    source = {
+        "HOME": str(tmp_path),
+        "USER": "network-selector-probe",
+        "HTTP_PROXY": "http://127.0.0.1:8123",
+        "NO_PROXY": "127.0.0.1",
+    }
+    disabled = run_bootstrap_environment(
+        source,
+        EnvironmentConfig(cli_dir=cli_dir, network_proxy=False),
+    )
+    enabled = run_bootstrap_environment(
+        source,
+        EnvironmentConfig(cli_dir=cli_dir, network_proxy=True),
+    )
+
+    assert "HTTP_PROXY" not in dict(disabled.child_environment_fingerprints)
+    assert "NO_PROXY" not in dict(disabled.child_environment_fingerprints)
+    assert "HTTP_PROXY" in dict(enabled.child_environment_fingerprints)
+    assert "NO_PROXY" in dict(enabled.child_environment_fingerprints)
+    assert disabled.network_proxy_selector_authenticated
+    assert enabled.network_proxy_selector_authenticated
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "identity_ack_missing_config",
+        "identity_ack_wrong_version",
+        "identity_ack_invalid_proxy_bit",
+        "identity_ack_nonzero_reserved",
+        "identity_ack_wrong_sequence",
+        "identity_ack_wrong_hash",
+    ],
+)
+def test_malformed_identity_ack_config_fails_before_anchor(
+    scenario: str,
+) -> None:
+    """Unbound or noncanonical launch configuration must spawn no next stage."""
+    evidence = run_lifecycle_scenario(scenario)
+
+    assert evidence.outcome == "unconfirmed"
+    assert evidence.fail_dead_exit_code == 75
+    assert evidence.next_stage_spawned is False
+    assert evidence.cli_exec_count == 0
+    assert evidence.identity_ack_config_rejected
+    assert evidence.unsafe_numeric_signal_count == 0
 
 
 def test_control_frame_round_trip_and_validation_are_bounded() -> None:
