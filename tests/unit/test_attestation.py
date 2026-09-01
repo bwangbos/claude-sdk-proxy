@@ -551,6 +551,27 @@ class _CloseFaultSelector:
         self.selector.close()
 
 
+class _BlockingCloseStream:
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.close_count = 0
+
+    @property
+    def closed(self) -> bool:
+        return self.stream.closed
+
+    def fileno(self) -> int:
+        return self.stream.fileno()
+
+    def close(self) -> None:
+        self.close_count += 1
+        self.entered.set()
+        assert self.release.wait(timeout=2)
+        self.stream.close()
+
+
 @pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
 def test_selector_construction_failure_cleans_captured_version_owner(
     tmp_path: Path,
@@ -738,6 +759,173 @@ def test_post_reap_close_failure_retains_resource_only_owner(
             for stream in (owner.process.stdout, owner.process.stderr):
                 if stream is not None and not stream.closed:
                     stream.close()
+
+
+@pytest.mark.parametrize(
+    "failure_type", [KeyboardInterrupt, MemoryError, SystemExit, RuntimeError]
+)
+def test_popen_baseexception_retains_ambiguous_spawn_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    calls = 0
+    signals: list[tuple[int, int]] = []
+
+    def fail_popen(*_args: object, **_kwargs: object) -> Never:
+        nonlocal calls
+        calls += 1
+        raise failure_type("injected Popen failure")
+
+    monkeypatch.setattr(implementation.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(
+        implementation.os,
+        "killpg",
+        lambda pgid, signal_number: signals.append((pgid, signal_number)),
+    )
+    try:
+        with _launch_inputs(tmp_path) as inputs:
+            with pytest.raises(failure_type, match="Popen failure"):
+                _prepare(inputs)
+            assert len(implementation._RETAINED_VERSION_PROBES) == 1
+            reservation = next(iter(implementation._RETAINED_VERSION_PROBES.values()))
+            assert (
+                reservation.state
+                is implementation._VersionProbeOwnerState.AMBIGUOUS_SPAWN
+            )
+            assert reservation.process is None
+            with pytest.raises(AttestationError, match="cleanup is unconfirmed"):
+                _prepare(inputs)
+        assert calls == 1
+        assert signals == []
+    finally:
+        implementation._RETAINED_VERSION_PROBES.clear()
+
+
+def test_interrupt_between_popen_return_and_promotion_retains_exact_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes: list[Any] = []
+
+    def interrupt_before_promotion(_reservation: Any, process: Any) -> Never:
+        processes.append(process)
+        raise KeyboardInterrupt("injected before promotion")
+
+    monkeypatch.setattr(
+        implementation,
+        "_promote_version_probe_reservation",
+        interrupt_before_promotion,
+    )
+    try:
+        with _launch_inputs(tmp_path) as inputs:
+            with pytest.raises(KeyboardInterrupt, match="before promotion"):
+                _prepare(inputs)
+            assert len(processes) == 1
+            assert len(implementation._RETAINED_VERSION_PROBES) == 1
+            owner = next(iter(implementation._RETAINED_VERSION_PROBES.values()))
+            assert owner.process is processes[0]
+            assert (
+                owner.state
+                is implementation._VersionProbeOwnerState.AMBIGUOUS_SPAWN
+            )
+    finally:
+        if processes:
+            process = processes[0]
+            process.wait(timeout=2)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+        implementation._RETAINED_VERSION_PROBES.clear()
+
+
+def _spawn_finished_version_probe(inputs: _LaunchInputs) -> Any:
+    effective = build_child_environment(inputs.source, inputs.environment_config)
+    owner = implementation._spawn_and_register_version_probe(
+        inputs.descriptors.real_cli, effective
+    )
+    assert owner.process.stdout is not None
+    assert owner.process.stderr is not None
+    owner.process.stdout.read()
+    owner.process.stderr.read()
+    return owner
+
+
+@pytest.mark.parametrize("status_available", [False, True])
+def test_wait_baseexception_reconciles_only_available_exit_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_available: bool,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        owner = _spawn_finished_version_probe(inputs)
+        original_wait = owner.process.wait
+
+        def interrupting_wait(*args: object, **kwargs: object) -> Never:
+            if status_available:
+                original_wait(*args, **kwargs)
+            raise KeyboardInterrupt("injected wait interruption")
+
+        monkeypatch.setattr(owner.process, "wait", interrupting_wait)
+        try:
+            with pytest.raises(KeyboardInterrupt, match="wait interruption"):
+                implementation._reap_version_probe_leader(owner)
+            expected = (
+                implementation._VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+                if status_available
+                else implementation._VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+            )
+            assert owner.state is expected
+            assert (owner.process.returncode is not None) is status_available
+            assert implementation._RETAINED_VERSION_PROBES == {
+                owner.leader_pid: owner
+            }
+        finally:
+            monkeypatch.setattr(owner.process, "wait", original_wait)
+            if (
+                owner.process.returncode is not None
+                and owner.state
+                is implementation._VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+            ):
+                owner.state = (
+                    implementation._VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+                )
+            implementation._cleanup_version_probe_owner(owner)
+
+
+def test_concurrent_reaped_cleanup_retries_are_serialized(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        owner = _spawn_finished_version_probe(inputs)
+        implementation._reap_version_probe_leader(owner)
+        assert owner.process.stdout is not None
+        blocking = _BlockingCloseStream(owner.process.stdout)
+        owner.process.stdout = blocking  # type: ignore[assignment]
+        outcomes: list[BaseException | None] = []
+
+        def cleanup() -> None:
+            try:
+                implementation._cleanup_version_probe_owner(owner)
+            except BaseException as error:
+                outcomes.append(error)
+            else:
+                outcomes.append(None)
+
+        first = threading.Thread(target=cleanup)
+        second = threading.Thread(target=cleanup)
+        first.start()
+        assert blocking.entered.wait(timeout=2)
+        second.start()
+        time.sleep(0.05)
+        blocking.release.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+        assert not first.is_alive() and not second.is_alive()
+        assert blocking.close_count == 1
+        assert sum(outcome is None for outcome in outcomes) == 1
+        assert sum(isinstance(outcome, AttestationError) for outcome in outcomes) == 1
+        assert owner.leader_pid not in implementation._RETAINED_VERSION_PROBES
 
 
 def test_prepare_binds_workdir_to_task5_instance(tmp_path: Path) -> None:
