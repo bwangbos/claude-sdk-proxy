@@ -328,13 +328,14 @@ def _snapshot_cli(path: Path) -> CliExecutableIdentity:
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _VersionProbeOwner:
     """Exact direct-child/group ownership retained until group absence."""
 
     process: subprocess.Popen[bytes]
     leader_pid: int
     pgid: int
+    selector: selectors.BaseSelector | None = None
 
 
 _VERSION_PROBE_LOCK = threading.Lock()
@@ -468,6 +469,7 @@ def _terminate_version_probe(owner: _VersionProbeOwner) -> None:
         ):
             raise AttestationError("version probe group cleanup is unconfirmed")
         _reap_version_probe_leader(owner)
+        _RETAINED_VERSION_PROBES.pop(owner.leader_pid, None)
     except BaseException:
         # Retaining the unreaped direct-child Popen object preserves the PID /
         # PGID reuse sentinel. Future probes fail closed rather than signal a
@@ -511,6 +513,35 @@ def _finish_version_probe(owner: _VersionProbeOwner, deadline: float) -> int:
     return _reap_version_probe_leader(owner)
 
 
+def _close_version_probe_resources(
+    owner: _VersionProbeOwner, *, preserve_pipes: bool
+) -> None:
+    first_error: BaseException | None = None
+    selector = owner.selector
+    if selector is not None:
+        try:
+            selector.close()
+        except BaseException as error:
+            first_error = error
+        else:
+            owner.selector = None
+    if not preserve_pipes:
+        for stream in (
+            owner.process.stdin,
+            owner.process.stdout,
+            owner.process.stderr,
+        ):
+            if stream is None or stream.closed:
+                continue
+            try:
+                stream.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+    if first_error is not None:
+        raise first_error
+
+
 def _run_bounded_version_probe(
     path: Path, environment: Mapping[str, str]
 ) -> tuple[int, bytes, bytes]:
@@ -535,26 +566,24 @@ def _run_bounded_version_probe_locked(
     except OSError as error:
         raise AttestationError("CLI version measurement failed") from error
     owner = _capture_version_probe_owner(process)
-    if process.stdout is None or process.stderr is None:
-        _terminate_version_probe(owner)
-        raise AttestationError("CLI version probe pipes are unavailable")
-
-    streams = (process.stdout, process.stderr)
-    outputs = {
-        process.stdout.fileno(): bytearray(),
-        process.stderr.fileno(): bytearray(),
-    }
-    selector = selectors.DefaultSelector()
-    deadline = time.monotonic() + _VERSION_PROBE_TIMEOUT_SECONDS
     try:
+        if process.stdout is None or process.stderr is None:
+            raise AttestationError("CLI version probe pipes are unavailable")
+        streams = (process.stdout, process.stderr)
+        outputs = {
+            process.stdout.fileno(): bytearray(),
+            process.stderr.fileno(): bytearray(),
+        }
+        owner.selector = selectors.DefaultSelector()
+        deadline = time.monotonic() + _VERSION_PROBE_TIMEOUT_SECONDS
         for stream in streams:
             os.set_blocking(stream.fileno(), False)
-            selector.register(stream.fileno(), selectors.EVENT_READ)
-        while selector.get_map():
+            owner.selector.register(stream.fileno(), selectors.EVENT_READ)
+        while owner.selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AttestationError("CLI version measurement timed out")
-            events = selector.select(remaining)
+            events = owner.selector.select(remaining)
             if not events:
                 raise AttestationError("CLI version measurement timed out")
             for key, _mask in events:
@@ -563,7 +592,7 @@ def _run_bounded_version_probe_locked(
                 except BlockingIOError:
                     continue
                 if not chunk:
-                    selector.unregister(key.fd)
+                    owner.selector.unregister(key.fd)
                     continue
                 output = outputs[key.fd]
                 output.extend(chunk)
@@ -576,12 +605,21 @@ def _run_bounded_version_probe_locked(
             bytes(outputs[process.stderr.fileno()]),
         )
     except BaseException:
-        _terminate_version_probe(owner)
+        if owner.process.returncode is None:
+            _terminate_version_probe(owner)
         raise
     finally:
-        selector.close()
-        for stream in streams:
-            stream.close()
+        retained = _RETAINED_VERSION_PROBES.get(owner.leader_pid) is owner
+        if retained:
+            try:
+                _close_version_probe_resources(owner, preserve_pipes=True)
+            except BaseException:
+                # The strong retained owner also retains a selector that could
+                # not be closed. Preserve the primary unconfirmed-cleanup
+                # failure and all process pipes for later operator recovery.
+                pass
+        else:
+            _close_version_probe_resources(owner, preserve_pipes=False)
 
 
 def _measure_cli(

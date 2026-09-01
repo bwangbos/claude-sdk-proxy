@@ -585,9 +585,7 @@ def test_unproved_post_capture_cleanup_retains_owner_and_blocks_future_probe(
                 _prepare(inputs)
             assert len(captured) == 1
             owner = captured[0]
-            assert implementation._RETAINED_VERSION_PROBES == {
-                owner.leader_pid: owner
-            }
+            assert implementation._RETAINED_VERSION_PROBES == {owner.leader_pid: owner}
             assert owner.process.returncode is None
             assert not owner.process.stdout.closed
             assert not owner.process.stderr.closed
