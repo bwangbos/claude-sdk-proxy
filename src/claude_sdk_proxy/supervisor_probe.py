@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -36,6 +36,44 @@ _WORKDIR_NAME = "allocation.workdir"
 _RETAINED_CLEANUP_ACTORS: list[subprocess.Popen[bytes]] = []
 _RETAINED_CLEANUP_DIRECTORIES: list[tempfile.TemporaryDirectory[str]] = []
 _RETAINED_UNCONFIRMED_PATHS: list[Path] = []
+_ProcessIdentityTuple = tuple[int, int, int, int, int, int, int, bytes, bytes]
+
+
+@dataclass
+class _RetainedActorChain:
+    """Owned exception-path resources awaiting an explicit reconciler."""
+
+    flow: str
+    instance: Path
+    parent_dirfd: int
+    journal: Journal
+    process: subprocess.Popen[bytes]
+    anchor: _ProcessIdentityTuple
+    controls: tuple[socket.socket, ...]
+    executor_task4_reaped: bool
+
+
+@dataclass(frozen=True)
+class _RetainedActorChainInspection:
+    flow: str
+    canonical_state: str
+    actor_live_or_task4_reaped: bool
+    supervisor_task4_reaped: bool
+    anchor_identity_exact: bool
+    workdir_retained: bool
+    journal_retained: bool
+
+
+@dataclass(frozen=True)
+class _TestActorChainTeardown:
+    group_absent: bool
+    supervisor_child_reaped: bool
+    untracked_orphan_count: int
+    workdir_retained: bool
+    journal_retained: bool
+
+
+_RETAINED_ACTOR_CHAINS: list[_RetainedActorChain] = []
 _CONTROL_MAGIC = 0x464C5043
 _CONTROL_VERSION = 1
 _CONTROL_HEADER_SIZE = 44
@@ -152,6 +190,15 @@ _CLEANUP_GROUP_RESUMED_AFTER_FAILURE = 1 << 14
 
 class SupervisorProbeError(RuntimeError):
     """A native lifecycle substitute failed closed without exposing content."""
+
+
+def _python_exception_checkpoint(flow: str, checkpoint: str) -> None:
+    """Private deterministic fault boundary replaced only by Darwin tests."""
+
+
+def _retained_actor_chain_count() -> int:
+    """Return the number of exception paths still owned by the reconciler."""
+    return len(_RETAINED_ACTOR_CHAINS)
 
 
 @dataclass(frozen=True)
@@ -395,6 +442,10 @@ def _fresh_group_is_absent(pgid: int) -> bool:
             os.killpg(pgid, 0)
         except ProcessLookupError:
             return True
+        except PermissionError:
+            # A just-killed, unreaped group leader can remain observable but
+            # unsignalable until its retaining parent exits and reaps it.
+            pass
         time.sleep(0.001)
     return False
 
@@ -456,6 +507,161 @@ def _teardown_recorded_fresh_group(pgid: int) -> bool:
     return _fresh_group_is_absent(pgid)
 
 
+def _retain_failed_actor_chain(
+    flow: str,
+    instance: Path,
+    parent_dirfd: int,
+    journal: Journal,
+    process: subprocess.Popen[bytes],
+    anchor: _ProcessIdentityTuple,
+    controls: tuple[socket.socket | None, ...],
+    *,
+    executor_task4_reaped: bool,
+) -> None:
+    """Transfer every live handle after persisting a no-action terminal state."""
+    try:
+        head = journal.certify_head()
+        if head.state.kind.name not in {"DONE", "UNCONFIRMED"}:
+            journal.mark_unconfirmed(UnconfirmedReason.PROOF_UNAVAILABLE)
+            journal.certify_head()
+    except JournalError:
+        # The current durable prefix still owns the actor.  Losing its open
+        # handles would be less safe than retaining it for reconciliation.
+        pass
+    retained_controls = tuple(control for control in controls if control is not None)
+    _RETAINED_ACTOR_CHAINS.append(
+        _RetainedActorChain(
+            flow=flow,
+            instance=instance,
+            parent_dirfd=parent_dirfd,
+            journal=journal,
+            process=process,
+            anchor=anchor,
+            controls=retained_controls,
+            executor_task4_reaped=executor_task4_reaped,
+        )
+    )
+    if instance not in _RETAINED_UNCONFIRMED_PATHS:
+        _RETAINED_UNCONFIRMED_PATHS.append(instance)
+
+
+def _recover_failed_actor_via_task4(
+    journal: Journal,
+    process: subprocess.Popen[bytes],
+) -> bool:
+    """Reap a naturally failed supervisor through the exact Task 4 authority."""
+    reaped = False
+    try:
+        exit_code = _wait_for_unreaped_exit(process.pid)
+        head = journal.scan().head
+        kind = head.record.kind.name
+        if kind in {"ACTIVE_READY", "BATCH_ACTIVE"}:
+            while time.monotonic_ns() <= head.record.lease_deadline_ns:
+                time.sleep(0.001)
+            head = journal.retire_executor(
+                authority="exception-reconciler",
+                authority_epoch=1,
+                authority_deadline_ns=time.monotonic_ns() + 1_000_000_000,
+            )
+            kind = head.record.kind.name
+        if kind not in {"RETIRING_IDLE", "RETIRING_BATCH"}:
+            return False
+        proof = journal.confirm_executor_reaped(
+            deadline_ns=time.monotonic_ns() + 5_000_000_000
+        )
+        process.returncode = exit_code
+        reaped = True
+        if kind == "RETIRING_BATCH":
+            journal.reconcile_interrupted_batch(proof)
+        terminal = journal.mark_unconfirmed(UnconfirmedReason.PROOF_UNAVAILABLE)
+        certified = journal.certify_head()
+        return (
+            proof.pid == process.pid
+            and certified.sequence == terminal.sequence
+            and certified.state.kind.name == "UNCONFIRMED"
+        )
+    except (JournalError, SupervisorProbeError):
+        return reaped
+
+
+def _child_is_live_or_reapable(pid: int) -> bool:
+    try:
+        waited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        return False
+    if waited is not None and waited.si_pid == pid:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _inspect_last_retained_actor_chain() -> _RetainedActorChainInspection:
+    """Expose value-free retained-state evidence to the deterministic test."""
+    retained = _RETAINED_ACTOR_CHAINS[-1]
+    head = retained.journal.certify_head()
+    try:
+        observed = retained.journal.observe_process(retained.anchor[0])
+    except JournalError:
+        anchor_exact = _fresh_group_is_absent(retained.anchor[3])
+    else:
+        anchor_exact = _same_parsed_identity(observed, retained.anchor)
+    return _RetainedActorChainInspection(
+        flow=retained.flow,
+        canonical_state=head.state.kind.name,
+        actor_live_or_task4_reaped=(
+            retained.executor_task4_reaped
+            or _child_is_live_or_reapable(retained.process.pid)
+        ),
+        supervisor_task4_reaped=retained.executor_task4_reaped,
+        anchor_identity_exact=anchor_exact,
+        workdir_retained=(retained.instance / _WORKDIR_NAME).is_dir(),
+        journal_retained=(retained.instance / _JOURNAL_NAME).is_file(),
+    )
+
+
+def _test_release_last_retained_actor_chain() -> _TestActorChainTeardown:
+    """Test-only teardown of the newest freshly created exact actor chain."""
+    retained = _RETAINED_ACTOR_CHAINS.pop()
+    try:
+        observed = retained.journal.observe_process(retained.anchor[0])
+    except JournalError:
+        observed = None
+    if observed is not None:
+        if not _same_parsed_identity(observed, retained.anchor):
+            _RETAINED_ACTOR_CHAINS.append(retained)
+            raise SupervisorProbeError("test teardown anchor identity drifted")
+        if _process_is_stopped(observed.pid):
+            os.killpg(observed.pgid, signal.SIGCONT)
+        os.killpg(observed.pgid, signal.SIGKILL)
+    for control in retained.controls:
+        control.close()
+    supervisor_child_reaped = retained.executor_task4_reaped
+    if not retained.executor_task4_reaped:
+        try:
+            retained.process.wait(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            _RETAINED_ACTOR_CHAINS.append(retained)
+            raise SupervisorProbeError(
+                "fresh supervisor did not exit after test control teardown"
+            ) from error
+        supervisor_child_reaped = True
+    group_absent = _fresh_group_is_absent(retained.anchor[3])
+    if retained.process.stderr is not None:
+        retained.process.stderr.close()
+    retained.journal.close()
+    os.close(retained.parent_dirfd)
+    return _TestActorChainTeardown(
+        group_absent=group_absent,
+        supervisor_child_reaped=supervisor_child_reaped,
+        untracked_orphan_count=0 if group_absent and supervisor_child_reaped else 1,
+        workdir_retained=(retained.instance / _WORKDIR_NAME).is_dir(),
+        journal_retained=(retained.instance / _JOURNAL_NAME).is_file(),
+    )
+
+
 def _run_real_wedged_supervisor() -> LifecycleEvidence:
     instance = Path(tempfile.mkdtemp(prefix="claude-real-wedged-"))
     parent_dirfd = _open_private_directory(instance)
@@ -469,6 +675,7 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
         tuple[int, int, int, int, int, int, int, bytes, bytes] | None
     ) = None
     retained = False
+    resources_transferred = False
     try:
         _make_lock_files(parent_dirfd)
         journal, receipt = Journal.create_at(
@@ -531,12 +738,14 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
         trace.append(running_name)
         running = journal.certify_bootstrap(7, running_payload)
         anchor_identity = _parse_process_identity(anchor_payload)
+        _python_exception_checkpoint("wedged", "anchor_identity_known")
         active = journal.scan().head
         if (
             active.record.kind.name != "ACTIVE_READY"
             or active.record.process_pid != process.pid
         ):
             raise SupervisorProbeError("real wedged supervisor is not executor")
+        _python_exception_checkpoint("wedged", "executor_observed")
         retirement_blocked = False
         try:
             journal.retire_executor(
@@ -546,25 +755,20 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
             )
         except JournalError:
             retirement_blocked = True
-        if not retirement_blocked or process.poll() is not None:
+        if not retirement_blocked:
             raise SupervisorProbeError("live wedged supervisor was replaceable")
+        _python_exception_checkpoint("wedged", "retirement_blocked")
         observed_supervisor = journal.observe_process(process.pid)
         if observed_supervisor.pid != active.record.process_pid:
             raise SupervisorProbeError("wedged executor identity drifted")
+        _python_exception_checkpoint("wedged", "supervisor_identity_observed")
         terminal = journal.mark_unconfirmed(UnconfirmedReason.PROOF_UNAVAILABLE)
+        _python_exception_checkpoint("wedged", "unconfirmed_persisted")
         certified = journal.certify_head()
-        process.kill()
-        process.wait(timeout=5)
-        teardown_absent = _teardown_fresh_actor_group(
-            journal,
-            anchor_identity,
-            stopped=False,
-        )
-        if not teardown_absent:
-            raise SupervisorProbeError("wedged group survived test teardown")
+        _python_exception_checkpoint("wedged", "unconfirmed_certified")
         retained = True
         _RETAINED_UNCONFIRMED_PATHS.append(instance)
-        return LifecycleEvidence(
+        evidence = LifecycleEvidence(
             scenario="wedged_supervisor",
             outcome="unconfirmed",
             anchor_alive=True,
@@ -595,27 +799,72 @@ def _run_real_wedged_supervisor() -> LifecycleEvidence:
             observed_handoff_records=2,
             observed_live_executor=True,
             production_recovery_signal_count=0,
-            test_teardown_group_absent=teardown_absent,
-            untracked_orphan_count=0,
             original_supervisor_actor_chain=True,
         )
+        _python_exception_checkpoint("wedged", "evidence_captured")
+        _retain_failed_actor_chain(
+            "wedged",
+            instance,
+            parent_dirfd,
+            journal,
+            process,
+            anchor_identity,
+            (parent_control, parent_fallback),
+            executor_task4_reaped=False,
+        )
+        resources_transferred = True
+        teardown = _test_release_last_retained_actor_chain()
+        if not teardown.group_absent or not teardown.supervisor_child_reaped:
+            raise SupervisorProbeError("wedged actor chain survived test teardown")
+        return replace(
+            evidence,
+            test_teardown_group_absent=teardown.group_absent,
+            untracked_orphan_count=teardown.untracked_orphan_count,
+        )
+    except BaseException:
+        if (
+            not resources_transferred
+            and journal is not None
+            and process is not None
+            and anchor_identity is not None
+        ):
+            _retain_failed_actor_chain(
+                "wedged",
+                instance,
+                parent_dirfd,
+                journal,
+                process,
+                anchor_identity,
+                (parent_control, parent_fallback),
+                executor_task4_reaped=False,
+            )
+            resources_transferred = True
+        raise
     finally:
-        if parent_control is not None:
+        if parent_control is not None and not resources_transferred:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None:
+        if parent_fallback is not None and not resources_transferred:
             parent_fallback.close()
         if child_fallback is not None:
             child_fallback.close()
-        if process is not None and process.poll() is None:
-            process.kill()
+        if (
+            process is not None
+            and not resources_transferred
+            and anchor_identity is None
+        ):
             process.wait(timeout=5)
-        if process is not None and process.stderr is not None:
+        if (
+            process is not None
+            and process.stderr is not None
+            and not resources_transferred
+        ):
             process.stderr.close()
-        if journal is not None:
+        if journal is not None and not resources_transferred:
             journal.close()
-        os.close(parent_dirfd)
+        if not resources_transferred:
+            os.close(parent_dirfd)
         if not retained:
             _RETAINED_UNCONFIRMED_PATHS.append(instance)
 
@@ -650,6 +899,8 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
     ) = None
     executor_reaped = False
     retained = False
+    resources_transferred = False
+    cleanup_requested = False
     try:
         _make_lock_files(parent_dirfd)
         journal, receipt = Journal.create_at(
@@ -716,20 +967,28 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
         trace.append(running_name)
         running = journal.certify_bootstrap(7, running_payload)
         anchor_identity = _parse_process_identity(anchor_payload)
+        _python_exception_checkpoint("actor_loss", "anchor_identity_known")
         cleanup_expectation = _prepare_cleanup_request(journal)
+        _python_exception_checkpoint("actor_loss", "cleanup_request_prepared")
         cleanup_sequence = cleanup_expectation.sequence
         parent_control.sendall(_cleanup_request_frame(cleanup_expectation))
+        cleanup_requested = True
+        _python_exception_checkpoint("actor_loss", "cleanup_request_sent")
         if injection_code != 11:
             ack_name, ack_payload = _receive_control_frame(parent_control, 12)
             _accept_cleanup_ack(cleanup_expectation, ack_name, ack_payload)
+            _python_exception_checkpoint("actor_loss", "cleanup_ack_accepted")
         exit_code = _wait_for_unreaped_exit(process.pid)
         if exit_code != 86:
             raise SupervisorProbeError(
                 f"actor-loss checkpoint exited with code {exit_code}"
             )
+        _python_exception_checkpoint("actor_loss", "actor_loss_observed")
         error_payload = struct.pack("<I", 100 + injection_code)
         injected = journal.certify_bootstrap(11, error_payload)
+        _python_exception_checkpoint("actor_loss", "actor_loss_record_certified")
         before_recovery = journal.scan().head
+        _python_exception_checkpoint("actor_loss", "recovery_head_observed")
         batch_active = before_recovery.record.kind.name == "BATCH_ACTIVE"
         process_target_exact = False
         exact_batch = ""
@@ -758,8 +1017,12 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
                 stale_blocked = True
             if not stale_blocked:
                 raise SupervisorProbeError("dead supervisor authority was reused")
+            _python_exception_checkpoint(
+                "actor_loss", "dead_executor_reuse_rejected"
+            )
         while time.monotonic_ns() <= before_recovery.record.lease_deadline_ns:
             time.sleep(0.001)
+        _python_exception_checkpoint("actor_loss", "executor_lease_expired")
         authority_deadline = time.monotonic_ns() + (
             50_000_000 if name == "retirement_replacement" else 1_000_000_000
         )
@@ -768,6 +1031,7 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             authority_epoch=1,
             authority_deadline_ns=authority_deadline,
         )
+        _python_exception_checkpoint("actor_loss", "executor_retired")
         handoff_records = 1
         if name == "retirement_replacement":
             while time.monotonic_ns() <= authority_deadline:
@@ -777,15 +1041,22 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
                 authority_epoch=2,
                 authority_deadline_ns=time.monotonic_ns() + 1_000_000_000,
             )
+            _python_exception_checkpoint(
+                "actor_loss", "retirement_authority_replaced"
+            )
             handoff_records += 1
         proof = journal.confirm_executor_reaped(
             deadline_ns=time.monotonic_ns() + 5_000_000_000
         )
         executor_reaped = True
         process.returncode = exit_code
+        _python_exception_checkpoint("actor_loss", "executor_reap_confirmed")
         reconciled = None
         if retired.record.kind.name == "RETIRING_BATCH":
             reconciled = journal.reconcile_interrupted_batch(proof)
+            _python_exception_checkpoint(
+                "actor_loss", "interrupted_batch_reconciled"
+            )
             handoff_records += 1
         successor = None
         activated = None
@@ -796,25 +1067,23 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
                 "recovery-2",
                 claim_deadline_ns=time.monotonic_ns() + 1_000_000_000,
             )
+            _python_exception_checkpoint("actor_loss", "successor_prepared")
             activated = journal.activate_executor(
                 2,
                 "recovery-2",
                 os.getpid(),
                 lease_deadline_ns=time.monotonic_ns() + 1_000_000_000,
             )
+            _python_exception_checkpoint("actor_loss", "successor_activated")
             handoff_records += 2
         group_stopped = injection_code in {2, 3} and _process_is_stopped(
             anchor_identity[0]
         )
+        _python_exception_checkpoint("actor_loss", "group_state_observed")
         terminal = journal.mark_unconfirmed(UnconfirmedReason.PROOF_UNAVAILABLE)
+        _python_exception_checkpoint("actor_loss", "unconfirmed_persisted")
         certified = journal.certify_head()
-        teardown_absent = _teardown_fresh_actor_group(
-            journal,
-            anchor_identity,
-            stopped=group_stopped,
-        )
-        if not teardown_absent:
-            raise SupervisorProbeError("fresh actor-loss group survived test teardown")
+        _python_exception_checkpoint("actor_loss", "unconfirmed_certified")
         retained = True
         _RETAINED_UNCONFIRMED_PATHS.append(instance)
         canonical_sequences = (
@@ -823,7 +1092,7 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             armed_sequence,
             running.sequence,
         )
-        return LifecycleEvidence(
+        evidence = LifecycleEvidence(
             scenario=name,
             outcome="unconfirmed",
             stop_used=injection_code in {2, 3, 4, 5, 6},
@@ -886,28 +1155,81 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
                 and (not batch_active or reconciled is not None)
             ),
             production_recovery_signal_count=0,
-            test_teardown_group_absent=teardown_absent,
-            untracked_orphan_count=0,
             original_supervisor_actor_chain=True,
             observed_handoff_records=handoff_records,
         )
+        _python_exception_checkpoint("actor_loss", "evidence_captured")
+        _retain_failed_actor_chain(
+            "actor_loss",
+            instance,
+            parent_dirfd,
+            journal,
+            process,
+            anchor_identity,
+            (parent_control, parent_fallback),
+            executor_task4_reaped=executor_reaped,
+        )
+        resources_transferred = True
+        teardown = _test_release_last_retained_actor_chain()
+        if not teardown.group_absent or not teardown.supervisor_child_reaped:
+            raise SupervisorProbeError(
+                "fresh actor-loss chain survived test teardown"
+            )
+        return replace(
+            evidence,
+            test_teardown_group_absent=teardown.group_absent,
+            untracked_orphan_count=teardown.untracked_orphan_count,
+        )
+    except BaseException:
+        if (
+            not resources_transferred
+            and journal is not None
+            and process is not None
+            and anchor_identity is not None
+        ):
+            if cleanup_requested and not executor_reaped:
+                executor_reaped = _recover_failed_actor_via_task4(
+                    journal,
+                    process,
+                )
+            _retain_failed_actor_chain(
+                "actor_loss",
+                instance,
+                parent_dirfd,
+                journal,
+                process,
+                anchor_identity,
+                (parent_control, parent_fallback),
+                executor_task4_reaped=executor_reaped,
+            )
+            resources_transferred = True
+        raise
     finally:
-        if parent_control is not None:
+        if parent_control is not None and not resources_transferred:
             parent_control.close()
         if child_control is not None:
             child_control.close()
-        if parent_fallback is not None:
+        if parent_fallback is not None and not resources_transferred:
             parent_fallback.close()
         if child_fallback is not None:
             child_fallback.close()
-        if process is not None and process.poll() is None and not executor_reaped:
-            process.kill()
+        if (
+            process is not None
+            and not resources_transferred
+            and anchor_identity is None
+            and not executor_reaped
+        ):
             process.wait(timeout=5)
-        if process is not None and process.stderr is not None:
+        if (
+            process is not None
+            and process.stderr is not None
+            and not resources_transferred
+        ):
             process.stderr.close()
-        if journal is not None:
+        if journal is not None and not resources_transferred:
             journal.close()
-        os.close(parent_dirfd)
+        if not resources_transferred:
+            os.close(parent_dirfd)
         if not retained:
             _RETAINED_UNCONFIRMED_PATHS.append(instance)
 

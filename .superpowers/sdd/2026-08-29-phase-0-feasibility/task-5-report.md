@@ -467,3 +467,91 @@ pre-existing allocation was contacted or modified. Production-path signals
 were emitted only by the original retaining supervisor before injected death;
 all other signals were explicitly separated test teardown of freshly spawned,
 deterministically identified Task 5 process groups.
+
+## Fix Round 4
+
+Fix Round 4 base: `6963b6b935d373dd8d5df01cb086f4a352f3c64a`
+
+Fix Round 4 commit: this commit
+
+### Review finding disposition
+
+- Actor-loss and wedged Python exception paths no longer call `poll`, `kill`,
+  or `wait` on the original supervisor in their production evidence cleanup.
+  Once anchor identity is known, journal, directory, control sockets, stderr,
+  `Popen`, and exact anchor identity transfer atomically to an in-memory
+  retained-chain owner before stack unwinding can close or reap them.
+- The exception owner first appends and certifies durable `UNCONFIRMED` when
+  the current Task 4 state permits it. If an injected supervisor has naturally
+  become reapable after the exact cleanup request, it instead waits for the
+  recorded lease, retires the exact executor, reaps it through Task 4,
+  reconciles an interrupted exact batch where present, and only then persists
+  `UNCONFIRMED`. A pre-request or wedged live supervisor remains live with all
+  control and journal handles retained for a caller/reconciler.
+- Normal lifecycle evidence is constructed before any test cleanup. The
+  separately named test-only release path re-observes the exact fresh anchor,
+  resumes it when stopped, signals only that anchor's fresh group, closes its
+  retained control channels, waits for natural supervisor exit or recognizes
+  its prior Task 4 reap, and proves both group absence and zero untracked
+  orphans. It closes every retained FD exactly once and deliberately leaves the
+  durable `UNCONFIRMED` journal and workdir present.
+- The former wedged-path `process.poll()/kill()/wait()` sequence was removed.
+  The live-executor rejection is now established by the failed Task 4
+  retirement plus exact process observation, so observing evidence cannot
+  accidentally reap the supervisor.
+
+### TDD evidence
+
+The first RED run failed because no retained-chain inspection/release contract
+existed. After the initial retention slice, the 26-row matrix exposed that
+post-request exception paths retained a reapable supervisor without completing
+available Task 4 recovery. The final GREEN implementation distinguishes these
+cases: two pre-request checkpoints retain the live actor, while every later
+actor-loss checkpoint proves Task 4 supervisor reap before test teardown.
+
+The deterministic matrix injects a Python exception after every meaningful
+top-level checkpoint once anchor identity is known: 19 actor-loss points from
+request preparation through ACK, death observation, retirement, exact-batch
+reconciliation, successor activation, terminal certification, and evidence
+capture; plus seven wedged points from executor observation through terminal
+certification and evidence capture. Every row proves certified
+`UNCONFIRMED`, exact anchor identity or absence, retained artifacts, live actor
+or Task 4 reap, exact test-only group absence, zero orphan count, and no
+`ResourceWarning`.
+
+Final focused command:
+
+```text
+UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache uv run pytest --strict-markers --forbid-skips -W error tests/darwin/test_bootstrap.py tests/darwin/test_group_cleanup.py tests/darwin/test_anchor_fallback.py tests/darwin/test_reconciliation.py -v
+```
+
+It collected 63 tests and passed all 63 with zero skips, XPASS, or warnings in
+18.64 seconds. A final bounded stress run repeated all 26 exception rows three
+times; all 78 executions passed.
+
+### Fix-round full verification
+
+- `UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache make check`: 151 unit tests
+  passed; Ruff and strict mypy were clean.
+- Host-permission `UV_CACHE_DIR=/private/tmp/claude-proxy-uv-cache make
+  darwin`: 168 Darwin tests passed with zero skips, XPASS, or warnings.
+- `make -B native` rebuilt all seven native targets with Apple clang strict C17
+  flags (`-Wall -Wextra -Werror -pedantic`).
+- Apple clang static analysis of `native/lifecycle.c`, production and probe
+  supervisor variants, `native/claude_anchor.c`, and
+  `native/claude_probe_child.c` produced five empty 370-byte plist reports and
+  no diagnostics.
+- `file` reports arm64 Mach-O for both supervisors, the anchor, probe child,
+  and both lifecycle dylibs. `otool -L` confirms all lifecycle consumers use
+  the exact production `@rpath` install name.
+- The production dylib exports no `_cpl_fault_*` symbol. The production
+  supervisor contains no Task 5 injection selector or injection-name strings;
+  the separately compiled probe supervisor contains the expected selectors.
+  Existing compile-time and Python ABI assertions remained green.
+- `git diff --check` is clean, and no analyzer output was written into the
+  worktree.
+
+No Claude CLI, model, credential, network peer, pre-existing process, or
+pre-existing allocation was contacted or modified. Signals were confined to
+fresh, exactly re-observed Task 5 groups under the user's scoped authorization.
+No retained `UNCONFIRMED` artifact was deleted.
