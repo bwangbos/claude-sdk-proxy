@@ -606,6 +606,47 @@ class _ReentrantCloseResource:
         self.resource.close()
 
 
+class _EffectThenReentrantSelector:
+    def __init__(self, selector: Any, owner: Any, *, reentry: str) -> None:
+        self.selector = selector
+        self.owner = owner
+        self.reentry = reentry
+        self.in_callback = False
+        self.close_count = 0
+        self.real_close_count = 0
+        self.recursive_errors: list[AttestationError] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.selector, name)
+
+    def _reenter(self) -> AttestationError:
+        try:
+            implementation._cleanup_version_probe_owner(self.owner)
+        except AttestationError as error:
+            self.recursive_errors.append(error)
+            return error
+        raise AssertionError("recursive selector cleanup unexpectedly succeeded")
+
+    def _close_real_selector(self) -> None:
+        self.real_close_count += 1
+        self.selector.close()
+
+    def close(self) -> None:
+        self.close_count += 1
+        if self.in_callback:
+            raise AssertionError("recursive cleanup repeated selector close")
+        self.in_callback = True
+        try:
+            if self.reentry == "before":
+                error = self._reenter()
+                self._close_real_selector()
+                raise error
+            self._close_real_selector()
+            raise self._reenter()
+        finally:
+            self.in_callback = False
+
+
 @pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
 def test_selector_construction_failure_cleans_captured_version_owner(
     tmp_path: Path,
@@ -770,14 +811,24 @@ def test_post_reap_close_failure_retains_resource_only_owner(
         assert implementation._RETAINED_VERSION_PROBES == {owner.leader_pid: owner}
         owner.state = original_state
 
-        faults[0].fail_close = False
-
         def forbidden_killpg(_pgid: int, _signal: int) -> Never:
             raise AssertionError("post-reap cleanup attempted group signaling")
 
         monkeypatch.setattr(implementation.os, "killpg", forbidden_killpg)
-        implementation._cleanup_version_probe_owner(owner)
-        assert owner.leader_pid not in implementation._RETAINED_VERSION_PROBES
+        faults[0].fail_close = False
+        if resource == "selector":
+            assert (
+                owner.selector_close_disposition
+                is implementation._VersionProbeSelectorCloseDisposition.AMBIGUOUS
+            )
+            with pytest.raises(AttestationError, match="selector close is ambiguous"):
+                implementation._cleanup_version_probe_owner(owner)
+            assert implementation._RETAINED_VERSION_PROBES == {
+                owner.leader_pid: owner
+            }
+        else:
+            implementation._cleanup_version_probe_owner(owner)
+            assert owner.leader_pid not in implementation._RETAINED_VERSION_PROBES
     finally:
         if captured:
             owner = captured[0]
@@ -1085,8 +1136,116 @@ def test_reaped_cleanup_rejects_same_thread_reentry(
             assert len(wrapped.recursive_errors) == 1
         finally:
             if implementation._RETAINED_VERSION_PROBES:
-                wrapped.reenter = False
+                disposition = getattr(
+                    implementation, "_VersionProbeSelectorCloseDisposition", None
+                )
+                if resource_name == "selector" and disposition is not None:
+                    assert (
+                        owner.selector_close_disposition
+                        is disposition.AMBIGUOUS
+                    )
+                    with pytest.raises(
+                        AttestationError, match="selector close is ambiguous"
+                    ):
+                        implementation._cleanup_version_probe_owner(owner)
+                    assert wrapped.close_count == 1
+                    implementation._RETAINED_VERSION_PROBES.pop(
+                        owner.leader_pid, None
+                    )
+                    resource.close()
+                elif resource_name == "selector":
+                    implementation._RETAINED_VERSION_PROBES.pop(
+                        owner.leader_pid, None
+                    )
+                    resource.close()
+                    for stream in (owner.process.stdout, owner.process.stderr):
+                        if stream is not None and not stream.closed:
+                            stream.close()
+                else:
+                    wrapped.reenter = False
+                    implementation._cleanup_version_probe_owner(owner)
+
+
+@pytest.mark.parametrize("reentry", ["before", "after"])
+def test_selector_effect_then_reentrant_error_is_never_retried(
+    tmp_path: Path,
+    reentry: str,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        owner = _spawn_finished_version_probe(inputs)
+        implementation._reap_version_probe_leader(owner)
+        selector = implementation.selectors.DefaultSelector()
+        wrapped = _EffectThenReentrantSelector(selector, owner, reentry=reentry)
+        owner.selector = wrapped
+        try:
+            disposition = implementation._VersionProbeSelectorCloseDisposition
+            assert owner.selector_close_disposition is disposition.PENDING
+            with pytest.raises(AttestationError, match="already in progress"):
                 implementation._cleanup_version_probe_owner(owner)
+            assert owner.selector_close_disposition is disposition.AMBIGUOUS
+            assert owner.selector is wrapped
+            assert wrapped.close_count == 1
+            assert wrapped.real_close_count == 1
+            assert len(wrapped.recursive_errors) == 1
+            assert owner.process.stdout.closed
+            assert owner.process.stderr.closed
+            assert owner.cleanup_in_progress is False
+            assert implementation._RETAINED_VERSION_PROBES == {
+                owner.leader_pid: owner
+            }
+
+            with pytest.raises(AttestationError, match="selector close is ambiguous"):
+                implementation._cleanup_version_probe_owner(owner)
+            assert wrapped.close_count == 1
+            assert wrapped.real_close_count == 1
+            assert implementation._RETAINED_VERSION_PROBES == {
+                owner.leader_pid: owner
+            }
+        finally:
+            implementation._RETAINED_VERSION_PROBES.pop(owner.leader_pid, None)
+            if wrapped.real_close_count == 0:
+                selector.close()
+            for stream in (owner.process.stdout, owner.process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+
+
+@pytest.mark.parametrize("tampered", [None, 0, 1, "pending"])
+def test_selector_close_disposition_tampering_fails_before_action(
+    tmp_path: Path,
+    tampered: object,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        owner = _spawn_finished_version_probe(inputs)
+        implementation._reap_version_probe_leader(owner)
+        selector = implementation.selectors.DefaultSelector()
+        owner.selector = selector
+        owner.selector_close_disposition = tampered
+        try:
+            with pytest.raises(AttestationError, match="owner state"):
+                implementation._cleanup_version_probe_owner(owner)
+            assert implementation._RETAINED_VERSION_PROBES == {
+                owner.leader_pid: owner
+            }
+            assert owner.selector is selector
+            assert not owner.process.stdout.closed
+            assert not owner.process.stderr.closed
+        finally:
+            if implementation._RETAINED_VERSION_PROBES:
+                disposition = getattr(
+                    implementation, "_VersionProbeSelectorCloseDisposition", None
+                )
+                if disposition is not None:
+                    owner.selector_close_disposition = disposition.PENDING
+                    implementation._cleanup_version_probe_owner(owner)
+                else:
+                    implementation._RETAINED_VERSION_PROBES.pop(
+                        owner.leader_pid, None
+                    )
+                    selector.close()
+                    for stream in (owner.process.stdout, owner.process.stderr):
+                        if stream is not None and not stream.closed:
+                            stream.close()
 
 
 @pytest.mark.parametrize("tampered", [None, 0, 1, "yes"])
