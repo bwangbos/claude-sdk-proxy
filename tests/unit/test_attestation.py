@@ -509,6 +509,98 @@ def test_cli_version_probe_cleans_group_after_leader_exits(tmp_path: Path) -> No
                 os.killpg(descendant_pgid, signal.SIGKILL)
 
 
+def _cleanup_fault_injected_version_owner(owner: Any) -> None:
+    try:
+        implementation._terminate_version_probe(owner)
+    finally:
+        implementation._RETAINED_VERSION_PROBES.pop(owner.leader_pid, None)
+        for stream in (owner.process.stdin, owner.process.stdout, owner.process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_selector_construction_failure_cleans_captured_version_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    body = "#!/bin/sh\ntrap '' TERM\nwhile :; do /bin/sleep 1; done\n"
+    captured: list[Any] = []
+    original_capture = implementation._capture_version_probe_owner
+
+    def capture_owner(process: Any) -> Any:
+        owner = original_capture(process)
+        captured.append(owner)
+        return owner
+
+    def fail_selector() -> Never:
+        raise failure_type("injected selector construction failure")
+
+    monkeypatch.setattr(implementation, "_capture_version_probe_owner", capture_owner)
+    monkeypatch.setattr(implementation.selectors, "DefaultSelector", fail_selector)
+    try:
+        with _launch_inputs(tmp_path, cli_body=body) as inputs:
+            with pytest.raises(failure_type, match="selector construction"):
+                _prepare(inputs)
+        assert len(captured) == 1
+        owner = captured[0]
+        assert owner.process.returncode is not None
+        assert owner.leader_pid not in implementation._RETAINED_VERSION_PROBES
+        assert owner.process.stdout.closed
+        assert owner.process.stderr.closed
+    finally:
+        if captured and captured[0].process.returncode is None:
+            _cleanup_fault_injected_version_owner(captured[0])
+
+
+def test_unproved_post_capture_cleanup_retains_owner_and_blocks_future_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = "#!/bin/sh\ntrap '' TERM\nwhile :; do /bin/sleep 1; done\n"
+    captured: list[Any] = []
+    original_capture = implementation._capture_version_probe_owner
+    original_wait = implementation._wait_for_version_probe_group_absence
+
+    def capture_owner(process: Any) -> Any:
+        owner = original_capture(process)
+        captured.append(owner)
+        return owner
+
+    def fail_selector() -> Never:
+        raise RuntimeError("injected selector construction failure")
+
+    def fail_absence(*_args: object) -> Never:
+        raise AttestationError("injected group absence failure")
+
+    monkeypatch.setattr(implementation, "_capture_version_probe_owner", capture_owner)
+    monkeypatch.setattr(implementation.selectors, "DefaultSelector", fail_selector)
+    monkeypatch.setattr(
+        implementation, "_wait_for_version_probe_group_absence", fail_absence
+    )
+    try:
+        with _launch_inputs(tmp_path, cli_body=body) as inputs:
+            with pytest.raises(AttestationError, match="group absence failure"):
+                _prepare(inputs)
+            assert len(captured) == 1
+            owner = captured[0]
+            assert implementation._RETAINED_VERSION_PROBES == {
+                owner.leader_pid: owner
+            }
+            assert owner.process.returncode is None
+            assert not owner.process.stdout.closed
+            assert not owner.process.stderr.closed
+            with pytest.raises(AttestationError, match="cleanup is unconfirmed"):
+                _prepare(inputs)
+    finally:
+        monkeypatch.setattr(
+            implementation, "_wait_for_version_probe_group_absence", original_wait
+        )
+        if captured:
+            _cleanup_fault_injected_version_owner(captured[0])
+
+
 def test_prepare_binds_workdir_to_task5_instance(tmp_path: Path) -> None:
     with _launch_inputs(tmp_path) as inputs:
         unrelated = tmp_path / "unrelated"
