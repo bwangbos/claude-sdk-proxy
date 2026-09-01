@@ -117,7 +117,10 @@ def test_network_proxy_selection_is_authenticated_before_environment_build(
         "identity_ack_missing_config",
         "identity_ack_wrong_version",
         "identity_ack_invalid_proxy_bit",
+        "identity_ack_nonzero_reserved_byte",
         "identity_ack_nonzero_reserved",
+        "identity_ack_truncated_config",
+        "identity_ack_oversized_config",
         "identity_ack_wrong_sequence",
         "identity_ack_wrong_hash",
     ],
@@ -134,6 +137,26 @@ def test_malformed_identity_ack_config_fails_before_anchor(
     assert evidence.cli_exec_count == 0
     assert evidence.identity_ack_config_rejected
     assert evidence.unsafe_numeric_signal_count == 0
+
+
+def test_fixed_relay_fd_collision_preserves_normal_bootstrap_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    """A valid proxy channel numbered 198 must relocate without narrowing input."""
+    cli_dir = Path(__file__).resolve().parents[2] / "build/bin"
+    evidence = run_bootstrap_environment(
+        {"HOME": str(tmp_path), "USER": "fixed-fd-collision-probe"},
+        EnvironmentConfig(cli_dir=cli_dir, network_proxy=False),
+        force_control_fd_collision=True,
+    )
+
+    assert evidence.outcome == "done"
+    assert evidence.cli_exec_count == 1
+    assert evidence.external_control_relocated_from_fixed_fd
+    assert evidence.private_internal_relay_fd
+    assert evidence.external_control_fd_closed_on_cli_exec
+    assert evidence.internal_control_fd_closed_on_cli_exec
+    assert evidence.cleanup_done_sequence > 0
 
 
 def test_control_frame_round_trip_and_validation_are_bounded() -> None:

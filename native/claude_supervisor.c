@@ -439,8 +439,7 @@ static int parse_bootstrap_values(struct bootstrap_values *out) {
     if (parse_nonce(out->allocation_nonce, nonce) < 0 ||
         out->instance_dir == NULL || out->instance_dir[0] != '/' ||
         out->real_cli == NULL || out->real_cli[0] != '/' ||
-        parse_fd(fd_text, &out->control_fd) < 0 ||
-        out->control_fd == CPL_ANCHOR_INTERNAL_CONTROL_FD) {
+        parse_fd(fd_text, &out->control_fd) < 0) {
         return -1;
     }
     if (out->cleanup_injection == UINT32_MAX) {
@@ -747,23 +746,71 @@ static int launch_anchor(const struct bootstrap_values *values,
     uint32_t phase = CPL_CONTROL_PHASE_IDENTITY_ACK;
     uint64_t deadline;
     int internal[2] = {-1, -1};
+    int external_control_fd = values->control_fd;
     size_t fixed_count = 10U;
     size_t total;
     size_t index;
     pid_t child;
     int status = CPL_ERR_SYSTEM;
+    bool external_control_relocated = false;
     bool altered_executable_observed = false;
 
     if (verified_anchor_path(anchor_path) < 0 ||
         verify_real_cli(values->real_cli, &expected) < 0 ||
-        parse_nonce(values->allocation_nonce, nonce) < 0 ||
-        socketpair(AF_UNIX, SOCK_STREAM, 0, internal) < 0 ||
-        snprintf(control_fd, sizeof(control_fd), "%d", values->control_fd) < 0) {
+        parse_nonce(values->allocation_nonce, nonce) < 0) {
+        return -1;
+    }
+    if (external_control_fd == CPL_ANCHOR_INTERNAL_CONTROL_FD) {
+        external_control_fd = fcntl(external_control_fd, F_DUPFD_CLOEXEC, 3);
+        if (external_control_fd < 0) {
+            return -1;
+        }
+        external_control_relocated = true;
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, internal) < 0) {
+        if (external_control_relocated) {
+            (void)close(external_control_fd);
+        }
+        return -1;
+    }
+    if (internal[0] == CPL_ANCHOR_INTERNAL_CONTROL_FD) {
+        int relocated = fcntl(internal[0], F_DUPFD_CLOEXEC, 3);
+
+        if (relocated < 0) {
+            (void)close(internal[0]);
+            (void)close(internal[1]);
+            if (external_control_relocated) {
+                (void)close(external_control_fd);
+            }
+            return -1;
+        }
+        if (close(internal[0]) < 0) {
+            (void)close(relocated);
+            (void)close(internal[1]);
+            if (external_control_relocated) {
+                (void)close(external_control_fd);
+            }
+            return -1;
+        }
+        internal[0] = relocated;
+    }
+    if (snprintf(control_fd, sizeof(control_fd), "%d",
+            external_control_fd) < 0) {
+        (void)close(internal[0]);
+        (void)close(internal[1]);
+        if (external_control_relocated) {
+            (void)close(external_control_fd);
+        }
         return -1;
     }
     total = fixed_count + (size_t)cli_argc + 1U;
     anchor_argv = calloc(total, sizeof(*anchor_argv));
     if (anchor_argv == NULL) {
+        (void)close(internal[0]);
+        (void)close(internal[1]);
+        if (external_control_relocated) {
+            (void)close(external_control_fd);
+        }
         return -1;
     }
     anchor_argv[0] = anchor_path;
@@ -784,11 +831,14 @@ static int launch_anchor(const struct bootstrap_values *values,
         free(anchor_argv);
         (void)close(internal[0]);
         (void)close(internal[1]);
+        if (external_control_relocated) {
+            (void)close(external_control_fd);
+        }
         return -1;
     }
     if (child == 0) {
         (void)close(internal[0]);
-        if (fcntl(values->control_fd, F_SETFD, 0) < 0 ||
+        if (fcntl(external_control_fd, F_SETFD, 0) < 0 ||
             (internal[1] != CPL_ANCHOR_INTERNAL_CONTROL_FD &&
              dup2(internal[1], CPL_ANCHOR_INTERNAL_CONTROL_FD) < 0)) {
             _exit(SUPERVISOR_FAIL_DEAD_EXIT);
@@ -803,8 +853,14 @@ static int launch_anchor(const struct bootstrap_values *values,
         _exit(SUPERVISOR_FAIL_DEAD_EXIT);
     }
     (void)close(internal[1]);
+    if (external_control_relocated && close(values->control_fd) < 0) {
+        free(anchor_argv);
+        (void)close(internal[0]);
+        (void)close(external_control_fd);
+        return -1;
+    }
     free(anchor_argv);
-    status = relay_gate(values->control_fd, internal[0], journal, nonce,
+    status = relay_gate(external_control_fd, internal[0], journal, nonce,
         CPL_CONTROL_ANCHOR_IDENTITY, CPL_CONTROL_ANCHOR_ACK, &phase, &frame);
     if (status == CPL_OK && frame.payload_length == sizeof(anchor_identity)) {
         (void)memcpy(&anchor_identity, frame.payload, sizeof(anchor_identity));
@@ -817,7 +873,7 @@ static int launch_anchor(const struct bootstrap_values *values,
         status = CPL_ERR_CONTROL_PAYLOAD;
     }
     if (status == CPL_OK) {
-        status = relay_gate(values->control_fd, internal[0], journal, nonce,
+        status = relay_gate(external_control_fd, internal[0], journal, nonce,
             CPL_CONTROL_CLI_ARMED, CPL_CONTROL_ARMED_ACK, &phase, &frame);
     }
     if (status == CPL_OK && frame.payload_length == sizeof(armed)) {
@@ -874,11 +930,11 @@ static int launch_anchor(const struct bootstrap_values *values,
         status = CPL_OK;
     }
     if (status == CPL_OK && altered_executable_observed) {
-        status = publish_identity_rejection(values->control_fd, journal,
+        status = publish_identity_rejection(external_control_fd, journal,
             nonce, &phase, CLEANUP_INJECTION_ALTERED_EXECUTABLE, 0U,
             &running);
-        (void)close(internal[0]);
-        return status == CPL_OK ? -1 : status;
+        status = status == CPL_OK ? CPL_ERR_PROCESS_IDENTITY : status;
+        goto done;
     }
     if (status == CPL_OK) {
         status = cpl_journal_bootstrap_append(journal,
@@ -895,12 +951,12 @@ static int launch_anchor(const struct bootstrap_values *values,
             (uint32_t)sizeof(running), control_deadline());
     }
     if (status == CPL_OK) {
-        status = cpl_control_frame_write(values->control_fd,
+        status = cpl_control_frame_write(external_control_fd,
             CPL_CONTROL_CLI_RUNNING, nonce, (const uint8_t *)&running,
             (uint32_t)sizeof(running), control_deadline());
     }
     if (status == CPL_OK) {
-        status = cpl_control_frame_read(values->control_fd, nonce,
+        status = cpl_control_frame_read(external_control_fd, nonce,
             lease_deadline(), &request);
     }
     if (status == CPL_OK && values->cleanup_injection ==
@@ -941,7 +997,7 @@ static int launch_anchor(const struct bootstrap_values *values,
         (void)memset(&cleanup_ack, 0, sizeof(cleanup_ack));
         cleanup_ack.sequence = bootstrap.sequence;
         (void)memcpy(cleanup_ack.hash, bootstrap.hash, CPL_HASH_SIZE);
-        status = cpl_control_frame_write(values->control_fd,
+        status = cpl_control_frame_write(external_control_fd,
             CPL_CONTROL_CLEANUP_ACK, nonce,
             (const uint8_t *)&cleanup_ack,
             (uint32_t)sizeof(cleanup_ack),
@@ -964,12 +1020,12 @@ static int launch_anchor(const struct bootstrap_values *values,
                 CLEANUP_INJECTION_ALTERED_EXECUTABLE &&
             values->cleanup_injection <=
                 CLEANUP_INJECTION_UNEXPECTED_DESCENDANT) {
-            (void)publish_identity_rejection(values->control_fd, journal,
+            (void)publish_identity_rejection(external_control_fd, journal,
                 nonce, &phase, values->cleanup_injection,
                 cleanup.unexpected_group_member_count,
                 &cleanup.rejection_observed);
-            (void)close(internal[0]);
-            return -1;
+            status = CPL_ERR_PROCESS_IDENTITY;
+            goto done;
         }
         (void)memset(&evidence, 0, sizeof(evidence));
         if (cleanup.stop_used) {
@@ -1031,13 +1087,17 @@ static int launch_anchor(const struct bootstrap_values *values,
                 CPL_CONTROL_CLEANUP_RESULT, false);
         }
         if (status == CPL_OK) {
-            status = cpl_control_frame_write(values->control_fd,
+            status = cpl_control_frame_write(external_control_fd,
                 CPL_CONTROL_CLEANUP_RESULT, nonce,
                 (const uint8_t *)&evidence, (uint32_t)sizeof(evidence),
                 control_deadline());
         }
     }
+done:
     (void)close(internal[0]);
+    if (external_control_relocated) {
+        (void)close(external_control_fd);
+    }
     return status == CPL_OK ? 0 : -1;
 }
 

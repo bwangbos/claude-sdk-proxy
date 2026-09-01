@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import os
 import signal
@@ -12,7 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -398,10 +399,14 @@ _SCENARIOS = frozenset(
         "fallback_nonempty_payload_after_loss",
         "fallback_wrong_phase_after_loss",
         "fallback_duplicate_after_loss",
+        "fallback_control_fd_198_after_loss",
         "identity_ack_missing_config",
         "identity_ack_wrong_version",
         "identity_ack_invalid_proxy_bit",
+        "identity_ack_nonzero_reserved_byte",
         "identity_ack_nonzero_reserved",
+        "identity_ack_truncated_config",
+        "identity_ack_oversized_config",
         "identity_ack_wrong_sequence",
         "identity_ack_wrong_hash",
     }
@@ -572,6 +577,7 @@ class LifecycleEvidence:
     shared_proxy_fallback_channel: bool = False
     external_control_read_by_supervisor_while_live: bool = False
     anchor_external_read_count_while_supervisor_live: int = 0
+    external_control_relocated_from_fixed_fd: bool = False
 
     @property
     def stop_or_kill_used(self) -> bool:
@@ -634,6 +640,7 @@ def run_lifecycle_scenario(name: str) -> LifecycleEvidence:
         "fallback_nonempty_payload_after_loss",
         "fallback_wrong_phase_after_loss",
         "fallback_duplicate_after_loss",
+        "fallback_control_fd_198_after_loss",
     }:
         return _run_real_supervisorless_fallback(name)
     if name in _REAL_ACTOR_LOSS:
@@ -2205,21 +2212,39 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
         parent_control, child_control = socket.socketpair()
         parent_control.settimeout(10)
         output_path = instance / "fallback-output"
+        force_control_fd_collision = name == "fallback_control_fd_198_after_loss"
         environment = {
             "HOME": str(instance),
             "USER": "fallback-probe",
             "LOCAL_PROXY_ALLOCATION_NONCE": _NONCE_HEX,
             "LOCAL_PROXY_INSTANCE_DIR": str(instance),
             "LOCAL_PROXY_REAL_CLAUDE": str(_probe_child_path()),
-            "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
+            "LOCAL_PROXY_CONTROL_FD": (
+                str(_ANCHOR_INTERNAL_CONTROL_FD)
+                if force_control_fd_collision
+                else str(child_control.fileno())
+            ),
         }
-        process = subprocess.Popen(
-            [str(_supervisor_path()), "--output-path", str(output_path)],
-            env=environment,
-            pass_fds=(child_control.fileno(),),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+        restore_fixed_fd = (
+            _install_fixed_control_fd_for_spawn(child_control.fileno())
+            if force_control_fd_collision
+            else None
         )
+        try:
+            process = subprocess.Popen(
+                [str(_supervisor_path()), "--output-path", str(output_path)],
+                env=environment,
+                pass_fds=(
+                    (_ANCHOR_INTERNAL_CONTROL_FD,)
+                    if force_control_fd_collision
+                    else (child_control.fileno(),)
+                ),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        finally:
+            if restore_fixed_fd is not None:
+                restore_fixed_fd()
         child_control.close()
         child_control = None
         trace: list[str] = []
@@ -2431,6 +2456,9 @@ def _run_real_supervisorless_fallback(name: str) -> LifecycleEvidence:
             private_internal_relay_fd=True,
             external_control_fd_closed_on_cli_exec=True,
             internal_control_fd_closed_on_cli_exec=True,
+            external_control_relocated_from_fixed_fd=(
+                force_control_fd_collision
+            ),
         )
     finally:
         if parent_control is not None:
@@ -2499,6 +2527,36 @@ def _encode_control_frame(message_type: int, payload: bytes = b"") -> bytes:
         _NONCE,
     )
     return header + payload + struct.pack("<I", _crc32c(header + payload))
+
+
+def _install_fixed_control_fd_for_spawn(source_fd: int) -> Callable[[], None]:
+    """Temporarily install FD 198 so subprocess can preserve that exact number."""
+    saved_fd: int | None
+    saved_inheritable = False
+    try:
+        saved_inheritable = os.get_inheritable(_ANCHOR_INTERNAL_CONTROL_FD)
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise
+        saved_fd = None
+    else:
+        saved_fd = os.dup(_ANCHOR_INTERNAL_CONTROL_FD)
+    os.dup2(source_fd, _ANCHOR_INTERNAL_CONTROL_FD, inheritable=True)
+
+    def restore() -> None:
+        if saved_fd is None:
+            os.close(_ANCHOR_INTERNAL_CONTROL_FD)
+            return
+        try:
+            os.dup2(
+                saved_fd,
+                _ANCHOR_INTERNAL_CONTROL_FD,
+                inheritable=saved_inheritable,
+            )
+        finally:
+            os.close(saved_fd)
+
+    return restore
 
 
 def _receive_exact(control: socket.socket, length: int) -> bytes:
@@ -2659,6 +2717,8 @@ def _run_identity_ack_config_rejection(name: str) -> LifecycleEvidence:
                     version += 1
                 elif name == "identity_ack_invalid_proxy_bit":
                     proxy_bit = 2
+                elif name == "identity_ack_nonzero_reserved_byte":
+                    reserved_byte = 1
                 elif name == "identity_ack_nonzero_reserved":
                     reserved_word = 1
                 elif name == "identity_ack_wrong_sequence":
@@ -2674,6 +2734,10 @@ def _run_identity_ack_config_rejection(name: str) -> LifecycleEvidence:
                     sequence,
                     head_hash,
                 )
+                if name == "identity_ack_truncated_config":
+                    config_payload = config_payload[:-1]
+                elif name == "identity_ack_oversized_config":
+                    config_payload += b"\0"
             parent_control.sendall(_encode_control_frame(2, config_payload))
             returncode = process.wait(timeout=5)
             return LifecycleEvidence(
@@ -3455,7 +3519,10 @@ def _run_real_fail_dead_boundary(name: str) -> LifecycleEvidence:
 
 
 def run_bootstrap_environment(
-    source: Mapping[str, str], config: EnvironmentConfig
+    source: Mapping[str, str],
+    config: EnvironmentConfig,
+    *,
+    force_control_fd_collision: bool = False,
 ) -> LifecycleEvidence:
     """Exec a value-dumping substitute through the real supervisor and anchor."""
     supervisor = _supervisor_path()
@@ -3501,17 +3568,34 @@ def run_bootstrap_environment(
                     "LOCAL_PROXY_ALLOCATION_NONCE": _NONCE_HEX,
                     "LOCAL_PROXY_INSTANCE_DIR": str(instance),
                     "LOCAL_PROXY_REAL_CLAUDE": str(probe_child),
-                    "LOCAL_PROXY_CONTROL_FD": str(child_control.fileno()),
+                    "LOCAL_PROXY_CONTROL_FD": (
+                        str(_ANCHOR_INTERNAL_CONTROL_FD)
+                        if force_control_fd_collision
+                        else str(child_control.fileno())
+                    ),
                 }
             )
             arguments = [str(supervisor), "--output-path", str(output_path)]
-            process = subprocess.Popen(
-                arguments,
-                env=source_environment,
-                pass_fds=(child_control.fileno(),),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+            restore_fixed_fd = (
+                _install_fixed_control_fd_for_spawn(child_control.fileno())
+                if force_control_fd_collision
+                else None
             )
+            try:
+                process = subprocess.Popen(
+                    arguments,
+                    env=source_environment,
+                    pass_fds=(
+                        (_ANCHOR_INTERNAL_CONTROL_FD,)
+                        if force_control_fd_collision
+                        else (child_control.fileno(),)
+                    ),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            finally:
+                if restore_fixed_fd is not None:
+                    restore_fixed_fd()
             child_control.close()
             child_control = None
             trace: list[str] = []
@@ -3637,6 +3721,10 @@ def run_bootstrap_environment(
                 identity_ack_config_version=_SUPERVISOR_CONFIG_VERSION,
                 identity_ack_bound_to_certified_head=True,
                 identity_ack_reserved_zero=True,
+                external_control_relocated_from_fixed_fd=(
+                    force_control_fd_collision
+                ),
+                cleanup_done_sequence=cleanup.done_sequence,
             )
         except subprocess.TimeoutExpired as error:
             if process is not None:

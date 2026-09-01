@@ -977,3 +977,57 @@ No Claude CLI, model, credential, network peer, pre-existing process, or
 pre-existing allocation was contacted or modified. Signals were limited to
 freshly spawned, exactly re-observed Task 5 probe groups. No live Task 6 gate
 was executed.
+
+## Task 6 integration fix round 1
+
+Fix base: `6364d07cf219135e50cde0e09a26cb82168ac4e5`
+
+Fix commit: this commit
+
+### Breaker-finding disposition
+
+- `LOCAL_PROXY_CONTROL_FD=198` is now accepted as a valid authenticated proxy
+  endpoint. Before the supervisor creates its private socketpair, it duplicates
+  that endpoint with `F_DUPFD_CLOEXEC`; because all existing owned descriptors
+  are occupied, the new descriptor cannot alias one of them. The original 198
+  remains reserved while the socketpair is created, so neither private endpoint
+  can take the fixed target number.
+- The child clears close-on-exec only on the relocated external endpoint, maps
+  the private anchor endpoint to 198 with `dup2`, and passes the relocated
+  endpoint in the existing exact `--control-fd` position. The parent closes its
+  old 198 copy after fork, retains the relocated endpoint for normal control,
+  and closes that duplicate on every return path. The anchor therefore receives
+  the same authenticated socket endpoint, preserves sole-reader handoff after
+  supervisor loss, and leaks neither endpoint into the real CLI.
+- A defensive internal-reader relocation also handles the extreme case where
+  `socketpair` itself returns 198 when the external endpoint has another
+  number. It uses the same close-on-exec duplication rule before freeing 198
+  for the child endpoint; an occupied descriptor can never be selected by the
+  duplication call.
+- Fixed configuration validation now has independent negative rows for the
+  one-byte reserved field and the four-byte reserved field, plus payloads one
+  byte shorter and one byte longer than the 48-byte ABI value. All reject before
+  environment construction or anchor spawn.
+
+### TDD and verification evidence
+
+The focused RED collected 25 tests and ended with five failures and 20 passes:
+the reserved-byte, truncated, and oversized configuration scenarios were
+unknown; the normal-cleanup collision call lacked a forcing seam; and the
+supervisor-loss collision scenario was unknown. After implementation, the
+focused suite passed all 25 tests in 2.67 seconds.
+
+The final full bounded host-permission Darwin suite passed all 210 tests in 34.34
+seconds with zero skips or XPASS. `make check` passed 216 unit tests (including
+the still-uncommitted Task 6 unit rows), Ruff, and strict mypy. Strict C17 native
+builds and the 48-byte compile-time ABI assertion passed, and `git diff --check`
+was clean. Apple clang static analysis of the production and injection
+supervisors emitted two empty 370-byte plist reports with no diagnostics. The
+collision launcher temporarily preserves exact FD 198 only in
+the fresh subprocess and restores any parent occupant immediately after spawn;
+it performs no network or live-child operation.
+
+No Claude CLI, model, credential, network peer, pre-existing process, or
+pre-existing allocation was contacted or modified. Signals were limited to
+freshly spawned, exactly re-observed Task 5 probe groups. No live Task 6 gate
+was executed.

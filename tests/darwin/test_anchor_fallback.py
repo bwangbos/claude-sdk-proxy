@@ -99,3 +99,18 @@ def test_duplicate_fallback_request_is_ignored_after_one_authenticated_signal() 
     assert result.rejected_request_no_signal
     assert result.self_term_signal_count == 1
     assert result.workdir_removed is False
+
+
+def test_fixed_relay_fd_collision_preserves_supervisor_loss_fallback() -> None:
+    """Relocating proxy FD 198 must preserve the anchor's authenticated endpoint."""
+    result = run_lifecycle_scenario("fallback_control_fd_198_after_loss")
+
+    assert result.outcome == "unconfirmed"
+    assert result.external_control_relocated_from_fixed_fd
+    assert result.shared_proxy_fallback_channel
+    assert result.supervisor_loss_proven
+    assert result.self_term_request_authenticated
+    assert result.fallback_payload_exact
+    assert result.self_term_signal_count == 1
+    assert result.external_control_fd_closed_on_cli_exec
+    assert result.internal_control_fd_closed_on_cli_exec
