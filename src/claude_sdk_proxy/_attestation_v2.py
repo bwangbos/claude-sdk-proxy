@@ -334,6 +334,12 @@ class _VersionProbeOwnerState(StrEnum):
     REAPED_RESOURCE_CLOSE_PENDING = "reaped_resource_close_pending"
 
 
+class _VersionProbeSelectorCloseDisposition(StrEnum):
+    PENDING = "pending"
+    AMBIGUOUS = "ambiguous"
+    CLOSED = "closed"
+
+
 @dataclass
 class _VersionProbeOwner:
     """Exact direct-child/group ownership retained until group absence."""
@@ -343,6 +349,9 @@ class _VersionProbeOwner:
     pgid: int = 0
     state: _VersionProbeOwnerState = _VersionProbeOwnerState.AMBIGUOUS_SPAWN
     selector: selectors.BaseSelector | None = None
+    selector_close_disposition: _VersionProbeSelectorCloseDisposition = (
+        _VersionProbeSelectorCloseDisposition.PENDING
+    )
     cleanup_in_progress: bool = False
 
 
@@ -363,6 +372,10 @@ def _validate_version_probe_owner(
             not isinstance(owner, _VersionProbeOwner)
             or len(_RETAINED_VERSION_PROBES) != 1
             or not isinstance(owner.state, _VersionProbeOwnerState)
+            or not isinstance(
+                owner.selector_close_disposition,
+                _VersionProbeSelectorCloseDisposition,
+            )
             or type(owner.cleanup_in_progress) is not bool
         ):
             raise AttestationError("version probe owner state is invalid")
@@ -384,6 +397,8 @@ def _validate_version_probe_owner(
                     )
                 )
                 or owner.selector is not None
+                or owner.selector_close_disposition
+                is not _VersionProbeSelectorCloseDisposition.PENDING
                 or _RETAINED_VERSION_PROBES.get(_VERSION_PROBE_RESERVATION_KEY)
                 is not owner
             ):
@@ -409,6 +424,16 @@ def _validate_version_probe_owner(
             and process.returncode is None
         ):
             raise AttestationError("reaped version probe owner lacks exit status")
+        if (
+            owner.state is _VersionProbeOwnerState.LIVE_CLEANUP_PENDING
+            and owner.selector_close_disposition
+            is not _VersionProbeSelectorCloseDisposition.PENDING
+        ) or (
+            owner.selector_close_disposition
+            is _VersionProbeSelectorCloseDisposition.AMBIGUOUS
+            and owner.selector is None
+        ):
+            raise AttestationError("version probe owner state is invalid")
 
 
 def _reserve_version_probe_capacity() -> _VersionProbeOwner:
@@ -720,13 +745,35 @@ def _close_version_probe_resources(owner: _VersionProbeOwner) -> None:
     assert process is not None
     first_error: BaseException | None = None
     selector = owner.selector
-    if selector is not None:
-        try:
-            selector.close()
-        except BaseException as error:
-            first_error = error
+    if (
+        owner.selector_close_disposition
+        is _VersionProbeSelectorCloseDisposition.AMBIGUOUS
+    ):
+        first_error = AttestationError("version probe selector close is ambiguous")
+    elif (
+        owner.selector_close_disposition
+        is _VersionProbeSelectorCloseDisposition.PENDING
+    ):
+        if selector is None:
+            owner.selector_close_disposition = (
+                _VersionProbeSelectorCloseDisposition.CLOSED
+            )
         else:
-            owner.selector = None
+            # Selector close is a one-shot release. Mark it ambiguous before
+            # entering caller-controlled close code; only a clean return can
+            # prove CLOSED, and the exact object remains strongly owned until
+            # final registry removal.
+            owner.selector_close_disposition = (
+                _VersionProbeSelectorCloseDisposition.AMBIGUOUS
+            )
+            try:
+                selector.close()
+            except BaseException as error:
+                first_error = error
+            else:
+                owner.selector_close_disposition = (
+                    _VersionProbeSelectorCloseDisposition.CLOSED
+                )
     for stream in (
         process.stdin,
         process.stdout,
@@ -741,7 +788,10 @@ def _close_version_probe_resources(owner: _VersionProbeOwner) -> None:
                 first_error = error
     if first_error is not None:
         raise first_error
-    if owner.selector is not None or any(
+    if (
+        owner.selector_close_disposition
+        is not _VersionProbeSelectorCloseDisposition.CLOSED
+    ) or any(
         stream is not None and not stream.closed
         for stream in (
             process.stdin,
