@@ -28,8 +28,8 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 def _record_rejected_report(report: pytest.CollectReport | pytest.TestReport) -> None:
     if report.skipped:
         _REJECTED_REPORTS.add((report.nodeid, getattr(report, "when", "collect")))
-    elif isinstance(report, pytest.TestReport) and report.passed and getattr(
-        report, "wasxfail", None
+    elif isinstance(report, pytest.TestReport) and report.passed and hasattr(
+        report, "wasxfail"
     ):
         _REJECTED_REPORTS.add((report.nodeid, f"{report.when}-xpass"))
 

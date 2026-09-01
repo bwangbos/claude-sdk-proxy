@@ -242,3 +242,47 @@ required `2.1.251`. The fail-closed runtime concern therefore remains.
   subscription probe was run.
 - The installed CLI remains outside the pinned supported runtime tuple and is
   rejected by `read_cli_identity()`.
+
+## Review round 2
+
+### Finding addressed
+
+The XPASS gate previously required `wasxfail` to be truthy. Pytest represents
+an unconditional `@pytest.mark.xfail` XPASS with the present-but-empty value
+`wasxfail=""`, so that valid XPASS escaped the gate. The collector now checks
+for `wasxfail` attribute presence on a passed `TestReport`, preserving the
+opt-in nature of the release gate and rejecting both reasoned and reasonless
+non-strict XPASS reports.
+
+### RED/GREEN evidence
+
+RED before the collector correction:
+
+```console
+$ uv run pytest --strict-markers --forbid-skips -W error tests/unit/test_pytest_policy.py -v
+... test_forbid_skips_fails_a_reasonless_non_strict_xpass FAILED
+E       AssertionError: assert <ExitCode.OK: 0> == <ExitCode.TESTS_FAILED: 1>
+========================= 1 failed, 7 passed in 0.12s =========================
+```
+
+The pytester fixture uses exactly `@pytest.mark.xfail` without `reason=` and a
+passing test body, exercising the empty `wasxfail` representation. GREEN after
+switching from truthiness to attribute-presence detection:
+
+```console
+$ uv run pytest --strict-markers --forbid-skips -W error tests/unit/test_pytest_policy.py -v
+============================== 8 passed in 0.11s ===============================
+```
+
+### Full verification
+
+```console
+$ make check
+... clang -std=c17 -Wall -Wextra -Werror -pedantic ...
+============================== 24 passed in 0.60s ==============================
+All checks passed!
+Success: no issues found in 2 source files
+```
+
+No live subscription probe was run. The existing fail-closed policy verdict
+and unsupported installed CLI concern remain unchanged.

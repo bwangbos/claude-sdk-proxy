@@ -49,6 +49,19 @@ def test_forbid_skips_fails_a_non_strict_xpass(pytester: pytest.Pytester) -> Non
     result.stdout.fnmatch_lines(["*release policy forbids skipped or XPASS reports:*"])
 
 
+def test_forbid_skips_fails_a_reasonless_non_strict_xpass(
+    pytester: pytest.Pytester,
+) -> None:
+    """An empty pytest ``wasxfail`` marker still represents an XPASS."""
+    install_policy(pytester)
+    pytester.makepyfile(
+        "import pytest\n\n@pytest.mark.xfail\ndef test_xpass(): assert True\n"
+    )
+    result = pytester.runpytest("--forbid-skips", "-q")
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.stdout.fnmatch_lines(["*release policy forbids skipped or XPASS reports:*"])
+
+
 def test_required_anyio_gate_executes_with_zero_skips(
     pytester: pytest.Pytester,
 ) -> None:
