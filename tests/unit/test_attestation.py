@@ -9,6 +9,7 @@ import os
 import pickle
 import shlex
 import shutil
+import signal
 import socket
 import struct
 import threading
@@ -474,6 +475,42 @@ def test_cli_version_probe_bounds_concurrent_stdout_and_stderr(tmp_path: Path) -
             _prepare(inputs)
         assert time.monotonic() - started < 2
         assert not marker.exists()
+
+
+def test_cli_version_probe_cleans_group_after_leader_exits(tmp_path: Path) -> None:
+    descendant_file = tmp_path / "version-descendant.pid"
+    descendant_script = (
+        "trap '' TERM; "
+        f"printf \"$$\" > {shlex.quote(str(descendant_file))}; "
+        "/bin/sleep 0.1; "
+        "/usr/bin/head -c 300 /dev/zero; "
+        "while :; do /bin/sleep 1; done"
+    )
+    body = (
+        "#!/bin/sh\n"
+        f"/bin/sh -c {shlex.quote(descendant_script)} &\n"
+        "exit 0\n"
+    )
+    descendant_pid: int | None = None
+    try:
+        with _launch_inputs(tmp_path, cli_body=body) as inputs:
+            with pytest.raises(AttestationError, match="output bound"):
+                _prepare(inputs)
+            deadline = time.monotonic() + 1
+            while not descendant_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            descendant_pid = int(descendant_file.read_text())
+            with pytest.raises(ProcessLookupError):
+                os.kill(descendant_pid, 0)
+    finally:
+        if descendant_pid is not None:
+            try:
+                descendant_pgid = os.getpgid(descendant_pid)
+            except ProcessLookupError:
+                pass
+            else:
+                assert descendant_pgid != os.getpgrp()
+                os.killpg(descendant_pgid, signal.SIGKILL)
 
 
 def test_prepare_binds_workdir_to_task5_instance(tmp_path: Path) -> None:
