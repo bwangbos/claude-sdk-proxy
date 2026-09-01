@@ -32,6 +32,15 @@ def test_retaining_supervisor_owns_group_cleanup(
     assert evidence.workdir_removed and evidence.durable_delete_receipt
     assert set(evidence.signal_authorities) == {"retained_parent_group"}
     assert evidence.unsafe_numeric_signal_count == 0
+    assert evidence.cleanup_request_authenticated
+    assert evidence.cleanup_task4_admitted
+    assert evidence.cleanup_batch_count == 4
+    assert evidence.cleanup_completed_steps == 0xF
+    assert evidence.cleanup_done_sequence > evidence.canonical_control_sequences[-1]
+    assert evidence.same_canonical_journal
+    assert evidence.evidence_observed_not_inferred
+    assert evidence.group_enumeration_complete
+    assert evidence.control_fd_phase_enforced
 
 
 @pytest.mark.parametrize(

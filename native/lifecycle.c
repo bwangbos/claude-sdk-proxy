@@ -29,9 +29,14 @@
 #define CPL_MAX_NAME 180U
 #define CPL_LOCK_RETRY_NS 500000ULL
 #define CPL_DEFAULT_DEADLINE_NS 1000000000ULL
+#define CPL_BOOTSTRAP_RECORD_SIZE 356U
+#define CPL_BOOTSTRAP_PAYLOAD_OFFSET 96U
 
 static const uint8_t CPL_MAGIC[CPL_MAGIC_SIZE] = {
     'C', 'P', 'L', 'J', 'R', 'N', '0', '1'
+};
+static const uint8_t CPL_BOOTSTRAP_MAGIC[CPL_MAGIC_SIZE] = {
+    'C', 'P', 'L', 'B', 'O', 'O', 'T', '1'
 };
 
 struct cpl_journal {
@@ -113,6 +118,9 @@ _Static_assert(sizeof(struct cpl_action_token) == CPL_ABI_ACTION_TOKEN_SIZE,
     "cpl_action_token ABI layout changed");
 _Static_assert(sizeof(struct cpl_reap_proof) == CPL_ABI_REAP_PROOF_SIZE,
     "cpl_reap_proof ABI layout changed");
+_Static_assert(sizeof(struct cpl_cleanup_evidence) ==
+    CPL_ABI_CLEANUP_EVIDENCE_SIZE,
+    "cpl_cleanup_evidence ABI layout changed");
 _Static_assert(sizeof(struct cpl_control_frame) == CPL_ABI_CONTROL_FRAME_SIZE,
     "cpl_control_frame ABI layout changed");
 _Static_assert(CPL_HEADER_SIZE + sizeof(struct cpl_record) ==
@@ -128,6 +136,11 @@ static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t atfork_once = PTHREAD_ONCE_INIT;
 static cpl_journal *registry_head = NULL;
 static int atfork_status = CPL_ERR_SYSTEM;
+
+static int ensure_owner(cpl_journal *journal);
+static int take_mutex(pthread_mutex_t *mutex, uint64_t deadline);
+static int take_flock(int fd, uint64_t deadline);
+static int release_flock(int fd);
 
 #ifdef CPL_ENABLE_FAULT_INJECTION
 #define CPL_RECEIPT_REGISTRY_CAPACITY 64U
@@ -599,7 +612,11 @@ int cpl_control_phase_accept(uint32_t *inout_phase, uint16_t type,
         return CPL_OK;
     }
     expected = *inout_phase + 1U;
-    if ((uint32_t)type != expected ||
+    if (((uint32_t)type != expected &&
+         !(type == CPL_CONTROL_SELF_TERM_REQUEST &&
+           *inout_phase == CPL_CONTROL_PHASE_CLI_RUNNING) &&
+         !(type == CPL_CONTROL_CLEANUP_RESULT &&
+           *inout_phase == CPL_CONTROL_PHASE_CLEANUP_REQUEST)) ||
         ((type == CPL_CONTROL_IDENTITY_ACK ||
           type == CPL_CONTROL_ANCHOR_ACK ||
           type == CPL_CONTROL_ARMED_ACK) && !durable_head_certified)) {
@@ -607,6 +624,307 @@ int cpl_control_phase_accept(uint32_t *inout_phase, uint16_t type,
     }
     *inout_phase = (uint32_t)type;
     return CPL_OK;
+}
+
+struct bootstrap_chain {
+    uint64_t sequence;
+    uint64_t physical_eof;
+    uint16_t type;
+    uint32_t payload_length;
+    uint8_t hash[CPL_HASH_SIZE];
+    uint8_t payload[CPL_BOOTSTRAP_MAX_PAYLOAD];
+    bool present;
+};
+
+static bool bootstrap_transition(uint16_t current, bool present,
+    uint16_t next) {
+    if (!present) {
+        return next == CPL_CONTROL_SUPERVISOR_IDENTITY;
+    }
+    if (current == CPL_CONTROL_SUPERVISOR_IDENTITY) {
+        return next == CPL_CONTROL_ANCHOR_IDENTITY;
+    }
+    if (current == CPL_CONTROL_ANCHOR_IDENTITY) {
+        return next == CPL_CONTROL_CLI_ARMED;
+    }
+    if (current == CPL_CONTROL_CLI_ARMED) {
+        return next == CPL_CONTROL_CLI_RUNNING;
+    }
+    if (current == CPL_CONTROL_CLI_RUNNING) {
+        return next == CPL_CONTROL_CLEANUP_REQUEST ||
+            next == CPL_CONTROL_SELF_TERM_REQUEST;
+    }
+    if (current == CPL_CONTROL_CLEANUP_REQUEST) {
+        return next == CPL_CONTROL_CLEANUP_RESULT;
+    }
+    return false;
+}
+
+static bool decode_bootstrap_record(cpl_journal *journal,
+    const uint8_t *record, uint64_t expected_sequence,
+    const uint8_t expected_parent[CPL_HASH_SIZE], uint16_t current_type,
+    bool present, struct bootstrap_chain *out) {
+    uint8_t candidate[CPL_BOOTSTRAP_RECORD_SIZE];
+    uint32_t payload_length;
+    uint32_t stored_checksum;
+    uint16_t type;
+
+    if (memcmp(record, CPL_BOOTSTRAP_MAGIC, CPL_MAGIC_SIZE) != 0 ||
+        get_u16(record + 8U) != CPL_CONTROL_VERSION ||
+        get_u16(record + 10U) != CPL_BOOTSTRAP_PAYLOAD_OFFSET ||
+        get_u32(record + 12U) != CPL_BOOTSTRAP_RECORD_SIZE ||
+        memcmp(record + 16U, journal->nonce, CPL_HASH_SIZE) != 0 ||
+        get_u64(record + 48U) != expected_sequence ||
+        memcmp(record + 56U, expected_parent, CPL_HASH_SIZE) != 0) {
+        return false;
+    }
+    type = get_u16(record + 88U);
+    payload_length = get_u32(record + 92U);
+    if (payload_length > CPL_BOOTSTRAP_MAX_PAYLOAD ||
+        !bootstrap_transition(current_type, present, type)) {
+        return false;
+    }
+    (void)memcpy(candidate, record, sizeof(candidate));
+    stored_checksum = get_u32(candidate + CPL_BOOTSTRAP_RECORD_SIZE - 4U);
+    (void)memset(candidate + CPL_BOOTSTRAP_RECORD_SIZE - 4U, 0, 4U);
+    if (crc32c(candidate, sizeof(candidate)) != stored_checksum) {
+        return false;
+    }
+    out->sequence = expected_sequence;
+    out->type = type;
+    out->payload_length = payload_length;
+    (void)memcpy(out->payload, record + CPL_BOOTSTRAP_PAYLOAD_OFFSET,
+        payload_length);
+    sha256(record, CPL_BOOTSTRAP_RECORD_SIZE, out->hash);
+    out->present = true;
+    return true;
+}
+
+static int scan_bootstrap(cpl_journal *journal, struct bootstrap_chain *out) {
+    struct stat metadata;
+    uint8_t *bytes;
+    uint64_t offset = 0U;
+    uint8_t zero_hash[CPL_HASH_SIZE] = {0};
+    ssize_t got;
+
+    (void)memset(out, 0, sizeof(*out));
+    if (fstat(journal->fd, &metadata) < 0 || metadata.st_size < 0 ||
+        (uint64_t)metadata.st_size > journal->hard_limit) {
+        return CPL_ERR_CORRUPT;
+    }
+    out->physical_eof = (uint64_t)metadata.st_size;
+    if (out->physical_eof == 0U) {
+        return CPL_OK;
+    }
+    bytes = malloc((size_t)out->physical_eof);
+    if (bytes == NULL) {
+        return CPL_ERR_SYSTEM;
+    }
+    got = pread(journal->fd, bytes, (size_t)out->physical_eof, 0);
+    if (got < 0 || (uint64_t)got != out->physical_eof) {
+        free(bytes);
+        return CPL_ERR_SYSTEM;
+    }
+    while (offset + CPL_BOOTSTRAP_RECORD_SIZE <= out->physical_eof) {
+        if (memcmp(bytes + offset, CPL_BOOTSTRAP_MAGIC,
+                CPL_MAGIC_SIZE) == 0) {
+            struct bootstrap_chain candidate = *out;
+            const uint8_t *parent = out->present ? out->hash : zero_hash;
+
+            if (decode_bootstrap_record(journal, bytes + offset,
+                    out->sequence + 1U, parent, out->type, out->present,
+                    &candidate)) {
+                candidate.physical_eof = out->physical_eof;
+                *out = candidate;
+                offset += CPL_BOOTSTRAP_RECORD_SIZE;
+                continue;
+            }
+        }
+        ++offset;
+    }
+    free(bytes);
+    return CPL_OK;
+}
+
+static bool valid_physical_bootstrap_record(cpl_journal *journal,
+    const uint8_t *record, uint64_t remaining) {
+    uint8_t candidate[CPL_BOOTSTRAP_RECORD_SIZE];
+    uint32_t stored_checksum;
+
+    if (remaining < CPL_BOOTSTRAP_RECORD_SIZE ||
+        memcmp(record, CPL_BOOTSTRAP_MAGIC, CPL_MAGIC_SIZE) != 0 ||
+        get_u16(record + 8U) != CPL_CONTROL_VERSION ||
+        get_u16(record + 10U) != CPL_BOOTSTRAP_PAYLOAD_OFFSET ||
+        get_u32(record + 12U) != CPL_BOOTSTRAP_RECORD_SIZE ||
+        memcmp(record + 16U, journal->nonce, CPL_HASH_SIZE) != 0 ||
+        get_u32(record + 92U) > CPL_BOOTSTRAP_MAX_PAYLOAD) {
+        return false;
+    }
+    (void)memcpy(candidate, record, sizeof(candidate));
+    stored_checksum = get_u32(candidate + CPL_BOOTSTRAP_RECORD_SIZE - 4U);
+    (void)memset(candidate + CPL_BOOTSTRAP_RECORD_SIZE - 4U, 0, 4U);
+    return crc32c(candidate, sizeof(candidate)) == stored_checksum;
+}
+
+static int bootstrap_certify_internal(cpl_journal *journal,
+    uint16_t expected_type, const uint8_t *expected_payload,
+    uint32_t expected_payload_length, uint64_t deadline,
+    struct cpl_bootstrap_head *out) {
+    uint32_t attempts = 0U;
+
+    for (;;) {
+        struct bootstrap_chain first;
+        struct bootstrap_chain second;
+        int status;
+
+        ++attempts;
+        status = take_mutex(&journal->append_mutex, deadline);
+        if (status != CPL_OK) {
+            return status;
+        }
+        status = take_flock(journal->append_lock_fd, deadline);
+        if (status == CPL_OK) {
+            status = scan_bootstrap(journal, &first);
+            (void)release_flock(journal->append_lock_fd);
+        }
+        (void)pthread_mutex_unlock(&journal->append_mutex);
+        if (status != CPL_OK || !first.present ||
+            first.type != expected_type ||
+            first.payload_length != expected_payload_length ||
+            (expected_payload_length > 0U &&
+             memcmp(first.payload, expected_payload,
+                 expected_payload_length) != 0)) {
+            return status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+        }
+        if (fcntl(journal->fd, F_FULLFSYNC) < 0) {
+            return CPL_ERR_SYSTEM;
+        }
+        status = take_mutex(&journal->append_mutex, deadline);
+        if (status != CPL_OK) {
+            return status;
+        }
+        status = take_flock(journal->append_lock_fd, deadline);
+        if (status == CPL_OK) {
+            status = scan_bootstrap(journal, &second);
+            (void)release_flock(journal->append_lock_fd);
+        }
+        (void)pthread_mutex_unlock(&journal->append_mutex);
+        if (status != CPL_OK) {
+            return status;
+        }
+        if (first.physical_eof == second.physical_eof &&
+            first.sequence == second.sequence &&
+            memcmp(first.hash, second.hash, CPL_HASH_SIZE) == 0) {
+            (void)memset(out, 0, sizeof(*out));
+            out->sequence = second.sequence;
+            out->physical_eof = second.physical_eof;
+            out->type = second.type;
+            out->payload_length = second.payload_length;
+            out->attempts = attempts;
+            out->present = true;
+            (void)memcpy(out->hash, second.hash, CPL_HASH_SIZE);
+            (void)memcpy(out->payload, second.payload,
+                second.payload_length);
+            return CPL_OK;
+        }
+        if (monotonic_ns() >= deadline) {
+            return CPL_ERR_CERTIFY_TIMEOUT;
+        }
+    }
+}
+
+int cpl_journal_bootstrap_certify(cpl_journal *journal,
+    uint16_t expected_type, const uint8_t *expected_payload,
+    uint32_t expected_payload_length, uint64_t deadline_ns,
+    struct cpl_bootstrap_head *out) {
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status;
+
+    if (out == NULL || !valid_control_type(expected_type) ||
+        expected_payload_length > CPL_BOOTSTRAP_MAX_PAYLOAD ||
+        (expected_payload_length > 0U && expected_payload == NULL)) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    status = ensure_owner(journal);
+    return status == CPL_OK ? bootstrap_certify_internal(journal,
+        expected_type, expected_payload, expected_payload_length, deadline,
+        out) : status;
+}
+
+int cpl_journal_bootstrap_append(cpl_journal *journal, uint16_t type,
+    const uint8_t *payload, uint32_t payload_length, uint64_t deadline_ns,
+    struct cpl_bootstrap_head *out) {
+    struct bootstrap_chain chain;
+    uint8_t record[CPL_BOOTSTRAP_RECORD_SIZE];
+    uint8_t zero_hash[CPL_HASH_SIZE] = {0};
+    const uint8_t *parent;
+    struct stat metadata;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    uint32_t checksum;
+    ssize_t written;
+    int status;
+
+    if (out == NULL || payload_length > CPL_BOOTSTRAP_MAX_PAYLOAD ||
+        (payload_length > 0U && payload == NULL) ||
+        !valid_control_type(type)) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(out, 0, sizeof(*out));
+    status = ensure_owner(journal);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = take_mutex(&journal->append_mutex, deadline);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = take_flock(journal->append_lock_fd, deadline);
+    if (status != CPL_OK) {
+        (void)pthread_mutex_unlock(&journal->append_mutex);
+        return status;
+    }
+    status = scan_bootstrap(journal, &chain);
+    if (status == CPL_OK && !bootstrap_transition(chain.type, chain.present,
+            type)) {
+        status = CPL_ERR_CONTROL_PHASE;
+    }
+    if (status == CPL_OK && (fstat(journal->fd, &metadata) < 0 ||
+            metadata.st_size < 0 ||
+            (uint64_t)metadata.st_size + CPL_BOOTSTRAP_RECORD_SIZE >
+                journal->normal_limit)) {
+        status = CPL_ERR_NORMAL_LIMIT;
+    }
+    if (status == CPL_OK) {
+        (void)memset(record, 0, sizeof(record));
+        (void)memcpy(record, CPL_BOOTSTRAP_MAGIC, CPL_MAGIC_SIZE);
+        put_u16(record + 8U, CPL_CONTROL_VERSION);
+        put_u16(record + 10U, CPL_BOOTSTRAP_PAYLOAD_OFFSET);
+        put_u32(record + 12U, CPL_BOOTSTRAP_RECORD_SIZE);
+        (void)memcpy(record + 16U, journal->nonce, CPL_HASH_SIZE);
+        put_u64(record + 48U, chain.sequence + 1U);
+        parent = chain.present ? chain.hash : zero_hash;
+        (void)memcpy(record + 56U, parent, CPL_HASH_SIZE);
+        put_u16(record + 88U, type);
+        put_u32(record + 92U, payload_length);
+        if (payload_length > 0U) {
+            (void)memcpy(record + CPL_BOOTSTRAP_PAYLOAD_OFFSET, payload,
+                payload_length);
+        }
+        checksum = crc32c(record, sizeof(record));
+        put_u32(record + CPL_BOOTSTRAP_RECORD_SIZE - 4U, checksum);
+        written = write(journal->fd, record, sizeof(record));
+        if (written < 0 || (size_t)written != sizeof(record)) {
+            journal->unhealthy = true;
+            status = CPL_ERR_IO_SHORT;
+        }
+    }
+    (void)release_flock(journal->append_lock_fd);
+    (void)pthread_mutex_unlock(&journal->append_mutex);
+    if (status != CPL_OK) {
+        return status;
+    }
+    return bootstrap_certify_internal(journal, type, payload, payload_length,
+        deadline, out);
 }
 
 static int validate_component(const char *name) {
@@ -1586,6 +1904,10 @@ static int scan_internal(cpl_journal *journal, struct cpl_chain *out) {
         struct cpl_state next;
         int transition;
 
+        if (valid_physical_bootstrap_record(journal, candidate, remaining)) {
+            offset += CPL_BOOTSTRAP_RECORD_SIZE;
+            continue;
+        }
         if (remaining < CPL_HEADER_SIZE) {
             out->invalid_bytes += remaining;
             break;

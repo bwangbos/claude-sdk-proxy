@@ -156,6 +156,16 @@ class CertifiedHead:
 
 
 @dataclass(frozen=True)
+class BootstrapHead:
+    hash: bytes
+    sequence: int
+    physical_eof: int
+    message_type: int
+    payload: bytes = field(repr=False)
+    attempts: int = 0
+
+
+@dataclass(frozen=True)
 class ReapProof:
     pid: int
     _certified_hash: bytes = field(default=b"", compare=False, repr=False)
@@ -300,6 +310,21 @@ class _CCertifiedHead(ctypes.Structure):
     ]
 
 
+class _CBootstrapHead(ctypes.Structure):
+    _fields_ = [
+        ("sequence", ctypes.c_uint64),
+        ("physical_eof", ctypes.c_uint64),
+        ("type", ctypes.c_uint16),
+        ("reserved_type", ctypes.c_uint16),
+        ("payload_length", ctypes.c_uint32),
+        ("attempts", ctypes.c_uint32),
+        ("present", ctypes.c_bool),
+        ("reserved", ctypes.c_uint8 * 3),
+        ("hash", ctypes.c_uint8 * HASH_SIZE),
+        ("payload", ctypes.c_uint8 * 256),
+    ]
+
+
 _JOURNAL_ABI_SIZES: Final = {
     _CCreateReceipt: 68,
     _CWorkdirReceipt: 88,
@@ -425,6 +450,24 @@ def _load_library(path: Path) -> ctypes.CDLL:
         ctypes.POINTER(_CCertifiedHead),
     ]
     library.cpl_journal_certify.restype = ctypes.c_int
+    library.cpl_journal_bootstrap_append.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint16,
+        byte_pointer,
+        ctypes.c_uint32,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CBootstrapHead),
+    ]
+    library.cpl_journal_bootstrap_append.restype = ctypes.c_int
+    library.cpl_journal_bootstrap_certify.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint16,
+        byte_pointer,
+        ctypes.c_uint32,
+        ctypes.c_uint64,
+        ctypes.POINTER(_CBootstrapHead),
+    ]
+    library.cpl_journal_bootstrap_certify.restype = ctypes.c_int
     library.cpl_journal_create_workdir.argtypes = [
         ctypes.c_void_p,
         ctypes.c_int,
@@ -1125,6 +1168,44 @@ class Journal:
             native.physical_eof,
             _state_from_c(native.state),
             native.has_intent,
+            native.attempts,
+        )
+
+    def certify_bootstrap(
+        self,
+        message_type: int,
+        payload: bytes,
+        deadline_ns: int | None = None,
+    ) -> BootstrapHead:
+        if (
+            isinstance(message_type, bool)
+            or not 1 <= message_type <= 10
+            or not isinstance(payload, bytes)
+            or len(payload) > 256
+        ):
+            raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
+        storage = (ctypes.c_uint8 * max(1, len(payload)))()
+        if payload:
+            ctypes.memmove(storage, payload, len(payload))
+        native = _CBootstrapHead()
+        _raise_status(
+            self._native_call(
+                self._library.cpl_journal_bootstrap_certify,
+                message_type,
+                storage,
+                len(payload),
+                _deadline(deadline_ns),
+                ctypes.byref(native),
+            )
+        )
+        if not native.present:
+            raise JournalError(JournalErrorCode.AUTHORITY)
+        return BootstrapHead(
+            bytes(native.hash),
+            native.sequence,
+            native.physical_eof,
+            native.type,
+            bytes(native.payload[: native.payload_length]),
             native.attempts,
         )
 

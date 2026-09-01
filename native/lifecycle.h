@@ -47,6 +47,7 @@ extern "C" {
 #define CPL_ABI_DELETE_RECEIPT_SIZE 40U
 #define CPL_ABI_ACTION_TOKEN_SIZE 72U
 #define CPL_ABI_REAP_PROOF_SIZE 72U
+#define CPL_ABI_CLEANUP_EVIDENCE_SIZE 24U
 #define CPL_CONTROL_MAGIC 0x464c5043U
 #define CPL_CONTROL_VERSION 1U
 #define CPL_CONTROL_MAX_PAYLOAD 4096U
@@ -56,6 +57,7 @@ extern "C" {
     (CPL_CONTROL_WIRE_HEADER_SIZE + CPL_CONTROL_MAX_PAYLOAD +            \
      CPL_CONTROL_WIRE_CHECKSUM_SIZE)
 #define CPL_ABI_CONTROL_FRAME_SIZE 4144U
+#define CPL_BOOTSTRAP_MAX_PAYLOAD 256U
 
 typedef struct cpl_journal cpl_journal;
 
@@ -106,7 +108,8 @@ enum cpl_control_type {
     CPL_CONTROL_CLI_RUNNING = 7,
     CPL_CONTROL_CLEANUP_REQUEST = 8,
     CPL_CONTROL_SELF_TERM_REQUEST = 9,
-    CPL_CONTROL_ERROR = 10,
+    CPL_CONTROL_CLEANUP_RESULT = 10,
+    CPL_CONTROL_ERROR = 11,
 };
 
 enum cpl_control_phase {
@@ -120,7 +123,8 @@ enum cpl_control_phase {
     CPL_CONTROL_PHASE_CLI_RUNNING = 7,
     CPL_CONTROL_PHASE_CLEANUP_REQUEST = 8,
     CPL_CONTROL_PHASE_SELF_TERM_REQUEST = 9,
-    CPL_CONTROL_PHASE_ERROR = 10,
+    CPL_CONTROL_PHASE_CLEANUP_RESULT = 10,
+    CPL_CONTROL_PHASE_ERROR = 11,
 };
 
 struct cpl_control_frame {
@@ -131,6 +135,19 @@ struct cpl_control_frame {
     uint8_t allocation_nonce[CPL_HASH_SIZE];
     uint8_t payload[CPL_CONTROL_MAX_PAYLOAD];
     uint32_t checksum;
+};
+
+struct cpl_bootstrap_head {
+    uint64_t sequence;
+    uint64_t physical_eof;
+    uint16_t type;
+    uint16_t reserved_type;
+    uint32_t payload_length;
+    uint32_t attempts;
+    bool present;
+    uint8_t reserved[3];
+    uint8_t hash[CPL_HASH_SIZE];
+    uint8_t payload[CPL_BOOTSTRAP_MAX_PAYLOAD];
 };
 
 enum cpl_storage_state {
@@ -229,6 +246,33 @@ struct cpl_process_identity {
     uint64_t executable_ino;
     uint8_t boot_id[CPL_HASH_SIZE];
     uint8_t executable_hash[CPL_HASH_SIZE];
+};
+
+struct cpl_cli_armed_identity {
+    struct cpl_process_identity member;
+    uint64_t expected_executable_dev;
+    uint64_t expected_executable_ino;
+    uint8_t expected_executable_hash[CPL_HASH_SIZE];
+    uint8_t expected_path_hash[CPL_HASH_SIZE];
+};
+
+enum cpl_cleanup_evidence_flag {
+    CPL_CLEANUP_STOP_USED = 1U << 0,
+    CPL_CLEANUP_STOPPED_ENUMERATED = 1U << 1,
+    CPL_CLEANUP_TERM_USED = 1U << 2,
+    CPL_CLEANUP_KILL_USED = 1U << 3,
+    CPL_CLEANUP_ZOMBIE_OBSERVED = 1U << 4,
+    CPL_CLEANUP_ABSENCE_ENUMERATED = 1U << 5,
+    CPL_CLEANUP_ANCHOR_REAPED = 1U << 6,
+    CPL_CLEANUP_TASK4_DONE = 1U << 7,
+    CPL_CLEANUP_GROUP_ENUMERATION_COMPLETE = 1U << 8,
+};
+
+struct cpl_cleanup_evidence {
+    uint32_t flags;
+    uint32_t batch_count;
+    uint64_t completed_steps;
+    uint64_t done_sequence;
 };
 
 struct cpl_batch_descriptor {
@@ -421,6 +465,12 @@ int cpl_control_frame_read(int fd,
     struct cpl_control_frame *out);
 int cpl_control_phase_accept(uint32_t *inout_phase, uint16_t type,
     bool durable_head_certified);
+int cpl_journal_bootstrap_append(cpl_journal *j, uint16_t type,
+    const uint8_t *payload, uint32_t payload_length, uint64_t deadline_ns,
+    struct cpl_bootstrap_head *out);
+int cpl_journal_bootstrap_certify(cpl_journal *j, uint16_t expected_type,
+    const uint8_t *expected_payload, uint32_t expected_payload_length,
+    uint64_t deadline_ns, struct cpl_bootstrap_head *out);
 int cpl_journal_create_workdir(cpl_journal *j,
     int workdir_parent_dirfd, const struct cpl_create_receipt *create_receipt,
     uint64_t deadline_ns, struct cpl_workdir_receipt *receipt);

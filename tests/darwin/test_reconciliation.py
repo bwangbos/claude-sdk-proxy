@@ -25,6 +25,8 @@ def test_crash_boundary_is_reconcilable(boundary: str) -> None:
     assert result.outcome in {"done", "unconfirmed"}
     assert result.unsafe_numeric_signal_count == 0
     assert result.canonical_head_certified
+    assert result.same_canonical_journal
+    assert result.evidence_observed_not_inferred
 
 
 @pytest.mark.parametrize(

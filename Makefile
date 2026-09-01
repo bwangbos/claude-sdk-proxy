@@ -7,7 +7,7 @@ C17_FLAGS := -std=c17 -Wall -Wextra -Werror -pedantic
 
 .PHONY: native unit darwin live-core live-tools check
 
-native: build/bin/darwin-probe build/lib/libclaude_proxy_lifecycle.dylib build/lib/libclaude_proxy_lifecycle_fault.dylib build/bin/claude-proxy-supervisor build/bin/claude-proxy-anchor
+native: build/bin/darwin-probe build/lib/libclaude_proxy_lifecycle.dylib build/lib/libclaude_proxy_lifecycle_fault.dylib build/bin/claude-proxy-supervisor build/bin/claude-proxy-anchor build/bin/claude-proxy-probe-child
 
 build/bin:
 	mkdir -p $@
@@ -29,6 +29,9 @@ build/bin/claude-proxy-supervisor: native/claude_supervisor.c native/lifecycle.h
 
 build/bin/claude-proxy-anchor: native/claude_anchor.c native/lifecycle.h build/lib/libclaude_proxy_lifecycle.dylib | build/bin
 	$(CLANG) $(C17_FLAGS) -isysroot $(SDKROOT) native/claude_anchor.c -Lbuild/lib -lclaude_proxy_lifecycle -Wl,-rpath,@loader_path/../lib -o $@
+
+build/bin/claude-proxy-probe-child: native/claude_probe_child.c | build/bin
+	$(CLANG) $(C17_FLAGS) -isysroot $(SDKROOT) native/claude_probe_child.c -o $@
 
 unit:
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/unit

@@ -55,6 +55,18 @@ def test_native_bootstrap_environment_matches_python_allowlist(tmp_path: Path) -
         "CLI_RUNNING",
     )
     assert evidence.ack_after_durable_certification
+    assert evidence.exact_canonical_ack_heads
+    assert evidence.canonical_control_types == (
+        "SUPERVISOR_IDENTITY",
+        "ANCHOR_IDENTITY",
+        "CLI_ARMED",
+        "CLI_RUNNING",
+    )
+    assert evidence.canonical_control_sequences == (1, 2, 3, 4)
+    assert evidence.post_exec_identity_verified
+    assert evidence.cli_control_fd_closed_on_exec
+    assert evidence.network_proxy_selector_authenticated
+    assert evidence.probe_mode_collision_impossible
 
 
 def test_control_frame_round_trip_and_validation_are_bounded() -> None:
@@ -80,8 +92,21 @@ def test_bootstrap_control_eof_is_fail_dead_before_next_stage() -> None:
     """Losing bootstrap control before identity ACK must not spawn the anchor."""
     evidence = run_lifecycle_scenario("supervisor_before_identity")
 
-    assert evidence.outcome == "done"
+    assert evidence.outcome == "unconfirmed"
     assert evidence.fail_dead_exit_code == 75
     assert evidence.next_stage_spawned is False
     assert evidence.cli_exec_count == 0
+    assert evidence.same_canonical_journal
+    assert evidence.evidence_observed_not_inferred
+    assert evidence.artifacts_retained
+    assert evidence.workdir_removed is False
     assert evidence.unsafe_numeric_signal_count == 0
+
+
+def test_ordinary_argv_cannot_select_a_test_probe_mode() -> None:
+    """Untrusted ordinary CLI arguments must never intercept the shim itself."""
+    evidence = run_lifecycle_scenario("ordinary_probe_argument_collision")
+
+    assert evidence.fail_dead_exit_code == 75
+    assert evidence.probe_mode_collision_impossible
+    assert evidence.cli_exec_count == 0

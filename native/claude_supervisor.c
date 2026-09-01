@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/proc.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -69,6 +70,8 @@ struct bootstrap_values {
     const char *instance_dir;
     const char *real_cli;
     int control_fd;
+    int anchor_fallback_fd;
+    bool network_proxy_enabled;
 };
 
 struct group_probe {
@@ -83,6 +86,28 @@ struct group_probe {
     bool group_absent;
     bool absence_enumerated;
 };
+
+struct cleanup_result {
+    bool stop_used;
+    bool enumerated_while_stopped;
+    bool term_used;
+    bool kill_used;
+    bool zombie_observed;
+    bool absence_enumerated;
+    bool anchor_reaped;
+    bool task4_completed;
+    uint32_t batch_count;
+    uint64_t completed_steps;
+    uint64_t done_sequence;
+};
+
+static bool enumerate_stopped_group(pid_t pgid, pid_t anchor);
+static bool enumerate_absence_with_unreaped_anchor(pid_t pgid,
+    pid_t anchor);
+static int wait_unreaped(pid_t pid, bool *observed);
+static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
+    const struct cpl_process_identity *anchor,
+    struct cleanup_result *result);
 
 static volatile sig_atomic_t anchor_term_seen = 0;
 
@@ -109,6 +134,16 @@ static uint64_t control_deadline(void) {
     }
     return (uint64_t)now.tv_sec * 1000000000ULL +
         (uint64_t)now.tv_nsec + 5000000000ULL;
+}
+
+static uint64_t lease_deadline(void) {
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+        return 0U;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ULL +
+        (uint64_t)now.tv_nsec + 30000000000ULL;
 }
 
 static void bounded_pause(void) {
@@ -364,20 +399,28 @@ fail:
 
 static int parse_bootstrap_values(struct bootstrap_values *out) {
     const char *fd_text;
+    const char *network_proxy;
     uint8_t nonce[CPL_HASH_SIZE];
 
     (void)memset(out, 0, sizeof(*out));
     out->control_fd = -1;
+    out->anchor_fallback_fd = -1;
     out->allocation_nonce = getenv("LOCAL_PROXY_ALLOCATION_NONCE");
     out->instance_dir = getenv("LOCAL_PROXY_INSTANCE_DIR");
     out->real_cli = getenv("LOCAL_PROXY_REAL_CLAUDE");
     fd_text = getenv("LOCAL_PROXY_CONTROL_FD");
+    network_proxy = getenv("LOCAL_PROXY_NETWORK_PROXY");
     if (parse_nonce(out->allocation_nonce, nonce) < 0 ||
         out->instance_dir == NULL || out->instance_dir[0] != '/' ||
         out->real_cli == NULL || out->real_cli[0] != '/' ||
-        parse_fd(fd_text, &out->control_fd) < 0) {
+        parse_fd(fd_text, &out->control_fd) < 0 ||
+        parse_fd(getenv("LOCAL_PROXY_ANCHOR_CONTROL_FD"),
+            &out->anchor_fallback_fd) < 0 || network_proxy == NULL ||
+        (strcmp(network_proxy, "0") != 0 &&
+         strcmp(network_proxy, "1") != 0)) {
         return -1;
     }
+    out->network_proxy_enabled = strcmp(network_proxy, "1") == 0;
     return 0;
 }
 
@@ -405,7 +448,7 @@ static int own_supervisor_domain(const struct bootstrap_values *values,
     if (status == CPL_OK) {
         (void)memcpy(executor, "supervisor", strlen("supervisor"));
         status = cpl_journal_activate_executor(*out, 1U, executor,
-            (int64_t)getpid(), monotonic_deadline(), monotonic_deadline(),
+            (int64_t)getpid(), lease_deadline(), control_deadline(),
             &activated);
     }
     if (status == CPL_OK) {
@@ -427,6 +470,7 @@ static int supervisor_identity_handshake(
     const struct bootstrap_values *values, cpl_journal *journal) {
     struct cpl_process_identity identity;
     struct cpl_control_frame frame;
+    struct cpl_bootstrap_head bootstrap;
     struct cpl_certified_head certified;
     uint8_t nonce[CPL_HASH_SIZE];
     uint32_t phase = CPL_CONTROL_PHASE_NONE;
@@ -436,6 +480,11 @@ static int supervisor_identity_handshake(
         return -1;
     }
     status = cpl_process_observe((int64_t)getpid(), &identity);
+    if (status == CPL_OK) {
+        status = cpl_journal_bootstrap_append(journal,
+            CPL_CONTROL_SUPERVISOR_IDENTITY, (const uint8_t *)&identity,
+            (uint32_t)sizeof(identity), control_deadline(), &bootstrap);
+    }
     if (status == CPL_OK) {
         status = cpl_control_frame_write(values->control_fd,
             CPL_CONTROL_SUPERVISOR_IDENTITY, nonce,
@@ -481,16 +530,18 @@ static int verified_anchor_path(char out[PATH_MAX]) {
     return result > 0 && result < PATH_MAX ? 0 : -1;
 }
 
-static int verify_real_cli(const char *path) {
+static int verify_real_cli(const char *path,
+    struct cpl_cli_armed_identity *expected) {
     struct stat metadata;
     uint8_t digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256_CTX context;
     uint8_t buffer[4096];
     int fd;
 
-    if (path == NULL || path[0] != '/') {
+    if (path == NULL || path[0] != '/' || expected == NULL) {
         return -1;
     }
+    (void)memset(expected, 0, sizeof(*expected));
     fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0 || fstat(fd, &metadata) < 0 || !S_ISREG(metadata.st_mode) ||
         metadata.st_uid != geteuid() || (metadata.st_mode & S_IXUSR) == 0 ||
@@ -516,24 +567,115 @@ static int verify_real_cli(const char *path) {
         }
     }
     (void)close(fd);
-    return CC_SHA256_Final(digest, &context) == 1 ? 0 : -1;
+    if (CC_SHA256_Final(digest, &context) != 1) {
+        return -1;
+    }
+    expected->expected_executable_dev = (uint64_t)metadata.st_dev;
+    expected->expected_executable_ino = (uint64_t)metadata.st_ino;
+    (void)memcpy(expected->expected_executable_hash, digest, sizeof(digest));
+    (void)CC_SHA256(path, (CC_LONG)strlen(path), expected->expected_path_hash);
+    return 0;
+}
+
+static bool same_incarnation(const struct cpl_process_identity *left,
+    const struct cpl_process_identity *right) {
+    return left->pid == right->pid && left->start_ns == right->start_ns &&
+        left->uid == right->uid && left->pgid == right->pgid &&
+        left->sid == right->sid && left->flags == right->flags &&
+        memcmp(left->boot_id, right->boot_id, CPL_HASH_SIZE) == 0;
+}
+
+static bool same_exact_identity(const struct cpl_process_identity *left,
+    const struct cpl_process_identity *right) {
+    return same_incarnation(left, right) &&
+        left->executable_dev == right->executable_dev &&
+        left->executable_ino == right->executable_ino &&
+        memcmp(left->executable_hash, right->executable_hash,
+            CPL_HASH_SIZE) == 0;
+}
+
+static bool matches_expected_cli(const struct cpl_process_identity *actual,
+    const struct cpl_cli_armed_identity *armed) {
+    return same_incarnation(actual, &armed->member) &&
+        actual->executable_dev == armed->expected_executable_dev &&
+        actual->executable_ino == armed->expected_executable_ino &&
+        memcmp(actual->executable_hash, armed->expected_executable_hash,
+            CPL_HASH_SIZE) == 0;
+}
+
+static int relay_gate(int external_fd, int internal_fd,
+    cpl_journal *journal, const uint8_t nonce[CPL_HASH_SIZE],
+    uint16_t identity_type, uint16_t ack_type, uint32_t *phase,
+    struct cpl_control_frame *identity) {
+    struct cpl_control_frame ack;
+    struct cpl_bootstrap_head certified;
+    int status = cpl_control_frame_read(internal_fd, nonce,
+        control_deadline(), identity);
+
+    if (status == CPL_OK && identity->type != identity_type) {
+        status = CPL_ERR_CONTROL_PHASE;
+    }
+    if (status == CPL_OK) {
+        status = cpl_journal_bootstrap_certify(journal, identity_type,
+            identity->payload, identity->payload_length, control_deadline(),
+            &certified);
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_phase_accept(phase, identity_type, false);
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_frame_write(external_fd, identity_type, nonce,
+            identity->payload, identity->payload_length, control_deadline());
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_frame_read(external_fd, nonce,
+            control_deadline(), &ack);
+    }
+    if (status == CPL_OK && ack.type != ack_type) {
+        status = CPL_ERR_CONTROL_PHASE;
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_phase_accept(phase, ack.type, true);
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_frame_write(internal_fd, ack_type, nonce, NULL,
+            0U, control_deadline());
+    }
+    return status;
 }
 
 static int launch_anchor(const struct bootstrap_values *values,
     struct child_environment *child_environment, int cli_argc,
-    char **cli_argv) {
+    char **cli_argv, cpl_journal *journal, int directory_fd) {
     char anchor_path[PATH_MAX];
     char control_fd[32];
+    char fallback_fd[32];
     char **anchor_argv;
-    size_t fixed_count = 10U;
+    struct cpl_cli_armed_identity expected;
+    struct cpl_cli_armed_identity armed;
+    struct cpl_control_frame frame;
+    struct cpl_control_frame request;
+    struct cpl_process_identity anchor_identity;
+    struct cpl_process_identity running;
+    struct cpl_bootstrap_head bootstrap;
+    struct timespec now;
+    uint8_t nonce[CPL_HASH_SIZE];
+    uint32_t phase = CPL_CONTROL_PHASE_IDENTITY_ACK;
+    uint64_t deadline;
+    int internal[2] = {-1, -1};
+    size_t fixed_count = 12U;
     size_t total;
     size_t index;
     pid_t child;
-    int child_status;
+    int status = CPL_ERR_SYSTEM;
 
     if (verified_anchor_path(anchor_path) < 0 ||
-        verify_real_cli(values->real_cli) < 0 ||
-        snprintf(control_fd, sizeof(control_fd), "%d", values->control_fd) < 0) {
+        verify_real_cli(values->real_cli, &expected) < 0 ||
+        parse_nonce(values->allocation_nonce, nonce) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, internal) < 0 ||
+        snprintf(control_fd, sizeof(control_fd), "%d", internal[1]) < 0 ||
+        snprintf(fallback_fd, sizeof(fallback_fd), "%d",
+            values->anchor_fallback_fd) < 0) {
         return -1;
     }
     total = fixed_count + (size_t)cli_argc + 1U;
@@ -550,108 +692,178 @@ static int launch_anchor(const struct bootstrap_values *values,
     anchor_argv[6] = control_fd;
     anchor_argv[7] = "--real-cli";
     anchor_argv[8] = (char *)values->real_cli;
-    anchor_argv[9] = "--";
+    anchor_argv[9] = "--fallback-control-fd";
+    anchor_argv[10] = fallback_fd;
+    anchor_argv[11] = "--";
     for (index = 0U; index < (size_t)cli_argc; ++index) {
         anchor_argv[fixed_count + index] = cli_argv[index];
     }
     child = fork();
     if (child < 0) {
         free(anchor_argv);
+        (void)close(internal[0]);
+        (void)close(internal[1]);
         return -1;
     }
     if (child == 0) {
+        (void)close(values->control_fd);
+        (void)close(internal[0]);
+        if (fcntl(values->anchor_fallback_fd, F_SETFD, 0) < 0) {
+            _exit(SUPERVISOR_FAIL_DEAD_EXIT);
+        }
         execve(anchor_path, anchor_argv, child_environment->entries);
         _exit(SUPERVISOR_FAIL_DEAD_EXIT);
     }
+    (void)close(internal[1]);
+    (void)close(values->anchor_fallback_fd);
     free(anchor_argv);
-    if (waitpid(child, &child_status, 0) != child ||
-        !WIFEXITED(child_status)) {
-        return -1;
-    }
-    return WEXITSTATUS(child_status);
-}
-
-struct environment_fingerprint {
-    char name[SUPERVISOR_NAME_CAPACITY];
-    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
-};
-
-static int compare_fingerprint(const void *left, const void *right) {
-    const struct environment_fingerprint *first = left;
-    const struct environment_fingerprint *second = right;
-
-    return strcmp(first->name, second->name);
-}
-
-static int dump_environment(int control_fd) {
-    struct environment_fingerprint entries[SUPERVISOR_ENV_CAPACITY];
-    char **entry;
-    size_t count = 0U;
-    size_t index;
-
-    for (entry = environ; *entry != NULL; ++entry) {
-        const char *separator = strchr(*entry, '=');
-        size_t name_length;
-
-        if (separator == NULL || count >= SUPERVISOR_ENV_CAPACITY) {
-            return SUPERVISOR_FAIL_DEAD_EXIT;
+    status = relay_gate(values->control_fd, internal[0], journal, nonce,
+        CPL_CONTROL_ANCHOR_IDENTITY, CPL_CONTROL_ANCHOR_ACK, &phase, &frame);
+    if (status == CPL_OK && frame.payload_length == sizeof(anchor_identity)) {
+        (void)memcpy(&anchor_identity, frame.payload, sizeof(anchor_identity));
+        if (anchor_identity.pid != child || anchor_identity.pid !=
+                anchor_identity.pgid || anchor_identity.pid !=
+                anchor_identity.sid) {
+            status = CPL_ERR_PROCESS_IDENTITY;
         }
-        name_length = (size_t)(separator - *entry);
-        if (name_length == 0U || name_length >= sizeof(entries[count].name)) {
-            return SUPERVISOR_FAIL_DEAD_EXIT;
-        }
-        (void)memcpy(entries[count].name, *entry, name_length);
-        entries[count].name[name_length] = '\0';
-        (void)CC_SHA256(separator + 1U, (CC_LONG)strlen(separator + 1U),
-            entries[count].digest);
-        ++count;
-    }
-    qsort(entries, count, sizeof(entries[0]), compare_fingerprint);
-    for (index = 0U; index < count; ++index) {
-        char line[SUPERVISOR_NAME_CAPACITY + CC_SHA256_DIGEST_LENGTH * 2U + 3U];
-        size_t cursor;
-        size_t digest_index;
-        static const char hexadecimal[] = "0123456789abcdef";
-
-        cursor = strlen(entries[index].name);
-        (void)memcpy(line, entries[index].name, cursor);
-        line[cursor++] = '\t';
-        for (digest_index = 0U; digest_index < CC_SHA256_DIGEST_LENGTH;
-             ++digest_index) {
-            line[cursor++] = hexadecimal[entries[index].digest[digest_index] >> 4U];
-            line[cursor++] = hexadecimal[entries[index].digest[digest_index] & 15U];
-        }
-        line[cursor++] = '\n';
-        if (write_all(control_fd, line, cursor) < 0) {
-            return SUPERVISOR_FAIL_DEAD_EXIT;
-        }
-    }
-    return 0;
-}
-
-static int run_environment_probe(int control_fd, const char *nonce_text) {
-    struct cpl_process_identity identity;
-    uint8_t nonce[CPL_HASH_SIZE];
-    uint32_t phase = CPL_CONTROL_PHASE_ARMED_ACK;
-    int status;
-
-    if (parse_nonce(nonce_text, nonce) < 0) {
-        return SUPERVISOR_FAIL_DEAD_EXIT;
-    }
-    status = cpl_process_observe((int64_t)getpid(), &identity);
-    if (status == CPL_OK) {
-        status = cpl_control_frame_write(control_fd,
-            CPL_CONTROL_CLI_RUNNING, nonce, (const uint8_t *)&identity,
-            (uint32_t)sizeof(identity), control_deadline());
+    } else if (status == CPL_OK) {
+        status = CPL_ERR_CONTROL_PAYLOAD;
     }
     if (status == CPL_OK) {
-        status = cpl_control_phase_accept(&phase,
-            CPL_CONTROL_CLI_RUNNING, false);
+        status = relay_gate(values->control_fd, internal[0], journal, nonce,
+            CPL_CONTROL_CLI_ARMED, CPL_CONTROL_ARMED_ACK, &phase, &frame);
     }
-    if (status != CPL_OK) {
-        return SUPERVISOR_FAIL_DEAD_EXIT;
+    if (status == CPL_OK && frame.payload_length == sizeof(armed)) {
+        (void)memcpy(&armed, frame.payload, sizeof(armed));
+        if (armed.member.pgid != anchor_identity.pgid ||
+            armed.member.sid != anchor_identity.sid ||
+            armed.expected_executable_dev !=
+                expected.expected_executable_dev ||
+            armed.expected_executable_ino !=
+                expected.expected_executable_ino ||
+            memcmp(armed.expected_executable_hash,
+                expected.expected_executable_hash, CPL_HASH_SIZE) != 0 ||
+            memcmp(armed.expected_path_hash, expected.expected_path_hash,
+                CPL_HASH_SIZE) != 0) {
+            status = CPL_ERR_PROCESS_IDENTITY;
+        }
+    } else if (status == CPL_OK) {
+        status = CPL_ERR_CONTROL_PAYLOAD;
     }
-    return dump_environment(control_fd);
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+        status = CPL_ERR_SYSTEM;
+        deadline = 0U;
+    } else {
+        deadline = (uint64_t)now.tv_sec * 1000000000ULL +
+            (uint64_t)now.tv_nsec + 5000000000ULL;
+    }
+    while (status == CPL_OK) {
+        status = cpl_process_observe(armed.member.pid, &running);
+        if (status == CPL_OK && matches_expected_cli(&running, &armed)) {
+            break;
+        }
+        if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0 ||
+            (uint64_t)now.tv_sec * 1000000000ULL +
+                (uint64_t)now.tv_nsec >= deadline) {
+            status = CPL_ERR_CERTIFY_TIMEOUT;
+            break;
+        }
+        bounded_pause();
+        status = CPL_OK;
+    }
+    if (status == CPL_OK) {
+        status = cpl_journal_bootstrap_append(journal,
+            CPL_CONTROL_CLI_RUNNING, (const uint8_t *)&running,
+            (uint32_t)sizeof(running), control_deadline(), &bootstrap);
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_phase_accept(&phase, CPL_CONTROL_CLI_RUNNING,
+            false);
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_frame_write(internal[0],
+            CPL_CONTROL_CLI_RUNNING, nonce, (const uint8_t *)&running,
+            (uint32_t)sizeof(running), control_deadline());
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_frame_write(values->control_fd,
+            CPL_CONTROL_CLI_RUNNING, nonce, (const uint8_t *)&running,
+            (uint32_t)sizeof(running), control_deadline());
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_frame_read(values->control_fd, nonce,
+            lease_deadline(), &request);
+    }
+    if (status == CPL_OK && request.type != CPL_CONTROL_CLEANUP_REQUEST) {
+        status = CPL_ERR_CONTROL_PHASE;
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_phase_accept(&phase, request.type, false);
+    }
+    if (status == CPL_OK) {
+        status = cpl_journal_bootstrap_append(journal,
+            CPL_CONTROL_CLEANUP_REQUEST, request.payload,
+            request.payload_length, control_deadline(), &bootstrap);
+    }
+    if (status == CPL_OK) {
+        status = cpl_control_frame_write(internal[0],
+            CPL_CONTROL_CLEANUP_REQUEST, nonce, request.payload,
+            request.payload_length, control_deadline());
+    }
+    if (status == CPL_OK) {
+        struct cleanup_result cleanup;
+        struct cpl_cleanup_evidence evidence;
+
+        (void)memset(&cleanup, 0, sizeof(cleanup));
+        status = retained_group_cleanup(journal, directory_fd,
+            &anchor_identity, &cleanup);
+        (void)memset(&evidence, 0, sizeof(evidence));
+        if (cleanup.stop_used) {
+            evidence.flags |= CPL_CLEANUP_STOP_USED;
+        }
+        if (cleanup.enumerated_while_stopped) {
+            evidence.flags |= CPL_CLEANUP_STOPPED_ENUMERATED;
+        }
+        if (cleanup.term_used) {
+            evidence.flags |= CPL_CLEANUP_TERM_USED;
+        }
+        if (cleanup.kill_used) {
+            evidence.flags |= CPL_CLEANUP_KILL_USED;
+        }
+        if (cleanup.zombie_observed) {
+            evidence.flags |= CPL_CLEANUP_ZOMBIE_OBSERVED;
+        }
+        if (cleanup.absence_enumerated) {
+            evidence.flags |= CPL_CLEANUP_ABSENCE_ENUMERATED |
+                CPL_CLEANUP_GROUP_ENUMERATION_COMPLETE;
+        }
+        if (cleanup.anchor_reaped) {
+            evidence.flags |= CPL_CLEANUP_ANCHOR_REAPED;
+        }
+        if (cleanup.task4_completed) {
+            evidence.flags |= CPL_CLEANUP_TASK4_DONE;
+        }
+        evidence.batch_count = cleanup.batch_count;
+        evidence.completed_steps = cleanup.completed_steps;
+        evidence.done_sequence = cleanup.done_sequence;
+        if (status == CPL_OK) {
+            status = cpl_journal_bootstrap_append(journal,
+                CPL_CONTROL_CLEANUP_RESULT, (const uint8_t *)&evidence,
+                (uint32_t)sizeof(evidence), control_deadline(), &bootstrap);
+        }
+        if (status == CPL_OK) {
+            status = cpl_control_phase_accept(&phase,
+                CPL_CONTROL_CLEANUP_RESULT, false);
+        }
+        if (status == CPL_OK) {
+            status = cpl_control_frame_write(values->control_fd,
+                CPL_CONTROL_CLEANUP_RESULT, nonce,
+                (const uint8_t *)&evidence, (uint32_t)sizeof(evidence),
+                control_deadline());
+        }
+    }
+    (void)close(internal[0]);
+    return status == CPL_OK ? 0 : -1;
 }
 
 static int wait_unreaped(pid_t pid, bool *observed) {
@@ -679,34 +891,76 @@ static int wait_unreaped(pid_t pid, bool *observed) {
     return -1;
 }
 
+struct bounded_group_members {
+    pid_t *items;
+    size_t count;
+};
+
+static bool list_group_members(pid_t pgid,
+    struct bounded_group_members *out) {
+    enum { MAX_GROUP_MEMBERS = 4096 };
+    size_t capacity = 16U;
+
+    (void)memset(out, 0, sizeof(*out));
+    while (capacity <= MAX_GROUP_MEMBERS) {
+        pid_t *first = calloc(capacity, sizeof(*first));
+        pid_t *second = calloc(capacity, sizeof(*second));
+        int listed;
+        int confirmed;
+
+        if (first == NULL || second == NULL) {
+            free(first);
+            free(second);
+            return false;
+        }
+        listed = proc_listpgrppids(pgid, first,
+            (int)(capacity * sizeof(*first)));
+        confirmed = proc_listpgrppids(pgid, second,
+            (int)(capacity * sizeof(*second)));
+        if (listed < 0 || confirmed < 0 || (size_t)listed >= capacity ||
+            (size_t)confirmed >= capacity || confirmed > listed) {
+            free(first);
+            free(second);
+            if (listed < 0 || confirmed < 0 || capacity == MAX_GROUP_MEMBERS) {
+                return false;
+            }
+            capacity *= 2U;
+            continue;
+        }
+        free(first);
+        out->items = second;
+        out->count = (size_t)confirmed;
+        return true;
+    }
+    return false;
+}
+
+static void free_group_members(struct bounded_group_members *members) {
+    free(members->items);
+    members->items = NULL;
+    members->count = 0U;
+}
+
 static bool enumerate_stopped_group(pid_t pgid, pid_t anchor) {
     uint64_t deadline = monotonic_deadline();
 
     for (;;) {
-        pid_t members[64];
-        size_t limit;
+        struct bounded_group_members members;
         size_t index;
         unsigned present = 0U;
         bool anchor_found = false;
         bool all_stopped = true;
-        int listed;
 
-        (void)memset(members, 0, sizeof(members));
-        listed = proc_listpgrppids(pgid, members, (int)sizeof(members));
-        if (listed > 0) {
-            limit = (size_t)listed;
-            if (limit > sizeof(members) / sizeof(members[0])) {
-                limit = sizeof(members) / sizeof(members[0]);
-            }
-            for (index = 0U; index < limit; ++index) {
+        if (list_group_members(pgid, &members)) {
+            for (index = 0U; index < members.count; ++index) {
                 struct proc_bsdinfo information;
 
-                if (members[index] <= 0) {
+                if (members.items[index] <= 0) {
                     continue;
                 }
                 ++present;
-                anchor_found = anchor_found || members[index] == anchor;
-                if (proc_pidinfo(members[index], PROC_PIDTBSDINFO, 0U,
+                anchor_found = anchor_found || members.items[index] == anchor;
+                if (proc_pidinfo(members.items[index], PROC_PIDTBSDINFO, 0U,
                         &information, (int)sizeof(information)) !=
                         (int)sizeof(information) ||
                     information.pbi_status != SSTOP) {
@@ -714,8 +968,10 @@ static bool enumerate_stopped_group(pid_t pgid, pid_t anchor) {
                 }
             }
             if (present >= 2U && anchor_found && all_stopped) {
+                free_group_members(&members);
                 return true;
             }
+            free_group_members(&members);
         }
         if (monotonic_deadline() == 0U ||
             monotonic_deadline() - 1000000000ULL >= deadline) {
@@ -730,33 +986,27 @@ static bool enumerate_absence_with_unreaped_anchor(pid_t pgid,
     uint64_t deadline = monotonic_deadline();
 
     for (;;) {
-        pid_t members[64];
-        size_t limit;
+        struct bounded_group_members members;
         size_t index;
         bool anchor_seen = false;
         bool unexpected = false;
-        int listed;
 
-        (void)memset(members, 0, sizeof(members));
-        listed = proc_listpgrppids(pgid, members, (int)sizeof(members));
-        if (listed >= 0) {
-            limit = (size_t)listed;
-            if (limit > sizeof(members) / sizeof(members[0])) {
-                limit = sizeof(members) / sizeof(members[0]);
-            }
-            for (index = 0U; index < limit; ++index) {
-                if (members[index] <= 0) {
+        if (list_group_members(pgid, &members)) {
+            for (index = 0U; index < members.count; ++index) {
+                if (members.items[index] <= 0) {
                     continue;
                 }
-                if (members[index] != anchor) {
+                if (members.items[index] != anchor) {
                     unexpected = true;
                     continue;
                 }
                 anchor_seen = true;
             }
-            if (!unexpected && (listed == 0 || anchor_seen)) {
+            if (!unexpected && (members.count == 0U || anchor_seen)) {
+                free_group_members(&members);
                 return true;
             }
+            free_group_members(&members);
         }
         if (monotonic_deadline() == 0U ||
             monotonic_deadline() - 1000000000ULL >= deadline) {
@@ -764,6 +1014,145 @@ static bool enumerate_absence_with_unreaped_anchor(pid_t pgid,
         }
         bounded_pause();
     }
+}
+
+static int complete_cleanup_batch(cpl_journal *journal, int directory_fd,
+    const char *batch_name, const struct cpl_batch_descriptor *descriptors,
+    uint32_t descriptor_count, struct cleanup_result *result) {
+    struct cpl_action_token token;
+    struct cpl_append_result admitted;
+    struct cpl_append_result completed;
+    uint8_t executor[CPL_ID_SIZE] = {0};
+    uint8_t batch_nonce[CPL_ID_SIZE] = {0};
+    uint32_t token_state = CPL_ACTION_TOKEN_RETAINED;
+    uint64_t completed_steps = 0U;
+    size_t batch_length = strlen(batch_name);
+    int status;
+
+    if (batch_length == 0U || batch_length >= CPL_ID_SIZE) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memcpy(executor, "supervisor", strlen("supervisor"));
+    (void)memcpy(batch_nonce, batch_name, batch_length);
+    status = cpl_journal_admit_batch(journal, 1U, executor, batch_nonce,
+        descriptors, descriptor_count, control_deadline(), &token,
+        &admitted);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_execute_batch(journal, &token, directory_fd,
+        control_deadline(), &completed_steps);
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = cpl_journal_complete_batch(journal, &token,
+        control_deadline(), &token_state, &completed);
+    if (status != CPL_OK || token_state != CPL_ACTION_TOKEN_CONSUMED) {
+        return status == CPL_OK ? CPL_ERR_BATCH_TOKEN : status;
+    }
+    ++result->batch_count;
+    result->completed_steps = completed_steps;
+    return CPL_OK;
+}
+
+static int retained_group_cleanup(cpl_journal *journal, int directory_fd,
+    const struct cpl_process_identity *anchor,
+    struct cleanup_result *result) {
+    struct cpl_process_identity observed;
+    struct proc_bsdinfo process;
+    struct cpl_batch_descriptor descriptor;
+    struct cpl_append_result done;
+    uint8_t executor[CPL_ID_SIZE] = {0};
+    int status;
+
+    if (journal == NULL || result == NULL || anchor == NULL ||
+        anchor->pid <= 0 || anchor->pid != anchor->pgid ||
+        anchor->pid != anchor->sid ||
+        cpl_process_observe(anchor->pid, &observed) != CPL_OK ||
+        !same_exact_identity(anchor, &observed) ||
+        proc_pidinfo((int)anchor->pid, PROC_PIDTBSDINFO, 0U, &process,
+            (int)sizeof(process)) != (int)sizeof(process) ||
+        process.pbi_ppid != (uint32_t)getpid()) {
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    if (killpg(anchor->pgid, SIGSTOP) < 0) {
+        return CPL_ERR_SYSTEM;
+    }
+    result->stop_used = true;
+    result->enumerated_while_stopped = enumerate_stopped_group(
+        anchor->pgid, (pid_t)anchor->pid);
+    if (!result->enumerated_while_stopped ||
+        killpg(anchor->pgid, SIGCONT) < 0 ||
+        killpg(anchor->pgid, SIGTERM) < 0) {
+        return CPL_ERR_PROCESS_IDENTITY;
+    }
+    result->term_used = true;
+    if (wait_unreaped((pid_t)anchor->pid, &result->zombie_observed) < 0) {
+        if (killpg(anchor->pgid, SIGKILL) < 0) {
+            return CPL_ERR_SYSTEM;
+        }
+        result->kill_used = true;
+        if (wait_unreaped((pid_t)anchor->pid,
+                &result->zombie_observed) < 0) {
+            return CPL_ERR_REAP_REQUIRED;
+        }
+    }
+    if (!result->zombie_observed) {
+        return CPL_ERR_REAP_REQUIRED;
+    }
+    result->absence_enumerated = enumerate_absence_with_unreaped_anchor(
+        anchor->pgid, (pid_t)anchor->pid);
+    if (!result->absence_enumerated) {
+        return CPL_ERR_PROCESS_PRESENT;
+    }
+
+    (void)memset(&descriptor, 0, sizeof(descriptor));
+    descriptor.kind = CPL_DESCRIPTOR_PROCESS_ABSENT;
+    descriptor.required_steps = 0U;
+    descriptor.target = *anchor;
+    status = complete_cleanup_batch(journal, directory_fd,
+        "process-absent", &descriptor, 1U, result);
+    if (status != CPL_OK) {
+        return status;
+    }
+    (void)memset(&descriptor, 0, sizeof(descriptor));
+    descriptor.kind = CPL_DESCRIPTOR_REAP_PROCESS;
+    descriptor.required_steps = CPL_STEP_PROCESS_ABSENT;
+    descriptor.target = *anchor;
+    status = complete_cleanup_batch(journal, directory_fd, "anchor-reap",
+        &descriptor, 1U, result);
+    if (status != CPL_OK) {
+        return status;
+    }
+    result->anchor_reaped = true;
+    (void)memset(&descriptor, 0, sizeof(descriptor));
+    descriptor.kind = CPL_DESCRIPTOR_REMOVE_WORKDIR;
+    descriptor.required_steps = CPL_STEP_PROCESS_ABSENT |
+        CPL_STEP_EXECUTOR_REAPED;
+    status = complete_cleanup_batch(journal, directory_fd,
+        "workdir-remove", &descriptor, 1U, result);
+    if (status != CPL_OK) {
+        return status;
+    }
+    (void)memset(&descriptor, 0, sizeof(descriptor));
+    descriptor.kind = CPL_DESCRIPTOR_TERMINAL_CHECKS;
+    descriptor.required_steps = CPL_STEP_PROCESS_ABSENT |
+        CPL_STEP_EXECUTOR_REAPED | CPL_STEP_WORKDIR_REMOVED;
+    status = complete_cleanup_batch(journal, directory_fd,
+        "terminal-checks", &descriptor, 1U, result);
+    if (status != CPL_OK || result->completed_steps !=
+            CPL_ALL_COMPLETED_STEPS) {
+        return status == CPL_OK ? CPL_ERR_PRECONDITION : status;
+    }
+    (void)memcpy(executor, "supervisor", strlen("supervisor"));
+    status = cpl_journal_finish_done(journal, 1U, executor,
+        control_deadline(), &done);
+    if (status != CPL_OK) {
+        return status;
+    }
+    result->done_sequence = done.sequence;
+    result->task4_completed = true;
+    return CPL_OK;
 }
 
 static void group_anchor_child(int ready_fd, int control_fd, bool stubborn) {
@@ -1252,53 +1641,33 @@ int main(int argc, char **argv) {
     struct child_environment child_environment;
     cpl_journal *journal = NULL;
     int directory_fd = -1;
-    bool network_proxy_enabled = false;
     int cli_argc;
     char **cli_argv;
-    char *environment_probe_argv[5];
-    char control_fd[32];
+    const char *scenario_token;
     int status;
+    struct sigaction ignored;
 
-    if (argc == 6 && strcmp(argv[1], "--dump-environment") == 0 &&
-        strcmp(argv[2], "--control-fd") == 0 &&
-        strcmp(argv[4], "--allocation-nonce") == 0) {
-        int output_fd;
-
-        if (parse_fd(argv[3], &output_fd) < 0) {
-            return SUPERVISOR_USAGE_EXIT;
-        }
-        return run_environment_probe(output_fd, argv[5]);
+    (void)memset(&ignored, 0, sizeof(ignored));
+    ignored.sa_handler = SIG_IGN;
+    (void)sigemptyset(&ignored.sa_mask);
+    if (sigaction(SIGPIPE, &ignored, NULL) < 0) {
+        return SUPERVISOR_FAIL_DEAD_EXIT;
     }
-    if (argc == 3 && strcmp(argv[1], "--probe-scenario") == 0) {
+
+    scenario_token = getenv("LOCAL_PROXY_PROBE_SCENARIO_TOKEN");
+    if (argc == 3 && strcmp(argv[1], "--probe-scenario") == 0 &&
+        scenario_token != NULL &&
+        strcmp(scenario_token, "task5-local-only") == 0) {
         return run_scenario(argv[2]);
     }
     if (parse_bootstrap_values(&bootstrap) < 0) {
         return SUPERVISOR_FAIL_DEAD_EXIT;
     }
-    if (argc >= 2 && strcmp(argv[1], "--probe-environment") == 0) {
-        network_proxy_enabled = argc == 3 &&
-            strcmp(argv[2], "--network-proxy-enabled") == 0;
-        if (argc > 3 || (argc == 3 && !network_proxy_enabled)) {
-            return SUPERVISOR_USAGE_EXIT;
-        }
-        if (snprintf(control_fd, sizeof(control_fd), "%d",
-                bootstrap.control_fd) < 0) {
-            return SUPERVISOR_FAIL_DEAD_EXIT;
-        }
-        environment_probe_argv[0] = "--dump-environment";
-        environment_probe_argv[1] = "--control-fd";
-        environment_probe_argv[2] = control_fd;
-        environment_probe_argv[3] = "--allocation-nonce";
-        environment_probe_argv[4] = (char *)bootstrap.allocation_nonce;
-        cli_argc = 5;
-        cli_argv = environment_probe_argv;
-    } else {
-        cli_argc = argc - 1;
-        cli_argv = argv + 1;
-    }
+    cli_argc = argc - 1;
+    cli_argv = argv + 1;
     if (cli_argc <= 0 || own_supervisor_domain(&bootstrap, &journal,
             &directory_fd) < 0 || build_child_environment(bootstrap.real_cli,
-            network_proxy_enabled, &child_environment) < 0) {
+            bootstrap.network_proxy_enabled, &child_environment) < 0) {
         if (journal != NULL) {
             cpl_journal_close(journal);
         }
@@ -1313,7 +1682,8 @@ int main(int argc, char **argv) {
         (void)close(directory_fd);
         return SUPERVISOR_FAIL_DEAD_EXIT;
     }
-    status = launch_anchor(&bootstrap, &child_environment, cli_argc, cli_argv);
+    status = launch_anchor(&bootstrap, &child_environment, cli_argc, cli_argv,
+        journal, directory_fd);
     free_child_environment(&child_environment);
     cpl_journal_close(journal);
     (void)close(directory_fd);
