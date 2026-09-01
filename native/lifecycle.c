@@ -57,6 +57,7 @@ struct cpl_journal {
     uint8_t reap_capability[CPL_HASH_SIZE];
     uint8_t reap_head_hash[CPL_HASH_SIZE];
     struct cpl_process_identity reaped_identity;
+    uint64_t action_initial_completed_steps;
     uint64_t action_completed_steps;
     uint32_t authorized_record_kind;
     pthread_t authorized_thread;
@@ -109,7 +110,11 @@ _Static_assert(sizeof(struct cpl_reap_proof) == CPL_ABI_REAP_PROOF_SIZE,
 _Static_assert(CPL_HEADER_SIZE + sizeof(struct cpl_record) ==
     CPL_PHYSICAL_RECORD_SIZE, "physical record size changed");
 _Static_assert(CPL_MAX_AUTHORITY_EPOCH == 2U,
-    "eight-record recovery tail permits exactly one authority replacement");
+    "recovery tail permits exactly one authority replacement");
+_Static_assert(CPL_MAX_RECOVERY_CLEANUP_BATCHES == 4U,
+    "one recovery cleanup batch per fixed cleanup step");
+_Static_assert(CPL_RECOVERY_RECORD_COUNT == 14U,
+    "recovery tail derivation changed");
 
 static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t atfork_once = PTHREAD_ONCE_INIT;
@@ -726,7 +731,7 @@ static int open_lock_at(int parent_dirfd, const char *journal_name,
 static int validate_limits(uint64_t normal_limit, uint64_t hard_limit) {
     if (normal_limit < CPL_PHYSICAL_RECORD_SIZE ||
         normal_limit >= hard_limit || hard_limit > (uint64_t)INT64_MAX ||
-        hard_limit - normal_limit < CPL_RECOVERY_BYTES) {
+        hard_limit - normal_limit != CPL_RECOVERY_BYTES) {
         return CPL_ERR_INVALID_ARGUMENT;
     }
     return CPL_OK;
@@ -1036,6 +1041,16 @@ static int validate_record_descriptors(const struct cpl_record *record) {
     return CPL_OK;
 }
 
+static uint64_t completed_descriptor_steps(const struct cpl_state *state) {
+    uint64_t completed = state->completed_steps;
+    uint32_t index;
+
+    for (index = 0U; index < state->descriptor_count; ++index) {
+        completed |= descriptor_step(state->descriptors[index].kind);
+    }
+    return completed;
+}
+
 static int validate_temporal_admission(const struct cpl_state *current,
     const struct cpl_record *record, uint64_t now) {
     switch (record->kind) {
@@ -1163,7 +1178,8 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
         if (current->kind == CPL_STATE_BATCH_ACTIVE &&
-            record->batch_outcome == CPL_BATCH_NONE) {
+            record->batch_outcome == CPL_BATCH_NONE &&
+            record->completed_steps == completed_descriptor_steps(current)) {
             state_from_record(&next, record, CPL_STATE_ACTIVE_READY);
             preserve_allocation(&next, current);
             preserve_process_identity(&next, current);
@@ -1171,8 +1187,11 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
                 CPL_ID_SIZE);
             (void)memset(next.exact_batch, 0, CPL_ID_SIZE);
         } else if (current->kind == CPL_STATE_RETIRING_BATCH &&
-            (record->batch_outcome == CPL_BATCH_COMPLETED ||
-             record->batch_outcome == CPL_BATCH_INTERRUPTED)) {
+            ((record->batch_outcome == CPL_BATCH_COMPLETED &&
+              record->completed_steps ==
+                  completed_descriptor_steps(current)) ||
+             (record->batch_outcome == CPL_BATCH_INTERRUPTED &&
+              record->completed_steps == current->completed_steps))) {
             next = *current;
             next.kind = CPL_STATE_RETIRING_IDLE;
             next.batch_outcome = record->batch_outcome;
@@ -2744,6 +2763,7 @@ int cpl_journal_admit_batch(cpl_journal *journal, uint64_t generation,
         goto failed;
     }
     random_capability(journal->action_capability);
+    journal->action_initial_completed_steps = chain.state.completed_steps;
     journal->action_completed_steps = chain.state.completed_steps;
     journal->action_owner_thread = pthread_self();
     journal->action_held = true;
@@ -2767,6 +2787,17 @@ static int validate_action_token(cpl_journal *journal,
         return CPL_ERR_BATCH_TOKEN;
     }
     return CPL_OK;
+}
+
+static void release_action_token(cpl_journal *journal) {
+    journal->action_held = false;
+    journal->action_executed = false;
+    journal->action_initial_completed_steps = 0U;
+    journal->action_completed_steps = 0U;
+    (void)memset(journal->action_capability, 0, CPL_HASH_SIZE);
+    (void)memset(&journal->action_owner_thread, 0,
+        sizeof(journal->action_owner_thread));
+    unlock_action(journal);
 }
 
 static int require_certified_batch(cpl_journal *journal,
@@ -2944,11 +2975,27 @@ int cpl_journal_complete_batch(cpl_journal *journal,
     }
 
 done:
-    journal->action_held = false;
-    journal->action_executed = false;
-    (void)memset(journal->action_capability, 0, CPL_HASH_SIZE);
-    unlock_action(journal);
+    release_action_token(journal);
     return status;
+}
+
+int cpl_journal_abandon_batch(cpl_journal *journal,
+    const struct cpl_action_token *token) {
+    int status = ensure_owner(journal);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    status = validate_action_token(journal, token);
+    if (status != CPL_OK) {
+        return status;
+    }
+    if (journal->action_executed || journal->action_completed_steps !=
+            journal->action_initial_completed_steps) {
+        return CPL_ERR_PRECONDITION;
+    }
+    release_action_token(journal);
+    return CPL_OK;
 }
 
 int cpl_journal_finish_done(cpl_journal *journal, uint64_t generation,

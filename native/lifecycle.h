@@ -14,10 +14,21 @@ extern "C" {
 #define CPL_WORKDIR_NAME_SIZE 64U
 #define CPL_MAX_BATCH_DESCRIPTORS 4U
 #define CPL_PHYSICAL_RECORD_SIZE 1172U
-#define CPL_RECOVERY_RECORD_COUNT 8U
+#define CPL_MAX_RECOVERY_CLEANUP_BATCHES CPL_MAX_BATCH_DESCRIPTORS
+#define CPL_RECOVERY_HANDOFF_RECORD_COUNT 5U
+#define CPL_RECOVERY_TERMINAL_RECORD_COUNT 1U
+#define CPL_RECOVERY_RECORD_COUNT                                        \
+    (CPL_RECOVERY_HANDOFF_RECORD_COUNT +                                \
+     (2U * CPL_MAX_RECOVERY_CLEANUP_BATCHES) +                          \
+     CPL_RECOVERY_TERMINAL_RECORD_COUNT)
 #define CPL_RECOVERY_BYTES                                                \
     (CPL_PHYSICAL_RECORD_SIZE * CPL_RECOVERY_RECORD_COUNT)
-/* The fixed eight-record recovery tail budgets one authority replacement. */
+/*
+ * The finite worst-case recovery lineage is five handoff records
+ * (retirement, one authority replacement, interrupted-batch resolution,
+ * successor preparation, successor activation), two records for each of the
+ * four unique ordered cleanup steps, then terminal DONE or UNCONFIRMED.
+ */
 #define CPL_INITIAL_AUTHORITY_EPOCH 1U
 #define CPL_MAX_AUTHORITY_REPLACEMENTS 1U
 #define CPL_MAX_AUTHORITY_EPOCH                                           \
@@ -365,6 +376,8 @@ int cpl_journal_execute_batch(cpl_journal *j,
 int cpl_journal_complete_batch(cpl_journal *j,
     const struct cpl_action_token *token, uint64_t deadline_ns,
     struct cpl_append_result *out);
+int cpl_journal_abandon_batch(cpl_journal *j,
+    const struct cpl_action_token *token);
 int cpl_journal_finish_done(cpl_journal *j, uint64_t generation,
     const uint8_t executor[CPL_ID_SIZE], uint64_t deadline_ns,
     struct cpl_append_result *out);

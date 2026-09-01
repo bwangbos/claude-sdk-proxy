@@ -481,6 +481,11 @@ def _load_library(path: Path) -> ctypes.CDLL:
         ctypes.POINTER(_CAppendResult),
     ]
     library.cpl_journal_complete_batch.restype = ctypes.c_int
+    library.cpl_journal_abandon_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_CActionToken),
+    ]
+    library.cpl_journal_abandon_batch.restype = ctypes.c_int
     library.cpl_journal_finish_done.argtypes = [
         ctypes.c_void_p,
         ctypes.c_uint64,
@@ -567,18 +572,21 @@ def _load_library(path: Path) -> ctypes.CDLL:
 class AdmittedBatch:
     """A native action-lock capability; only its admitting thread may use it."""
 
-    __slots__ = ("_journal", "_token")
+    __slots__ = ("_journal", "_owner_thread_id", "_token", "_valid")
 
     def __init__(self, token: object, journal: Journal, native: _CActionToken) -> None:
         if token is not _BATCH_TOKEN:
             raise TypeError("batch capabilities are created by native admission")
         self._journal = journal
         self._token = native
+        self._owner_thread_id = threading.get_ident()
+        self._valid = True
 
     def execute(self, deadline_ns: int | None = None) -> int:
         completed = ctypes.c_uint64()
         _raise_status(
-            self._journal._native_call(
+            self._journal._batch_native_call(
+                self,
                 self._journal._library.cpl_journal_execute_batch,
                 ctypes.byref(self._token),
                 self._journal._workdir_parent_dirfd,
@@ -590,15 +598,27 @@ class AdmittedBatch:
 
     def complete(self, deadline_ns: int | None = None) -> CanonicalRecord:
         output = _CAppendResult()
-        _raise_status(
-            self._journal._native_call(
-                self._journal._library.cpl_journal_complete_batch,
-                ctypes.byref(self._token),
-                _deadline(deadline_ns),
-                ctypes.byref(output),
-            )
+        status = self._journal._batch_native_call(
+            self,
+            self._journal._library.cpl_journal_complete_batch,
+            ctypes.byref(self._token),
+            _deadline(deadline_ns),
+            ctypes.byref(output),
         )
+        if status != JournalErrorCode.BATCH_TOKEN:
+            self._journal._release_batch_lease(self)
+        _raise_status(status)
         return _canonical(output)
+
+    def abandon(self) -> None:
+        status = self._journal._batch_native_call(
+            self,
+            self._journal._library.cpl_journal_abandon_batch,
+            ctypes.byref(self._token),
+        )
+        if status == 0:
+            self._journal._release_batch_lease(self)
+        _raise_status(status)
 
 
 class Journal:
@@ -628,6 +648,8 @@ class Journal:
         self._operation_condition = threading.Condition()
         self._active_operations = 0
         self._handle_state = _HandleState.OPEN
+        self._closing_thread_id: int | None = None
+        self._outstanding_batch_owner: int | None = None
 
     @classmethod
     def create_at(
@@ -868,18 +890,52 @@ class Journal:
 
     @contextmanager
     def _operation(self) -> Iterator[ctypes.c_void_p]:
+        handle = self._acquire_operation()
+        try:
+            yield handle
+        finally:
+            self._release_operation()
+
+    def _acquire_operation(self) -> ctypes.c_void_p:
         with self._operation_condition:
             if self._handle_state is not _HandleState.OPEN:
                 raise JournalError(JournalErrorCode.CLOSED)
             self._active_operations += 1
+            return ctypes.c_void_p(self._handle.value)
+
+    def _release_operation(self) -> None:
+        with self._operation_condition:
+            self._active_operations -= 1
+            if self._active_operations == 0:
+                self._operation_condition.notify_all()
+
+    def _batch_native_call(
+        self,
+        batch: AdmittedBatch,
+        function: Callable[..., int],
+        *args: object,
+    ) -> int:
+        with self._operation_condition:
+            current_thread = threading.get_ident()
+            if (
+                not batch._valid
+                or batch._owner_thread_id != current_thread
+                or self._outstanding_batch_owner != current_thread
+                or self._handle_state is _HandleState.CLOSED
+            ):
+                raise JournalError(JournalErrorCode.BATCH_TOKEN)
             handle = ctypes.c_void_p(self._handle.value)
-        try:
-            yield handle
-        finally:
-            with self._operation_condition:
-                self._active_operations -= 1
-                if self._active_operations == 0:
-                    self._operation_condition.notify_all()
+        return int(function(handle, *args))
+
+    def _release_batch_lease(self, batch: AdmittedBatch) -> None:
+        with self._operation_condition:
+            if not batch._valid:
+                raise JournalError(JournalErrorCode.BATCH_TOKEN)
+            batch._valid = False
+            self._outstanding_batch_owner = None
+            self._active_operations -= 1
+            if self._active_operations == 0:
+                self._operation_condition.notify_all()
 
     def _native_call(self, function: Callable[..., int], *args: object) -> int:
         with self._operation() as handle:
@@ -888,10 +944,14 @@ class Journal:
     def _exclusive_pointer_call(
         self, function: Callable[..., int], *args: object
     ) -> int:
+        current_thread = threading.get_ident()
         with self._operation_condition:
             if self._handle_state is not _HandleState.OPEN:
                 raise JournalError(JournalErrorCode.CLOSED)
+            if self._outstanding_batch_owner == current_thread:
+                raise JournalError(JournalErrorCode.BATCH_TOKEN)
             self._handle_state = _HandleState.CLOSING
+            self._closing_thread_id = current_thread
             while self._active_operations:
                 self._operation_condition.wait()
         try:
@@ -903,15 +963,24 @@ class Journal:
                     if self._handle.value
                     else _HandleState.CLOSED
                 )
+                self._closing_thread_id = None
                 self._operation_condition.notify_all()
 
     def close(self) -> None:
+        current_thread = threading.get_ident()
         with self._operation_condition:
             while self._handle_state is _HandleState.CLOSING:
+                if self._closing_thread_id == current_thread:
+                    return
+                if self._outstanding_batch_owner == current_thread:
+                    raise JournalError(JournalErrorCode.BATCH_TOKEN)
                 self._operation_condition.wait()
             if self._handle_state is _HandleState.CLOSED:
                 return
+            if self._outstanding_batch_owner == current_thread:
+                raise JournalError(JournalErrorCode.BATCH_TOKEN)
             self._handle_state = _HandleState.CLOSING
+            self._closing_thread_id = current_thread
             while self._active_operations:
                 self._operation_condition.wait()
             handle = ctypes.c_void_p(self._handle.value)
@@ -921,6 +990,7 @@ class Journal:
             with self._operation_condition:
                 self._handle = ctypes.c_void_p()
                 self._handle_state = _HandleState.CLOSED
+                self._closing_thread_id = None
                 self._operation_condition.notify_all()
 
     def scan(self) -> CanonicalChain:
@@ -1201,19 +1271,31 @@ class Journal:
         descriptor_array = array_type(*(_descriptor_to_c(item) for item in descriptors))
         token = _CActionToken()
         output = _CAppendResult()
-        _raise_status(
-            self._native_call(
-                self._library.cpl_journal_admit_batch,
-                generation,
-                _fixed_id(executor),
-                _fixed_id(batch_nonce),
-                descriptor_array,
-                len(descriptors),
-                _deadline(deadline_ns),
-                ctypes.byref(token),
-                ctypes.byref(output),
+        handle = self._acquire_operation()
+        try:
+            _raise_status(
+                int(
+                    self._library.cpl_journal_admit_batch(
+                        handle,
+                        generation,
+                        _fixed_id(executor),
+                        _fixed_id(batch_nonce),
+                        descriptor_array,
+                        len(descriptors),
+                        _deadline(deadline_ns),
+                        ctypes.byref(token),
+                        ctypes.byref(output),
+                    )
+                )
             )
-        )
+        except BaseException:
+            self._release_operation()
+            raise
+        with self._operation_condition:
+            if self._outstanding_batch_owner is not None:
+                self._release_operation()
+                raise JournalError(JournalErrorCode.BATCH_TOKEN)
+            self._outstanding_batch_owner = threading.get_ident()
         return AdmittedBatch(_BATCH_TOKEN, self, token)
 
     def finish_done(

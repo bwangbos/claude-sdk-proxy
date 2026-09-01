@@ -44,6 +44,8 @@ _TARGET = ProcessIdentity(
 )
 _PROCESS_ABSENT = BatchDescriptor(BatchDescriptorKind.PROCESS_ABSENT, 0, _TARGET)
 _REAP_PROCESS = BatchDescriptor(BatchDescriptorKind.REAP_PROCESS, 1, _TARGET)
+_REMOVE_WORKDIR = BatchDescriptor(BatchDescriptorKind.REMOVE_WORKDIR, 3)
+_TERMINAL_CHECKS = BatchDescriptor(BatchDescriptorKind.TERMINAL_CHECKS, 7)
 
 
 def test_no_generation_may_prepare_exact_candidate() -> None:
@@ -139,6 +141,85 @@ def test_active_executor_admits_and_completes_repeatable_batches() -> None:
         completed_steps=1,
     ))
     assert second.exact_batch == "batch-2"
+
+
+def test_completed_batch_must_advance_every_admitted_descriptor_step() -> None:
+    active = _bound(State.active_ready(2, "executor-1", lease_deadline_ns=500))
+    batch = Lifecycle.apply(
+        active,
+        Record.batch_active(
+            2,
+            "batch-1",
+            executor="executor-1",
+            lease_deadline_ns=500,
+            descriptors=(_PROCESS_ABSENT,),
+        ),
+    )
+
+    with pytest.raises(IllegalTransition):
+        Lifecycle.apply(
+            batch,
+            Record.batch_done(
+                2,
+                "batch-1",
+                executor="executor-1",
+                lease_deadline_ns=500,
+                completed_steps=0,
+            ),
+        )
+
+
+def test_fixed_cleanup_steps_bound_recovery_to_four_complete_batches() -> None:
+    state = replace(
+        _bound(State.active_ready(2, "executor-1", lease_deadline_ns=500)),
+        authority_epoch=2,
+    )
+    completed_steps = 0
+    descriptors = (
+        _PROCESS_ABSENT,
+        _REAP_PROCESS,
+        _REMOVE_WORKDIR,
+        _TERMINAL_CHECKS,
+    )
+
+    for index, descriptor in enumerate(descriptors, start=1):
+        batch_nonce = f"batch-{index}"
+        active = Lifecycle.apply(
+            state,
+            Record.batch_active(
+                2,
+                batch_nonce,
+                executor="executor-1",
+                lease_deadline_ns=500,
+                completed_steps=completed_steps,
+                descriptors=(descriptor,),
+            ),
+        )
+        completed_steps |= 1 << (index - 1)
+        state = Lifecycle.apply(
+            active,
+            Record.batch_done(
+                2,
+                batch_nonce,
+                executor="executor-1",
+                lease_deadline_ns=500,
+                completed_steps=completed_steps,
+            ),
+        )
+
+    assert completed_steps == ALL_COMPLETED_STEPS
+    with pytest.raises(IllegalTransition):
+        Lifecycle.apply(
+            state,
+            Record.batch_active(
+                2,
+                "batch-5",
+                executor="executor-1",
+                lease_deadline_ns=500,
+                completed_steps=completed_steps,
+                descriptors=(_TERMINAL_CHECKS,),
+            ),
+        )
 
 
 def test_batch_cycle_preserves_recorded_process_identity() -> None:

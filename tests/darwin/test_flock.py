@@ -18,7 +18,9 @@ from claude_sdk_proxy.journal import (
 from claude_sdk_proxy.lifecycle import Record
 
 NORMAL_LIMIT = 32 * 1024
-HARD_LIMIT = 48 * 1024
+PHYSICAL_RECORD_SIZE = 108 + 1064
+RECOVERY_RECORD_COUNT = 14
+HARD_LIMIT = NORMAL_LIMIT + PHYSICAL_RECORD_SIZE * RECOVERY_RECORD_COUNT
 
 
 def _future() -> int:
@@ -386,7 +388,7 @@ journal, receipt = Journal._create_at_for_test(
     "allocation.journal",
     b"n" * 32,
     32768,
-    49152,
+    49176,
     workdir_parent_dirfd=parent,
     workdir_name="allocation.workdir",
     library_path=library,
@@ -426,6 +428,56 @@ os._exit(0)
             "-c",
             script,
             str(tmp_path / "close-race"),
+            str(_fault_library()),
+        ],
+        check=False,
+        timeout=5,
+    )
+    assert completed.returncode == 0
+
+
+def test_same_thread_recursive_close_is_idempotent(tmp_path: Path) -> None:
+    script = r'''
+import os
+import sys
+from pathlib import Path
+from claude_sdk_proxy.journal import Journal
+
+root = Path(sys.argv[1])
+root.mkdir(mode=0o700)
+parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+for suffix in (".append.lock", ".action.lock"):
+    fd = os.open(
+        "allocation.journal" + suffix,
+        os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent,
+    )
+    os.close(fd)
+journal, _ = Journal._create_at_for_test(
+    parent,
+    "allocation.journal",
+    b"n" * 32,
+    32768,
+    49176,
+    library_path=Path(sys.argv[2]),
+)
+native_close = journal._library.cpl_journal_close
+
+def reentrant_close(handle):
+    journal.close()
+    native_close(handle)
+
+journal._library.cpl_journal_close = reentrant_close
+journal.close()
+raise SystemExit(0 if journal.closed else 9)
+'''
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path / "reentrant-close"),
             str(_fault_library()),
         ],
         check=False,

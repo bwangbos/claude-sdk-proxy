@@ -27,9 +27,11 @@ from claude_sdk_proxy.lifecycle import (
 )
 
 NORMAL_LIMIT = 32 * 1024
-HARD_LIMIT = 48 * 1024
 PHYSICAL_RECORD_SIZE = 108 + 1064
-RECOVERY_RECORD_COUNT = 8
+MAX_RECOVERY_CLEANUP_BATCHES = 4
+RECOVERY_RECORD_COUNT = 5 + (2 * MAX_RECOVERY_CLEANUP_BATCHES) + 1
+RECOVERY_BYTES = PHYSICAL_RECORD_SIZE * RECOVERY_RECORD_COUNT
+HARD_LIMIT = NORMAL_LIMIT + RECOVERY_BYTES
 
 
 def _make_lock_files(parent_dirfd: int, journal_name: str) -> None:
@@ -254,7 +256,7 @@ def test_physical_eof_enforces_normal_recovery_and_hard_ceilings(
     journal, _, parent_dirfd = make_journal(
         tmp_path,
         normal_limit=4096,
-        hard_limit=16 * 1024,
+        hard_limit=4096 + RECOVERY_BYTES,
         fault=True,
         bound=True,
     )
@@ -285,11 +287,13 @@ def test_physical_eof_enforces_normal_recovery_and_hard_ceilings(
     hard_journal, _, hard_parent_dirfd = make_journal(
         hard_path,
         normal_limit=4096,
-        hard_limit=16 * 1024,
+        hard_limit=4096 + RECOVERY_BYTES,
         fault=True,
     )
     try:
-        hard_journal.raw_append_for_test(b"y" * 15_000)
+        hard_journal.raw_append_for_test(
+            b"y" * (4096 + RECOVERY_BYTES - PHYSICAL_RECORD_SIZE - 100)
+        )
         with pytest.raises(JournalError) as caught:
             hard_journal.mark_unconfirmed(
                 UnconfirmedReason.NORMAL_REGION_EXHAUSTED,
@@ -705,8 +709,35 @@ def test_bootstrap_requires_bound_workdir_and_absence_is_terminal(
         os.close(parent_dirfd)
 
 
-def test_insufficient_static_recovery_tail_is_rejected_before_create(
+def test_exact_static_recovery_tail_is_accepted(
     tmp_path: Path,
+) -> None:
+    os.chmod(tmp_path, 0o700)
+    parent_dirfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    normal_limit = PHYSICAL_RECORD_SIZE
+    journal: Journal | None = None
+    try:
+        journal, receipt = Journal.create_at(
+            parent_dirfd,
+            "allocation.journal",
+            b"n" * 32,
+            normal_limit,
+            normal_limit + RECOVERY_BYTES,
+            workdir_parent_dirfd=parent_dirfd,
+            workdir_name="allocation.workdir",
+        )
+        assert receipt.intent_parent_dirsynced is True
+    finally:
+        if journal is not None:
+            journal.close()
+        os.close(parent_dirfd)
+
+
+@pytest.mark.parametrize("reserve_delta", [-1, 1])
+def test_nonexact_static_recovery_tail_is_rejected_before_create(
+    tmp_path: Path,
+    reserve_delta: int,
 ) -> None:
     os.chmod(tmp_path, 0o700)
     parent_dirfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -719,7 +750,7 @@ def test_insufficient_static_recovery_tail_is_rejected_before_create(
                 "allocation.journal",
                 b"n" * 32,
                 normal_limit,
-                normal_limit + PHYSICAL_RECORD_SIZE * RECOVERY_RECORD_COUNT - 1,
+                normal_limit + RECOVERY_BYTES + reserve_delta,
                 workdir_parent_dirfd=parent_dirfd,
                 workdir_name="allocation.workdir",
             )

@@ -19,8 +19,11 @@ from claude_sdk_proxy.journal import (
 from claude_sdk_proxy.lifecycle import Record, StateKind
 
 NORMAL_LIMIT = 64 * 1024
-HARD_LIMIT = 96 * 1024
 PHYSICAL_RECORD_SIZE = 108 + 1064
+MAX_RECOVERY_CLEANUP_BATCHES = 4
+RECOVERY_RECORD_COUNT = 5 + (2 * MAX_RECOVERY_CLEANUP_BATCHES) + 1
+RECOVERY_BYTES = PHYSICAL_RECORD_SIZE * RECOVERY_RECORD_COUNT
+HARD_LIMIT = NORMAL_LIMIT + RECOVERY_BYTES
 CREATE_POINTS = (
     "after_openat",
     "after_preallocate",
@@ -976,9 +979,11 @@ def test_batch_retry_reconciles_unlink_with_fresh_parent_fsync(
         os.close(parent_dirfd)
 
 
-def test_exact_eight_record_recovery_tail_reaches_done(tmp_path: Path) -> None:
+def test_exact_recovery_tail_completes_four_batches_and_rejects_fifth(
+    tmp_path: Path,
+) -> None:
     normal_limit = PHYSICAL_RECORD_SIZE * 12
-    hard_limit = normal_limit + PHYSICAL_RECORD_SIZE * 8
+    hard_limit = normal_limit + RECOVERY_BYTES
     parent_dirfd = _open_parent(tmp_path)
     _make_lock_files(parent_dirfd, "allocation.journal")
     journal, create_receipt = Journal._create_at_for_test(
@@ -1127,19 +1132,34 @@ def test_exact_eight_record_recovery_tail_reaches_done(tmp_path: Path) -> None:
             os._exit(0)
         second_target = journal.observe_process(second_target_pid)
         os.kill(second_target_pid, 9)
-        cleanup = journal.admit_batch(
-            2,
-            "executor-2",
-            "cleanup-2",
-            [
-                journal.process_absent_descriptor(second_target),
-                journal.reap_process_descriptor(second_target),
-                journal.remove_bound_workdir_descriptor(),
-                journal.terminal_checks_descriptor(),
-            ],
+        cleanup_descriptors = (
+            journal.process_absent_descriptor(second_target),
+            journal.reap_process_descriptor(second_target),
+            journal.remove_bound_workdir_descriptor(),
+            journal.terminal_checks_descriptor(),
         )
-        assert cleanup.execute() == 15
-        cleanup.complete()
+        for index, descriptor in enumerate(cleanup_descriptors, start=1):
+            cleanup = journal.admit_batch(
+                2,
+                "executor-2",
+                f"cleanup-{index}",
+                [descriptor],
+            )
+            assert cleanup.execute() == (1 << index) - 1
+            assert cleanup.complete().record.completed_steps == (1 << index) - 1
+
+        before_rejected_batch = journal.scan()
+        with pytest.raises(JournalError) as caught:
+            journal.admit_batch(
+                2,
+                "executor-2",
+                "cleanup-5",
+                [journal.terminal_checks_descriptor()],
+            )
+        assert caught.value.code is JournalErrorCode.PRECONDITION
+        after_rejected_batch = journal.scan()
+        assert after_rejected_batch.physical_eof == before_rejected_batch.physical_eof
+        assert after_rejected_batch.head.hash == before_rejected_batch.head.hash
         done = journal.finish_done(2, "executor-2")
         assert done.record.kind is StateKind.DONE
         assert journal.scan().physical_eof == hard_limit

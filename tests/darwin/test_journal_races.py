@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from claude_sdk_proxy.journal import (
+    AdmittedBatch,
     Journal,
     JournalError,
     JournalErrorCode,
@@ -16,7 +17,9 @@ from claude_sdk_proxy.journal import (
 from claude_sdk_proxy.lifecycle import Record, StateKind
 
 NORMAL_LIMIT = 64 * 1024
-HARD_LIMIT = 96 * 1024
+PHYSICAL_RECORD_SIZE = 108 + 1064
+RECOVERY_RECORD_COUNT = 14
+HARD_LIMIT = NORMAL_LIMIT + PHYSICAL_RECORD_SIZE * RECOVERY_RECORD_COUNT
 
 
 def _future() -> int:
@@ -79,6 +82,176 @@ def _open(parent_dirfd: int, *, fault: bool = False) -> Journal:
         NORMAL_LIMIT,
         HARD_LIMIT,
     )
+
+
+def _admit_absence_batch(journal: Journal) -> tuple[AdmittedBatch, int]:
+    future = _future()
+    journal.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=future),
+        RecordClass.NORMAL,
+    )
+    journal.activate_executor(
+        1,
+        "executor-1",
+        os.getpid(),
+        lease_deadline_ns=future,
+    )
+    target_pid = os.fork()
+    if target_pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    target = journal.observe_process(target_pid)
+    os.kill(target_pid, 9)
+    batch = journal.admit_batch(
+        1,
+        "executor-1",
+        "batch-1",
+        [journal.process_absent_descriptor(target)],
+    )
+    return batch, target_pid
+
+
+def _reap_target(pid: int) -> None:
+    try:
+        os.kill(pid, 9)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def test_cross_thread_close_waits_for_admitted_batch_completion(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    batch, target_pid = _admit_absence_batch(journal)
+    close_errors: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            journal.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+    closer = threading.Thread(target=close)
+    closer.start()
+    try:
+        closer.join(timeout=0.05)
+        assert closer.is_alive()
+        assert batch.execute() == 1
+        assert batch.complete().record.completed_steps == 1
+        closer.join(timeout=2)
+        assert not closer.is_alive()
+        assert close_errors == []
+        assert journal.closed is True
+    finally:
+        _reap_target(target_pid)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_owner_close_with_admitted_batch_fails_without_deadlock(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    batch, target_pid = _admit_absence_batch(journal)
+    try:
+        started = time.monotonic_ns()
+        with pytest.raises(JournalError) as caught:
+            journal.close()
+        assert caught.value.code is JournalErrorCode.BATCH_TOKEN
+        assert time.monotonic_ns() - started < 100_000_000
+        assert journal.closed is False
+        batch.abandon()
+        journal.close()
+        assert journal.closed is True
+    finally:
+        _reap_target(target_pid)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_wrong_thread_completion_does_not_consume_admitted_batch(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    batch, target_pid = _admit_absence_batch(journal)
+    results: list[object] = []
+    try:
+        assert batch.execute() == 1
+
+        def complete() -> None:
+            try:
+                results.append(batch.complete())
+            except BaseException as error:
+                results.append(error)
+
+        wrong_thread = threading.Thread(target=complete)
+        wrong_thread.start()
+        wrong_thread.join(timeout=2)
+        assert not wrong_thread.is_alive()
+        assert len(results) == 1
+        assert isinstance(results[0], JournalError)
+        assert results[0].code is JournalErrorCode.BATCH_TOKEN
+        assert batch.complete().record.completed_steps == 1
+    finally:
+        _reap_target(target_pid)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_owner_abandon_invalidates_batch_once_and_releases_waiting_close(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    batch, target_pid = _admit_absence_batch(journal)
+    close_errors: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            journal.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+    closer = threading.Thread(target=close)
+    closer.start()
+    try:
+        closer.join(timeout=0.05)
+        assert closer.is_alive()
+        batch.abandon()
+        with pytest.raises(JournalError) as caught:
+            batch.abandon()
+        assert caught.value.code is JournalErrorCode.BATCH_TOKEN
+        with pytest.raises(JournalError) as caught:
+            batch.complete()
+        assert caught.value.code is JournalErrorCode.BATCH_TOKEN
+        closer.join(timeout=2)
+        assert not closer.is_alive()
+        assert close_errors == []
+        assert journal.closed is True
+    finally:
+        _reap_target(target_pid)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_abandon_rejects_unrecorded_batch_effects_and_preserves_completion(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    batch, target_pid = _admit_absence_batch(journal)
+    try:
+        assert batch.execute() == 1
+        with pytest.raises(JournalError) as caught:
+            batch.abandon()
+        assert caught.value.code is JournalErrorCode.PRECONDITION
+        assert batch.complete().record.completed_steps == 1
+    finally:
+        _reap_target(target_pid)
+        journal.close()
+        os.close(parent_dirfd)
 
 
 def test_concurrent_sibling_appends_admit_exactly_one_child(tmp_path: Path) -> None:
@@ -686,7 +859,7 @@ def test_batch_active_cannot_retire_before_executor_lease_expiry(
             os.getpid(),
             lease_deadline_ns=lease,
         )
-        journal.admit_batch(
+        admitted = journal.admit_batch(
             1,
             "executor-1",
             "batch-1",
@@ -701,6 +874,7 @@ def test_batch_active_cannot_retire_before_executor_lease_expiry(
         assert caught.value.code is JournalErrorCode.AUTHORITY
         assert journal.scan().head.record.kind is StateKind.BATCH_ACTIVE
     finally:
+        admitted.abandon()
         journal.close()
         os.close(parent_dirfd)
 
@@ -723,7 +897,7 @@ def test_batch_retirement_rechecks_expiry_at_barrier(
         os.getpid(),
         lease_deadline_ns=lease,
     )
-    executor.admit_batch(
+    admitted = executor.admit_batch(
         1,
         "executor-1",
         "batch-1",
@@ -772,6 +946,7 @@ def test_batch_retirement_rechecks_expiry_at_barrier(
         os.close(release_read)
         os.close(release_write)
         reconciler.close()
+        admitted.abandon()
         executor.close()
         os.close(parent_dirfd)
 
