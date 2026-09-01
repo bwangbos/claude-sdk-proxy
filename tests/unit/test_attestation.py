@@ -481,16 +481,12 @@ def test_cli_version_probe_cleans_group_after_leader_exits(tmp_path: Path) -> No
     descendant_file = tmp_path / "version-descendant.pid"
     descendant_script = (
         "trap '' TERM; "
-        f"printf \"$$\" > {shlex.quote(str(descendant_file))}; "
+        f'printf "$$" > {shlex.quote(str(descendant_file))}; '
         "/bin/sleep 0.1; "
         "/usr/bin/head -c 300 /dev/zero; "
         "while :; do /bin/sleep 1; done"
     )
-    body = (
-        "#!/bin/sh\n"
-        f"/bin/sh -c {shlex.quote(descendant_script)} &\n"
-        "exit 0\n"
-    )
+    body = f"#!/bin/sh\n/bin/sh -c {shlex.quote(descendant_script)} &\nexit 0\n"
     descendant_pid: int | None = None
     try:
         with _launch_inputs(tmp_path, cli_body=body) as inputs:

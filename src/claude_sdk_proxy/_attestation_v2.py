@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import ctypes
 import hashlib
 import json
 import os
@@ -68,6 +69,8 @@ _REQUEST_ID = re.compile(r"req_[1-9][0-9]*_[0-9a-f]{8}\Z")
 _VERSION_STDOUT = b"2.1.251 (Claude Code)\n"
 _VERSION_OUTPUT_LIMIT = 256
 _VERSION_PROBE_TIMEOUT_SECONDS = 5.0
+_VERSION_PROBE_TERM_SECONDS = 0.25
+_VERSION_PROBE_KILL_SECONDS = 2.0
 _CONTROL_NAMES = {
     1: "SUPERVISOR_IDENTITY",
     2: "IDENTITY_ACK",
@@ -325,29 +328,199 @@ def _snapshot_cli(path: Path) -> CliExecutableIdentity:
     )
 
 
-def _terminate_version_probe(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
+@dataclass(frozen=True)
+class _VersionProbeOwner:
+    """Exact direct-child/group ownership retained until group absence."""
+
+    process: subprocess.Popen[bytes]
+    leader_pid: int
+    pgid: int
+
+
+_VERSION_PROBE_LOCK = threading.Lock()
+_RETAINED_VERSION_PROBES: dict[int, _VersionProbeOwner] = {}
+_LIBPROC: ctypes.CDLL | None = None
+
+
+def _libproc() -> ctypes.CDLL:
+    global _LIBPROC
+    if _LIBPROC is None:
+        try:
+            library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        except OSError as error:
+            raise AttestationError(
+                "version probe group enumeration is unavailable"
+            ) from error
+        library.proc_listpgrppids.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        library.proc_listpgrppids.restype = ctypes.c_int
+        _LIBPROC = library
+    return _LIBPROC
+
+
+def _list_version_probe_group(pgid: int) -> tuple[int, ...]:
+    capacity = 16
+    while capacity <= 4096:
+        first = (ctypes.c_int * capacity)()
+        second = (ctypes.c_int * capacity)()
+        listed = _libproc().proc_listpgrppids(pgid, first, ctypes.sizeof(first))
+        confirmed = _libproc().proc_listpgrppids(pgid, second, ctypes.sizeof(second))
+        if listed < 0 or confirmed < 0:
+            raise AttestationError("version probe group enumeration failed")
+        if listed >= capacity or confirmed >= capacity or confirmed > listed:
+            if capacity == 4096:
+                raise AttestationError("version probe group enumeration is unbounded")
+            capacity *= 2
+            continue
+        return tuple(sorted(pid for pid in second[:confirmed] if pid > 0))
+    raise AttestationError("version probe group enumeration is unavailable")
+
+
+def _version_probe_leader_state(
+    owner: _VersionProbeOwner,
+) -> Literal["live", "reapable"]:
+    transition_deadline = time.monotonic() + 0.05
+    while True:
+        try:
+            observed = os.waitid(
+                os.P_PID,
+                owner.leader_pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError as error:
+            raise AttestationError("version probe leader ownership was lost") from error
+        if observed is not None and observed.si_pid == owner.leader_pid:
+            return "reapable"
+        try:
+            current_pgid = os.getpgid(owner.leader_pid)
+        except ProcessLookupError:
+            # The direct child may exit between WNOHANG and getpgid. Retry the
+            # non-reaping observation under a short bound while Darwin
+            # publishes the waitable state.
+            if time.monotonic() >= transition_deadline:
+                break
+            time.sleep(0.001)
+            continue
+        if current_pgid != owner.pgid:
+            raise AttestationError("version probe process group identity changed")
+        return "live"
+    raise AttestationError("version probe leader identity became ambiguous")
+
+
+def _version_probe_group_is_absent(owner: _VersionProbeOwner) -> bool:
+    state = _version_probe_leader_state(owner)
+    members = _list_version_probe_group(owner.pgid)
+    return state == "reapable" and all(member == owner.leader_pid for member in members)
+
+
+def _wait_for_version_probe_group_absence(
+    owner: _VersionProbeOwner, seconds: float
+) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if _version_probe_group_is_absent(owner):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.001)
+
+
+def _signal_version_probe_group(owner: _VersionProbeOwner, signal_number: int) -> None:
+    # The exact, unreaped direct child is the group-ID reuse sentinel. Never
+    # signal after losing it, and never signal a group not proven to be its own
+    # start_new_session group.
+    _version_probe_leader_state(owner)
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(owner.pgid, signal_number)
     except ProcessLookupError:
-        pass
+        if not _version_probe_group_is_absent(owner):
+            raise AttestationError(
+                "version probe process group disappeared ambiguously"
+            )
+
+
+def _reap_version_probe_leader(owner: _VersionProbeOwner) -> int:
+    if not _version_probe_group_is_absent(owner):
+        raise AttestationError("version probe group absence is unconfirmed")
     try:
-        process.wait(timeout=0.25)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=2)
+        return owner.process.wait(timeout=0.25)
     except subprocess.TimeoutExpired as error:
-        raise AttestationError("CLI version probe could not be reaped") from error
+        raise AttestationError("version probe leader could not be reaped") from error
+
+
+def _retain_version_probe(owner: _VersionProbeOwner) -> None:
+    _RETAINED_VERSION_PROBES[owner.leader_pid] = owner
+
+
+def _terminate_version_probe(owner: _VersionProbeOwner) -> None:
+    try:
+        if not _wait_for_version_probe_group_absence(owner, 0):
+            _signal_version_probe_group(owner, signal.SIGTERM)
+        if not _wait_for_version_probe_group_absence(
+            owner, _VERSION_PROBE_TERM_SECONDS
+        ):
+            _signal_version_probe_group(owner, signal.SIGKILL)
+        if not _wait_for_version_probe_group_absence(
+            owner, _VERSION_PROBE_KILL_SECONDS
+        ):
+            raise AttestationError("version probe group cleanup is unconfirmed")
+        _reap_version_probe_leader(owner)
+    except BaseException:
+        # Retaining the unreaped direct-child Popen object preserves the PID /
+        # PGID reuse sentinel. Future probes fail closed rather than signal a
+        # numeric group whose ownership can no longer be proved.
+        _retain_version_probe(owner)
+        raise
+
+
+def _capture_version_probe_owner(
+    process: subprocess.Popen[bytes],
+) -> _VersionProbeOwner:
+    owner = _VersionProbeOwner(process, process.pid, process.pid)
+    try:
+        try:
+            current_pgid = os.getpgid(owner.leader_pid)
+        except ProcessLookupError:
+            # Successful Popen return proves the start_new_session setsid step
+            # completed before exec. An already-reapable direct child remains
+            # the exact PID/PGID sentinel even though getpgid no longer reports
+            # zombies on Darwin.
+            if _version_probe_leader_state(owner) != "reapable":
+                raise
+        else:
+            if current_pgid != owner.pgid:
+                raise AttestationError(
+                    "version probe did not create an isolated session"
+                )
+    except BaseException:
+        _retain_version_probe(owner)
+        raise
+    return owner
+
+
+def _finish_version_probe(owner: _VersionProbeOwner, deadline: float) -> int:
+    while _version_probe_leader_state(owner) != "reapable":
+        if time.monotonic() >= deadline:
+            raise AttestationError("CLI version measurement timed out")
+        time.sleep(0.001)
+    if not _version_probe_group_is_absent(owner):
+        raise AttestationError("CLI version probe retained descendant processes")
+    return _reap_version_probe_leader(owner)
 
 
 def _run_bounded_version_probe(
+    path: Path, environment: Mapping[str, str]
+) -> tuple[int, bytes, bytes]:
+    with _VERSION_PROBE_LOCK:
+        if _RETAINED_VERSION_PROBES:
+            raise AttestationError("prior version probe cleanup is unconfirmed")
+        return _run_bounded_version_probe_locked(path, environment)
+
+
+def _run_bounded_version_probe_locked(
     path: Path, environment: Mapping[str, str]
 ) -> tuple[int, bytes, bytes]:
     try:
@@ -361,8 +534,9 @@ def _run_bounded_version_probe(
         )
     except OSError as error:
         raise AttestationError("CLI version measurement failed") from error
+    owner = _capture_version_probe_owner(process)
     if process.stdout is None or process.stderr is None:
-        _terminate_version_probe(process)
+        _terminate_version_probe(owner)
         raise AttestationError("CLI version probe pipes are unavailable")
 
     streams = (process.stdout, process.stderr)
@@ -395,20 +569,14 @@ def _run_bounded_version_probe(
                 output.extend(chunk)
                 if len(output) > _VERSION_OUTPUT_LIMIT:
                     raise AttestationError("CLI version probe exceeded output bound")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise AttestationError("CLI version measurement timed out")
-        try:
-            returncode = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as error:
-            raise AttestationError("CLI version measurement timed out") from error
+        returncode = _finish_version_probe(owner, deadline)
         return (
             returncode,
             bytes(outputs[process.stdout.fileno()]),
             bytes(outputs[process.stderr.fileno()]),
         )
     except BaseException:
-        _terminate_version_probe(process)
+        _terminate_version_probe(owner)
         raise
     finally:
         selector.close()
