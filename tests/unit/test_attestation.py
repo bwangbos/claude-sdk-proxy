@@ -519,6 +519,38 @@ def _cleanup_fault_injected_version_owner(owner: Any) -> None:
                 stream.close()
 
 
+class _CloseFaultStream:
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.fail_close = True
+
+    @property
+    def closed(self) -> bool:
+        return self.stream.closed
+
+    def fileno(self) -> int:
+        return self.stream.fileno()
+
+    def close(self) -> None:
+        if self.fail_close:
+            raise RuntimeError("injected stream close failure")
+        self.stream.close()
+
+
+class _CloseFaultSelector:
+    def __init__(self, selector: Any) -> None:
+        self.selector = selector
+        self.fail_close = True
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.selector, name)
+
+    def close(self) -> None:
+        if self.fail_close:
+            raise RuntimeError("injected selector close failure")
+        self.selector.close()
+
+
 @pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
 def test_selector_construction_failure_cleans_captured_version_owner(
     tmp_path: Path,
@@ -597,6 +629,114 @@ def test_unproved_post_capture_cleanup_retains_owner_and_blocks_future_probe(
         )
         if captured:
             _cleanup_fault_injected_version_owner(captured[0])
+
+
+def test_interrupt_immediately_after_capture_retains_authoritative_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = "#!/bin/sh\ntrap '' TERM\nwhile :; do /bin/sleep 1; done\n"
+    captured: list[Any] = []
+    original_capture = implementation._capture_version_probe_owner
+
+    def interrupt_after_capture(process: Any) -> Never:
+        owner = original_capture(process)
+        captured.append(owner)
+        raise KeyboardInterrupt("injected immediately after capture")
+
+    monkeypatch.setattr(
+        implementation, "_capture_version_probe_owner", interrupt_after_capture
+    )
+    try:
+        with _launch_inputs(tmp_path, cli_body=body) as inputs:
+            with pytest.raises(KeyboardInterrupt, match="immediately after capture"):
+                _prepare(inputs)
+            assert len(captured) == 1
+            owner = captured[0]
+            assert implementation._RETAINED_VERSION_PROBES == {
+                owner.leader_pid: owner
+            }
+            assert owner.process.returncode is None
+            assert not owner.process.stdout.closed
+            assert not owner.process.stderr.closed
+            with pytest.raises(AttestationError, match="cleanup is unconfirmed"):
+                _prepare(inputs)
+    finally:
+        if captured:
+            _cleanup_fault_injected_version_owner(captured[0])
+
+
+@pytest.mark.parametrize("resource", ["selector", "stdout", "stderr"])
+def test_post_reap_close_failure_retains_resource_only_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+) -> None:
+    captured: list[Any] = []
+    faults: list[Any] = []
+    original_capture = implementation._capture_version_probe_owner
+    original_selector = implementation.selectors.DefaultSelector
+
+    def capture_owner(process: Any) -> Any:
+        owner = original_capture(process)
+        captured.append(owner)
+        if resource in {"stdout", "stderr"}:
+            fault = _CloseFaultStream(getattr(process, resource))
+            setattr(process, resource, fault)
+            faults.append(fault)
+        return owner
+
+    if resource == "selector":
+
+        def create_selector() -> _CloseFaultSelector:
+            fault = _CloseFaultSelector(original_selector())
+            faults.append(fault)
+            return fault
+
+        monkeypatch.setattr(
+            implementation.selectors, "DefaultSelector", create_selector
+        )
+    monkeypatch.setattr(implementation, "_capture_version_probe_owner", capture_owner)
+    try:
+        with _launch_inputs(tmp_path) as inputs:
+            with pytest.raises(RuntimeError, match="close failure"):
+                _prepare(inputs)
+        assert len(captured) == 1
+        owner = captured[0]
+        assert owner.process.returncode is not None
+        assert implementation._RETAINED_VERSION_PROBES == {owner.leader_pid: owner}
+        assert owner.state is implementation._VersionProbeOwnerState.REAPED_RESOURCE_CLOSE_PENDING
+
+        original_state = owner.state
+        owner.state = "tampered"
+        with pytest.raises(AttestationError, match="owner state"):
+            implementation._cleanup_version_probe_owner(owner)
+        assert implementation._RETAINED_VERSION_PROBES == {owner.leader_pid: owner}
+        owner.state = original_state
+
+        faults[0].fail_close = False
+
+        def forbidden_killpg(_pgid: int, _signal: int) -> Never:
+            raise AssertionError("post-reap cleanup attempted group signaling")
+
+        monkeypatch.setattr(implementation.os, "killpg", forbidden_killpg)
+        implementation._cleanup_version_probe_owner(owner)
+        assert owner.leader_pid not in implementation._RETAINED_VERSION_PROBES
+    finally:
+        if captured:
+            owner = captured[0]
+            state_type = getattr(implementation, "_VersionProbeOwnerState", None)
+            if state_type is not None:
+                owner.state = state_type.REAPED_RESOURCE_CLOSE_PENDING
+            for fault in faults:
+                fault.fail_close = False
+            implementation._RETAINED_VERSION_PROBES.pop(owner.leader_pid, None)
+            selector = getattr(owner, "selector", None)
+            if selector is not None:
+                selector.close()
+            for stream in (owner.process.stdout, owner.process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
 
 
 def test_prepare_binds_workdir_to_task5_instance(tmp_path: Path) -> None:
