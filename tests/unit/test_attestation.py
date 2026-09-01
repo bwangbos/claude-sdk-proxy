@@ -8,6 +8,8 @@ import json
 import os
 import pickle
 import shutil
+import shlex
+import socket
 import struct
 import threading
 import time
@@ -15,7 +17,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Never
 
 import anyio
 import pytest
@@ -91,6 +93,32 @@ def _cli_identity(path: Path) -> CliExecutableIdentity:
         st_ino=metadata.st_ino,
         mode=metadata.st_mode,
         sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+
+
+def _identity_payload(
+    pid: int,
+    *,
+    pgid: int,
+    sid: int,
+    executable_dev: int = 1,
+    executable_ino: int = 1,
+    executable_hash: bytes = b"e" * 32,
+) -> bytes:
+    return (
+        struct.pack(
+            "<qQIiiIQQ",
+            pid,
+            1,
+            os.getuid(),
+            pgid,
+            sid,
+            0x3F,
+            executable_dev,
+            executable_ino,
+        )
+        + b"b" * 32
+        + executable_hash
     )
 
 
@@ -409,6 +437,45 @@ def test_prepare_rejects_nonexact_cli_version_output(tmp_path: Path) -> None:
             _prepare(inputs)
 
 
+def test_manifest_mismatch_rejects_before_cli_execution(tmp_path: Path) -> None:
+    marker = tmp_path / "version-executed"
+    body = (
+        "#!/bin/sh\n"
+        f"printf marker > {shlex.quote(str(marker))}\n"
+        "printf '2.1.251 (Claude Code)\\n'\n"
+    )
+    with _launch_inputs(tmp_path, cli_body=body) as inputs:
+        mismatched = replace(
+            inputs.manifest,
+            cli_executable=replace(inputs.manifest.cli_executable, sha256="0" * 64),
+        )
+        with pytest.raises(AttestationError, match="manifest identity"):
+            prepare_supervisor_launch(
+                inputs.config,
+                inputs.descriptors,
+                mismatched,
+                source_environment=inputs.source,
+                environment_config=inputs.environment_config,
+            )
+        assert not marker.exists()
+
+
+def test_cli_version_probe_bounds_concurrent_stdout_and_stderr(tmp_path: Path) -> None:
+    marker = tmp_path / "flood-completed"
+    body = (
+        "#!/bin/sh\n"
+        "/usr/bin/head -c 1048576 /dev/zero\n"
+        "/usr/bin/head -c 1048576 /dev/zero >&2\n"
+        f"printf marker > {shlex.quote(str(marker))}\n"
+    )
+    with _launch_inputs(tmp_path, cli_body=body) as inputs:
+        started = time.monotonic()
+        with pytest.raises(AttestationError, match="output bound"):
+            _prepare(inputs)
+        assert time.monotonic() - started < 2
+        assert not marker.exists()
+
+
 def test_prepare_binds_workdir_to_task5_instance(tmp_path: Path) -> None:
     with _launch_inputs(tmp_path) as inputs:
         unrelated = tmp_path / "unrelated"
@@ -544,6 +611,66 @@ def test_cleanup_result_requires_complete_normal_task5_evidence() -> None:
         )
 
 
+def test_authenticated_armed_frame_requires_anchor_same_incarnation(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        parent, peer = socket.socketpair()
+        parent.settimeout(2)
+        peer.settimeout(2)
+        supervisor = _identity_payload(100, pgid=100, sid=100)
+        anchor = _identity_payload(200, pgid=200, sid=200)
+        cli = inputs.manifest.cli_executable
+        armed = (
+            _identity_payload(
+                201,
+                pgid=200,
+                sid=200,
+                executable_dev=cli.st_dev,
+                executable_ino=cli.st_ino,
+                executable_hash=bytes.fromhex(cli.sha256),
+            )
+            + struct.pack("<QQ", cli.st_dev, cli.st_ino)
+            + bytes.fromhex(cli.sha256)
+            + bytes.fromhex(cli.path_sha256)
+        )
+
+        def publish_authenticated_frames() -> None:
+            try:
+                for message_type, payload, ack_type in (
+                    (1, supervisor, 2),
+                    (3, anchor, 4),
+                    (5, armed, None),
+                ):
+                    inputs.journal.append_bootstrap(message_type, payload)
+                    peer.sendall(
+                        implementation._encode_control_frame(
+                            message_type, _NONCE, payload
+                        )
+                    )
+                    if ack_type is not None:
+                        implementation._receive_control_frame(peer, _NONCE, ack_type)
+            finally:
+                peer.close()
+
+        publisher = threading.Thread(target=publish_authenticated_frames)
+        publisher.start()
+        try:
+            with pytest.raises(AttestationError, match="armed CLI identity"):
+                implementation._perform_handshake(
+                    parent,
+                    inputs.journal,
+                    _NONCE,
+                    cli,
+                    False,
+                    100,
+                )
+        finally:
+            parent.close()
+            publisher.join(timeout=2)
+        assert not publisher.is_alive()
+
+
 async def test_real_task5_handshake_creates_opaque_runtime_receipt_and_sends_ack(
     tmp_path: Path,
 ) -> None:
@@ -576,6 +703,12 @@ async def test_real_task5_handshake_creates_opaque_runtime_receipt_and_sends_ack
             assert receipt.identity_ack_sequence > 0
             assert len(receipt.identity_ack_hash) == hashlib.sha256().digest_size
             assert receipt.network_proxy_enabled is True
+            assert receipt.authorizes_authentication is False
+            original_hash = receipt.identity_ack_hash
+            object.__setattr__(receipt, "_identity_ack_hash", b"x" * 32)
+            with pytest.raises(AttestationError, match="receipt"):
+                _ = receipt.identity_ack_hash
+            object.__setattr__(receipt, "_identity_ack_hash", original_hash)
             with pytest.raises(AttestationError, match="sealed"):
                 receipt._identity_ack_hash = b"x" * 32
             with pytest.raises((AttestationError, TypeError)):
@@ -585,6 +718,30 @@ async def test_real_task5_handshake_creates_opaque_runtime_receipt_and_sends_ack
 
         assert not (inputs.descriptors.instance_dir / _JOURNAL_NAME).exists()
         assert not (inputs.descriptors.instance_dir / _WORKDIR_NAME).exists()
+
+
+def test_forged_handshake_receipt_properties_fail_closed() -> None:
+    forged = object.__new__(implementation.SupervisorHandshakeReceipt)
+    for name, value in {
+        "_token": object(),
+        "_control_trace": ("forged",),
+        "_canonical_control_types": ("forged",),
+        "_canonical_control_sequences": (1,),
+        "_canonical_control_hashes": (b"x" * 32,),
+        "_identity_ack_sequence": 1,
+        "_identity_ack_hash": b"x" * 32,
+        "_network_proxy_enabled": True,
+    }.items():
+        object.__setattr__(forged, name, value)
+    try:
+        object.__setattr__(forged, "_fingerprint", "0" * 64)
+    except AttributeError:
+        pass
+
+    with pytest.raises(AttestationError, match="receipt"):
+        _ = forged.identity_ack_hash
+    with pytest.raises((AttestationError, TypeError, pickle.PicklingError)):
+        pickle.dumps(forged)
 
 
 async def test_transport_sends_only_one_exact_initialize_and_buffers_everything_else(
@@ -645,6 +802,90 @@ class _ImmediateCloseProcess:
         return None
 
 
+def _finish_native_handshake(
+    transport: AttestedSupervisorTransport,
+    cli: CliExecutableIdentity,
+    *,
+    supervisor_certification: tuple[bytes, Any] | None = None,
+) -> implementation.SupervisorHandshakeReceipt:
+    control = transport._control
+    journal = transport._journal
+    nonce = transport._nonce
+    process = transport._process
+    assert process is not None
+    if supervisor_certification is None:
+        supervisor_payload, supervisor_head = implementation._certify_identity(
+            control, journal, nonce, 1
+        )
+    else:
+        supervisor_payload, supervisor_head = supervisor_certification
+    assert implementation._parse_process_identity(supervisor_payload).pid == process.pid
+    canonical = journal.certify_head()
+    control.sendall(
+        implementation._encode_control_frame(
+            2,
+            nonce,
+            struct.pack("<HBBIQ32s", 1, 0, 0, 0, canonical.sequence, canonical.hash),
+        )
+    )
+    anchor_payload, anchor_head = implementation._certify_identity(
+        control, journal, nonce, 3
+    )
+    control.sendall(implementation._encode_control_frame(4, nonce))
+    armed_payload, armed_head = implementation._certify_identity(
+        control, journal, nonce, 5
+    )
+    assert implementation._same_incarnation(
+        implementation._parse_process_identity(anchor_payload),
+        implementation._parse_process_identity(armed_payload[:112]),
+    )
+    control.sendall(implementation._encode_control_frame(6, nonce))
+    running_payload, running_head = implementation._certify_identity(
+        control, journal, nonce, 7
+    )
+    assert implementation._parse_process_identity(running_payload).executable_hash.hex() == (
+        cli.sha256
+    )
+    return implementation.SupervisorHandshakeReceipt._create(
+        implementation._RECEIPT_TOKEN,
+        sequences=(
+            supervisor_head.sequence,
+            anchor_head.sequence,
+            armed_head.sequence,
+            running_head.sequence,
+        ),
+        hashes=(
+            supervisor_head.hash,
+            anchor_head.hash,
+            armed_head.hash,
+            running_head.hash,
+        ),
+        ack_sequence=canonical.sequence,
+        ack_hash=canonical.hash,
+        network_proxy_enabled=False,
+    )
+
+
+async def _finish_and_close_failed_handshake(
+    transport: AttestedSupervisorTransport,
+    cli: CliExecutableIdentity,
+    *,
+    supervisor_certification: tuple[bytes, Any] | None = None,
+) -> None:
+    if transport._process is None or transport._control.fileno() < 0:
+        return
+    receipt = await anyio.to_thread.run_sync(
+        lambda: _finish_native_handshake(
+            transport,
+            cli,
+            supervisor_certification=supervisor_certification,
+        )
+    )
+    transport._handshake_receipt = receipt
+    transport._cleanup_unconfirmed = False
+    await transport.close()
+
+
 async def test_confirmed_prehandshake_process_is_released(tmp_path: Path) -> None:
     with _launch_inputs(tmp_path) as inputs:
         launch = _prepare(inputs)
@@ -673,6 +914,112 @@ async def test_process_aclose_is_bounded_and_unconfirmed_ownership_is_retained(
         assert transport.cleanup_unconfirmed is True
         assert transport._process is process
         launch.close()
+
+
+async def test_close_from_cancelled_scope_shields_cleanup_transition(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        process = _HangingCloseProcess()
+        transport._process = process  # type: ignore[assignment]
+        transport._ready = True
+
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await transport.close()
+
+        assert transport.is_ready() is False
+        assert transport.cleanup_unconfirmed is True
+        assert transport._process is process
+        launch.close()
+
+
+async def test_failed_handshake_before_first_frame_retains_task4_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+
+        def fail_before_first_frame(*_args: object) -> Never:
+            deadline = time.monotonic() + 2
+            while (
+                inputs.journal.scan().head.record.kind.name != "ACTIVE_READY"
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+            raise AttestationError("fault before first frame")
+
+        monkeypatch.setattr(
+            implementation, "_perform_handshake", fail_before_first_frame
+        )
+        try:
+            with pytest.raises(AttestationError, match="handshake failed closed"):
+                await transport.connect()
+            owned = transport._process
+            assert owned is not None
+            assert inputs.journal.scan().head.record.kind.name == "ACTIVE_READY"
+
+            with pytest.raises(AttestationError, match="cleanup is unconfirmed"):
+                await transport.close()
+
+            assert transport._process is owned
+            assert inputs.journal.scan().head.record.kind.name == "ACTIVE_READY"
+            assert transport.cleanup_unconfirmed is True
+        finally:
+            monkeypatch.undo()
+            await _finish_and_close_failed_handshake(
+                transport, inputs.manifest.cli_executable
+            )
+
+
+async def test_failed_handshake_after_certified_first_frame_retains_task4_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        certification: list[tuple[bytes, Any]] = []
+
+        def fail_after_certification(
+            control: socket.socket,
+            journal: Journal,
+            nonce: bytes,
+            *_args: object,
+        ) -> Never:
+            certification.append(
+                implementation._certify_identity(control, journal, nonce, 1)
+            )
+            raise AttestationError("fault after certified first frame")
+
+        monkeypatch.setattr(
+            implementation, "_perform_handshake", fail_after_certification
+        )
+        try:
+            with pytest.raises(AttestationError, match="handshake failed closed"):
+                await transport.connect()
+            assert len(certification) == 1
+            owned = transport._process
+            assert owned is not None
+            assert inputs.journal.scan().head.record.kind.name == "ACTIVE_READY"
+
+            with pytest.raises(AttestationError, match="cleanup is unconfirmed"):
+                await transport.close()
+
+            assert transport._process is owned
+            assert inputs.journal.scan().head.record.kind.name == "ACTIVE_READY"
+            assert transport.cleanup_unconfirmed is True
+        finally:
+            monkeypatch.undo()
+            await _finish_and_close_failed_handshake(
+                transport,
+                inputs.manifest.cli_executable,
+                supervisor_certification=(certification[0] if certification else None),
+            )
 
 
 def test_default_sdk_transport_is_rejected(tmp_path: Path) -> None:
