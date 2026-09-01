@@ -7,6 +7,7 @@
 #include <libproc.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
@@ -112,6 +113,8 @@ _Static_assert(sizeof(struct cpl_action_token) == CPL_ABI_ACTION_TOKEN_SIZE,
     "cpl_action_token ABI layout changed");
 _Static_assert(sizeof(struct cpl_reap_proof) == CPL_ABI_REAP_PROOF_SIZE,
     "cpl_reap_proof ABI layout changed");
+_Static_assert(sizeof(struct cpl_control_frame) == CPL_ABI_CONTROL_FRAME_SIZE,
+    "cpl_control_frame ABI layout changed");
 _Static_assert(CPL_HEADER_SIZE + sizeof(struct cpl_record) ==
     CPL_PHYSICAL_RECORD_SIZE, "physical record size changed");
 _Static_assert(CPL_MAX_AUTHORITY_EPOCH == 2U,
@@ -368,6 +371,242 @@ static uint32_t crc32c(const uint8_t *data, size_t length) {
 static void sha256(const uint8_t *data, size_t length,
     uint8_t out[CPL_HASH_SIZE]) {
     (void)CC_SHA256(data, (CC_LONG)length, out);
+}
+
+static bool valid_control_type(uint16_t type) {
+    return type >= CPL_CONTROL_SUPERVISOR_IDENTITY &&
+        type <= CPL_CONTROL_ERROR;
+}
+
+int cpl_control_frame_encode(uint16_t type,
+    const uint8_t allocation_nonce[CPL_HASH_SIZE], const uint8_t *payload,
+    uint32_t payload_length, uint8_t *out, uint32_t out_capacity,
+    uint32_t *out_length) {
+    uint32_t wire_length;
+    uint32_t checksum;
+
+    if (out_length != NULL) {
+        *out_length = 0U;
+    }
+    if (!valid_control_type(type) || allocation_nonce == NULL ||
+        is_zero(allocation_nonce, CPL_HASH_SIZE) || out == NULL ||
+        out_length == NULL || payload_length > CPL_CONTROL_MAX_PAYLOAD ||
+        (payload_length > 0U && payload == NULL)) {
+        return payload_length > CPL_CONTROL_MAX_PAYLOAD ?
+            CPL_ERR_CONTROL_PAYLOAD : CPL_ERR_INVALID_ARGUMENT;
+    }
+    wire_length = CPL_CONTROL_WIRE_HEADER_SIZE + payload_length +
+        CPL_CONTROL_WIRE_CHECKSUM_SIZE;
+    if (out_capacity < wire_length) {
+        return CPL_ERR_CONTROL_PAYLOAD;
+    }
+    (void)memset(out, 0, wire_length);
+    put_u32(out, CPL_CONTROL_MAGIC);
+    put_u16(out + 4U, CPL_CONTROL_VERSION);
+    put_u16(out + 6U, type);
+    put_u32(out + 8U, payload_length);
+    (void)memcpy(out + 12U, allocation_nonce, CPL_HASH_SIZE);
+    if (payload_length > 0U) {
+        (void)memcpy(out + CPL_CONTROL_WIRE_HEADER_SIZE, payload,
+            payload_length);
+    }
+    checksum = crc32c(out, wire_length - CPL_CONTROL_WIRE_CHECKSUM_SIZE);
+    put_u32(out + wire_length - CPL_CONTROL_WIRE_CHECKSUM_SIZE, checksum);
+    *out_length = wire_length;
+    return CPL_OK;
+}
+
+int cpl_control_frame_decode(const uint8_t *wire, uint32_t wire_length,
+    const uint8_t expected_nonce[CPL_HASH_SIZE],
+    struct cpl_control_frame *out) {
+    uint32_t payload_length;
+    uint32_t expected_length;
+    uint32_t checksum;
+    uint32_t stored_checksum;
+    uint16_t type;
+
+    if (out == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(out, 0, sizeof(*out));
+    if (wire == NULL || expected_nonce == NULL ||
+        wire_length < CPL_CONTROL_WIRE_HEADER_SIZE +
+            CPL_CONTROL_WIRE_CHECKSUM_SIZE) {
+        return CPL_ERR_CONTROL_FRAME;
+    }
+    payload_length = get_u32(wire + 8U);
+    if (payload_length > CPL_CONTROL_MAX_PAYLOAD) {
+        return CPL_ERR_CONTROL_PAYLOAD;
+    }
+    expected_length = CPL_CONTROL_WIRE_HEADER_SIZE + payload_length +
+        CPL_CONTROL_WIRE_CHECKSUM_SIZE;
+    if (wire_length != expected_length ||
+        get_u32(wire) != CPL_CONTROL_MAGIC ||
+        get_u16(wire + 4U) != CPL_CONTROL_VERSION) {
+        return CPL_ERR_CONTROL_FRAME;
+    }
+    type = get_u16(wire + 6U);
+    if (!valid_control_type(type) ||
+        memcmp(wire + 12U, expected_nonce, CPL_HASH_SIZE) != 0) {
+        return CPL_ERR_CONTROL_FRAME;
+    }
+    stored_checksum = get_u32(
+        wire + wire_length - CPL_CONTROL_WIRE_CHECKSUM_SIZE);
+    checksum = crc32c(wire, wire_length - CPL_CONTROL_WIRE_CHECKSUM_SIZE);
+    if (stored_checksum != checksum) {
+        return CPL_ERR_CONTROL_FRAME;
+    }
+    out->magic = CPL_CONTROL_MAGIC;
+    out->version = CPL_CONTROL_VERSION;
+    out->type = type;
+    out->payload_length = payload_length;
+    (void)memcpy(out->allocation_nonce, expected_nonce, CPL_HASH_SIZE);
+    if (payload_length > 0U) {
+        (void)memcpy(out->payload, wire + CPL_CONTROL_WIRE_HEADER_SIZE,
+            payload_length);
+    }
+    out->checksum = stored_checksum;
+    return CPL_OK;
+}
+
+static int control_wait(int fd, short events, uint64_t deadline) {
+    struct pollfd descriptor;
+
+    for (;;) {
+        uint64_t now = monotonic_ns();
+        uint64_t remaining;
+        uint64_t milliseconds;
+        int timeout;
+        int result;
+
+        if (now == 0U || now >= deadline) {
+            return CPL_ERR_CERTIFY_TIMEOUT;
+        }
+        remaining = deadline - now;
+        milliseconds = (remaining + 999999U) / 1000000U;
+        timeout = milliseconds > (uint64_t)INT_MAX ? INT_MAX :
+            (int)milliseconds;
+        descriptor.fd = fd;
+        descriptor.events = events;
+        descriptor.revents = 0;
+        result = poll(&descriptor, 1U, timeout);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result < 0) {
+            return CPL_ERR_SYSTEM;
+        }
+        if (result == 0) {
+            return CPL_ERR_CERTIFY_TIMEOUT;
+        }
+        if ((descriptor.revents & events) != 0) {
+            return CPL_OK;
+        }
+        return CPL_ERR_CONTROL_FRAME;
+    }
+}
+
+static int control_transfer(int fd, uint8_t *bytes, uint32_t length,
+    uint64_t deadline, bool writing) {
+    uint32_t offset = 0U;
+
+    if (fd < 0 || bytes == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    while (offset < length) {
+        ssize_t result;
+        int status = control_wait(fd, writing ? POLLOUT : POLLIN, deadline);
+
+        if (status != CPL_OK) {
+            return status;
+        }
+        if (writing) {
+            result = write(fd, bytes + offset, (size_t)(length - offset));
+        } else {
+            result = read(fd, bytes + offset, (size_t)(length - offset));
+        }
+        if (result < 0 && (errno == EINTR || errno == EAGAIN)) {
+            continue;
+        }
+        if (result <= 0) {
+            return CPL_ERR_CONTROL_FRAME;
+        }
+        offset += (uint32_t)result;
+    }
+    return CPL_OK;
+}
+
+int cpl_control_frame_write(int fd, uint16_t type,
+    const uint8_t allocation_nonce[CPL_HASH_SIZE], const uint8_t *payload,
+    uint32_t payload_length, uint64_t deadline_ns) {
+    uint8_t wire[CPL_CONTROL_MAX_WIRE_SIZE];
+    uint32_t wire_length = 0U;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status = cpl_control_frame_encode(type, allocation_nonce, payload,
+        payload_length, wire, sizeof(wire), &wire_length);
+
+    if (status != CPL_OK) {
+        return status;
+    }
+    return control_transfer(fd, wire, wire_length, deadline, true);
+}
+
+int cpl_control_frame_read(int fd,
+    const uint8_t expected_nonce[CPL_HASH_SIZE], uint64_t deadline_ns,
+    struct cpl_control_frame *out) {
+    uint8_t wire[CPL_CONTROL_MAX_WIRE_SIZE];
+    uint32_t payload_length;
+    uint32_t wire_length;
+    uint64_t deadline = effective_deadline(deadline_ns);
+    int status;
+
+    if (out == NULL || expected_nonce == NULL) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    (void)memset(out, 0, sizeof(*out));
+    status = control_transfer(fd, wire, CPL_CONTROL_WIRE_HEADER_SIZE,
+        deadline, false);
+    if (status != CPL_OK) {
+        return status;
+    }
+    payload_length = get_u32(wire + 8U);
+    if (payload_length > CPL_CONTROL_MAX_PAYLOAD) {
+        return CPL_ERR_CONTROL_PAYLOAD;
+    }
+    wire_length = CPL_CONTROL_WIRE_HEADER_SIZE + payload_length +
+        CPL_CONTROL_WIRE_CHECKSUM_SIZE;
+    status = control_transfer(fd, wire + CPL_CONTROL_WIRE_HEADER_SIZE,
+        payload_length + CPL_CONTROL_WIRE_CHECKSUM_SIZE, deadline, false);
+    if (status != CPL_OK) {
+        return status;
+    }
+    return cpl_control_frame_decode(wire, wire_length, expected_nonce, out);
+}
+
+int cpl_control_phase_accept(uint32_t *inout_phase, uint16_t type,
+    bool durable_head_certified) {
+    uint32_t expected;
+
+    if (inout_phase == NULL || *inout_phase > CPL_CONTROL_PHASE_ERROR ||
+        !valid_control_type(type)) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    if (type == CPL_CONTROL_ERROR) {
+        if (*inout_phase == CPL_CONTROL_PHASE_ERROR) {
+            return CPL_ERR_CONTROL_PHASE;
+        }
+        *inout_phase = CPL_CONTROL_PHASE_ERROR;
+        return CPL_OK;
+    }
+    expected = *inout_phase + 1U;
+    if ((uint32_t)type != expected ||
+        ((type == CPL_CONTROL_IDENTITY_ACK ||
+          type == CPL_CONTROL_ANCHOR_ACK ||
+          type == CPL_CONTROL_ARMED_ACK) && !durable_head_certified)) {
+        return CPL_ERR_CONTROL_PHASE;
+    }
+    *inout_phase = (uint32_t)type;
+    return CPL_OK;
 }
 
 static int validate_component(const char *name) {

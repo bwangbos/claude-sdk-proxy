@@ -66,6 +66,9 @@ class JournalErrorCode(IntEnum):
     PRECONDITION = 28
     REAP_REQUIRED = 29
     RECEIPT = 30
+    CONTROL_FRAME = 31
+    CONTROL_PHASE = 32
+    CONTROL_PAYLOAD = 33
 
 
 class JournalError(RuntimeError):

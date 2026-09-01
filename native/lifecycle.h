@@ -47,6 +47,15 @@ extern "C" {
 #define CPL_ABI_DELETE_RECEIPT_SIZE 40U
 #define CPL_ABI_ACTION_TOKEN_SIZE 72U
 #define CPL_ABI_REAP_PROOF_SIZE 72U
+#define CPL_CONTROL_MAGIC 0x464c5043U
+#define CPL_CONTROL_VERSION 1U
+#define CPL_CONTROL_MAX_PAYLOAD 4096U
+#define CPL_CONTROL_WIRE_HEADER_SIZE 44U
+#define CPL_CONTROL_WIRE_CHECKSUM_SIZE 4U
+#define CPL_CONTROL_MAX_WIRE_SIZE                                         \
+    (CPL_CONTROL_WIRE_HEADER_SIZE + CPL_CONTROL_MAX_PAYLOAD +            \
+     CPL_CONTROL_WIRE_CHECKSUM_SIZE)
+#define CPL_ABI_CONTROL_FRAME_SIZE 4144U
 
 typedef struct cpl_journal cpl_journal;
 
@@ -82,6 +91,46 @@ enum cpl_error {
     CPL_ERR_PRECONDITION = 28,
     CPL_ERR_REAP_REQUIRED = 29,
     CPL_ERR_RECEIPT = 30,
+    CPL_ERR_CONTROL_FRAME = 31,
+    CPL_ERR_CONTROL_PHASE = 32,
+    CPL_ERR_CONTROL_PAYLOAD = 33,
+};
+
+enum cpl_control_type {
+    CPL_CONTROL_SUPERVISOR_IDENTITY = 1,
+    CPL_CONTROL_IDENTITY_ACK = 2,
+    CPL_CONTROL_ANCHOR_IDENTITY = 3,
+    CPL_CONTROL_ANCHOR_ACK = 4,
+    CPL_CONTROL_CLI_ARMED = 5,
+    CPL_CONTROL_ARMED_ACK = 6,
+    CPL_CONTROL_CLI_RUNNING = 7,
+    CPL_CONTROL_CLEANUP_REQUEST = 8,
+    CPL_CONTROL_SELF_TERM_REQUEST = 9,
+    CPL_CONTROL_ERROR = 10,
+};
+
+enum cpl_control_phase {
+    CPL_CONTROL_PHASE_NONE = 0,
+    CPL_CONTROL_PHASE_SUPERVISOR_IDENTITY = 1,
+    CPL_CONTROL_PHASE_IDENTITY_ACK = 2,
+    CPL_CONTROL_PHASE_ANCHOR_IDENTITY = 3,
+    CPL_CONTROL_PHASE_ANCHOR_ACK = 4,
+    CPL_CONTROL_PHASE_CLI_ARMED = 5,
+    CPL_CONTROL_PHASE_ARMED_ACK = 6,
+    CPL_CONTROL_PHASE_CLI_RUNNING = 7,
+    CPL_CONTROL_PHASE_CLEANUP_REQUEST = 8,
+    CPL_CONTROL_PHASE_SELF_TERM_REQUEST = 9,
+    CPL_CONTROL_PHASE_ERROR = 10,
+};
+
+struct cpl_control_frame {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t type;
+    uint32_t payload_length;
+    uint8_t allocation_nonce[CPL_HASH_SIZE];
+    uint8_t payload[CPL_CONTROL_MAX_PAYLOAD];
+    uint32_t checksum;
 };
 
 enum cpl_storage_state {
@@ -357,6 +406,21 @@ int cpl_journal_certify(cpl_journal *j, uint64_t deadline_ns,
     struct cpl_certified_head *out);
 int cpl_lifecycle_apply(const struct cpl_state *current,
     const struct cpl_record *record, struct cpl_state *out);
+int cpl_control_frame_encode(uint16_t type,
+    const uint8_t allocation_nonce[CPL_HASH_SIZE], const uint8_t *payload,
+    uint32_t payload_length, uint8_t *out, uint32_t out_capacity,
+    uint32_t *out_length);
+int cpl_control_frame_decode(const uint8_t *wire, uint32_t wire_length,
+    const uint8_t expected_nonce[CPL_HASH_SIZE],
+    struct cpl_control_frame *out);
+int cpl_control_frame_write(int fd, uint16_t type,
+    const uint8_t allocation_nonce[CPL_HASH_SIZE], const uint8_t *payload,
+    uint32_t payload_length, uint64_t deadline_ns);
+int cpl_control_frame_read(int fd,
+    const uint8_t expected_nonce[CPL_HASH_SIZE], uint64_t deadline_ns,
+    struct cpl_control_frame *out);
+int cpl_control_phase_accept(uint32_t *inout_phase, uint16_t type,
+    bool durable_head_certified);
 int cpl_journal_create_workdir(cpl_journal *j,
     int workdir_parent_dirfd, const struct cpl_create_receipt *create_receipt,
     uint64_t deadline_ns, struct cpl_workdir_receipt *receipt);
