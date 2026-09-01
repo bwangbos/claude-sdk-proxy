@@ -401,15 +401,22 @@ operation = threading.Thread(
 operation.start()
 if os.read(notified_read, 1) != b"1":
     os._exit(6)
-closer = threading.Thread(target=journal.close)
-closer.start()
-closer.join(timeout=0.05)
-if not closer.is_alive():
+closers = [threading.Thread(target=journal.close) for _ in range(2)]
+for closer in closers:
+    closer.start()
+for closer in closers:
+    closer.join(timeout=0.05)
+if not all(closer.is_alive() for closer in closers):
     os._exit(7)
 os.write(release_write, b"1")
 operation.join(timeout=2)
-closer.join(timeout=2)
-if operation.is_alive() or closer.is_alive() or not journal.closed:
+for closer in closers:
+    closer.join(timeout=2)
+if (
+    operation.is_alive()
+    or any(closer.is_alive() for closer in closers)
+    or not journal.closed
+):
     os._exit(8)
 os._exit(0)
 '''

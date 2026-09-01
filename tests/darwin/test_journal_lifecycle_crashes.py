@@ -28,6 +28,13 @@ CREATE_POINTS = (
     "after_journal_fullfsync",
     "after_intent_parent_fsync",
 )
+CREATE_DEADLINE_POINTS = (
+    "before_create_openat",
+    "before_create_preallocate",
+    "before_create_intent_write",
+    "before_create_fullfsync",
+    "before_create_parent_fsync",
+)
 PARTIAL_DELETE_POINTS = (
     "after_authority_revalidated",
     "after_workdir_absence_verified",
@@ -97,6 +104,60 @@ def _create(
             library_path=library_path,
         )
     return journal
+
+
+@pytest.mark.parametrize("point", CREATE_DEADLINE_POINTS)
+def test_create_expiry_at_final_boundary_stops_next_mutation(
+    tmp_path: Path,
+    point: str,
+) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    deadline = time.monotonic_ns() + 200_000_000
+    Journal.configure_create_pause_for_test(
+        _fault_library(), point, notified_write, release_read, deadline
+    )
+    results: list[object] = []
+
+    def create() -> None:
+        try:
+            results.append(_create(parent_dirfd, library_path=_fault_library()))
+        except BaseException as error:
+            results.append(error)
+
+    thread = threading.Thread(target=create)
+    thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        while time.monotonic_ns() <= deadline:
+            time.sleep(0.001)
+        os.write(release_write, b"1")
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(results) == 1
+        assert isinstance(results[0], JournalError)
+        assert results[0].code is JournalErrorCode.LOCK_TIMEOUT
+        journal_path = tmp_path / "allocation.journal"
+        if point == "before_create_openat":
+            assert not journal_path.exists()
+        elif point in {
+            "before_create_preallocate",
+            "before_create_intent_write",
+        }:
+            assert journal_path.stat().st_size == 0
+        else:
+            assert journal_path.stat().st_size == PHYSICAL_RECORD_SIZE
+    finally:
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        for result in results:
+            if isinstance(result, Journal):
+                result.close()
+        os.close(parent_dirfd)
 
 
 def _open(
@@ -620,6 +681,55 @@ def test_workdir_name_must_still_resolve_to_opened_inode_before_bound_append(
         os.close(parent_dirfd)
 
 
+def test_dependent_artifact_inserted_between_absence_scans_blocks_authority(
+    tmp_path: Path,
+) -> None:
+    parent_dirfd = _open_parent(tmp_path)
+    _make_lock_files(parent_dirfd, "allocation.journal")
+    journal_fd = os.open(
+        "allocation.journal",
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent_dirfd,
+    )
+    os.close(journal_fd)
+    journal = _open(parent_dirfd, library_path=_fault_library())
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    journal.configure_lifecycle_pause_for_test(
+        "after_first_dependent_scan",
+        notified_write,
+        release_read,
+    )
+    results: list[object] = []
+
+    def certify() -> None:
+        try:
+            results.append(journal.certify_unreleased_partial_create())
+        except BaseException as error:
+            results.append(error)
+
+    thread = threading.Thread(target=certify)
+    thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        (tmp_path / "allocation.spawn").write_bytes(b"")
+        os.write(release_write, b"1")
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(results) == 1
+        assert isinstance(results[0], JournalError)
+        assert results[0].code is JournalErrorCode.WORKDIR_PRESENT
+        assert (tmp_path / "allocation.journal").exists()
+    finally:
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        journal.close()
+        os.close(parent_dirfd)
+
+
 def test_controlled_cleanup_slot_gate_consumes_only_native_delete_receipt(
     tmp_path: Path,
 ) -> None:
@@ -943,13 +1053,61 @@ def test_exact_eight_record_recovery_tail_reaches_done(tmp_path: Path) -> None:
         os.kill(executor_pid, 9)
         while time.monotonic_ns() <= authority_deadline:
             time.sleep(0.001)
+        replacement_deadline = time.monotonic_ns() + 40_000_000
         journal.replace_retirement_authority(
             authority="reconciler-2",
             authority_epoch=2,
-            authority_deadline_ns=_future(),
+            authority_deadline_ns=replacement_deadline,
         )
+        replacement_eof = journal.scan().physical_eof
+        while time.monotonic_ns() <= replacement_deadline:
+            time.sleep(0.001)
+        with pytest.raises(JournalError) as caught:
+            journal.replace_retirement_authority(
+                authority="reconciler-3",
+                authority_epoch=3,
+                authority_deadline_ns=_future(),
+            )
+        assert caught.value.code is JournalErrorCode.AUTHORITY
+        assert journal.scan().physical_eof == replacement_eof
         proof = journal.confirm_executor_reaped(deadline_ns=_future())
         journal.reconcile_interrupted_batch(proof)
+        claim_deadline = time.monotonic_ns() + 200_000_000
+        notified_read, notified_write = os.pipe()
+        release_read, release_write = os.pipe()
+        journal.configure_lifecycle_pause_for_test(
+            "before_successor_append", notified_write, release_read
+        )
+        successor_results: list[object] = []
+
+        def prepare_expiring_successor() -> None:
+            try:
+                successor_results.append(
+                    journal.prepare_successor(
+                        proof,
+                        2,
+                        "executor-2",
+                        claim_deadline_ns=claim_deadline,
+                    )
+                )
+            except BaseException as error:
+                successor_results.append(error)
+
+        successor_thread = threading.Thread(target=prepare_expiring_successor)
+        successor_thread.start()
+        assert os.read(notified_read, 1) == b"1"
+        while time.monotonic_ns() <= claim_deadline:
+            time.sleep(0.001)
+        os.write(release_write, b"1")
+        successor_thread.join(timeout=2)
+        assert not successor_thread.is_alive()
+        assert len(successor_results) == 1
+        assert isinstance(successor_results[0], JournalError)
+        assert successor_results[0].code is JournalErrorCode.AUTHORITY
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
         journal.prepare_successor(
             proof,
             2,

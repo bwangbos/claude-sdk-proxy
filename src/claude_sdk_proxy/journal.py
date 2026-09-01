@@ -87,6 +87,12 @@ class UnconfirmedReason(IntEnum):
     IDENTITY_UNAVAILABLE = 3
 
 
+class _HandleState(IntEnum):
+    OPEN = 1
+    CLOSING = 2
+    CLOSED = 3
+
+
 @dataclass(frozen=True)
 class JournalCreateReceipt:
     intent_parent_dirsynced: bool
@@ -621,7 +627,7 @@ class Journal:
         self._workdir_name = workdir_name
         self._operation_condition = threading.Condition()
         self._active_operations = 0
-        self._closing = False
+        self._handle_state = _HandleState.OPEN
 
     @classmethod
     def create_at(
@@ -828,7 +834,7 @@ class Journal:
     @property
     def closed(self) -> bool:
         with self._operation_condition:
-            return not bool(self._handle.value)
+            return self._handle_state is _HandleState.CLOSED
 
     @property
     def unhealthy(self) -> bool:
@@ -857,13 +863,13 @@ class Journal:
 
     def _require_open(self) -> None:
         with self._operation_condition:
-            if self._closing or not self._handle.value:
+            if self._handle_state is not _HandleState.OPEN:
                 raise JournalError(JournalErrorCode.CLOSED)
 
     @contextmanager
     def _operation(self) -> Iterator[ctypes.c_void_p]:
         with self._operation_condition:
-            if self._closing or not self._handle.value:
+            if self._handle_state is not _HandleState.OPEN:
                 raise JournalError(JournalErrorCode.CLOSED)
             self._active_operations += 1
             handle = ctypes.c_void_p(self._handle.value)
@@ -883,31 +889,39 @@ class Journal:
         self, function: Callable[..., int], *args: object
     ) -> int:
         with self._operation_condition:
-            if self._closing or not self._handle.value:
+            if self._handle_state is not _HandleState.OPEN:
                 raise JournalError(JournalErrorCode.CLOSED)
-            self._closing = True
+            self._handle_state = _HandleState.CLOSING
             while self._active_operations:
                 self._operation_condition.wait()
         try:
             return int(function(ctypes.byref(self._handle), *args))
         finally:
             with self._operation_condition:
-                if self._handle.value:
-                    self._closing = False
+                self._handle_state = (
+                    _HandleState.OPEN
+                    if self._handle.value
+                    else _HandleState.CLOSED
+                )
                 self._operation_condition.notify_all()
 
     def close(self) -> None:
         with self._operation_condition:
-            while self._closing and self._handle.value:
+            while self._handle_state is _HandleState.CLOSING:
                 self._operation_condition.wait()
-            if not self._handle.value:
+            if self._handle_state is _HandleState.CLOSED:
                 return
-            self._closing = True
+            self._handle_state = _HandleState.CLOSING
             while self._active_operations:
                 self._operation_condition.wait()
-            handle = self._handle
-            self._handle = ctypes.c_void_p()
-        self._library.cpl_journal_close(handle)
+            handle = ctypes.c_void_p(self._handle.value)
+        try:
+            self._library.cpl_journal_close(handle)
+        finally:
+            with self._operation_condition:
+                self._handle = ctypes.c_void_p()
+                self._handle_state = _HandleState.CLOSED
+                self._operation_condition.notify_all()
 
     def scan(self) -> CanonicalChain:
         chain = _CChain()
@@ -1357,6 +1371,10 @@ class Journal:
             "before_retirement_expiry_check": 2,
             "after_batch_admission_append": 3,
             "before_retirement_append": 4,
+            "after_first_dependent_scan": 5,
+            "before_activation_append": 6,
+            "before_successor_append": 7,
+            "before_authority_replacement_append": 8,
         }
         try:
             selected = points[point]
@@ -1371,6 +1389,41 @@ class Journal:
         ]
         function.restype = ctypes.c_int
         _raise_status(self._native_call(function, selected, notify_fd, wait_fd))
+
+    @staticmethod
+    def configure_create_pause_for_test(
+        library_path: Path,
+        point: str,
+        notify_fd: int,
+        wait_fd: int,
+        deadline_ns: int,
+    ) -> None:
+        points = {
+            "before_create_openat": 1,
+            "before_create_preallocate": 2,
+            "before_create_intent_write": 3,
+            "before_create_fullfsync": 4,
+            "before_create_parent_fsync": 5,
+        }
+        try:
+            selected = points[point]
+        except KeyError as error:
+            raise ValueError("unknown create pause point") from error
+        library = _load_library(library_path)
+        try:
+            function = library.cpl_fault_configure_create_pause
+        except AttributeError as error:
+            raise JournalError(JournalErrorCode.UNSUPPORTED) from error
+        function.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+        ]
+        function.restype = ctypes.c_int
+        _raise_status(
+            int(function(selected, notify_fd, wait_fd, deadline_ns))
+        )
 
     def fail_batch_after_step_for_test(self, step: int) -> None:
         function = self._fault("cpl_fault_fail_batch_after_step")

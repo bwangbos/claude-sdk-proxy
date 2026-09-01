@@ -17,6 +17,11 @@ extern "C" {
 #define CPL_RECOVERY_RECORD_COUNT 8U
 #define CPL_RECOVERY_BYTES                                                \
     (CPL_PHYSICAL_RECORD_SIZE * CPL_RECOVERY_RECORD_COUNT)
+/* The fixed eight-record recovery tail budgets one authority replacement. */
+#define CPL_INITIAL_AUTHORITY_EPOCH 1U
+#define CPL_MAX_AUTHORITY_REPLACEMENTS 1U
+#define CPL_MAX_AUTHORITY_EPOCH                                           \
+    (CPL_INITIAL_AUTHORITY_EPOCH + CPL_MAX_AUTHORITY_REPLACEMENTS)
 
 #define CPL_ABI_PROCESS_IDENTITY_SIZE 112U
 #define CPL_ABI_BATCH_DESCRIPTOR_SIZE 120U
@@ -397,6 +402,18 @@ enum cpl_fault_pause_point {
     CPL_FAULT_BEFORE_RETIREMENT_EXPIRY_CHECK = 2,
     CPL_FAULT_AFTER_BATCH_ADMISSION_APPEND = 3,
     CPL_FAULT_BEFORE_RETIREMENT_APPEND = 4,
+    CPL_FAULT_AFTER_FIRST_DEPENDENT_SCAN = 5,
+    CPL_FAULT_BEFORE_ACTIVATION_APPEND = 6,
+    CPL_FAULT_BEFORE_SUCCESSOR_APPEND = 7,
+    CPL_FAULT_BEFORE_AUTHORITY_REPLACEMENT_APPEND = 8,
+};
+
+enum cpl_fault_create_pause_point {
+    CPL_FAULT_BEFORE_CREATE_OPENAT = 1,
+    CPL_FAULT_BEFORE_CREATE_PREALLOCATE = 2,
+    CPL_FAULT_BEFORE_CREATE_INTENT_WRITE = 3,
+    CPL_FAULT_BEFORE_CREATE_FULLFSYNC = 4,
+    CPL_FAULT_BEFORE_CREATE_PARENT_FSYNC = 5,
 };
 
 enum cpl_unconfirmed_reason {
@@ -405,6 +422,8 @@ enum cpl_unconfirmed_reason {
     CPL_UNCONFIRMED_IDENTITY_UNAVAILABLE = 3,
 };
 #ifdef CPL_ENABLE_FAULT_INJECTION
+int cpl_fault_configure_create_pause(uint32_t point, int notify_fd,
+    int wait_fd, uint64_t deadline_ns);
 int cpl_fault_configure_lifecycle_pause(cpl_journal *j, uint32_t point,
     int notify_fd, int wait_fd);
 int cpl_fault_fail_batch_after_step(cpl_journal *j, uint32_t step);

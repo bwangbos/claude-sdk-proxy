@@ -215,6 +215,224 @@ def test_retirement_winning_before_batch_admission_blocks_batch(tmp_path: Path) 
         os.close(parent_dirfd)
 
 
+def test_initial_retirement_authority_epoch_is_fixed(tmp_path: Path) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    lease = time.monotonic_ns() + 20_000_000
+    try:
+        journal.append(
+            Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+            RecordClass.NORMAL,
+        )
+        journal.activate_executor(
+            1,
+            "executor-1",
+            os.getpid(),
+            lease_deadline_ns=lease,
+        )
+        while time.monotonic_ns() <= lease:
+            time.sleep(0.001)
+        before = journal.scan()
+        with pytest.raises(JournalError) as caught:
+            journal.retire_executor(
+                authority="reconciler-2",
+                authority_epoch=2,
+                authority_deadline_ns=_future(),
+            )
+        assert caught.value.code is JournalErrorCode.AUTHORITY
+        assert journal.scan().physical_eof == before.physical_eof
+        assert journal.scan().head.hash == before.head.hash
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+@pytest.mark.parametrize("expiring_deadline", ["claim", "requested_lease"])
+def test_activation_rechecks_deadlines_at_final_append_boundary(
+    tmp_path: Path,
+    expiring_deadline: str,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    selected_deadline = time.monotonic_ns() + 200_000_000
+    claim_deadline = selected_deadline if expiring_deadline == "claim" else _future()
+    lease_deadline = (
+        selected_deadline if expiring_deadline == "requested_lease" else _future()
+    )
+    prepared = journal.append(
+        Record.prepared(
+            1,
+            "executor-1",
+            claim_deadline_ns=claim_deadline,
+        ),
+        RecordClass.NORMAL,
+    )
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    journal.configure_lifecycle_pause_for_test(
+        "before_activation_append", notified_write, release_read
+    )
+    results: list[object] = []
+
+    def activate() -> None:
+        try:
+            results.append(
+                journal.activate_executor(
+                    1,
+                    "executor-1",
+                    os.getpid(),
+                    lease_deadline_ns=lease_deadline,
+                )
+            )
+        except BaseException as error:
+            results.append(error)
+
+    thread = threading.Thread(target=activate)
+    thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        while time.monotonic_ns() <= selected_deadline:
+            time.sleep(0.001)
+        os.write(release_write, b"1")
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(results) == 1
+        assert isinstance(results[0], JournalError)
+        assert results[0].code is JournalErrorCode.AUTHORITY
+        assert journal.scan().head.hash == prepared.hash
+    finally:
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_retirement_rechecks_new_authority_deadline_before_append(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    lease = time.monotonic_ns() + 20_000_000
+    journal.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+        RecordClass.NORMAL,
+    )
+    active = journal.activate_executor(
+        1,
+        "executor-1",
+        os.getpid(),
+        lease_deadline_ns=lease,
+    )
+    while time.monotonic_ns() <= lease:
+        time.sleep(0.001)
+    authority_deadline = time.monotonic_ns() + 200_000_000
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    journal.configure_lifecycle_pause_for_test(
+        "before_retirement_append", notified_write, release_read
+    )
+    results: list[object] = []
+
+    def retire() -> None:
+        try:
+            results.append(
+                journal.retire_executor(
+                    authority="reconciler-1",
+                    authority_epoch=1,
+                    authority_deadline_ns=authority_deadline,
+                )
+            )
+        except BaseException as error:
+            results.append(error)
+
+    thread = threading.Thread(target=retire)
+    thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        while time.monotonic_ns() <= authority_deadline:
+            time.sleep(0.001)
+        os.write(release_write, b"1")
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(results) == 1
+        assert isinstance(results[0], JournalError)
+        assert results[0].code is JournalErrorCode.AUTHORITY
+        assert journal.scan().head.hash == active.hash
+    finally:
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_replacement_rechecks_new_authority_deadline_before_append(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path, fault=True)
+    lease = time.monotonic_ns() + 20_000_000
+    journal.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=_future()),
+        RecordClass.NORMAL,
+    )
+    journal.activate_executor(
+        1,
+        "executor-1",
+        os.getpid(),
+        lease_deadline_ns=lease,
+    )
+    while time.monotonic_ns() <= lease:
+        time.sleep(0.001)
+    initial_deadline = time.monotonic_ns() + 30_000_000
+    retired = journal.retire_executor(
+        authority="reconciler-1",
+        authority_epoch=1,
+        authority_deadline_ns=initial_deadline,
+    )
+    while time.monotonic_ns() <= initial_deadline:
+        time.sleep(0.001)
+    replacement_deadline = time.monotonic_ns() + 200_000_000
+    notified_read, notified_write = os.pipe()
+    release_read, release_write = os.pipe()
+    journal.configure_lifecycle_pause_for_test(
+        "before_authority_replacement_append", notified_write, release_read
+    )
+    results: list[object] = []
+
+    def replace() -> None:
+        try:
+            results.append(
+                journal.replace_retirement_authority(
+                    authority="reconciler-2",
+                    authority_epoch=2,
+                    authority_deadline_ns=replacement_deadline,
+                )
+            )
+        except BaseException as error:
+            results.append(error)
+
+    thread = threading.Thread(target=replace)
+    thread.start()
+    try:
+        assert os.read(notified_read, 1) == b"1"
+        while time.monotonic_ns() <= replacement_deadline:
+            time.sleep(0.001)
+        os.write(release_write, b"1")
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(results) == 1
+        assert isinstance(results[0], JournalError)
+        assert results[0].code is JournalErrorCode.AUTHORITY
+        assert journal.scan().head.hash == retired.hash
+    finally:
+        os.close(notified_read)
+        os.close(notified_write)
+        os.close(release_read)
+        os.close(release_write)
+        journal.close()
+        os.close(parent_dirfd)
+
+
 def test_retirement_preserves_admitted_batch_until_exact_outcome(
     tmp_path: Path,
 ) -> None:

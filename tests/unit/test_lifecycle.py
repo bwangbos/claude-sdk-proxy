@@ -321,6 +321,16 @@ def test_expired_retirement_authority_can_be_replaced(retiring: State) -> None:
     assert replacement.authority == "reconciler-2"
     assert replacement.authority_epoch == 2
 
+    with pytest.raises(IllegalTransition):
+        Lifecycle.apply(
+            replacement,
+            Record.replace_authority(
+                authority="reconciler-3",
+                authority_epoch=3,
+                deadline_ns=1_000,
+            ),
+        )
+
 
 def test_retiring_idle_hands_off_to_exact_next_generation() -> None:
     retired = _bound(State.retiring_idle(

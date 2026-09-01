@@ -806,6 +806,47 @@ def test_scanner_rejects_corrupt_descriptor_shape(
         os.close(parent_dirfd)
 
 
+def test_scanner_rejects_nonzero_descriptor_beyond_declared_count(
+    tmp_path: Path,
+) -> None:
+    journal, create_receipt, parent_dirfd = make_journal(tmp_path, fault=True)
+    journal.create_workdir(create_receipt)
+    future = time.monotonic_ns() + 5_000_000_000
+    journal.append(
+        Record.prepared(1, "executor-1", claim_deadline_ns=future),
+        RecordClass.NORMAL,
+    )
+    active = journal.activate_executor(
+        1,
+        "executor-1",
+        os.getpid(),
+        lease_deadline_ns=future,
+    )
+    identity = journal.observe_process(os.getpid())
+    forged = Record(
+        RecordKind.BATCH_ACTIVE,
+        generation=1,
+        lease_deadline_ns=future,
+        executor="executor-1",
+        exact_batch="batch-1",
+        descriptor_count=1,
+        descriptors=(
+            journal.process_absent_descriptor(identity),
+            journal.reap_process_descriptor(identity),
+        ),
+        parent=active.hash,
+    )
+    try:
+        journal.raw_append_for_test(journal.encode_physical_for_test(forged))
+        chain = journal.scan()
+        assert chain.head.hash == active.hash
+        assert chain.head.record.kind is StateKind.ACTIVE_READY
+        assert chain.stale_records == 1
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
 def test_atfork_registration_failure_fails_handle_construction(
     tmp_path: Path,
 ) -> None:

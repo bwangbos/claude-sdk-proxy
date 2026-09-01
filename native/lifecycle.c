@@ -108,6 +108,8 @@ _Static_assert(sizeof(struct cpl_reap_proof) == CPL_ABI_REAP_PROOF_SIZE,
     "cpl_reap_proof ABI layout changed");
 _Static_assert(CPL_HEADER_SIZE + sizeof(struct cpl_record) ==
     CPL_PHYSICAL_RECORD_SIZE, "physical record size changed");
+_Static_assert(CPL_MAX_AUTHORITY_EPOCH == 2U,
+    "eight-record recovery tail permits exactly one authority replacement");
 
 static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t atfork_once = PTHREAD_ONCE_INIT;
@@ -1034,6 +1036,33 @@ static int validate_record_descriptors(const struct cpl_record *record) {
     return CPL_OK;
 }
 
+static int validate_temporal_admission(const struct cpl_state *current,
+    const struct cpl_record *record, uint64_t now) {
+    switch (record->kind) {
+    case CPL_RECORD_PREPARED:
+        return record->deadline_ns > now ? CPL_OK : CPL_ERR_AUTHORITY;
+    case CPL_RECORD_ACTIVE_READY:
+        return current->deadline_ns > now &&
+            record->lease_deadline_ns > now ? CPL_OK : CPL_ERR_AUTHORITY;
+    case CPL_RECORD_BATCH_ACTIVE:
+        return current->lease_deadline_ns > now ? CPL_OK : CPL_ERR_AUTHORITY;
+    case CPL_RECORD_RETIRING_IDLE:
+    case CPL_RECORD_RETIRING_BATCH:
+        if (record->deadline_ns <= now) {
+            return CPL_ERR_AUTHORITY;
+        }
+        if (current->kind == CPL_STATE_PREPARED) {
+            return current->deadline_ns <= now ? CPL_OK : CPL_ERR_AUTHORITY;
+        }
+        return current->lease_deadline_ns <= now ? CPL_OK : CPL_ERR_AUTHORITY;
+    case CPL_RECORD_REPLACE_AUTHORITY:
+        return current->deadline_ns <= now && record->deadline_ns > now ?
+            CPL_OK : CPL_ERR_AUTHORITY;
+    default:
+        return CPL_OK;
+    }
+}
+
 int cpl_lifecycle_apply(const struct cpl_state *current,
     const struct cpl_record *record, struct cpl_state *out) {
     struct cpl_state next;
@@ -1161,7 +1190,8 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
     case CPL_RECORD_RETIRING_IDLE:
         if (record->generation != current->generation ||
             !has_id(record->authority) ||
-            record->authority_epoch <= current->authority_epoch) {
+            current->authority_epoch != 0U ||
+            record->authority_epoch != CPL_INITIAL_AUTHORITY_EPOCH) {
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
         if (current->kind == CPL_STATE_PREPARED &&
@@ -1193,8 +1223,8 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
             record->generation != current->generation ||
             !same_id(record->prior_actor, current->executor) ||
             !same_id(record->exact_batch, current->exact_batch) ||
-            !has_id(record->authority) ||
-            record->authority_epoch <= current->authority_epoch) {
+            !has_id(record->authority) || current->authority_epoch != 0U ||
+            record->authority_epoch != CPL_INITIAL_AUTHORITY_EPOCH) {
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
         state_from_record(&next, record, CPL_STATE_RETIRING_BATCH);
@@ -1209,7 +1239,8 @@ int cpl_lifecycle_apply(const struct cpl_state *current,
     case CPL_RECORD_REPLACE_AUTHORITY:
         if ((current->kind != CPL_STATE_RETIRING_IDLE &&
              current->kind != CPL_STATE_RETIRING_BATCH) ||
-            record->authority_epoch != current->authority_epoch + 1U ||
+            current->authority_epoch != CPL_INITIAL_AUTHORITY_EPOCH ||
+            record->authority_epoch != CPL_MAX_AUTHORITY_EPOCH ||
             !has_id(record->authority)) {
             return CPL_ERR_ILLEGAL_TRANSITION;
         }
@@ -1395,6 +1426,10 @@ static int scan_internal(cpl_journal *journal, struct cpl_chain *out) {
 #ifdef CPL_ENABLE_FAULT_INJECTION
 static int certify_notify_fd = -1;
 static int certify_wait_fd = -1;
+static uint32_t create_pause_point = 0U;
+static int create_pause_notify_fd = -1;
+static int create_pause_wait_fd = -1;
+static uint64_t create_pause_deadline_ns = 0U;
 
 static void fault_exit(const char *point) {
     const char *selected = getenv("CPL_FAULT_POINT");
@@ -1440,6 +1475,32 @@ static int fault_certify_pause(void) {
     return status;
 }
 
+static uint64_t fault_create_deadline(void) {
+    return create_pause_deadline_ns;
+}
+
+static int fault_create_pause(uint32_t point) {
+    int notify_fd = -1;
+    int wait_fd = -1;
+    int status = CPL_OK;
+
+    if (create_pause_point == point) {
+        notify_fd = create_pause_notify_fd;
+        wait_fd = create_pause_wait_fd;
+        create_pause_point = 0U;
+        create_pause_notify_fd = -1;
+        create_pause_wait_fd = -1;
+        create_pause_deadline_ns = 0U;
+    }
+    if (notify_fd >= 0 && wait_fd >= 0) {
+        status = checked_byte_write(notify_fd);
+        if (status == CPL_OK) {
+            status = checked_byte_read(wait_fd);
+        }
+    }
+    return status;
+}
+
 static int fault_lifecycle_pause(cpl_journal *journal, uint32_t point) {
     int status;
 
@@ -1464,6 +1525,15 @@ static int fault_certify_pause(void) {
     return CPL_OK;
 }
 
+static uint64_t fault_create_deadline(void) {
+    return 0U;
+}
+
+static int fault_create_pause(uint32_t point) {
+    (void)point;
+    return CPL_OK;
+}
+
 
 static int fault_lifecycle_pause(cpl_journal *journal, uint32_t point) {
     (void)journal;
@@ -1472,8 +1542,9 @@ static int fault_lifecycle_pause(cpl_journal *journal, uint32_t point) {
 }
 #endif
 
-static int preallocate_file(int fd, uint64_t length) {
+static int preallocate_file(int fd, uint64_t length, uint64_t deadline) {
     struct fstore allocation;
+    int status;
 
     if (length > (uint64_t)INT64_MAX) {
         return CPL_ERR_INVALID_ARGUMENT;
@@ -1482,10 +1553,17 @@ static int preallocate_file(int fd, uint64_t length) {
     allocation.fst_flags = F_ALLOCATECONTIG;
     allocation.fst_posmode = F_PEOFPOSMODE;
     allocation.fst_length = (off_t)length;
+    status = fault_create_pause(CPL_FAULT_BEFORE_CREATE_PREALLOCATE);
+    if (status != CPL_OK || monotonic_ns() >= deadline) {
+        return status != CPL_OK ? status : CPL_ERR_LOCK_TIMEOUT;
+    }
     if (fcntl(fd, F_PREALLOCATE, &allocation) == 0) {
         return CPL_OK;
     }
     allocation.fst_flags = F_ALLOCATEALL;
+    if (monotonic_ns() >= deadline) {
+        return CPL_ERR_LOCK_TIMEOUT;
+    }
     if (fcntl(fd, F_PREALLOCATE, &allocation) < 0) {
         return CPL_ERR_SYSTEM;
     }
@@ -1507,7 +1585,7 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
     ssize_t written;
     int fd;
     int status;
-    uint64_t deadline;
+    uint64_t deadline = effective_deadline(fault_create_deadline());
     bool mutex_held = false;
     bool flock_held = false;
 
@@ -1525,6 +1603,10 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
     status = validate_parent(parent_dirfd, &parent_stat);
     if (status != CPL_OK) {
         return status;
+    }
+    status = fault_create_pause(CPL_FAULT_BEFORE_CREATE_OPENAT);
+    if (status != CPL_OK || monotonic_ns() >= deadline) {
+        return status != CPL_OK ? status : CPL_ERR_LOCK_TIMEOUT;
     }
     fd = openat(parent_dirfd, journal_name,
         O_RDWR | O_CREAT | O_EXCL | O_APPEND | O_NOFOLLOW | O_CLOEXEC,
@@ -1546,7 +1628,7 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
         (void)close(fd);
         return status;
     }
-    status = preallocate_file(fd, hard_limit);
+    status = preallocate_file(fd, hard_limit, deadline);
     if (status != CPL_OK) {
         cpl_journal_close(journal);
         return status;
@@ -1566,7 +1648,6 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
         cpl_journal_close(journal);
         return status;
     }
-    deadline = effective_deadline(0U);
     status = take_mutex(&journal->append_mutex, deadline);
     if (status == CPL_OK) {
         mutex_held = true;
@@ -1585,11 +1666,12 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
         cpl_journal_close(journal);
         return status;
     }
-    if (monotonic_ns() >= deadline) {
+    status = fault_create_pause(CPL_FAULT_BEFORE_CREATE_INTENT_WRITE);
+    if (status != CPL_OK || monotonic_ns() >= deadline) {
         (void)release_flock(journal->append_lock_fd);
         (void)pthread_mutex_unlock(&journal->append_mutex);
         cpl_journal_close(journal);
-        return CPL_ERR_LOCK_TIMEOUT;
+        return status != CPL_OK ? status : CPL_ERR_LOCK_TIMEOUT;
     }
     written = write(fd, encoded, encoded_length);
     (void)release_flock(journal->append_lock_fd);
@@ -1600,12 +1682,23 @@ int cpl_journal_create_at(int parent_dirfd, const char *journal_name,
         return CPL_ERR_IO_SHORT;
     }
     fault_exit("after_intent_append");
+    status = fault_create_pause(CPL_FAULT_BEFORE_CREATE_FULLFSYNC);
+    if (status != CPL_OK || monotonic_ns() >= deadline) {
+        cpl_journal_close(journal);
+        return status != CPL_OK ? status : CPL_ERR_LOCK_TIMEOUT;
+    }
     if (fcntl(fd, F_FULLFSYNC) < 0) {
         cpl_journal_close(journal);
         return CPL_ERR_SYSTEM;
     }
     fault_exit("after_journal_fullfsync");
     status = validate_parent_identity(journal, parent_dirfd);
+    if (status == CPL_OK) {
+        status = fault_create_pause(CPL_FAULT_BEFORE_CREATE_PARENT_FSYNC);
+    }
+    if (status == CPL_OK && monotonic_ns() >= deadline) {
+        status = CPL_ERR_LOCK_TIMEOUT;
+    }
     if (status != CPL_OK || fsync(parent_dirfd) < 0) {
         cpl_journal_close(journal);
         return status == CPL_OK ? CPL_ERR_SYSTEM : status;
@@ -1814,6 +1907,11 @@ int cpl_journal_append(cpl_journal *journal, const uint8_t *record_bytes,
         status = CPL_ERR_AUTHORITY;
         goto done;
     }
+    status = validate_temporal_admission(&chain.state, &record,
+        monotonic_ns());
+    if (status != CPL_OK) {
+        goto done;
+    }
     if (!is_zero(record.parent_hash, CPL_HASH_SIZE) &&
         memcmp(record.parent_hash, chain.head_hash, CPL_HASH_SIZE) != 0) {
         status = CPL_ERR_PARENT_MISMATCH;
@@ -1857,6 +1955,11 @@ int cpl_journal_append(cpl_journal *journal, const uint8_t *record_bytes,
     (void)memcpy(record.parent_hash, chain.head_hash, CPL_HASH_SIZE);
     status = encode_record(journal, &record, chain.head_sequence + 1U,
         chain.head_hash, encoded, sizeof(encoded), &encoded_length, out->hash);
+    if (status != CPL_OK) {
+        goto done;
+    }
+    status = validate_temporal_admission(&chain.state, &record,
+        monotonic_ns());
     if (status != CPL_OK) {
         goto done;
     }
@@ -2192,7 +2295,7 @@ static int require_dependent_namespace_absent(cpl_journal *journal,
     size_t stem_length = journal_length - (sizeof(suffix) - 1U);
     DIR *directory;
     struct dirent *entry;
-    int duplicate_fd;
+    int scan_fd;
     int status = CPL_OK;
 
     if (snprintf(append_lock, sizeof(append_lock), "%s.append.lock",
@@ -2201,13 +2304,19 @@ static int require_dependent_namespace_absent(cpl_journal *journal,
             journal->journal_name) < 0) {
         return CPL_ERR_SYSTEM;
     }
-    duplicate_fd = dup(parent_dirfd);
-    if (duplicate_fd < 0) {
+    scan_fd = openat(parent_dirfd, ".",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (scan_fd < 0) {
         return CPL_ERR_SYSTEM;
     }
-    directory = fdopendir(duplicate_fd);
+    status = validate_workdir_parent_identity(journal, scan_fd);
+    if (status != CPL_OK) {
+        (void)close(scan_fd);
+        return status;
+    }
+    directory = fdopendir(scan_fd);
     if (directory == NULL) {
-        (void)close(duplicate_fd);
+        (void)close(scan_fd);
         return CPL_ERR_SYSTEM;
     }
     errno = 0;
@@ -2395,6 +2504,11 @@ int cpl_journal_certify_no_dependent_artifact(cpl_journal *journal,
     if (status != CPL_OK) {
         goto done;
     }
+    status = fault_lifecycle_pause(journal,
+        CPL_FAULT_AFTER_FIRST_DEPENDENT_SCAN);
+    if (status != CPL_OK) {
+        goto done;
+    }
     status = cpl_journal_certify(journal, deadline, &certified);
     if (status != CPL_OK) {
         goto done;
@@ -2530,6 +2644,11 @@ int cpl_journal_activate_executor(cpl_journal *journal, uint64_t generation,
         !same_id(chain.state.candidate, executor) ||
         chain.state.deadline_ns <= monotonic_ns()) {
         status = status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+        goto done;
+    }
+    status = fault_lifecycle_pause(journal,
+        CPL_FAULT_BEFORE_ACTIVATION_APPEND);
+    if (status != CPL_OK) {
         goto done;
     }
     (void)memset(&record, 0, sizeof(record));
@@ -2894,8 +3013,10 @@ int cpl_journal_retire_executor(cpl_journal *journal,
     bool action_locked = false;
 
     if (authority == NULL || !has_id(authority) || out == NULL ||
+        authority_epoch != CPL_INITIAL_AUTHORITY_EPOCH ||
         authority_deadline_ns <= monotonic_ns()) {
-        return CPL_ERR_INVALID_ARGUMENT;
+        return authority_epoch != CPL_INITIAL_AUTHORITY_EPOCH ?
+            CPL_ERR_AUTHORITY : CPL_ERR_INVALID_ARGUMENT;
     }
     for (;;) {
         struct cpl_chain rechecked;
@@ -2999,8 +3120,10 @@ int cpl_journal_replace_retirement_authority(cpl_journal *journal,
     int status;
 
     if (authority == NULL || !has_id(authority) || out == NULL ||
+        authority_epoch != CPL_MAX_AUTHORITY_EPOCH ||
         authority_deadline_ns <= monotonic_ns()) {
-        return CPL_ERR_INVALID_ARGUMENT;
+        return authority_epoch != CPL_MAX_AUTHORITY_EPOCH ?
+            CPL_ERR_AUTHORITY : CPL_ERR_INVALID_ARGUMENT;
     }
     status = lock_action(journal, deadline);
     if (status != CPL_OK) {
@@ -3011,8 +3134,14 @@ int cpl_journal_replace_retirement_authority(cpl_journal *journal,
         (chain.state.kind != CPL_STATE_RETIRING_IDLE &&
          chain.state.kind != CPL_STATE_RETIRING_BATCH) ||
         chain.state.deadline_ns > monotonic_ns() ||
-        authority_epoch != chain.state.authority_epoch + 1U) {
+        chain.state.authority_epoch != CPL_INITIAL_AUTHORITY_EPOCH ||
+        authority_epoch != CPL_MAX_AUTHORITY_EPOCH) {
         status = status == CPL_OK ? CPL_ERR_AUTHORITY : status;
+        goto done;
+    }
+    status = fault_lifecycle_pause(journal,
+        CPL_FAULT_BEFORE_AUTHORITY_REPLACEMENT_APPEND);
+    if (status != CPL_OK) {
         goto done;
     }
     (void)memset(&record, 0, sizeof(record));
@@ -3174,6 +3303,12 @@ int cpl_journal_prepare_successor(cpl_journal *journal,
     }
     status = lock_action(journal, deadline);
     if (status != CPL_OK) {
+        return status;
+    }
+    status = fault_lifecycle_pause(journal,
+        CPL_FAULT_BEFORE_SUCCESSOR_APPEND);
+    if (status != CPL_OK) {
+        unlock_action(journal);
         return status;
     }
     (void)memset(&record, 0, sizeof(record));
@@ -3461,12 +3596,27 @@ void cpl_journal_close(cpl_journal *journal) {
 }
 
 #ifdef CPL_ENABLE_FAULT_INJECTION
+int cpl_fault_configure_create_pause(uint32_t point, int notify_fd,
+    int wait_fd, uint64_t deadline_ns) {
+    if (point < CPL_FAULT_BEFORE_CREATE_OPENAT ||
+        point > CPL_FAULT_BEFORE_CREATE_PARENT_FSYNC || notify_fd < 0 ||
+        wait_fd < 0 || deadline_ns <= monotonic_ns()) {
+        return CPL_ERR_INVALID_ARGUMENT;
+    }
+    create_pause_point = point;
+    create_pause_notify_fd = notify_fd;
+    create_pause_wait_fd = wait_fd;
+    create_pause_deadline_ns = deadline_ns;
+    return CPL_OK;
+}
+
 int cpl_fault_configure_lifecycle_pause(cpl_journal *journal, uint32_t point,
     int notify_fd, int wait_fd) {
     int status = ensure_owner(journal);
 
     if (status != CPL_OK || point < CPL_FAULT_BEFORE_WORKDIR_BOUND_APPEND ||
-        point > CPL_FAULT_BEFORE_RETIREMENT_APPEND || notify_fd < 0 ||
+        point > CPL_FAULT_BEFORE_AUTHORITY_REPLACEMENT_APPEND ||
+        notify_fd < 0 ||
         wait_fd < 0) {
         return status == CPL_OK ? CPL_ERR_INVALID_ARGUMENT : status;
     }
