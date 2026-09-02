@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import signal
 import stat
 import threading
 from collections.abc import Iterator, Mapping
@@ -1207,6 +1208,44 @@ def test_manifest_collection_capabilities_have_no_public_constructor() -> None:
         ForgedRun.begin()
 
 
+@pytest.mark.parametrize("mutation", ["boolean", "integer_subclass", "missing"])
+def test_collection_run_creator_pid_tampering_fails_closed(mutation: str) -> None:
+    run = validated.ManifestCollectionRun.begin()
+    if mutation == "boolean":
+        object.__setattr__(run, "_creator_pid", True)
+    elif mutation == "integer_subclass":
+
+        class PidLike(int):
+            pass
+
+        object.__setattr__(run, "_creator_pid", PidLike(os.getpid()))
+    else:
+        object.__delattr__(run, "_creator_pid")
+
+    with pytest.raises(ManifestError, match="creator process is invalid"):
+        run.observe_gate(
+            "personal_subscription_policy",
+            True,
+            {"source": "creator_pid_tampering"},
+        )
+
+
+def test_collection_run_type_check_does_not_invoke_hostile_attribute_access() -> None:
+    class HostileRun(validated.ManifestCollectionRun):
+        def __getattribute__(self, _name: str) -> object:
+            raise AssertionError("hostile attribute access must remain unreachable")
+
+    forged = object.__new__(HostileRun)
+
+    with pytest.raises(ManifestError, match="run type"):
+        validated.ManifestCollectionRun.observe_gate(
+            forged,
+            "personal_subscription_policy",
+            True,
+            {"source": "hostile_run"},
+        )
+
+
 def test_collection_consumption_is_one_shot_under_concurrency() -> None:
     run = validated.ManifestCollectionRun.begin()
     collection = _complete_synthetic_collection(run)
@@ -1268,6 +1307,84 @@ def test_collection_authority_is_rejected_after_fork() -> None:
     assert os.WIFEXITED(status)
     assert os.WEXITSTATUS(status) == 0
     assert result == b"rejected"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+@pytest.mark.parametrize(
+    ("run_state", "method_name"),
+    [
+        ("pending", "observe_gate"),
+        ("completed", "observe_gate"),
+        ("consumed", "observe_gate"),
+        ("pending", "complete"),
+        ("completed", "complete"),
+        ("consumed", "complete"),
+        ("pending", "consume"),
+        ("completed", "consume"),
+        ("consumed", "consume"),
+    ],
+)
+def test_every_run_method_rejects_after_fork_before_held_lock(
+    run_state: str, method_name: str
+) -> None:
+    run = validated.ManifestCollectionRun.begin()
+    if run_state == "pending":
+        other_run = validated.ManifestCollectionRun.begin()
+        collection = _complete_synthetic_collection(other_run)
+    else:
+        collection = _complete_synthetic_collection(run)
+        if run_state == "consumed":
+            run.consume(collection)
+
+    read_fd, write_fd = os.pipe()
+    lock = object.__getattribute__(run, "_lock")
+    lock.acquire()
+    try:
+        child = os.fork()
+    except BaseException:
+        lock.release()
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
+    if child == 0:
+        os.close(read_fd)
+
+        def timeout(_signal_number: int, _frame: object) -> None:
+            os._exit(99)
+
+        signal.signal(signal.SIGALRM, timeout)
+        signal.alarm(2)
+        try:
+            if method_name == "observe_gate":
+                run.observe_gate(
+                    "personal_subscription_policy",
+                    True,
+                    {"source": "fork_regression"},
+                )
+            elif method_name == "complete":
+                run.complete({}, ())
+            else:
+                run.consume(collection)
+        except ManifestError as error:
+            os.write(write_fd, str(error).encode("ascii"))
+            os.close(write_fd)
+            os._exit(0)
+        except BaseException:
+            os._exit(98)
+        else:
+            os._exit(97)
+
+    lock.release()
+    os.close(write_fd)
+    try:
+        _, status = os.waitpid(child, 0)
+        result = os.read(read_fd, 128)
+    finally:
+        os.close(read_fd)
+
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 0
+    assert result == b"collection run belongs to another process"
 
 
 def test_collection_run_authority_has_a_finite_live_bound() -> None:
