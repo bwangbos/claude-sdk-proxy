@@ -1425,6 +1425,292 @@ class _InheritedBlockingAsyncLock:
         return None
 
 
+class _ResourceTouchTrap:
+    def __getattribute__(self, name: str) -> object:
+        if name.startswith("__"):
+            return object.__getattribute__(self, name)
+        raise AssertionError(f"transport traversed hostile resource attribute {name}")
+
+
+class _LockTouchTrap:
+    async def __aenter__(self) -> None:
+        raise AssertionError("transport acquired an unauthorized async lock")
+
+    async def __aexit__(
+        self,
+        _exc_type: object,
+        _exc: object,
+        _traceback: object,
+    ) -> None:
+        return None
+
+
+class _EffectThenRaiseProcess:
+    returncode = 0
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        raise RuntimeError("synthetic close effect then failure")
+
+
+class _ReentrantCloseProcess:
+    returncode = 0
+
+    def __init__(self, transport: AttestedSupervisorTransport) -> None:
+        self._transport = transport
+        self.ready_during_close: bool | None = None
+        self.connect_error: AttestationError | None = None
+
+    async def aclose(self) -> None:
+        self.ready_during_close = self._transport.is_ready()
+        try:
+            await self._transport.connect()
+        except AttestationError as error:
+            self.connect_error = error
+
+
+class _ConcurrentCloseProcess:
+    returncode = 0
+
+    def __init__(self) -> None:
+        self.entered = anyio.Event()
+        self.release = anyio.Event()
+
+    async def aclose(self) -> None:
+        self.entered.set()
+        await self.release.wait()
+
+
+def _exact_transport_forge(
+    transport: AttestedSupervisorTransport,
+) -> AttestedSupervisorTransport:
+    forged = object.__new__(AttestedSupervisorTransport)
+    for name, value in vars(transport).items():
+        object.__setattr__(forged, name, value)
+    return forged
+
+
+@pytest.mark.parametrize("operation", [copy.copy, copy.deepcopy, pickle.dumps])
+def test_transport_copy_and_pickle_are_rejected(
+    tmp_path: Path,
+    operation: Any,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        try:
+            with pytest.raises(AttestationError, match="transport.*(copied|pickled)"):
+                operation(transport)
+        finally:
+            launch.close()
+
+
+def test_shallow_copy_rejects_before_touching_aliased_async_lock(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        copied = _exact_transport_forge(transport)
+        assert copied._lock is transport._lock
+
+        async def exercise() -> None:
+            async with transport._lock:
+                with anyio.fail_after(0.1):
+                    with pytest.raises(AttestationError, match="transport authority"):
+                        await copied.connect()
+
+        try:
+            anyio.run(exercise)
+        finally:
+            launch.close()
+
+
+async def test_exact_class_forge_rejects_every_surface_before_resource_touch(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        forged = _exact_transport_forge(transport)
+        object.__setattr__(forged, "_lock", _LockTouchTrap())
+        object.__setattr__(forged, "_control", _ResourceTouchTrap())
+        object.__setattr__(forged, "_journal", _ResourceTouchTrap())
+        object.__setattr__(forged, "launch", _ResourceTouchTrap())
+        try:
+            property_names = (
+                "handshake_receipt",
+                "cleanup_unconfirmed",
+                "buffered_user_write_count",
+                "discarded_user_write_count",
+            )
+            for name in property_names:
+                descriptor = vars(AttestedSupervisorTransport)[name]
+                assert isinstance(descriptor, property)
+                getter = descriptor.fget
+                assert getter is not None
+                with pytest.raises(AttestationError, match="transport authority"):
+                    getter(forged)
+
+            with pytest.raises(AttestationError, match="transport authority"):
+                AttestedSupervisorTransport.is_ready(forged)
+            for operation in (
+                lambda: AttestedSupervisorTransport.connect(forged),
+                lambda: AttestedSupervisorTransport.write(
+                    forged, _ResourceTouchTrap()
+                ),
+                lambda: AttestedSupervisorTransport.release_buffered(forged),
+                lambda: AttestedSupervisorTransport.end_input(forged),
+                lambda: AttestedSupervisorTransport.close(forged),
+                lambda: AttestedSupervisorTransport._bounded_stdin_close(forged),
+                lambda: AttestedSupervisorTransport._bounded_process_aclose(forged),
+                lambda: AttestedSupervisorTransport._close_failed_handshake_process(
+                    forged
+                ),
+                lambda: AttestedSupervisorTransport._close_running_process(forged),
+                lambda: AttestedSupervisorTransport._close_transition(forged),
+            ):
+                with pytest.raises(AttestationError, match="transport authority"):
+                    await operation()
+            messages = AttestedSupervisorTransport.read_messages(forged)
+            with pytest.raises(AttestationError, match="transport authority"):
+                await anext(messages)
+        finally:
+            launch.close()
+
+
+async def test_close_burns_authority_before_effect_then_raise(tmp_path: Path) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        process = _EffectThenRaiseProcess()
+        transport._process = process  # type: ignore[assignment]
+        try:
+            with pytest.raises(RuntimeError, match="effect then failure"):
+                await transport.close()
+            assert process.close_calls == 1
+            assert transport.cleanup_unconfirmed is True
+
+            with pytest.raises(AttestationError, match="transport authority"):
+                await transport.close()
+            assert process.close_calls == 1
+        finally:
+            launch.close()
+
+
+async def test_close_reentrant_methods_reject_without_reacquiring_async_lock(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        process = _ReentrantCloseProcess(transport)
+        transport._process = process  # type: ignore[assignment]
+        try:
+            with anyio.fail_after(0.2):
+                await transport.close()
+
+            assert process.ready_during_close is False
+            assert isinstance(process.connect_error, AttestationError)
+        finally:
+            launch.close()
+
+
+async def test_concurrent_method_rejects_after_close_revokes_before_effects(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        process = _ConcurrentCloseProcess()
+        transport._process = process  # type: ignore[assignment]
+
+        async def close_transport() -> None:
+            await transport.close()
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(close_transport)
+                await process.entered.wait()
+                assert transport.is_ready() is False
+                with anyio.fail_after(0.1):
+                    with pytest.raises(AttestationError, match="transport authority"):
+                        await transport.connect()
+                process.release.set()
+        finally:
+            process.release.set()
+            launch.close()
+
+
+async def test_successful_close_revokes_all_stale_transport_access(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        await transport.close()
+
+        for operation in (
+            transport.connect,
+            transport.release_buffered,
+            transport.end_input,
+            transport.close,
+        ):
+            with pytest.raises(AttestationError, match="transport authority"):
+                await operation()
+        with pytest.raises(AttestationError, match="transport authority"):
+            transport.is_ready()
+        with pytest.raises(AttestationError, match="transport authority"):
+            _ = transport.handshake_receipt
+        launch.close()
+
+
+def test_transport_authority_capacity_releases_only_after_safe_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        implementation, "_MAX_LIVE_TRANSPORT_AUTHORITIES", 1, raising=False
+    )
+    with _launch_inputs(tmp_path / "one") as first_inputs:
+        with _launch_inputs(tmp_path / "two") as second_inputs:
+            first_launch = _prepare(first_inputs)
+            second_launch = _prepare(second_inputs)
+            first = AttestedSupervisorTransport(first_launch)
+            with pytest.raises(AttestationError, match="capacity"):
+                AttestedSupervisorTransport(second_launch)
+
+            anyio.run(first.close)
+            second = AttestedSupervisorTransport(second_launch)
+            anyio.run(second.close)
+            first_launch.close()
+            second_launch.close()
+
+
+async def test_transport_attribute_tampering_rejects_before_lock_or_resource(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        original_lock = transport._lock
+        original_control = transport._control
+        transport._lock = _LockTouchTrap()  # type: ignore[assignment]
+        transport._control = _ResourceTouchTrap()  # type: ignore[assignment]
+        try:
+            with pytest.raises(AttestationError, match="transport authority"):
+                await transport.connect()
+            with pytest.raises(AttestationError, match="transport authority"):
+                await transport.close()
+        finally:
+            transport._lock = original_lock
+            transport._control = original_control
+            launch.close()
+
+
 def test_claimed_transport_rejects_fork_child_before_inherited_async_lock(
     tmp_path: Path,
 ) -> None:
@@ -1456,6 +1742,77 @@ def test_claimed_transport_rejects_fork_child_before_inherited_async_lock(
         assert isinstance(
             build_attested_sdk_client(launch, transport=transport), ClaudeSDKClient
         )
+        launch.close()
+
+
+def test_fork_child_close_connect_and_ready_reject_before_held_lock_and_resources(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        original_lock = transport._lock
+        blocked_read, blocked_write = os.pipe()
+        transport._lock = _InheritedBlockingAsyncLock(blocked_read)  # type: ignore[assignment]
+        pid = os.fork()
+        if pid == 0:
+            os.close(blocked_write)
+            _child_alarm()
+            try:
+                for operation in (transport.connect, transport.close):
+                    try:
+                        anyio.run(operation)
+                    except AttestationError:
+                        pass
+                    else:
+                        os._exit(3)
+                try:
+                    transport.is_ready()
+                except AttestationError:
+                    pass
+                else:
+                    os._exit(4)
+            except BaseException:
+                os._exit(2)
+            os._exit(0)
+        try:
+            assert _wait_for_fork_child(pid) == 0
+        finally:
+            os.close(blocked_read)
+            os.close(blocked_write)
+            transport._lock = original_lock
+
+        assert transport.is_ready() is False
+        assert isinstance(
+            build_attested_sdk_client(launch, transport=transport), ClaudeSDKClient
+        )
+        anyio.run(transport.close)
+        launch.close()
+
+
+def test_fork_child_cannot_rebind_copied_transport_to_child_pid(tmp_path: Path) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        forged = _exact_transport_forge(transport)
+        pid = os.fork()
+        if pid == 0:
+            _child_alarm()
+            object.__setattr__(forged, "_creator_pid", os.getpid())
+            try:
+                forged.is_ready()
+            except AttestationError:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(3)
+        assert _wait_for_fork_child(pid) == 0
+
+        assert transport.is_ready() is False
+        assert isinstance(
+            build_attested_sdk_client(launch, transport=transport), ClaudeSDKClient
+        )
+        anyio.run(transport.close)
         launch.close()
 
 
