@@ -24,6 +24,16 @@ _FALLBACK_JSON = {
         '"name":"compaction","passed":false,"schema_version":1}\n'
     ),
 }
+_FALSE_REASON_CODES = frozenset(
+    {
+        "child_attestation_unavailable",
+        "live_success_claim_forbidden",
+        "invalid_invocation",
+        "probe_internal_error",
+        "live_probe_harness_unavailable",
+        "redaction_failure",
+    }
+)
 
 
 def _expected_name(argv: Sequence[str] | None) -> str:
@@ -50,6 +60,55 @@ def _write_fallback(expected_name: str) -> bool:
     return False
 
 
+def _materialize_final_report(
+    expected_name: str, source: object
+) -> dict[str, object] | None:
+    try:
+        if type(source) is not dict or len(source) != 4:
+            return None
+        fields: dict[str, object] = {}
+        for key, value in source.items():
+            if type(key) is not str or key not in {
+                "schema_version",
+                "name",
+                "passed",
+                "evidence",
+            }:
+                return None
+            fields[key] = value
+        if (
+            len(fields) != 4
+            or type(fields.get("schema_version")) is not int
+            or fields["schema_version"] != 1
+            or type(fields.get("name")) is not str
+            or fields["name"] != expected_name
+            or fields.get("passed") is not False
+        ):
+            return None
+        evidence = fields.get("evidence")
+        if type(evidence) is not dict or len(evidence) != 1:
+            return None
+        entries = tuple(evidence.items())
+        if len(entries) != 1:
+            return None
+        key, reason = entries[0]
+        if (
+            type(key) is not str
+            or key != "reason_code"
+            or type(reason) is not str
+            or reason not in _FALSE_REASON_CODES
+        ):
+            return None
+        return {
+            "schema_version": 1,
+            "name": expected_name,
+            "passed": False,
+            "evidence": {"reason_code": reason},
+        }
+    except BaseException:
+        return None
+
+
 def _emit(expected_name: str, result: ProbeResult) -> bool:
     try:
         if (
@@ -60,8 +119,11 @@ def _emit(expected_name: str, result: ProbeResult) -> bool:
             or result.passed is not False
         ):
             return _write_fallback(expected_name)
+        report = _materialize_final_report(expected_name, result.redacted_dict())
+        if report is None:
+            return _write_fallback(expected_name)
         payload = json.dumps(
-            result.redacted_dict(),
+            report,
             ensure_ascii=False,
             allow_nan=False,
             sort_keys=True,

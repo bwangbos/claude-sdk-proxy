@@ -540,7 +540,6 @@ class PathPolicy:
             "ancestor_dup",
             lambda: os.dup(descendant_fd),
         )
-        current_close_pending = True
         try:
             for _ in range(_MAX_ROOT_PARENT_WALK):
                 value = os.fstat(current)
@@ -565,13 +564,11 @@ class PathPolicy:
                 ):
                     _close_fd(self._resource_owner, parent)
                     return False
-                current_close_pending = False
-                _close_fd(self._resource_owner, current)
+                previous = current
                 current = parent
-                current_close_pending = True
+                _close_fd(self._resource_owner, previous)
         finally:
-            if current_close_pending:
-                _close_fd(self._resource_owner, current)
+            _close_fd(self._resource_owner, current)
         raise PathPolicyError("policy root disjointness could not be proved")
 
     @contextmanager
@@ -673,7 +670,7 @@ class PathPolicy:
         try:
             self._stat(components, root=root)
         except FileNotFoundError:
-            pass
+            _require_resource_health(self._resource_owner)
         return classification
 
     @staticmethod
@@ -725,14 +722,12 @@ class PathPolicy:
                 except BaseException:
                     _close_fd(self._resource_owner, child)
                     raise
-                _close_fd(self._resource_owner, current)
+                previous = current
                 current = child
+                _close_fd(self._resource_owner, previous)
             return current, components[-1]
         except BaseException:
-            try:
-                _close_fd(self._resource_owner, current)
-            except PathPolicyError:
-                pass
+            _close_fd(self._resource_owner, current)
             raise
 
     def _stat(
@@ -850,9 +845,11 @@ class PathPolicy:
                         dir_fd=parent_fd,
                     ),
                 )
-            finally:
+            except BaseException:
                 _close_fd(self._resource_owner, parent_fd)
+                raise
             try:
+                _close_fd(self._resource_owner, parent_fd)
                 opened = os.fstat(descriptor)
                 opened_metadata = _metadata("/".join(components), opened)
                 self._verify_proxy_file(opened)
