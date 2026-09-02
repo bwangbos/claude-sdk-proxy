@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -127,6 +128,7 @@ class _TransportAuthority:
     process: Any | None
     stdin: Any | None
     stdout: Any | None
+    stdout_descriptor_authority: tuple[int, tuple[int, int, int], bool] | None
     ready: bool
     closed: bool
     initialize_seen: bool
@@ -1360,6 +1362,7 @@ class PreparedSupervisorLaunch:
                 process=process,
                 stdin=stdin,
                 stdout=stdout,
+                stdout_descriptor_authority=_stdout_descriptor_authority(stdout),
                 ready=ready,
                 closed=closed_state,
                 initialize_seen=initialize_seen,
@@ -1945,10 +1948,28 @@ def _prepare_cleanup(control: socket.socket, journal: Journal, nonce: bytes) -> 
     _validate_cleanup_result(result, expected_done_sequence=head.sequence)
 
 
+def _stdout_pipe_identity(descriptor: int) -> tuple[int, int, int]:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise AttestationError("supervisor stdout authority is invalid") from error
+    if not stat.S_ISFIFO(metadata.st_mode):
+        raise AttestationError("supervisor stdout authority is invalid")
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode
+
+
 class _OwnedSupervisorProcess:
     """Popen owner that leaves the child reapable for Task 4 confirmation."""
 
-    __slots__ = ("_popen", "_stdin", "_stdout")
+    __slots__ = (
+        "_popen",
+        "_stdin",
+        "_stdout",
+        "_stdout_descriptor",
+        "_stdout_identity",
+        "_stdout_original_blocking",
+        "_stdout_state",
+    )
 
     def __init__(
         self,
@@ -1969,7 +1990,83 @@ class _OwnedSupervisorProcess:
         )
         self._popen = process
         self._stdin: IO[bytes] | None = process.stdin
-        self._stdout: IO[bytes] | None = process.stdout
+        stdout = process.stdout
+        if stdout is None:
+            self._stdout = None
+            self._stdout_descriptor = None
+            self._stdout_identity = None
+            self._stdout_original_blocking = None
+            self._stdout_state = "closed"
+        else:
+            descriptor = stdout.fileno()
+            identity = _stdout_pipe_identity(descriptor)
+            original_blocking = os.get_blocking(descriptor)
+            if type(original_blocking) is not bool:
+                raise AttestationError("supervisor stdout authority is invalid")
+            os.set_blocking(descriptor, False)
+            self._stdout = stdout
+            self._stdout_descriptor = descriptor
+            self._stdout_identity = identity
+            self._stdout_original_blocking = original_blocking
+            self._stdout_state = "active"
+
+    def _stdout_descriptor_snapshot(
+        self,
+    ) -> tuple[int, tuple[int, int, int], bool]:
+        stream = self._stdout
+        descriptor = self._stdout_descriptor
+        identity = self._stdout_identity
+        original_blocking = self._stdout_original_blocking
+        if (
+            self._stdout_state != "active"
+            or stream is None
+            or type(descriptor) is not int
+            or type(identity) is not tuple
+            or len(identity) != 3
+            or any(type(value) is not int for value in identity)
+            or type(original_blocking) is not bool
+        ):
+            raise AttestationError("supervisor stdout authority is invalid")
+        try:
+            current_descriptor = stream.fileno()
+            current_identity = _stdout_pipe_identity(descriptor)
+            nonblocking = os.get_blocking(descriptor) is False
+        except (OSError, ValueError) as error:
+            raise AttestationError(
+                "supervisor stdout authority is invalid"
+            ) from error
+        if (
+            type(current_descriptor) is not int
+            or current_descriptor != descriptor
+            or current_identity != identity
+            or not nonblocking
+        ):
+            raise AttestationError("supervisor stdout authority is invalid")
+        return descriptor, identity, original_blocking
+
+    def _matches_stdout_descriptor_authority(
+        self,
+        expected: tuple[int, tuple[int, int, int], bool] | None,
+        *,
+        allow_retired: bool,
+    ) -> bool:
+        stored = (
+            self._stdout_descriptor,
+            self._stdout_identity,
+            self._stdout_original_blocking,
+        )
+        if expected is None or stored != expected:
+            return False
+        if self._stdout_state == "active":
+            try:
+                return self._stdout_descriptor_snapshot() == expected
+            except AttestationError:
+                return False
+        return allow_retired and self._stdout_state in {
+            "closing",
+            "unconfirmed",
+            "closed",
+        }
 
     @property
     def pid(self) -> int:
@@ -1981,7 +2078,10 @@ class _OwnedSupervisorProcess:
 
     @property
     def pipes_available(self) -> bool:
-        return self._stdin is not None and self._stdout is not None
+        if self._stdin is None:
+            return False
+        self._stdout_descriptor_snapshot()
+        return True
 
     async def send(self, data: str) -> None:
         stream = self._stdin
@@ -2004,15 +2104,15 @@ class _OwnedSupervisorProcess:
             await anyio.to_thread.run_sync(write_all, abandon_on_cancel=True)
 
     async def receive(self) -> bytes:
-        stream = self._stdout
-        if stream is None:
-            return b""
-        return await anyio.to_thread.run_sync(
-            os.read,
-            stream.fileno(),
-            65536,
-            abandon_on_cancel=True,
-        )
+        while True:
+            descriptor, _, _ = self._stdout_descriptor_snapshot()
+            await anyio.wait_readable(descriptor)
+            descriptor, _, _ = self._stdout_descriptor_snapshot()
+            try:
+                return os.read(descriptor, 65536)
+            except BlockingIOError as error:
+                if error.errno not in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise
 
     async def close_stdin(self) -> None:
         stream = self._stdin
@@ -2021,10 +2121,22 @@ class _OwnedSupervisorProcess:
             self._stdin = None
 
     async def close_stdout(self) -> None:
+        if self._stdout_state == "closed":
+            return
+        descriptor, _, original_blocking = self._stdout_descriptor_snapshot()
         stream = self._stdout
-        if stream is not None:
-            await anyio.to_thread.run_sync(stream.close, abandon_on_cancel=True)
-            self._stdout = None
+        if stream is None:
+            raise AttestationError("supervisor stdout authority is invalid")
+        self._stdout_state = "closing"
+        try:
+            anyio.notify_closing(descriptor)
+            os.set_blocking(descriptor, original_blocking)
+            stream.close()
+        except BaseException:
+            self._stdout_state = "unconfirmed"
+            raise
+        self._stdout = None
+        self._stdout_state = "closed"
 
     def record_confirmed_exit(self, status: int) -> None:
         if self._popen.returncode is not None:
@@ -2032,14 +2144,30 @@ class _OwnedSupervisorProcess:
         self._popen.returncode = status
 
     async def aclose(self) -> None:
-        def close_streams() -> None:
-            for stream in (self._stdin, self._stdout):
-                if stream is not None:
-                    stream.close()
+        await self.close_stdin()
+        await self.close_stdout()
 
-        await anyio.to_thread.run_sync(close_streams, abandon_on_cancel=True)
-        self._stdin = None
-        self._stdout = None
+
+def _stdout_descriptor_authority(
+    value: object,
+) -> tuple[int, tuple[int, int, int], bool] | None:
+    if type(value) is not _OwnedSupervisorProcess:
+        return None
+    return value._stdout_descriptor_snapshot()
+
+
+def _stdout_descriptor_authority_matches(
+    value: object,
+    expected: tuple[int, tuple[int, int, int], bool] | None,
+    *,
+    allow_retired: bool,
+) -> bool:
+    if type(value) is not _OwnedSupervisorProcess:
+        return expected is None
+    return value._matches_stdout_descriptor_authority(
+        expected,
+        allow_retired=allow_retired,
+    )
 
 
 def _observe_successful_unreaped_exit(pid: int) -> None:
@@ -2188,6 +2316,11 @@ def _require_transport_authority_locked(
             and object.__getattribute__(transport, "_process") is authority.process
             and object.__getattribute__(transport, "_stdin") is authority.stdin
             and object.__getattribute__(transport, "_stdout") is authority.stdout
+            and _stdout_descriptor_authority_matches(
+                authority.stdout,
+                authority.stdout_descriptor_authority,
+                allow_retired=authority.state != "active",
+            )
             and object.__getattribute__(transport, "_ready") is authority.ready
             and object.__getattribute__(transport, "_closed") is authority.closed
             and object.__getattribute__(transport, "_initialize_seen")
@@ -2245,6 +2378,9 @@ def _update_transport_runtime(
         current = _require_transport_authority_locked(
             transport, states, expected=authority
         )
+        next_stdout_descriptor_authority = current.stdout_descriptor_authority
+        if stdout is not _UNCHANGED_TRANSPORT_FIELD:
+            next_stdout_descriptor_authority = _stdout_descriptor_authority(stdout)
         if process is not _UNCHANGED_TRANSPORT_FIELD:
             current.process = process
             object.__setattr__(transport, "_process", process)
@@ -2253,6 +2389,7 @@ def _update_transport_runtime(
             object.__setattr__(transport, "_stdin", stdin)
         if stdout is not _UNCHANGED_TRANSPORT_FIELD:
             current.stdout = stdout
+            current.stdout_descriptor_authority = next_stdout_descriptor_authority
             object.__setattr__(transport, "_stdout", stdout)
         if ready is not _UNCHANGED_TRANSPORT_FIELD:
             if type(ready) is not bool:
