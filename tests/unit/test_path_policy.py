@@ -417,6 +417,44 @@ def test_snapshot_certifies_each_nested_directory_across_its_descendants(
         policy.snapshot(root=RootKind.REAL_LOGIN)
 
 
+def test_snapshot_recertifies_earlier_entries_after_later_descendants(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = roots[0] / "settings.json"
+    target.write_bytes(b"ORIGINAL")
+    later = roots[0] / "workflows"
+    later.mkdir(mode=0o700)
+    later_inode = later.stat().st_ino
+    root_value = roots[0].stat()
+    original_scandir = os.scandir
+    mutated = False
+
+    def churning_scandir(
+        path: os.PathLike[str] | str | bytes | int = ".",
+    ) -> os.ScandirIterator[str]:
+        nonlocal mutated
+        if (
+            isinstance(path, int)
+            and os.fstat(path).st_ino == later_inode
+            and not mutated
+        ):
+            mutated = True
+            target.unlink()
+            target.write_bytes(b"REPLACED")
+            os.utime(
+                roots[0],
+                ns=(root_value.st_atime_ns, root_value.st_mtime_ns),
+            )
+        return original_scandir(path)
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", churning_scandir)
+
+    with pytest.raises(PathPolicyError, match="changed during snapshot"):
+        policy.snapshot(root=RootKind.REAL_LOGIN)
+
+
 def test_snapshot_depth_is_capped_for_bounded_descriptor_recursion(
     roots: tuple[Path, Path],
 ) -> None:
@@ -426,3 +464,147 @@ def test_snapshot_depth_is_capped_for_bounded_descriptor_recursion(
             proxy_owned_root=roots[1],
             max_depth=65,
         )
+
+
+def test_snapshot_returns_certified_final_directory_metadata(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+) -> None:
+    parent = roots[0] / "plugins"
+    parent.mkdir(mode=0o700)
+    child = parent / "nested"
+    child.mkdir(mode=0o700)
+
+    snapshot = {item.relative_path: item for item in policy.snapshot()}
+
+    for relative, path in (("plugins", parent), ("plugins/nested", child)):
+        value = path.lstat()
+        metadata = snapshot[relative]
+        assert (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.mode,
+            metadata.nlink,
+            metadata.size,
+            metadata.mtime_ns,
+        ) == (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+        )
+
+
+@pytest.mark.parametrize("failure", ["stat", "scandir"])
+def test_snapshot_unwind_closes_every_opened_authority(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    parent = roots[0] / "plugins"
+    parent.mkdir(mode=0o700)
+    child = parent / "nested"
+    child.mkdir(mode=0o700)
+    child_inode = child.stat().st_ino
+    original_open = os.open
+    original_close = os.close
+    original_stat = os.stat
+    original_scandir = os.scandir
+    opened: set[int] = set()
+
+    def tracking_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened.add(descriptor)
+        return descriptor
+
+    def tracking_close(descriptor: int) -> None:
+        try:
+            original_close(descriptor)
+        finally:
+            opened.discard(descriptor)
+
+    def failing_stat(
+        path: os.PathLike[str] | str | int,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        if failure == "stat" and path == "nested":
+            raise KeyboardInterrupt("STAT-UNWIND")
+        return original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    def failing_scandir(
+        path: os.PathLike[str] | str | bytes | int = ".",
+    ) -> os.ScandirIterator[str]:
+        if (
+            failure == "scandir"
+            and isinstance(path, int)
+            and os.fstat(path).st_ino == child_inode
+        ):
+            raise KeyboardInterrupt("SCANDIR-UNWIND")
+        return original_scandir(path)
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.open", tracking_open)
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.close", tracking_close)
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.stat", failing_stat)
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", failing_scandir)
+
+    with pytest.raises(KeyboardInterrupt, match="UNWIND"):
+        policy.snapshot(root=RootKind.REAL_LOGIN)
+
+    assert opened == set()
+
+
+def test_snapshot_effect_then_raise_close_unwinds_remaining_authority(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (roots[0] / "plugins").mkdir(mode=0o700)
+    original_open = os.open
+    original_close = os.close
+    opened: set[int] = set()
+    child_descriptor: int | None = None
+    injected = False
+
+    def tracking_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal child_descriptor
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened.add(descriptor)
+        if path == "plugins":
+            child_descriptor = descriptor
+        return descriptor
+
+    def effect_then_raise_close(descriptor: int) -> None:
+        nonlocal injected
+        try:
+            original_close(descriptor)
+        finally:
+            opened.discard(descriptor)
+        if descriptor == child_descriptor and not injected:
+            injected = True
+            raise KeyboardInterrupt("CLOSE-UNWIND")
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.open", tracking_open)
+    monkeypatch.setattr(
+        "claude_sdk_proxy.path_policy.os.close", effect_then_raise_close
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="CLOSE-UNWIND"):
+        policy.snapshot(root=RootKind.REAL_LOGIN)
+
+    assert opened == set()

@@ -347,6 +347,39 @@ def test_forked_children_invalidate_inherited_canary_authority_repeatedly(
     assert _consume_safe_canary_receipt(receipt) == hashlib.sha256(canary).hexdigest()
 
 
+def test_lazy_pid_boundary_invalidates_when_at_fork_handler_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_root = tmp_path / "real"
+    proxy_root = tmp_path / "proxy"
+    real_root.mkdir(mode=0o700)
+    proxy_root.mkdir(mode=0o700)
+    canary_dir = proxy_root / "canaries"
+    canary_dir.mkdir(mode=0o700)
+    target = canary_dir / "purity.txt"
+    target.write_bytes(b"SAFE")
+    target.chmod(0o600)
+    policy = PathPolicy(real_login_root=real_root, proxy_owned_root=proxy_root)
+    metadata = policy.metadata(Path("canaries/purity.txt"), root=RootKind.PROXY_OWNED)
+    receipt = safe_canary_digest(
+        b"SAFE",
+        policy=policy,
+        path=Path("canaries/purity.txt"),
+        expected=metadata,
+    )
+    simulated_child_pid = os.getpid() + 100_000
+    monkeypatch.setattr(
+        "claude_sdk_proxy.path_policy.os.getpid", lambda: simulated_child_pid
+    )
+
+    with pytest.raises(RuntimeError, match="process"):
+        _consume_safe_canary_receipt(receipt)
+
+    assert policy._canary_creator_pid == simulated_child_pid
+    assert policy._canary_records == {}
+
+
 def test_canary_policy_registry_does_not_retain_policies(tmp_path: Path) -> None:
     real_root = tmp_path / "real"
     proxy_root = tmp_path / "proxy"
@@ -513,20 +546,28 @@ def test_probe_cli_rejects_a_requested_live_success_claim(
     assert report["evidence"]["reason_code"] == "live_success_claim_forbidden"
 
 
+@pytest.mark.parametrize(
+    ("command", "runner_name", "report_name"),
+    [
+        ("prompt-purity", "run_prompt_purity_probe", "purity"),
+        ("compaction", "run_compaction_probe", "compaction"),
+    ],
+)
 def test_probe_cli_can_never_emit_or_exit_with_current_tuple_success(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    command: str,
+    runner_name: str,
+    report_name: str,
 ) -> None:
     def impossible_success() -> ProbeResult:
         return ProbeResult(
-            "purity", True, {"reason_code": "child_attestation_unavailable"}
+            report_name, True, {"reason_code": "child_attestation_unavailable"}
         )
 
-    monkeypatch.setattr(
-        "claude_sdk_proxy.probe_cli.run_prompt_purity_probe", impossible_success
-    )
+    monkeypatch.setattr(probe_cli, runner_name, impossible_success)
 
-    status = main(["prompt-purity"])
+    status = main([command])
     report = json.loads(capsys.readouterr().out)
 
     assert status != 0

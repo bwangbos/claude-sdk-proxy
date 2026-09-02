@@ -15,7 +15,7 @@ from claude_sdk_proxy.probes import (
 )
 
 _FALLBACK_JSON = (
-    '{"evidence":{"reason_code":"redaction_failure","redaction":"__redacted__"},'
+    '{"evidence":{"reason_code":"redaction_failure"},'
     '"name":"purity","passed":false,"schema_version":1}\n'
 )
 
@@ -81,7 +81,7 @@ def _main(argv: Sequence[str] | None) -> int:
         return 4
     if not _emit(result):
         return 5
-    return 0 if result.passed else 1
+    return 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:

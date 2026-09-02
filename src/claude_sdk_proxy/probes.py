@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Never, cast
+from typing import TYPE_CHECKING, Final, Never
 
 from claude_sdk_proxy.attestation import current_attestation_availability
 
@@ -17,10 +16,8 @@ if TYPE_CHECKING:
 
 REDACTION_MARKER: Final = "__redacted__"
 MAX_REDACTED_REPORT_BYTES: Final = 16_384
-_MAX_ITEMS: Final = 128
-_MAX_COUNT: Final = 1_000_000
+_MAX_ITEMS: Final = 1
 _MAX_CANARY_BYTES: Final = 256
-_CANONICAL_KEY = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _REPORT_NAMES = frozenset({"purity", "compaction", "path_persistence"})
 
 
@@ -34,31 +31,6 @@ class _ProbeReasonCode(StrEnum):
 
 
 _REASON_CODES = frozenset(reason.value for reason in _ProbeReasonCode)
-_SCHEMAS: Final[dict[str, dict[str, str]]] = {
-    "purity": {
-        "reason_code": "reason",
-        "shape": "shape",
-        "attribution_absent_observable": "bool",
-        "ambient_capability_absent": "bool",
-        "structured_user_input": "bool",
-        "advertised_tool_count": "count",
-    },
-    "compaction": {
-        "reason_code": "reason",
-        "auto_compaction_disabled": "bool",
-        "compact_boundary_count": "count",
-        "summary_event_count": "count",
-        "context_exhausted": "bool",
-    },
-    "path_persistence": {
-        "reason_code": "reason",
-        "persistence_absent": "bool",
-        "path_count": "count",
-        "modified_path_count": "count",
-        "unknown_path_count": "count",
-        "safe_canary_sha256": "canary_receipt",
-    },
-}
 
 
 class ProbeUnavailable(RuntimeError):
@@ -106,10 +78,7 @@ def _fixed_false(name: object) -> dict[str, object]:
         "schema_version": 1,
         "name": safe_name,
         "passed": False,
-        "evidence": {
-            "reason_code": _ProbeReasonCode.REDACTION_FAILURE.value,
-            "redaction": REDACTION_MARKER,
-        },
+        "evidence": {"reason_code": _ProbeReasonCode.REDACTION_FAILURE.value},
     }
 
 
@@ -126,7 +95,7 @@ def _materialize_mapping(value: Mapping[str, object]) -> dict[str, object]:
             if type(entry) is not tuple or len(entry) != 2:
                 raise _RedactionFailure()
             raw_key = entry[0]
-            if type(raw_key) is not str or _CANONICAL_KEY.fullmatch(raw_key) is None:
+            if type(raw_key) is not str or raw_key != "reason_code":
                 raise _RedactionFailure()
             entries.append((raw_key, entry[1]))
         else:
@@ -143,64 +112,17 @@ def _materialize_mapping(value: Mapping[str, object]) -> dict[str, object]:
         raise _RedactionFailure() from error
 
 
-def _exact_bool(value: object) -> bool:
-    if type(value) is not bool:
-        raise _RedactionFailure()
-    return value
-
-
-def _exact_count(value: object) -> int:
-    if type(value) is not int or not 0 <= value <= _MAX_COUNT:
-        raise _RedactionFailure()
-    return value
-
-
 def _exact_reason(value: object) -> str:
     if type(value) is not str or value not in _REASON_CODES:
         raise _RedactionFailure()
     return value
 
 
-def _exact_shape(value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping):
-        raise _RedactionFailure()
-    materialized = _materialize_mapping(cast("Mapping[str, object]", value))
-    if set(materialized) != {"blocks"}:
-        raise _RedactionFailure()
-    return {"blocks": _exact_count(materialized["blocks"])}
-
-
-def _consume_canary_receipt(value: object) -> str:
-    try:
-        from claude_sdk_proxy.path_policy import _consume_safe_canary_receipt
-
-        return _consume_safe_canary_receipt(value)
-    except BaseException as error:
-        raise _RedactionFailure() from error
-
-
-def _typed_evidence(name: str, evidence: Mapping[str, object]) -> dict[str, object]:
+def _typed_evidence(evidence: Mapping[str, object]) -> dict[str, object]:
     materialized = _materialize_mapping(evidence)
-    schema = _SCHEMAS[name]
-    if not set(materialized).issubset(schema) or "reason_code" not in materialized:
+    if set(materialized) != {"reason_code"}:
         raise _RedactionFailure()
-    output: dict[str, object] = {}
-    for key in sorted(materialized):
-        kind = schema[key]
-        value = materialized[key]
-        if kind == "reason":
-            output[key] = _exact_reason(value)
-        elif kind == "bool":
-            output[key] = _exact_bool(value)
-        elif kind == "count":
-            output[key] = _exact_count(value)
-        elif kind == "shape":
-            output[key] = _exact_shape(value)
-        elif kind == "canary_receipt":
-            output[key] = _consume_canary_receipt(value)
-        else:
-            raise _RedactionFailure()
-    return output
+    return {"reason_code": _exact_reason(materialized["reason_code"])}
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +146,9 @@ class ProbeResult:
     def redacted_dict(self) -> dict[str, object]:
         """Return a bounded V1 report or the fixed false failure record."""
         try:
-            evidence = _typed_evidence(self.name, self.evidence)
+            if self.passed:
+                raise _RedactionFailure()
+            evidence = _typed_evidence(self.evidence)
             report: dict[str, object] = {
                 "schema_version": 1,
                 "name": self.name,

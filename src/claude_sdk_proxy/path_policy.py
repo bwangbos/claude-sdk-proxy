@@ -7,6 +7,7 @@ import hmac
 import os
 import secrets
 import stat
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ _DEFAULT_MAX_SNAPSHOT_ENTRIES: Final = 2_048
 _DEFAULT_MAX_DEPTH: Final = 16
 _DEFAULT_MAX_CONTENT_BYTES: Final = 1_048_576
 _MAX_ROOT_PARENT_WALK: Final = 256
+_MAX_SNAPSHOT_DEPTH: Final = 64
 
 _CREDENTIAL_FILES = frozenset(
     {
@@ -104,6 +106,7 @@ class _CanaryRecord:
     relative_path: str
     metadata: PathMetadata
     digest: str
+    creator_pid: int
     fingerprint: str
 
 
@@ -115,6 +118,7 @@ class _SafeCanaryReceipt:
     _relative_path: str
     _metadata: PathMetadata
     _digest: str
+    _creator_pid: int
     _fingerprint: str
 
     def __copy__(self) -> Never:
@@ -125,6 +129,30 @@ class _SafeCanaryReceipt:
 
     def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
         raise TypeError("safe canary receipt cannot be pickled")
+
+
+_CANARY_POLICIES: weakref.WeakSet[PathPolicy] = weakref.WeakSet()
+
+
+def _invalidate_canary_authority_after_fork() -> None:
+    child_pid = os.getpid()
+    try:
+        for policy in _CANARY_POLICIES:
+            try:
+                policy._rotate_canary_authority(child_pid)
+            except BaseException:
+                # Lazy PID validation repeats fail-closed on first child use.
+                pass
+    except BaseException:
+        # Weak-set iteration failure is also covered by lazy PID validation.
+        pass
+
+
+try:
+    os.register_at_fork(after_in_child=_invalidate_canary_authority_after_fork)
+except (AttributeError, OSError):
+    # Non-POSIX or registration-denied runtimes use the lazy PID boundary.
+    pass
 
 
 def _metadata(relative: str, value: os.stat_result) -> PathMetadata:
@@ -194,6 +222,10 @@ class PathPolicy:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise PathPolicyError(f"{label} must be a positive integer")
+        if max_depth > _MAX_SNAPSHOT_DEPTH:
+            raise PathPolicyError(
+                f"snapshot depth limit must be at most {_MAX_SNAPSHOT_DEPTH}"
+            )
         login_fd, login_root = self._validate_root(
             real_login_root, RootKind.REAL_LOGIN
         )
@@ -227,7 +259,25 @@ class PathPolicy:
         self._approved_new: set[tuple[RootKind, tuple[str, ...]]] = set()
         self._canary_authority = object()
         self._canary_key = secrets.token_bytes(32)
+        self._canary_creator_pid = os.getpid()
         self._canary_records: dict[str, _CanaryRecord] = {}
+        _CANARY_POLICIES.add(self)
+
+    def _rotate_canary_authority(self, creator_pid: int) -> None:
+        self._canary_records.clear()
+        self._canary_authority = object()
+        self._canary_key = b""
+        self._canary_creator_pid = creator_pid
+        self._canary_key = secrets.token_bytes(32)
+
+    def _require_canary_creator(self) -> None:
+        current_pid = os.getpid()
+        if (
+            current_pid != self._canary_creator_pid
+            or len(self._canary_key) != 32
+        ):
+            self._rotate_canary_authority(current_pid)
+            raise PathPolicyError("safe canary authority changed process")
 
     @staticmethod
     def _root_flags() -> int:
@@ -581,6 +631,7 @@ class PathPolicy:
         relative_path: str,
         metadata: PathMetadata,
         digest: str,
+        creator_pid: int,
     ) -> str:
         fields = (
             root.value,
@@ -592,6 +643,7 @@ class PathPolicy:
             str(metadata.size),
             str(metadata.mtime_ns),
             digest,
+            str(creator_pid),
         )
         payload = "\0".join(fields).encode("utf-8")
         return hmac.new(self._canary_key, payload, hashlib.sha256).hexdigest()
@@ -604,6 +656,7 @@ class PathPolicy:
         expected: PathMetadata,
         root: RootKind,
     ) -> object:
+        self._require_canary_creator()
         if root is not RootKind.PROXY_OWNED:
             raise PathPolicyError("safe canary requires the proxy-owned root")
         components = self._components(path)
@@ -621,6 +674,7 @@ class PathPolicy:
             relative_path=relative_path,
             metadata=current,
             digest=digest,
+            creator_pid=self._canary_creator_pid,
         )
         if len(self._canary_records) >= self._max_snapshot_entries:
             raise PathPolicyError("safe canary receipt limit exceeded")
@@ -629,6 +683,7 @@ class PathPolicy:
             relative_path=relative_path,
             metadata=current,
             digest=digest,
+            creator_pid=self._canary_creator_pid,
             fingerprint=fingerprint,
         )
         self._canary_records[fingerprint] = record
@@ -639,11 +694,13 @@ class PathPolicy:
             _relative_path=relative_path,
             _metadata=current,
             _digest=digest,
+            _creator_pid=self._canary_creator_pid,
             _fingerprint=fingerprint,
         )
 
     def _consume_safe_canary_receipt(self, receipt: object) -> str:
         try:
+            self._require_canary_creator()
             if type(receipt) is not _SafeCanaryReceipt:
                 raise PathPolicyError("safe canary receipt is invalid")
             authority = object.__getattribute__(receipt, "_authority")
@@ -651,6 +708,7 @@ class PathPolicy:
             relative_path = object.__getattribute__(receipt, "_relative_path")
             metadata = object.__getattribute__(receipt, "_metadata")
             digest = object.__getattribute__(receipt, "_digest")
+            creator_pid = object.__getattribute__(receipt, "_creator_pid")
             fingerprint = object.__getattribute__(receipt, "_fingerprint")
             policy = object.__getattribute__(receipt, "_policy")
             if (
@@ -660,13 +718,17 @@ class PathPolicy:
                 or type(relative_path) is not str
                 or type(metadata) is not PathMetadata
                 or type(digest) is not str
+                or type(creator_pid) is not int
                 or type(fingerprint) is not str
+                or creator_pid != os.getpid()
+                or creator_pid != self._canary_creator_pid
             ):
                 raise PathPolicyError("safe canary receipt is invalid")
             verified_root = cast(RootKind, root)
             verified_path = relative_path
             verified_metadata = metadata
             verified_digest = digest
+            verified_creator_pid = creator_pid
             verified_fingerprint = fingerprint
             record = self._canary_records.get(verified_fingerprint)
             if record is None or (
@@ -674,12 +736,14 @@ class PathPolicy:
                 verified_path,
                 verified_metadata,
                 verified_digest,
+                verified_creator_pid,
                 verified_fingerprint,
             ) != (
                 record.root,
                 record.relative_path,
                 record.metadata,
                 record.digest,
+                record.creator_pid,
                 record.fingerprint,
             ):
                 raise PathPolicyError("safe canary receipt is invalid")
@@ -688,6 +752,7 @@ class PathPolicy:
                 relative_path=verified_path,
                 metadata=verified_metadata,
                 digest=verified_digest,
+                creator_pid=verified_creator_pid,
             )
             if not hmac.compare_digest(verified_fingerprint, expected_fingerprint):
                 raise PathPolicyError("safe canary receipt is invalid")
@@ -701,94 +766,154 @@ class PathPolicy:
         except BaseException as error:
             raise PathPolicyError("safe canary receipt is invalid") from error
 
+    @staticmethod
+    def _snapshot_names(
+        directory_fd: int, *, limit: int, overflow_message: str
+    ) -> tuple[str, ...]:
+        with os.scandir(directory_fd) as entries:
+            captured = list(islice(entries, limit + 1))
+        if len(captured) > limit:
+            raise PathPolicyError(overflow_message)
+        names: list[str] = []
+        for entry in captured:
+            name = entry.name
+            if type(name) is not str or name in {"", ".", ".."} or "/" in name:
+                raise PathPolicyError("snapshot encountered an ambiguous name")
+            names.append(name)
+        if len(set(names)) != len(names):
+            raise PathPolicyError("snapshot encountered duplicate names")
+        return tuple(sorted(names))
+
+    @staticmethod
+    def _verify_snapshot_entry(
+        value: os.stat_result, root_identity: _RootIdentity
+    ) -> None:
+        if stat.S_ISLNK(value.st_mode):
+            raise PathPolicyError("snapshot encountered a symlink")
+        if not (stat.S_ISREG(value.st_mode) or stat.S_ISDIR(value.st_mode)):
+            raise PathPolicyError(
+                "snapshot encountered a special filesystem object"
+            )
+        if value.st_dev != root_identity.st_dev:
+            raise PathPolicyError("snapshot crossed the verified root device")
+        if stat.S_ISREG(value.st_mode) and value.st_nlink != 1:
+            raise PathPolicyError("hard link escape is forbidden")
+
+    @staticmethod
+    def _snapshot_stat(directory_fd: int, name: str) -> os.stat_result:
+        try:
+            return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise PathPolicyError(
+                "snapshot directory changed during snapshot"
+            ) from error
+
+    def _snapshot_directory(
+        self,
+        directory_fd: int,
+        *,
+        prefix: tuple[str, ...],
+        depth: int,
+        root: RootKind,
+        root_identity: _RootIdentity,
+        output: list[PathMetadata],
+    ) -> os.stat_result:
+        before = os.fstat(directory_fd)
+        if not stat.S_ISDIR(before.st_mode) or before.st_dev != root_identity.st_dev:
+            raise PathPolicyError("snapshot directory identity is invalid")
+        remaining = self._max_snapshot_entries - len(output)
+        before_names = self._snapshot_names(
+            directory_fd,
+            limit=remaining,
+            overflow_message="snapshot entry limit exceeded",
+        )
+        if depth >= self._max_depth and before_names:
+            raise PathPolicyError("snapshot depth limit exceeded")
+
+        admitted: dict[str, os.stat_result] = {}
+        for name in before_names:
+            if len(output) >= self._max_snapshot_entries:
+                raise PathPolicyError("snapshot entry limit exceeded")
+            components = (*prefix, name)
+            captured = self._snapshot_stat(directory_fd, name)
+            self._verify_snapshot_entry(captured, root_identity)
+            if (root, components) in self._approved_new:
+                classification = PathClass.NEW_NONCREDENTIAL_SAFE
+            else:
+                classification = self._classify_components(components, root)
+            if classification is PathClass.UNKNOWN:
+                raise PathPolicyError(
+                    "snapshot encountered an unknown existing path"
+                )
+            final = self._snapshot_stat(directory_fd, name)
+            if not _same_stat(captured, final):
+                raise PathPolicyError("path identity changed during snapshot")
+            relative = "/".join(components)
+            if stat.S_ISREG(final.st_mode):
+                output.append(_metadata(relative, final))
+                admitted[name] = final
+                continue
+
+            try:
+                child = os.open(
+                    name,
+                    self._component_flags(directory=True),
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise PathPolicyError(
+                    "snapshot directory changed during snapshot"
+                ) from error
+            try:
+                opened = os.fstat(child)
+                if not _same_stat(opened, final):
+                    raise PathPolicyError("path identity changed during snapshot")
+                index = len(output)
+                output.append(_metadata(relative, opened))
+                certified = self._snapshot_directory(
+                    child,
+                    prefix=components,
+                    depth=depth + 1,
+                    root=root,
+                    root_identity=root_identity,
+                    output=output,
+                )
+                linked = self._snapshot_stat(directory_fd, name)
+                if not _same_stat(certified, linked):
+                    raise PathPolicyError("snapshot directory changed during snapshot")
+                output[index] = _metadata(relative, certified)
+                admitted[name] = certified
+            finally:
+                os.close(child)
+
+        after_names = self._snapshot_names(
+            directory_fd,
+            limit=len(before_names),
+            overflow_message="snapshot directory changed during snapshot",
+        )
+        if before_names != after_names:
+            raise PathPolicyError("snapshot directory changed during snapshot")
+        for name in after_names:
+            if not _same_stat(admitted[name], self._snapshot_stat(directory_fd, name)):
+                raise PathPolicyError("snapshot directory changed during snapshot")
+        after = os.fstat(directory_fd)
+        if not _same_stat(before, after):
+            raise PathPolicyError("snapshot directory changed during snapshot")
+        return after
+
     def snapshot(
         self, *, root: RootKind = RootKind.REAL_LOGIN
     ) -> tuple[PathMetadata, ...]:
         output: list[PathMetadata] = []
         with self._open_root(root) as (root_fd, root_identity):
-            stack: list[tuple[int, tuple[str, ...], int]] = [
-                (os.dup(root_fd), (), 0)
-            ]
-            try:
-                while stack:
-                    directory_fd, prefix, depth = stack.pop()
-                    try:
-                        if depth >= self._max_depth:
-                            with os.scandir(directory_fd) as entries:
-                                has_entry = next(entries, None) is not None
-                            if has_entry:
-                                raise PathPolicyError("snapshot depth limit exceeded")
-                            continue
-                        remaining = self._max_snapshot_entries - len(output)
-                        with os.scandir(directory_fd) as entries:
-                            names = sorted(
-                                entry.name
-                                for entry in islice(entries, remaining + 1)
-                            )
-                        if len(names) > remaining:
-                            raise PathPolicyError("snapshot entry limit exceeded")
-                        for name in names:
-                            components = (*prefix, name)
-                            if len(output) >= self._max_snapshot_entries:
-                                raise PathPolicyError("snapshot entry limit exceeded")
-                            captured = os.stat(
-                                name, dir_fd=directory_fd, follow_symlinks=False
-                            )
-                            if stat.S_ISLNK(captured.st_mode):
-                                raise PathPolicyError("snapshot encountered a symlink")
-                            if not (
-                                stat.S_ISREG(captured.st_mode)
-                                or stat.S_ISDIR(captured.st_mode)
-                            ):
-                                raise PathPolicyError(
-                                    "snapshot encountered a special filesystem object"
-                                )
-                            if captured.st_dev != root_identity.st_dev:
-                                raise PathPolicyError(
-                                    "snapshot crossed the verified root device"
-                                )
-                            if (
-                                stat.S_ISREG(captured.st_mode)
-                                and captured.st_nlink != 1
-                            ):
-                                raise PathPolicyError("hard link escape is forbidden")
-                            if (root, components) in self._approved_new:
-                                classification = PathClass.NEW_NONCREDENTIAL_SAFE
-                            else:
-                                classification = self._classify_components(
-                                    components, root
-                                )
-                            if classification is PathClass.UNKNOWN:
-                                raise PathPolicyError(
-                                    "snapshot encountered an unknown existing path"
-                                )
-                            final = os.stat(
-                                name, dir_fd=directory_fd, follow_symlinks=False
-                            )
-                            if not _same_stat(captured, final):
-                                raise PathPolicyError(
-                                    "path identity changed during snapshot"
-                                )
-                            if stat.S_ISDIR(final.st_mode):
-                                child = os.open(
-                                    name,
-                                    self._component_flags(directory=True),
-                                    dir_fd=directory_fd,
-                                )
-                                opened = os.fstat(child)
-                                if not _same_stat(opened, final):
-                                    os.close(child)
-                                    raise PathPolicyError(
-                                        "path identity changed during snapshot"
-                                    )
-                                stack.append((child, components, depth + 1))
-                            output.append(_metadata("/".join(components), final))
-                    finally:
-                        os.close(directory_fd)
-            except BaseException:
-                for directory_fd, _, _ in stack:
-                    os.close(directory_fd)
-                raise
+            self._snapshot_directory(
+                root_fd,
+                prefix=(),
+                depth=0,
+                root=root,
+                root_identity=root_identity,
+                output=output,
+            )
         return tuple(sorted(output, key=lambda item: item.relative_path))
 
 
