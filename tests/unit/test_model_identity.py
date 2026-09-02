@@ -10,6 +10,14 @@ from claude_sdk_proxy.attestation import (
     CanonicalEvent,
     ModelIdentityError,
     ModelIdentityGate,
+    current_attestation_availability,
+)
+from claude_sdk_proxy.probes import (
+    ProbeUnavailable,
+    run_session_probe,
+    run_stream_probe,
+    run_thinking_probe,
+    run_usage_probe,
 )
 
 
@@ -99,6 +107,7 @@ def test_a_later_authoritative_envelope_cannot_omit_model_identity() -> None:
         "haiku",
         "latest",
         "claude-sonnet-4-5",
+        "claude-3-5-sonnet",
         "claude-opus-4-1-latest",
     ],
 )
@@ -122,6 +131,9 @@ def test_events_are_frozen_snapshots_and_exact_builtin_types_are_required() -> N
 
 
 def test_invalid_or_oversized_events_poison_without_releasing_content() -> None:
+    with pytest.raises(ValueError, match="byte bound"):
+        text_delta("x" * (1024 * 1024 + 1))
+
     gate = ModelIdentityGate(expected="claude-sonnet-4-5-exact")
     assert gate.observe(text_delta("buffered")) == ()
 
@@ -131,3 +143,14 @@ def test_invalid_or_oversized_events_poison_without_releasing_content() -> None:
     with pytest.raises(ModelIdentityError, match="failed"):
         gate.observe(message_start(model="claude-sonnet-4-5-exact"))
 
+
+def test_all_semantic_probe_entry_points_fail_before_any_live_action() -> None:
+    assert current_attestation_availability().core_gate_available is False
+    for runner in (
+        run_session_probe,
+        run_stream_probe,
+        run_thinking_probe,
+        run_usage_probe,
+    ):
+        with pytest.raises(ProbeUnavailable, match="child_attestation_unavailable"):
+            runner()

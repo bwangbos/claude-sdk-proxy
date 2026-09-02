@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterator, Mapping
+from dataclasses import replace
 
 import pytest
+
 from claude_sdk_proxy.usage_evidence import (
     EvidenceSchemaError,
+    UsageDerivedField,
     UsageDialect,
     UsageEvidenceSchema,
+    UsageFieldSpec,
+    UsageIdentityBinding,
     UsageMappingFailure,
     UsageOperationClass,
+    UsageScalarKind,
 )
 
 
@@ -158,6 +164,58 @@ def test_usage_tuple_rejects_noncanonical_budget_identity(
             _load(row)
 
 
+def test_usage_tuple_rejects_an_older_style_moving_model_alias(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    row = copy.deepcopy(valid_usage_row_json)
+    assert isinstance(row["key"], dict)
+    row["key"]["backend_model_id"] = "claude-3-5-sonnet"
+    with pytest.raises(EvidenceSchemaError, match="moving alias"):
+        _load(row)
+
+
+def test_direct_leaf_types_reject_mutable_path_aliases() -> None:
+    with pytest.raises(EvidenceSchemaError, match="tuple"):
+        UsageFieldSpec(
+            sdk_path=["input_tokens"],  # type: ignore[arg-type]
+            kind=UsageScalarKind.NONNEGATIVE_INTEGER,
+            required=True,
+            nullable=False,
+        )
+    with pytest.raises(EvidenceSchemaError, match="tuple"):
+        UsageIdentityBinding(
+            sdk_path=("input_tokens",),
+            public_path=["input_tokens"],  # type: ignore[arg-type]
+        )
+    with pytest.raises(EvidenceSchemaError, match="tuple"):
+        UsageDerivedField(
+            public_path=("total_tokens",),
+            operation="checked_sum",
+            source_sdk_paths=[  # type: ignore[arg-type]
+                ("input_tokens",),
+                ("output_tokens",),
+            ],
+        )
+
+
+def test_frozen_aggregate_types_reject_mutable_container_aliases(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    schema = _load(valid_usage_row_json)
+    row = schema.rows[0]
+    mapping = row.dialect_mappings[0]
+    for constructor in (
+        lambda: replace(schema, rows=list(schema.rows)),  # type: ignore[arg-type]
+        lambda: replace(row, fields=list(row.fields)),  # type: ignore[arg-type]
+        lambda: replace(
+            mapping,
+            identity_bindings=list(mapping.identity_bindings),  # type: ignore[arg-type]
+        ),
+    ):
+        with pytest.raises(EvidenceSchemaError, match="tuple"):
+            constructor()
+
+
 def test_round_trip_recomputes_and_verifies_every_digest(
     valid_usage_row_json: dict[str, object],
 ) -> None:
@@ -186,6 +244,22 @@ def test_round_trip_recomputes_and_verifies_every_digest(
             )
         with pytest.raises(EvidenceSchemaError, match="digest"):
             UsageEvidenceSchema.from_json(forged)
+
+
+def test_explicit_null_digests_are_not_treated_as_absent(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    encoded = _load(valid_usage_row_json).to_json()
+    for digest_path in ("schema", "row", "mapping"):
+        invalid = copy.deepcopy(encoded)
+        if digest_path == "schema":
+            invalid["schema_digest"] = None
+        elif digest_path == "row":
+            invalid["rows"][0]["row_digest"] = None  # type: ignore[index]
+        else:
+            invalid["rows"][0]["dialect_mappings"][0]["mapping_digest"] = None  # type: ignore[index]
+        with pytest.raises(EvidenceSchemaError, match="digest"):
+            UsageEvidenceSchema.from_json(invalid)
 
 
 def test_reordered_input_has_stable_canonical_order_and_digests(
@@ -298,10 +372,28 @@ def test_passing_mapping_must_be_exhaustive_and_failure_rows_are_unusable(
     )
 
 
+def test_duplicate_mapping_failure_reasons_are_rejected_not_collapsed(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    row = copy.deepcopy(valid_usage_row_json)
+    _false_mapping(row, "openai", "unrepresentable_sdk_field")
+    mapping = _mapping(row, "openai")
+    mapping["failure_reasons"] = [
+        "unrepresentable_sdk_field",
+        "unrepresentable_sdk_field",
+    ]
+
+    with pytest.raises(EvidenceSchemaError, match="sorted and unique"):
+        _load(row)
+
+
 def test_illegal_or_semantically_unproved_public_paths_are_rejected(
     valid_usage_row_json: dict[str, object],
 ) -> None:
-    for public_path in (["future_tokens"], ["completion_tokens"]):
+    for public_path in (
+        ["future_tokens"],
+        ["prompt_tokens_details", "cached_tokens"],
+    ):
         row = copy.deepcopy(valid_usage_row_json)
         binding = _mapping(row, "openai")["identity_bindings"][0]  # type: ignore[index]
         assert isinstance(binding, dict)
@@ -362,7 +454,45 @@ def test_checked_sum_requires_exact_required_nonnullable_integer_sources(
             fields[0]["nullable"] = True
         else:
             fields[0]["kind"] = "string"
+    _false_mapping(row, "anthropic", "unrepresentable_sdk_field")
     with pytest.raises(EvidenceSchemaError, match="checked_sum"):
+        _load(row)
+
+
+def test_checked_sum_runtime_is_exact_and_overflow_checked(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    schema = _load(valid_usage_row_json)
+    mapping = schema.require_mapping(
+        schema.rows[0].key, UsageDialect.OPENAI
+    )[1]
+    derived = mapping.derived_fields[0]
+
+    assert derived.evaluate(
+        {("input_tokens",): 3, ("output_tokens",): 4}, integer_bound=7
+    ) == 7
+    for values, bound in (
+        ({("input_tokens",): 3}, 7),
+        ({("input_tokens",): None, ("output_tokens",): 4}, 7),
+        ({("input_tokens",): True, ("output_tokens",): 4}, 7),
+        ({("input_tokens",): -1, ("output_tokens",): 4}, 7),
+        ({("input_tokens",): "3", ("output_tokens",): 4}, 7),
+        ({("input_tokens",): 4, ("output_tokens",): 4}, 7),
+        ({("input_tokens",): 3, ("output_tokens",): 4}, True),
+    ):
+        with pytest.raises(EvidenceSchemaError, match="checked_sum"):
+            derived.evaluate(values, integer_bound=bound)  # type: ignore[arg-type]
+
+
+def test_budget_token_identity_has_a_finite_integer_bound(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    row = copy.deepcopy(valid_usage_row_json)
+    assert isinstance(row["key"], dict)
+    row["key"].update(
+        thinking_mode="enabled", budget_tokens=2**63, effort=None
+    )
+    with pytest.raises(EvidenceSchemaError, match="budget_tokens"):
         _load(row)
 
 
@@ -377,7 +507,7 @@ def test_nested_sdk_leaves_and_nullable_optionals_are_explicit_not_values(
             "sdk_path": ["cache_creation", "ephemeral_1h_input_tokens"],
             "kind": "nonnegative_integer",
             "required": False,
-            "nullable": True,
+            "nullable": False,
         }
     )
     anthropic = _mapping(row, "anthropic")
@@ -390,12 +520,52 @@ def test_nested_sdk_leaves_and_nullable_optionals_are_explicit_not_values(
     _false_mapping(row, "openai", "unrepresentable_sdk_field")
 
     schema = _load(row)
-    field = schema.rows[0].fields[0]
-    assert field.sdk_path == ("cache_creation", "ephemeral_1h_input_tokens")
-    assert field.required is False
-    assert field.nullable is True
-    serialized = schema.to_json()
-    assert "value" not in repr(serialized)
+    nested = schema.rows[0].fields[0]
+    assert nested.sdk_path == ("cache_creation", "ephemeral_1h_input_tokens")
+    assert nested.required is False
+    assert nested.nullable is False
+
+    nullable_row = copy.deepcopy(valid_usage_row_json)
+    nullable_row["fields"].append(  # type: ignore[union-attr]
+        {
+            "sdk_path": ["observed_nullable_field"],
+            "kind": "string",
+            "required": False,
+            "nullable": True,
+        }
+    )
+    _false_mapping(nullable_row, "anthropic", "nullability_mismatch")
+    _false_mapping(nullable_row, "openai", "unrepresentable_sdk_field")
+    nullable_schema = _load(nullable_row)
+    nullable = next(
+        field
+        for field in nullable_schema.rows[0].fields
+        if field.sdk_path == ("observed_nullable_field",)
+    )
+    assert nullable.required is False
+    assert nullable.nullable is True
+    assert "value" not in repr(nullable_schema.to_json())
+
+
+def test_nullable_sdk_leaf_requires_a_proved_nullable_public_leaf(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    row = copy.deepcopy(valid_usage_row_json)
+    row["fields"].append(  # type: ignore[union-attr]
+        {
+            "sdk_path": ["service_tier"],
+            "kind": "string",
+            "required": False,
+            "nullable": True,
+        }
+    )
+    _mapping(row, "anthropic")["identity_bindings"].append(  # type: ignore[union-attr]
+        {"sdk_path": ["service_tier"], "public_path": ["service_tier"]}
+    )
+    _false_mapping(row, "openai", "unrepresentable_sdk_field")
+
+    with pytest.raises(EvidenceSchemaError, match="nullability mismatch"):
+        _load(row)
 
 
 def test_unrepresentable_leaf_marks_only_the_exact_dialect_false(

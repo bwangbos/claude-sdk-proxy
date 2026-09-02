@@ -13,6 +13,7 @@ from claude_sdk_proxy.attestation import current_attestation_availability
 
 if TYPE_CHECKING:
     from claude_sdk_proxy.path_policy import PathMetadata, PathPolicy, RootKind
+    from claude_sdk_proxy.usage_evidence import UsageEvidenceSchema
 
 REDACTION_MARKER: Final = "__redacted__"
 MAX_REDACTED_REPORT_BYTES: Final = 16_384
@@ -186,6 +187,26 @@ def run_compaction_probe() -> ProbeResult:
     _require_live_prerequisites()
 
 
+def run_session_probe() -> ProbeResult:
+    """Run native-session evidence only after the attestation gate is affirmative."""
+    _require_live_prerequisites()
+
+
+def run_stream_probe() -> ProbeResult:
+    """Run exact-model/stream evidence only after attestation is affirmative."""
+    _require_live_prerequisites()
+
+
+def run_thinking_probe() -> ProbeResult:
+    """Run the exact thinking-tuple matrix only after attestation is affirmative."""
+    _require_live_prerequisites()
+
+
+def run_usage_probe() -> UsageEvidenceSchema:
+    """Build typed usage evidence only after attestation is affirmative."""
+    _require_live_prerequisites()
+
+
 __all__ = [
     "MAX_REDACTED_REPORT_BYTES",
     "REDACTION_MARKER",
@@ -193,5 +214,9 @@ __all__ = [
     "ProbeUnavailable",
     "run_compaction_probe",
     "run_prompt_purity_probe",
+    "run_session_probe",
+    "run_stream_probe",
+    "run_thinking_probe",
+    "run_usage_probe",
     "safe_canary_digest",
 ]

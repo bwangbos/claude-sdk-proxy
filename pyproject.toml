@@ -24,6 +24,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
 testpaths = ["tests"]
 markers = [
     "anyio: asynchronous test executed by the single asyncio backend",
