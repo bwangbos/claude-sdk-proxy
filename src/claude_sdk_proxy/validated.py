@@ -14,6 +14,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal, cast
 
+from claude_sdk_proxy.model_validation import (
+    ExactBackendModelError,
+    require_exact_backend_model,
+)
 from claude_sdk_proxy.platform import MountIdentity
 
 POLICY_URLS = (
@@ -28,7 +32,6 @@ _CLI_VERSION_OUTPUT = re.compile(
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _DARWIN_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){1,2}\Z")
 _FSID = re.compile(r"[0-9a-f]{8}:[0-9a-f]{8}\Z")
-_MODEL_ID = re.compile(r"[!-~]{1,256}\Z")
 _SDK_TOOL_MAX_JSON_DEPTH: Final = 16
 _SDK_TOOL_MAX_JSON_NODES: Final = 100_000
 _SDK_TOOL_MAX_STRING_BYTES: Final = 1024
@@ -213,20 +216,10 @@ def _nonnegative_integer(value: object, label: str) -> int:
 
 
 def _exact_backend_model(value: object) -> str:
-    if type(value) is not str or _MODEL_ID.fullmatch(value) is None:
-        raise _sdk_tool_error("backend model ID must be bounded visible ASCII")
-    lowered = value.lower()
-    if lowered in {"sonnet", "opus", "haiku", "latest", "default"} or lowered.endswith(
-        "-latest"
-    ):
-        raise _sdk_tool_error("backend model ID must be exact, not a moving alias")
-    if lowered.startswith("claude-") and lowered.rsplit("-", 1)[-1] in {
-        "sonnet",
-        "opus",
-        "haiku",
-    }:
-        raise _sdk_tool_error("backend model ID must be exact, not a moving alias")
-    return value
+    try:
+        return require_exact_backend_model(value)
+    except (TypeError, ExactBackendModelError) as error:
+        raise _sdk_tool_error("backend model ID must be exact bounded text") from error
 
 
 def _validate_mount_identity(value: object) -> MountIdentity:

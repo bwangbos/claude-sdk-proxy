@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final, Literal, cast
 
+from claude_sdk_proxy.model_validation import (
+    ExactBackendModelError,
+    require_exact_backend_model,
+)
+
 _MAX_ROWS: Final = 4096
 _MAX_FIELDS: Final = 128
 _MAX_BINDINGS: Final = 128
@@ -21,7 +26,6 @@ _MAX_JSON_STRING_BYTES: Final = 1024
 _MAX_USAGE_INTEGER: Final = 2**63 - 1
 _PATH_SEGMENT = re.compile(r"[a-z][a-z0-9_]*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_MODEL_ID = re.compile(r"[!-~]{1,256}\Z")
 _EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _THINKING_MODES = frozenset({"null", "disabled", "adaptive", "enabled"})
 
@@ -218,26 +222,16 @@ def _validate_runtime_digest(value: object) -> str:
 
 
 def _validate_backend_model(value: object) -> str:
-    if type(value) is not str or _MODEL_ID.fullmatch(value) is None:
-        raise _error("backend model ID must be bounded visible ASCII")
-    lowered = value.lower()
-    if lowered in {"sonnet", "opus", "haiku", "latest", "default"} or lowered.endswith(
-        "-latest"
-    ):
-        raise _error("backend model ID must be exact, not a moving alias")
-    if lowered.startswith("claude-") and lowered.rsplit("-", 1)[-1] in {
-        "sonnet",
-        "opus",
-        "haiku",
-    }:
-        raise _error("backend model ID must be exact, not a moving alias")
-    if lowered.startswith(("claude-sonnet-", "claude-opus-", "claude-haiku-")):
-        final_component = lowered.rsplit("-", 1)[-1]
-        if final_component != "exact" and not (
-            len(final_component) == 8 and final_component.isdigit()
-        ):
-            raise _error("backend model ID must be exact, not a moving alias")
-    return value
+    try:
+        return require_exact_backend_model(value)
+    except TypeError as error:
+        raise _error("backend model ID must be exact text") from error
+    except ExactBackendModelError as error:
+        if error.reason == "moving_alias":
+            raise _error(
+                "backend model ID must be exact, not a moving alias"
+            ) from error
+        raise _error("backend model ID must be bounded visible ASCII") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -999,30 +993,19 @@ class UsageEvidenceSchema:
                 break
         raise _error("exact usage tuple dialect mapping is missing")
 
-    def only_tool_row(
-        self, operation_class: UsageOperationClass | str
-    ) -> UsageEvidenceRow:
-        """Return one exact tool-operation row without tuple fallback."""
-        if type(operation_class) is str:
-            try:
-                selected = UsageOperationClass(operation_class)
-            except ValueError as error:
-                raise _error("tool operation class is not supported") from error
-        elif type(operation_class) is UsageOperationClass:
-            selected = operation_class
-        else:
-            raise _error("tool operation class must be exact text or enum")
-        if selected not in {
+    def only_tool_row(self, expected_key: UsageTupleKey) -> UsageEvidenceRow:
+        """Return the complete exact tool-operation tuple without fallback."""
+        if type(expected_key) is not UsageTupleKey:
+            raise _error("tool operation lookup requires an exact UsageTupleKey")
+        if expected_key.operation_class not in {
             UsageOperationClass.TOOL_USE_BOUNDARY,
             UsageOperationClass.POST_TOOL_RESULT,
         }:
             raise _error("tool operation class must name a tool result context")
-        matches = tuple(
-            row for row in self.rows if row.key.operation_class is selected
-        )
-        if len(matches) != 1:
-            raise _error("tool operation row must resolve to exactly one exact tuple")
-        return matches[0]
+        for row in self.rows:
+            if row.key == expected_key:
+                return row
+        raise _error("exact tool operation row is missing")
 
 
 __all__ = [

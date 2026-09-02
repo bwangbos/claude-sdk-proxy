@@ -10,6 +10,10 @@ from typing import Final
 
 from claude_sdk_proxy._attestation_v2 import *  # noqa: F403
 from claude_sdk_proxy._attestation_v2 import __all__ as _ATTESTATION_V2_ALL
+from claude_sdk_proxy.model_validation import (
+    ExactBackendModelError,
+    require_exact_backend_model,
+)
 
 _MAX_EVENT_TYPE_BYTES: Final = 32
 _MAX_MODEL_ID_BYTES: Final = 256
@@ -39,9 +43,6 @@ _EVENT_TYPES: Final = frozenset(
 )
 _AUTHORITATIVE_EVENT_TYPES: Final = frozenset({"message_start", "assistant"})
 _TERMINAL_EVENT_TYPES: Final = frozenset({"message_stop", "result", "error"})
-_GENERIC_MODEL_ALIASES: Final = frozenset(
-    {"sonnet", "opus", "haiku", "latest", "default"}
-)
 
 
 class ModelIdentityError(RuntimeError):
@@ -75,28 +76,12 @@ def _model_text(value: object) -> str:
 
 
 def _require_exact_backend_model(value: object) -> str:
-    model = _model_text(value)
-    lowered = model.lower()
-    if lowered in _GENERIC_MODEL_ALIASES or lowered.endswith("-latest"):
-        raise ModelIdentityError("expected model must be an exact backend model ID")
-    if lowered.startswith("claude-") and lowered.rsplit("-", 1)[-1] in {
-        "sonnet",
-        "opus",
-        "haiku",
-    }:
-        raise ModelIdentityError("expected model must be an exact backend model ID")
-    family_prefixes = ("claude-sonnet-", "claude-opus-", "claude-haiku-")
-    if lowered.startswith(family_prefixes):
-        final_component = lowered.rsplit("-", 1)[-1]
-        if final_component != "exact" and not (
-            len(final_component) == 8
-            and final_component.isascii()
-            and final_component.isdigit()
-        ):
-            raise ModelIdentityError(
-                "expected model must be an exact backend model ID"
-            )
-    return model
+    try:
+        return require_exact_backend_model(value)
+    except ExactBackendModelError as error:
+        raise ModelIdentityError(
+            "expected model must be an exact backend model ID"
+        ) from error
 
 
 def _public_model_alias(value: object) -> str:
