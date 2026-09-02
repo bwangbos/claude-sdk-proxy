@@ -487,6 +487,171 @@ def test_every_owned_resource_close_is_one_shot_and_owner_scoped(
     assert result == b"1"
 
 
+def test_classify_never_succeeds_after_missing_path_cleanup_becomes_ambiguous(
+    policy: PathPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        original_close = os.close
+        injected = False
+        close_calls = 0
+
+        def effect_then_raise_missing(descriptor: int) -> None:
+            nonlocal close_calls, injected
+            record = next(
+                (
+                    item
+                    for item in path_policy_impl._RESOURCE_REGISTRY.values()
+                    if item.owner is policy._resource_owner
+                    and item.resource == descriptor
+                    and item.kind == "component_dup"
+                ),
+                None,
+            )
+            if record is not None and not injected:
+                injected = True
+                close_calls += 1
+                original_close(descriptor)
+                raise FileNotFoundError("AMBIGUOUS-CLEANUP-MUST-NOT-MEAN-ABSENT")
+            original_close(descriptor)
+
+        monkeypatch.setattr(
+            "claude_sdk_proxy.path_policy.os.close", effect_then_raise_missing
+        )
+        failed_closed = False
+        try:
+            try:
+                policy.classify("missing/settings.json")
+            except PathPolicyError:
+                failed_closed = True
+            retained = [
+                item
+                for item in path_policy_impl._RESOURCE_REGISTRY.values()
+                if item.owner is policy._resource_owner
+            ]
+            verified = (
+                failed_closed
+                and close_calls == 1
+                and len(retained) == 1
+                and retained[0].kind == "component_dup"
+                and retained[0].state is path_policy_impl._ResourceState.AMBIGUOUS
+            )
+            os.write(write_fd, b"1" if verified else b"0")
+            original_close(write_fd)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    result = os.read(read_fd, 1)
+    os.close(read_fd)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert result == b"1"
+
+
+@pytest.mark.parametrize(
+    ("operation", "closing_kind", "acquired_kind"),
+    [
+        ("component_transfer", "component_dup", "component_child"),
+        ("content_transfer", "component_child", "content_file"),
+    ],
+)
+def test_cleanup_failure_after_acquisition_never_orphans_the_new_owner(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    closing_kind: str,
+    acquired_kind: str,
+) -> None:
+    plugins = roots[0] / "plugins"
+    plugins.mkdir(mode=0o700)
+    (plugins / "settings.json").write_bytes(b"NESTED")
+    canaries = roots[1] / "canaries"
+    canaries.mkdir(mode=0o700)
+    canary_path = canaries / "purity.txt"
+    canary = b"SAFE-CANARY"
+    canary_path.write_bytes(canary)
+    canary_path.chmod(0o600)
+    canary_metadata = policy.metadata("canaries/purity.txt", root=RootKind.PROXY_OWNED)
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        original_close = os.close
+        injected = False
+        close_calls = 0
+
+        def effect_then_raise_after_acquisition(descriptor: int) -> None:
+            nonlocal close_calls, injected
+            records = [
+                item
+                for item in path_policy_impl._RESOURCE_REGISTRY.values()
+                if item.owner is policy._resource_owner
+            ]
+            closing = next(
+                (
+                    item
+                    for item in records
+                    if item.resource == descriptor and item.kind == closing_kind
+                ),
+                None,
+            )
+            acquired = any(item.kind == acquired_kind for item in records)
+            if closing is not None and acquired and not injected:
+                injected = True
+                close_calls += 1
+                original_close(descriptor)
+                raise KeyboardInterrupt("TRANSFER-CLEANUP-AMBIGUOUS")
+            original_close(descriptor)
+
+        monkeypatch.setattr(
+            "claude_sdk_proxy.path_policy.os.close",
+            effect_then_raise_after_acquisition,
+        )
+        failed_closed = False
+        try:
+            try:
+                if operation == "component_transfer":
+                    policy.metadata("plugins/settings.json")
+                else:
+                    policy.scan_for_canary(
+                        "canaries/purity.txt",
+                        canary,
+                        expected=canary_metadata,
+                        root=RootKind.PROXY_OWNED,
+                    )
+            except KeyboardInterrupt:
+                failed_closed = True
+            retained = [
+                item
+                for item in path_policy_impl._RESOURCE_REGISTRY.values()
+                if item.owner is policy._resource_owner
+            ]
+            verified = (
+                failed_closed
+                and close_calls == 1
+                and len(retained) == 1
+                and retained[0].kind == closing_kind
+                and retained[0].state is path_policy_impl._ResourceState.AMBIGUOUS
+                and all(item.kind != acquired_kind for item in retained)
+            )
+            os.write(write_fd, b"1" if verified else b"0")
+            original_close(write_fd)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    result = os.read(read_fd, 1)
+    os.close(read_fd)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert result == b"1"
+
+
 def test_fd_capacity_is_bounded_per_owner_and_globally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

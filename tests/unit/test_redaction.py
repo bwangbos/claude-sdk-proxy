@@ -707,6 +707,53 @@ def test_cli_emit_rejects_probe_result_subclasses(
     assert report["evidence"] == {"reason_code": "probe_internal_error"}
 
 
+@pytest.mark.parametrize(
+    ("command", "runner_name", "expected_name", "mutation"),
+    [
+        ("prompt-purity", "run_prompt_purity_probe", "purity", "name"),
+        ("prompt-purity", "run_prompt_purity_probe", "purity", "passed"),
+        ("compaction", "run_compaction_probe", "compaction", "name"),
+        ("compaction", "run_compaction_probe", "compaction", "passed"),
+    ],
+)
+def test_cli_revalidates_materialized_report_after_hostile_redaction_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    runner_name: str,
+    expected_name: str,
+    mutation: str,
+) -> None:
+    class MutatingEvidence(dict[str, object]):
+        result: ProbeResult | None = None
+
+        def items(self):  # type: ignore[no-untyped-def]
+            assert self.result is not None
+            if mutation == "name":
+                wrong_name = "compaction" if expected_name == "purity" else "purity"
+                object.__setattr__(self.result, "name", wrong_name)
+            else:
+                object.__setattr__(self.result, "passed", True)
+            return super().items()
+
+    evidence = MutatingEvidence(reason_code="child_attestation_unavailable")
+    result = ProbeResult(expected_name, False, evidence)
+    evidence.result = result
+
+    monkeypatch.setattr(probe_cli, runner_name, lambda: result)
+
+    status = main([command])
+    report = json.loads(capsys.readouterr().out)
+
+    assert status != 0
+    assert report == {
+        "schema_version": 1,
+        "name": expected_name,
+        "passed": False,
+        "evidence": {"reason_code": "redaction_failure"},
+    }
+
+
 def test_cli_output_failure_never_escapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
