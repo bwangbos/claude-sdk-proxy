@@ -16,6 +16,7 @@ import struct
 import subprocess
 import threading
 import time
+import weakref
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -100,18 +101,63 @@ _EXPECTED_CANONICAL_TYPES = (
     "CLI_ARMED",
     "CLI_RUNNING",
 )
+_MAX_LIVE_TRANSPORT_AUTHORITIES = 32
 _LAUNCH_AUTHORITY_PID = os.getpid()
 _LAUNCH_TOKEN = object()
 _LAUNCH_CLAIM_LOCK = threading.RLock()
+_TRANSPORT_AUTHORITY_PID = os.getpid()
+_TRANSPORT_AUTHORITY_KEY = object()
 _RECEIPT_TOKEN = object()
 _TURN_TOKEN = object()
+
+
+@dataclass(slots=True)
+class _TransportAuthority:
+    reference: weakref.ReferenceType[Any]
+    creator_pid: int
+    key: object
+    launch: PreparedSupervisorLaunch
+    lock: Any
+    control: socket.socket
+    journal: Journal
+    nonce: bytes
+    network_proxy_enabled: bool
+    buffered: list[str]
+    process: Any | None
+    stdin: Any | None
+    stdout: Any | None
+    ready: bool
+    closed: bool
+    initialize_seen: bool
+    discarded: int
+    handshake_receipt: SupervisorHandshakeReceipt | None
+    cleanup_unconfirmed: bool
+    state: Literal["active", "closing", "unconfirmed", "closed"] = "active"
+    retained_transport: object | None = None
+
+
+_TRANSPORT_AUTHORITIES: dict[int, _TransportAuthority] = {}
+_INHERITED_TRANSPORT_AUTHORITY_QUARANTINE: list[
+    dict[int, _TransportAuthority]
+] = []
+_UNCHANGED_TRANSPORT_FIELD = object()
 
 
 def _invalidate_launch_authority_after_fork() -> None:
     """Create a fresh child authority without touching inherited resources."""
     global _LAUNCH_AUTHORITY_PID, _LAUNCH_CLAIM_LOCK, _LAUNCH_TOKEN
+    global _TRANSPORT_AUTHORITIES, _TRANSPORT_AUTHORITY_KEY
+    global _TRANSPORT_AUTHORITY_PID
+
+    # Some retired entries deliberately retain ambiguous resources. Keep the
+    # inherited mapping alive but non-authorizing so refcount finalization in
+    # the child cannot close or otherwise manipulate the parent's resources.
+    _INHERITED_TRANSPORT_AUTHORITY_QUARANTINE.append(_TRANSPORT_AUTHORITIES)
+    _TRANSPORT_AUTHORITIES = {}
     _LAUNCH_AUTHORITY_PID = os.getpid()
     _LAUNCH_TOKEN = object()
+    _TRANSPORT_AUTHORITY_PID = os.getpid()
+    _TRANSPORT_AUTHORITY_KEY = object()
     _LAUNCH_CLAIM_LOCK = threading.RLock()
 
 
@@ -1025,7 +1071,7 @@ class PreparedSupervisorLaunch:
     _sealed: bool
     _supervisor_environment_items: tuple[tuple[str, str], ...]
     _transport_claimed: bool
-    _transport_identity: object | None
+    _transport_identity: weakref.ReferenceType[object] | None
 
     def __new__(cls, *_args: object, **_kwargs: object) -> PreparedSupervisorLaunch:
         raise TypeError("PreparedSupervisorLaunch cannot be constructed publicly")
@@ -1207,27 +1253,141 @@ class PreparedSupervisorLaunch:
         _require_launch_authority(token)
         if type(transport) is not AttestedSupervisorTransport:
             raise AttestationError("transport claim creator process is invalid")
-        AttestedSupervisorTransport._require_creator_process(transport)
+        _require_transport_creator_process(transport)
         self._validate()
         with _LAUNCH_CLAIM_LOCK:
             PreparedSupervisorLaunch._require_creator_process(self)
+            _require_transport_creator_process(transport)
+            _require_launch_authority(token)
             if self._authority is not _LAUNCH_TOKEN:
                 raise AttestationError("transport claim authority is invalid")
             if type(self._transport_claimed) is not bool:
                 raise AttestationError("prepared launch claim state is invalid")
             if self._transport_claimed or self._transport_identity is not None:
                 raise AttestationError("prepared launch is already claimed")
+            if (
+                type(_TRANSPORT_AUTHORITY_PID) is not int
+                or _TRANSPORT_AUTHORITY_PID != os.getpid()
+            ):
+                raise AttestationError("transport authority process is invalid")
+            for closed_identity, closed in tuple(_TRANSPORT_AUTHORITIES.items()):
+                if closed.state == "closed":
+                    _TRANSPORT_AUTHORITIES.pop(closed_identity, None)
+            if (
+                type(_MAX_LIVE_TRANSPORT_AUTHORITIES) is not int
+                or _MAX_LIVE_TRANSPORT_AUTHORITIES <= 0
+                or len(_TRANSPORT_AUTHORITIES)
+                >= _MAX_LIVE_TRANSPORT_AUTHORITIES
+            ):
+                raise AttestationError("transport authority capacity is exhausted")
+
+            identity = id(transport)
+            claim_pid = os.getpid()
+            claim_lock = _LAUNCH_CLAIM_LOCK
+            authority_registry = _TRANSPORT_AUTHORITIES
+
+            def discard(
+                reference: weakref.ReferenceType[AttestedSupervisorTransport],
+            ) -> None:
+                if claim_pid != os.getpid():
+                    return
+                with claim_lock:
+                    current = authority_registry.get(identity)
+                    if current is not None and current.reference is reference:
+                        authority_registry.pop(identity, None)
+
+            reference = weakref.ref(transport, discard)
+            try:
+                launch = object.__getattribute__(transport, "launch")
+                lock = object.__getattribute__(transport, "_lock")
+                control = object.__getattribute__(transport, "_control")
+                journal = object.__getattribute__(transport, "_journal")
+                nonce = object.__getattribute__(transport, "_nonce")
+                network_proxy_enabled = object.__getattribute__(
+                    transport, "_network_proxy_enabled"
+                )
+                buffered = object.__getattribute__(transport, "_buffered")
+                process = object.__getattribute__(transport, "_process")
+                stdin = object.__getattribute__(transport, "_stdin")
+                stdout = object.__getattribute__(transport, "_stdout")
+                ready = object.__getattribute__(transport, "_ready")
+                closed_state = object.__getattribute__(transport, "_closed")
+                initialize_seen = object.__getattribute__(
+                    transport, "_initialize_seen"
+                )
+                discarded = object.__getattribute__(transport, "_discarded")
+                handshake_receipt = object.__getattribute__(
+                    transport, "_handshake_receipt"
+                )
+                cleanup_unconfirmed = object.__getattribute__(
+                    transport, "_cleanup_unconfirmed"
+                )
+            except BaseException as error:
+                raise AttestationError(
+                    "transport authority structure is invalid"
+                ) from error
+            if (
+                launch is not self
+                or type(nonce) is not bytes
+                or type(network_proxy_enabled) is not bool
+                or type(buffered) is not list
+                or process is not None
+                or stdin is not None
+                or stdout is not None
+                or ready is not False
+                or closed_state is not False
+                or initialize_seen is not False
+                or type(discarded) is not int
+                or discarded != 0
+                or handshake_receipt is not None
+                or cleanup_unconfirmed is not False
+            ):
+                raise AttestationError("transport authority structure is invalid")
+            authority = _TransportAuthority(
+                reference=reference,
+                creator_pid=claim_pid,
+                key=_TRANSPORT_AUTHORITY_KEY,
+                launch=self,
+                lock=lock,
+                control=control,
+                journal=journal,
+                nonce=nonce,
+                network_proxy_enabled=network_proxy_enabled,
+                buffered=buffered,
+                process=process,
+                stdin=stdin,
+                stdout=stdout,
+                ready=ready,
+                closed=closed_state,
+                initialize_seen=initialize_seen,
+                discarded=discarded,
+                handshake_receipt=handshake_receipt,
+                cleanup_unconfirmed=cleanup_unconfirmed,
+            )
             object.__setattr__(self, "_transport_claimed", True)
-            object.__setattr__(self, "_transport_identity", transport)
+            object.__setattr__(self, "_transport_identity", reference)
+            try:
+                authority_registry[identity] = authority
+            except BaseException:
+                object.__setattr__(self, "_transport_claimed", False)
+                object.__setattr__(self, "_transport_identity", None)
+                raise
 
     def _require_transport(self, transport: object) -> None:
         PreparedSupervisorLaunch._require_creator_process(self)
         if type(transport) is not AttestedSupervisorTransport:
             raise AttestationError("prepared launch transport identity changed")
         AttestedSupervisorTransport._require_creator_process(transport)
-        self._validate()
-        if self._transport_identity is not transport:
-            raise AttestationError("prepared launch transport identity changed")
+        with _LAUNCH_CLAIM_LOCK:
+            authority = _require_transport_authority_locked(transport, ("active",))
+            self._validate()
+            reference = self._transport_identity
+            if (
+                authority.launch is not self
+                or not isinstance(reference, weakref.ReferenceType)
+                or reference() is not transport
+            ):
+                raise AttestationError("prepared launch transport identity changed")
 
     def close(self) -> None:
         PreparedSupervisorLaunch._require_creator_process(self)
@@ -1970,8 +2130,235 @@ def _reconcile_failed_handshake_exit(
     return True
 
 
+def _require_transport_creator_process(transport: object) -> None:
+    """Reject foreign, forged-type transports without touching synchronization."""
+    if type(transport) is not AttestedSupervisorTransport:
+        raise AttestationError("transport creator process is invalid")
+    try:
+        creator_pid = object.__getattribute__(transport, "_creator_pid")
+    except BaseException as error:
+        raise AttestationError("transport creator process is invalid") from error
+    if type(creator_pid) is not int or creator_pid != os.getpid():
+        raise AttestationError("transport creator process is invalid")
+
+
+def _require_transport_authority_locked(
+    transport: object,
+    states: tuple[str, ...],
+    *,
+    expected: _TransportAuthority | None = None,
+) -> _TransportAuthority:
+    _require_transport_creator_process(transport)
+    if (
+        type(_TRANSPORT_AUTHORITY_PID) is not int
+        or _TRANSPORT_AUTHORITY_PID != os.getpid()
+    ):
+        raise AttestationError("transport authority process is invalid")
+    authority = _TRANSPORT_AUTHORITIES.get(id(transport))
+    if (
+        authority is None
+        or (expected is not None and authority is not expected)
+        or authority.reference() is not transport
+        or authority.creator_pid != os.getpid()
+        or authority.key is not _TRANSPORT_AUTHORITY_KEY
+        or authority.state not in states
+    ):
+        raise AttestationError("transport authority is invalid or no longer active")
+    try:
+        structure_is_valid = (
+            object.__getattribute__(transport, "launch") is authority.launch
+            and object.__getattribute__(transport, "_lock") is authority.lock
+            and object.__getattribute__(transport, "_control") is authority.control
+            and object.__getattribute__(transport, "_journal") is authority.journal
+            and object.__getattribute__(transport, "_nonce") is authority.nonce
+            and object.__getattribute__(transport, "_network_proxy_enabled")
+            is authority.network_proxy_enabled
+            and object.__getattribute__(transport, "_buffered") is authority.buffered
+            and object.__getattribute__(transport, "_process") is authority.process
+            and object.__getattribute__(transport, "_stdin") is authority.stdin
+            and object.__getattribute__(transport, "_stdout") is authority.stdout
+            and object.__getattribute__(transport, "_ready") is authority.ready
+            and object.__getattribute__(transport, "_closed") is authority.closed
+            and object.__getattribute__(transport, "_initialize_seen")
+            is authority.initialize_seen
+            and type(object.__getattribute__(transport, "_discarded")) is int
+            and object.__getattribute__(transport, "_discarded")
+            == authority.discarded
+            and object.__getattribute__(transport, "_handshake_receipt")
+            is authority.handshake_receipt
+            and object.__getattribute__(transport, "_cleanup_unconfirmed")
+            is authority.cleanup_unconfirmed
+        )
+    except BaseException as error:
+        raise AttestationError("transport authority structure is invalid") from error
+    if not structure_is_valid:
+        raise AttestationError("transport authority structure is invalid")
+    return authority
+
+
+def _require_transport_authority(
+    transport: object,
+    states: tuple[str, ...] = ("active",),
+    *,
+    expected: _TransportAuthority | None = None,
+) -> _TransportAuthority:
+    _require_transport_creator_process(transport)
+    if (
+        type(_TRANSPORT_AUTHORITY_PID) is not int
+        or _TRANSPORT_AUTHORITY_PID != os.getpid()
+    ):
+        raise AttestationError("transport authority process is invalid")
+    with _LAUNCH_CLAIM_LOCK:
+        return _require_transport_authority_locked(
+            transport, states, expected=expected
+        )
+
+
+def _update_transport_runtime(
+    transport: object,
+    authority: _TransportAuthority,
+    *,
+    states: tuple[str, ...] = ("active", "closing"),
+    process: object = _UNCHANGED_TRANSPORT_FIELD,
+    stdin: object = _UNCHANGED_TRANSPORT_FIELD,
+    stdout: object = _UNCHANGED_TRANSPORT_FIELD,
+    ready: object = _UNCHANGED_TRANSPORT_FIELD,
+    closed: object = _UNCHANGED_TRANSPORT_FIELD,
+    initialize_seen: object = _UNCHANGED_TRANSPORT_FIELD,
+    discarded: object = _UNCHANGED_TRANSPORT_FIELD,
+    handshake_receipt: object = _UNCHANGED_TRANSPORT_FIELD,
+    cleanup_unconfirmed: object = _UNCHANGED_TRANSPORT_FIELD,
+) -> None:
+    _require_transport_creator_process(transport)
+    with _LAUNCH_CLAIM_LOCK:
+        current = _require_transport_authority_locked(
+            transport, states, expected=authority
+        )
+        if process is not _UNCHANGED_TRANSPORT_FIELD:
+            current.process = process
+            object.__setattr__(transport, "_process", process)
+        if stdin is not _UNCHANGED_TRANSPORT_FIELD:
+            current.stdin = stdin
+            object.__setattr__(transport, "_stdin", stdin)
+        if stdout is not _UNCHANGED_TRANSPORT_FIELD:
+            current.stdout = stdout
+            object.__setattr__(transport, "_stdout", stdout)
+        if ready is not _UNCHANGED_TRANSPORT_FIELD:
+            if type(ready) is not bool:
+                raise AttestationError("transport ready state is invalid")
+            current.ready = ready
+            object.__setattr__(transport, "_ready", ready)
+        if closed is not _UNCHANGED_TRANSPORT_FIELD:
+            if type(closed) is not bool:
+                raise AttestationError("transport closed state is invalid")
+            current.closed = closed
+            object.__setattr__(transport, "_closed", closed)
+        if initialize_seen is not _UNCHANGED_TRANSPORT_FIELD:
+            if type(initialize_seen) is not bool:
+                raise AttestationError("transport initialize state is invalid")
+            current.initialize_seen = initialize_seen
+            object.__setattr__(transport, "_initialize_seen", initialize_seen)
+        if discarded is not _UNCHANGED_TRANSPORT_FIELD:
+            if type(discarded) is not int or discarded < 0:
+                raise AttestationError("transport discard count is invalid")
+            current.discarded = discarded
+            object.__setattr__(transport, "_discarded", discarded)
+        if handshake_receipt is not _UNCHANGED_TRANSPORT_FIELD:
+            if handshake_receipt is not None and type(
+                handshake_receipt
+            ) is not SupervisorHandshakeReceipt:
+                raise AttestationError("transport handshake receipt is invalid")
+            current.handshake_receipt = handshake_receipt
+            object.__setattr__(
+                transport, "_handshake_receipt", handshake_receipt
+            )
+        if cleanup_unconfirmed is not _UNCHANGED_TRANSPORT_FIELD:
+            if type(cleanup_unconfirmed) is not bool:
+                raise AttestationError("transport cleanup state is invalid")
+            current.cleanup_unconfirmed = cleanup_unconfirmed
+            object.__setattr__(
+                transport, "_cleanup_unconfirmed", cleanup_unconfirmed
+            )
+
+
+def _retain_transport_authority(
+    transport: object, authority: _TransportAuthority
+) -> None:
+    _require_transport_creator_process(transport)
+    with _LAUNCH_CLAIM_LOCK:
+        current = _require_transport_authority_locked(
+            transport, ("active",), expected=authority
+        )
+        current.retained_transport = transport
+
+
+def _begin_transport_close(
+    transport: object, authority: _TransportAuthority
+) -> None:
+    _require_transport_creator_process(transport)
+    with _LAUNCH_CLAIM_LOCK:
+        current = _require_transport_authority_locked(
+            transport, ("active",), expected=authority
+        )
+        current.retained_transport = transport
+        current.state = "closing"
+
+
+def _mark_transport_cleanup_unconfirmed(
+    transport: object, authority: _TransportAuthority
+) -> None:
+    _require_transport_creator_process(transport)
+    with _LAUNCH_CLAIM_LOCK:
+        current = _require_transport_authority_locked(
+            transport, ("closing",), expected=authority
+        )
+        current.state = "unconfirmed"
+        current.retained_transport = transport
+
+
+def _finish_transport_close(
+    transport: object, authority: _TransportAuthority
+) -> None:
+    _require_transport_creator_process(transport)
+    with _LAUNCH_CLAIM_LOCK:
+        current = _require_transport_authority_locked(
+            transport, ("closing",), expected=authority
+        )
+        current.state = "closed"
+        current.retained_transport = None
+
+
+def _require_internal_closing_transport_authority(
+    transport: object, authority: _TransportAuthority | None
+) -> _TransportAuthority:
+    _require_transport_creator_process(transport)
+    if authority is None or type(authority) is not _TransportAuthority:
+        raise AttestationError("transport authority is invalid for close helper")
+    return _require_transport_authority(
+        transport, ("closing",), expected=authority
+    )
+
+
 class AttestedSupervisorTransport(Transport):
     """SDK transport with exact env/FD control and an actual Task 5 handshake."""
+
+    _buffered: list[str]
+    _cleanup_unconfirmed: bool
+    _closed: bool
+    _control: socket.socket
+    _creator_pid: int
+    _discarded: int
+    _handshake_receipt: SupervisorHandshakeReceipt | None
+    _initialize_seen: bool
+    _journal: Journal
+    _lock: Any
+    _network_proxy_enabled: bool
+    _nonce: bytes
+    _process: Any | None
+    _ready: bool
+    _stdin: _OwnedSupervisorProcess | None
+    _stdout: _OwnedSupervisorProcess | None
+    launch: PreparedSupervisorLaunch
 
     def __init__(self, launch: PreparedSupervisorLaunch) -> None:
         if type(self) is not AttestedSupervisorTransport:
@@ -1979,24 +2366,28 @@ class AttestedSupervisorTransport(Transport):
         if type(launch) is not PreparedSupervisorLaunch:
             raise AttestationError("validated supervisor launch is required")
         PreparedSupervisorLaunch._require_creator_process(launch)
-        self._creator_pid = os.getpid()
+        object.__setattr__(self, "_creator_pid", os.getpid())
+        object.__setattr__(self, "launch", launch)
+        object.__setattr__(self, "_control", launch._parent_control)
+        object.__setattr__(self, "_journal", launch._descriptors.journal)
+        object.__setattr__(
+            self, "_nonce", bytes.fromhex(launch._descriptors.allocation_nonce)
+        )
+        object.__setattr__(
+            self, "_network_proxy_enabled", launch._network_proxy_enabled
+        )
+        object.__setattr__(self, "_process", None)
+        object.__setattr__(self, "_stdin", None)
+        object.__setattr__(self, "_stdout", None)
+        object.__setattr__(self, "_lock", anyio.Lock())
+        object.__setattr__(self, "_ready", False)
+        object.__setattr__(self, "_closed", False)
+        object.__setattr__(self, "_initialize_seen", False)
+        object.__setattr__(self, "_buffered", [])
+        object.__setattr__(self, "_discarded", 0)
+        object.__setattr__(self, "_handshake_receipt", None)
+        object.__setattr__(self, "_cleanup_unconfirmed", False)
         PreparedSupervisorLaunch._claim(launch, _LAUNCH_TOKEN, self)
-        self.launch = launch
-        self._control = launch._parent_control
-        self._journal = launch._descriptors.journal
-        self._nonce = bytes.fromhex(launch._descriptors.allocation_nonce)
-        self._network_proxy_enabled = launch._network_proxy_enabled
-        self._process: Any | None = None
-        self._stdin: _OwnedSupervisorProcess | None = None
-        self._stdout: _OwnedSupervisorProcess | None = None
-        self._lock = anyio.Lock()
-        self._ready = False
-        self._closed = False
-        self._initialize_seen = False
-        self._buffered: list[str] = []
-        self._discarded = 0
-        self._handshake_receipt: SupervisorHandshakeReceipt | None = None
-        self._cleanup_unconfirmed = False
 
     def __setattr__(self, name: str, value: object) -> None:
         if name == "_creator_pid":
@@ -2009,112 +2400,160 @@ class AttestedSupervisorTransport(Transport):
         object.__setattr__(self, name, value)
 
     def _require_creator_process(self) -> None:
-        if type(self) is not AttestedSupervisorTransport:
-            raise AttestationError("transport creator process is invalid")
-        try:
-            creator_pid = object.__getattribute__(self, "_creator_pid")
-        except BaseException as error:
-            raise AttestationError("transport creator process is invalid") from error
-        if type(creator_pid) is not int or creator_pid != os.getpid():
-            raise AttestationError("transport creator process is invalid")
+        _require_transport_authority(
+            self, ("active", "closing", "unconfirmed", "closed")
+        )
+
+    def __copy__(self) -> Never:
+        _require_transport_authority(
+            self, ("active", "closing", "unconfirmed", "closed")
+        )
+        raise AttestationError("transport cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> Never:
+        _require_transport_authority(
+            self, ("active", "closing", "unconfirmed", "closed")
+        )
+        raise AttestationError("transport cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        _require_transport_authority(
+            self, ("active", "closing", "unconfirmed", "closed")
+        )
+        raise AttestationError("transport cannot be pickled")
 
     @property
     def handshake_receipt(self) -> SupervisorHandshakeReceipt | None:
-        AttestedSupervisorTransport._require_creator_process(self)
-        receipt = self._handshake_receipt
+        authority = _require_transport_authority(
+            self, ("active", "closing", "unconfirmed", "closed")
+        )
+        receipt = authority.handshake_receipt
         if receipt is not None:
             receipt._validate()
         return receipt
 
     @property
     def cleanup_unconfirmed(self) -> bool:
-        AttestedSupervisorTransport._require_creator_process(self)
-        return self._cleanup_unconfirmed
+        authority = _require_transport_authority(
+            self, ("active", "closing", "unconfirmed", "closed")
+        )
+        return authority.cleanup_unconfirmed
 
     @property
     def buffered_user_write_count(self) -> int:
-        AttestedSupervisorTransport._require_creator_process(self)
-        return len(self._buffered)
+        authority = _require_transport_authority(
+            self, ("active", "closing", "unconfirmed", "closed")
+        )
+        return len(authority.buffered)
 
     @property
     def discarded_user_write_count(self) -> int:
-        AttestedSupervisorTransport._require_creator_process(self)
-        return self._discarded
+        authority = _require_transport_authority(
+            self, ("active", "closing", "unconfirmed", "closed")
+        )
+        return authority.discarded
 
     async def connect(self) -> None:
-        AttestedSupervisorTransport._require_creator_process(self)
-        async with self._lock:
-            if self._closed:
+        authority = _require_transport_authority(self)
+        async with authority.lock:
+            _require_transport_authority(self, expected=authority)
+            if authority.closed:
                 raise AttestationError("transport is closed")
-            if self._process is not None:
+            if authority.process is not None:
                 return
-            PreparedSupervisorLaunch._require_transport(self.launch, self)
-            command = self.launch.command
-            cli_identity = self.launch.cli_identity
-            environment = self.launch.supervisor_environment
-            inherited_fds = self.launch.inherited_fds
+            launch = authority.launch
+            if type(launch) is not PreparedSupervisorLaunch:
+                raise AttestationError("transport authority structure is invalid")
+            PreparedSupervisorLaunch._require_transport(launch, self)
+            command = launch.command
+            cli_identity = launch.cli_identity
+            environment = launch.supervisor_environment
+            inherited_fds = launch.inherited_fds
+            _retain_transport_authority(self, authority)
             process = await anyio.to_thread.run_sync(
                 lambda: _OwnedSupervisorProcess(
                     command,
-                    cwd=self.launch._config.cwd,
+                    cwd=launch._config.cwd,
                     environment=environment,
                     inherited_fds=inherited_fds,
                 )
             )
-            self._process = process
+            _update_transport_runtime(self, authority, process=process)
             if not process.pipes_available:
-                self._cleanup_unconfirmed = True
+                _update_transport_runtime(
+                    self, authority, cleanup_unconfirmed=True
+                )
                 raise AttestationError("supervisor pipes are unavailable")
-            self.launch._child_control.close()
+            launch._child_control.close()
             try:
-                self._handshake_receipt = await anyio.to_thread.run_sync(
+                receipt = await anyio.to_thread.run_sync(
                     _perform_handshake,
-                    self._control,
-                    self._journal,
-                    self._nonce,
+                    authority.control,
+                    authority.journal,
+                    authority.nonce,
                     cli_identity,
-                    self._network_proxy_enabled,
+                    authority.network_proxy_enabled,
                     process.pid,
                 )
+                _update_transport_runtime(
+                    self, authority, handshake_receipt=receipt
+                )
             except BaseException as error:
-                self._cleanup_unconfirmed = True
+                _update_transport_runtime(
+                    self, authority, cleanup_unconfirmed=True
+                )
                 if isinstance(error, Exception):
                     raise AttestationError(
                         "Task 5 supervisor handshake failed closed"
                     ) from error
                 raise
-            self._stdin = self._process
-            self._stdout = self._process
-            self._ready = True
+            _update_transport_runtime(
+                self,
+                authority,
+                stdin=process,
+                stdout=process,
+                ready=True,
+            )
 
     async def write(self, data: str) -> None:
-        AttestedSupervisorTransport._require_creator_process(self)
+        authority = _require_transport_authority(self)
         if not isinstance(data, str):
             raise AttestationError("transport write must be text")
-        async with self._lock:
-            if not self._ready or self._stdin is None or self._closed:
+        async with authority.lock:
+            _require_transport_authority(self, expected=authority)
+            if not authority.ready or authority.stdin is None or authority.closed:
                 raise AttestationError("transport is not ready")
-            if not self._initialize_seen and _is_safe_initialize(data):
-                self._initialize_seen = True
-                await self._stdin.send(data)
+            if not authority.initialize_seen and _is_safe_initialize(data):
+                _update_transport_runtime(
+                    self, authority, initialize_seen=True
+                )
+                await authority.stdin.send(data)
             else:
-                self._buffered.append(str(data))
+                authority.buffered.append(str(data))
 
     async def release_buffered(self) -> Never:
-        AttestedSupervisorTransport._require_creator_process(self)
-        async with self._lock:
-            self._discarded += len(self._buffered)
-            self._buffered.clear()
+        authority = _require_transport_authority(self)
+        async with authority.lock:
+            _require_transport_authority(self, expected=authority)
+            discarded = authority.discarded + len(authority.buffered)
+            _update_transport_runtime(self, authority, discarded=discarded)
+            authority.buffered.clear()
         await self.close()
         raise AttestationError("core attestation gate unavailable")
 
     async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
-        AttestedSupervisorTransport._require_creator_process(self)
-        if self._stdout is None:
-            raise AttestationError("transport is not connected")
+        authority = _require_transport_authority(self)
         buffer = ""
         decoder = codecs.getincrementaldecoder("utf-8")()
-        while chunk_bytes := await self._stdout.receive():
+        while True:
+            async with authority.lock:
+                _require_transport_authority(self, expected=authority)
+                stream = authority.stdout
+                if stream is None:
+                    raise AttestationError("transport is not connected")
+                chunk_bytes = await stream.receive()
+            if not chunk_bytes:
+                break
             chunk = decoder.decode(chunk_bytes)
             buffer += chunk
             if len(buffer.encode("utf-8")) > 1024 * 1024:
@@ -2135,66 +2574,107 @@ class AttestedSupervisorTransport(Transport):
             yield value
 
     def is_ready(self) -> bool:
-        AttestedSupervisorTransport._require_creator_process(self)
-        return self._ready and not self._closed
+        authority = _require_transport_authority(
+            self, ("active", "closing", "unconfirmed", "closed")
+        )
+        return authority.state == "active" and authority.ready and not authority.closed
 
-    async def _bounded_stdin_close(self) -> bool:
-        stream = self._stdin
+    async def _bounded_stdin_close(
+        self, authority: _TransportAuthority | None = None
+    ) -> bool:
+        current = _require_internal_closing_transport_authority(self, authority)
+        stream = current.stdin
         if stream is None:
             return True
         with anyio.move_on_after(0.25) as scope:
             await stream.close_stdin()
         if scope.cancel_called:
-            self._cleanup_unconfirmed = True
+            _update_transport_runtime(
+                self,
+                current,
+                states=("closing",),
+                cleanup_unconfirmed=True,
+            )
             return False
-        self._stdin = None
+        _update_transport_runtime(
+            self, current, states=("closing",), stdin=None
+        )
         return True
 
     async def end_input(self) -> None:
-        AttestedSupervisorTransport._require_creator_process(self)
-        async with self._lock:
-            if not await self._bounded_stdin_close():
+        authority = _require_transport_authority(self)
+        async with authority.lock:
+            _require_transport_authority(self, expected=authority)
+            stream = authority.stdin
+            if stream is None:
+                return
+            with anyio.move_on_after(0.25) as scope:
+                await stream.close_stdin()
+            if scope.cancel_called:
+                _update_transport_runtime(
+                    self, authority, cleanup_unconfirmed=True
+                )
                 raise AttestationError("stdin close timed out; cleanup is unconfirmed")
+            _update_transport_runtime(self, authority, stdin=None)
 
-    async def _bounded_process_aclose(self) -> bool:
-        if self._process is None:
+    async def _bounded_process_aclose(
+        self, authority: _TransportAuthority | None = None
+    ) -> bool:
+        current = _require_internal_closing_transport_authority(self, authority)
+        if current.process is None:
             return True
         with anyio.move_on_after(0.25) as scope:
-            await self._process.aclose()
+            await current.process.aclose()
         return not scope.cancel_called
 
-    async def _close_failed_handshake_process(self) -> bool:
-        process = self._process
+    async def _close_failed_handshake_process(
+        self, authority: _TransportAuthority | None = None
+    ) -> bool:
+        current = _require_internal_closing_transport_authority(self, authority)
+        process = current.process
         if process is None:
             return True
         if not isinstance(process, _OwnedSupervisorProcess):
             if process.returncode is None:
                 return False
-            process_closed = await self._bounded_process_aclose()
+            process_closed = await self._bounded_process_aclose(current)
             if process_closed:
-                self._process = None
-                self._stdin = None
-                self._stdout = None
+                _update_transport_runtime(
+                    self,
+                    current,
+                    states=("closing",),
+                    process=None,
+                    stdin=None,
+                    stdout=None,
+                )
             return process_closed
         try:
             reconciled = await anyio.to_thread.run_sync(
                 _reconcile_failed_handshake_exit,
-                self._journal,
+                current.journal,
                 process,
             )
         except Exception:
             return False
         if not reconciled:
             return False
-        if not await self._bounded_process_aclose():
+        if not await self._bounded_process_aclose(current):
             return False
-        self._process = None
-        self._stdin = None
-        self._stdout = None
+        _update_transport_runtime(
+            self,
+            current,
+            states=("closing",),
+            process=None,
+            stdin=None,
+            stdout=None,
+        )
         return False
 
-    async def _close_running_process(self) -> bool:
-        process = self._process
+    async def _close_running_process(
+        self, authority: _TransportAuthority | None = None
+    ) -> bool:
+        current = _require_internal_closing_transport_authority(self, authority)
+        process = current.process
         if process is None:
             return True
         if not isinstance(process, _OwnedSupervisorProcess):
@@ -2202,9 +2682,9 @@ class AttestedSupervisorTransport(Transport):
         try:
             await anyio.to_thread.run_sync(
                 _prepare_cleanup,
-                self._control,
-                self._journal,
-                self._nonce,
+                current.control,
+                current.journal,
+                current.nonce,
             )
             await anyio.to_thread.run_sync(
                 _observe_successful_unreaped_exit, process.pid
@@ -2212,50 +2692,92 @@ class AttestedSupervisorTransport(Transport):
         except Exception:
             return False
         try:
-            await anyio.to_thread.run_sync(self._journal.confirm_executor_reaped)
+            await anyio.to_thread.run_sync(current.journal.confirm_executor_reaped)
             process.record_confirmed_exit(0)
-            authority = await anyio.to_thread.run_sync(self._journal.certify_done)
-            await anyio.to_thread.run_sync(self._journal.delete_at, authority)
+            deletion = await anyio.to_thread.run_sync(current.journal.certify_done)
+            await anyio.to_thread.run_sync(current.journal.delete_at, deletion)
         except Exception:
             return False
-        if not await self._bounded_process_aclose():
+        if not await self._bounded_process_aclose(current):
             return False
-        self._process = None
-        self._stdin = None
-        self._stdout = None
+        _update_transport_runtime(
+            self,
+            current,
+            states=("closing",),
+            process=None,
+            stdin=None,
+            stdout=None,
+        )
         return True
 
     async def _close_transition(self) -> None:
-        async with self._lock:
-            if self._closed and self._process is None:
-                if self._cleanup_unconfirmed:
-                    raise AttestationError("transport cleanup is unconfirmed")
-                return
-            self._closed = True
-            self._ready = False
-            self._discarded += len(self._buffered)
-            self._buffered.clear()
-            stdin_closed = await self._bounded_stdin_close()
-            receipt = self._handshake_receipt
-            if receipt is None:
-                process_closed = await self._close_failed_handshake_process()
-            else:
+        authority = _require_transport_authority(self)
+        async with authority.lock:
+            _require_transport_authority(self, expected=authority)
+            _begin_transport_close(self, authority)
+            discarded = authority.discarded + len(authority.buffered)
+            _update_transport_runtime(
+                self,
+                authority,
+                states=("closing",),
+                closed=True,
+                ready=False,
+                discarded=discarded,
+            )
+            authority.buffered.clear()
+            try:
+                stdin_closed = await self._bounded_stdin_close(authority)
+                receipt = authority.handshake_receipt
+                if receipt is None:
+                    process_closed = await self._close_failed_handshake_process(
+                        authority
+                    )
+                else:
+                    try:
+                        receipt._validate()
+                    except AttestationError:
+                        # Receipt integrity is consumer-facing evidence; a caller
+                        # mutation cannot be allowed to suppress proven cleanup.
+                        pass
+                    process_closed = await self._close_running_process(authority)
+                if stdin_closed and process_closed:
+                    authority.control.close()
+                    launch = authority.launch
+                    if type(launch) is not PreparedSupervisorLaunch:
+                        raise AttestationError(
+                            "transport authority structure is invalid"
+                        )
+                    launch._child_control.close()
+                    _finish_transport_close(self, authority)
+                    return
+                _update_transport_runtime(
+                    self,
+                    authority,
+                    states=("closing",),
+                    cleanup_unconfirmed=True,
+                )
+                _mark_transport_cleanup_unconfirmed(self, authority)
+            except BaseException:
                 try:
-                    receipt._validate()
+                    _update_transport_runtime(
+                        self,
+                        authority,
+                        states=("closing",),
+                        cleanup_unconfirmed=True,
+                    )
                 except AttestationError:
-                    # Receipt integrity is consumer-facing evidence; a caller
-                    # mutation cannot be allowed to suppress proven cleanup.
                     pass
-                process_closed = await self._close_running_process()
-            if stdin_closed and process_closed:
-                self._control.close()
-                self.launch._child_control.close()
-                return
-            self._cleanup_unconfirmed = True
+                try:
+                    _mark_transport_cleanup_unconfirmed(self, authority)
+                except AttestationError:
+                    pass
+                raise
         raise AttestationError("transport cleanup is unconfirmed")
 
     async def close(self) -> None:
-        AttestedSupervisorTransport._require_creator_process(self)
+        authority = _require_transport_authority(self, ("active", "closed"))
+        if authority.state == "closed":
+            return
         failure: AttestationError | None = None
         with anyio.CancelScope(shield=True):
             try:
@@ -2263,7 +2785,18 @@ class AttestedSupervisorTransport(Transport):
             except AttestationError as error:
                 failure = error
             except BaseException:
-                self._cleanup_unconfirmed = True
+                try:
+                    authority = _require_transport_authority(
+                        self, ("active", "closing")
+                    )
+                    _update_transport_runtime(
+                        self,
+                        authority,
+                        states=("active", "closing"),
+                        cleanup_unconfirmed=True,
+                    )
+                except AttestationError:
+                    pass
                 raise
         # Re-deliver any ambient cancellation only after the shielded state
         # transition has either completed cleanup or retained exact ownership.

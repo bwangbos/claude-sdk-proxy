@@ -1484,6 +1484,20 @@ class _ConcurrentCloseProcess:
         await self.release.wait()
 
 
+class _BlockingSendStream:
+    def __init__(self) -> None:
+        self.entered = anyio.Event()
+        self.release = anyio.Event()
+        self.stdin_close_calls = 0
+
+    async def send(self, _data: str) -> None:
+        self.entered.set()
+        await self.release.wait()
+
+    async def close_stdin(self) -> None:
+        self.stdin_close_calls += 1
+
+
 def _exact_transport_forge(
     transport: AttestedSupervisorTransport,
 ) -> AttestedSupervisorTransport:
@@ -1491,6 +1505,18 @@ def _exact_transport_forge(
     for name, value in vars(transport).items():
         object.__setattr__(forged, name, value)
     return forged
+
+
+def _set_transport_runtime(
+    transport: AttestedSupervisorTransport,
+    *,
+    states: tuple[str, ...] = ("active",),
+    **changes: object,
+) -> None:
+    authority = implementation._require_transport_authority(transport, states)
+    implementation._update_transport_runtime(
+        transport, authority, states=states, **changes
+    )
 
 
 @pytest.mark.parametrize("operation", [copy.copy, copy.deepcopy, pickle.dumps])
@@ -1557,6 +1583,12 @@ async def test_exact_class_forge_rejects_every_surface_before_resource_touch(
 
             with pytest.raises(AttestationError, match="transport authority"):
                 AttestedSupervisorTransport.is_ready(forged)
+            with pytest.raises(AttestationError, match="transport authority"):
+                AttestedSupervisorTransport._require_creator_process(forged)
+            with pytest.raises(AttestationError, match="transport authority"):
+                PreparedSupervisorLaunch._require_transport(launch, forged)
+            with pytest.raises(AttestationError, match="transport authority"):
+                build_attested_sdk_client(launch, transport=forged)
             for operation in (
                 lambda: AttestedSupervisorTransport.connect(forged),
                 lambda: AttestedSupervisorTransport.write(
@@ -1587,7 +1619,7 @@ async def test_close_burns_authority_before_effect_then_raise(tmp_path: Path) ->
         launch = _prepare(inputs)
         transport = AttestedSupervisorTransport(launch)
         process = _EffectThenRaiseProcess()
-        transport._process = process  # type: ignore[assignment]
+        _set_transport_runtime(transport, process=process)
         try:
             with pytest.raises(RuntimeError, match="effect then failure"):
                 await transport.close()
@@ -1608,7 +1640,7 @@ async def test_close_reentrant_methods_reject_without_reacquiring_async_lock(
         launch = _prepare(inputs)
         transport = AttestedSupervisorTransport(launch)
         process = _ReentrantCloseProcess(transport)
-        transport._process = process  # type: ignore[assignment]
+        _set_transport_runtime(transport, process=process)
         try:
             with anyio.fail_after(0.2):
                 await transport.close()
@@ -1626,7 +1658,7 @@ async def test_concurrent_method_rejects_after_close_revokes_before_effects(
         launch = _prepare(inputs)
         transport = AttestedSupervisorTransport(launch)
         process = _ConcurrentCloseProcess()
-        transport._process = process  # type: ignore[assignment]
+        _set_transport_runtime(transport, process=process)
 
         async def close_transport() -> None:
             await transport.close()
@@ -1645,7 +1677,37 @@ async def test_concurrent_method_rejects_after_close_revokes_before_effects(
             launch.close()
 
 
-async def test_successful_close_revokes_all_stale_transport_access(
+async def test_close_waits_for_an_already_authorized_write_effect(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        stream = _BlockingSendStream()
+        _set_transport_runtime(transport, stdin=stream, ready=True)
+
+        async def write_initialize() -> None:
+            await transport.write(_initialize())
+
+        async def close_transport() -> None:
+            await transport.close()
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(write_initialize)
+                await stream.entered.wait()
+                tasks.start_soon(close_transport)
+                await anyio.sleep(0)
+                assert stream.stdin_close_calls == 0
+                stream.release.set()
+            assert stream.stdin_close_calls == 1
+            assert transport.is_ready() is False
+        finally:
+            stream.release.set()
+            launch.close()
+
+
+async def test_successful_close_revokes_all_stale_transport_effects(
     tmp_path: Path,
 ) -> None:
     with _launch_inputs(tmp_path) as inputs:
@@ -1657,14 +1719,17 @@ async def test_successful_close_revokes_all_stale_transport_access(
             transport.connect,
             transport.release_buffered,
             transport.end_input,
-            transport.close,
         ):
             with pytest.raises(AttestationError, match="transport authority"):
                 await operation()
         with pytest.raises(AttestationError, match="transport authority"):
-            transport.is_ready()
+            await transport.write("hostile retry")
+        messages = transport.read_messages()
         with pytest.raises(AttestationError, match="transport authority"):
-            _ = transport.handshake_receipt
+            await anext(messages)
+        assert transport.is_ready() is False
+        assert transport.handshake_receipt is None
+        await transport.close()
         launch.close()
 
 
@@ -1675,19 +1740,22 @@ def test_transport_authority_capacity_releases_only_after_safe_close(
     monkeypatch.setattr(
         implementation, "_MAX_LIVE_TRANSPORT_AUTHORITIES", 1, raising=False
     )
+    monkeypatch.setattr(implementation, "_TRANSPORT_AUTHORITIES", {}, raising=False)
     with _launch_inputs(tmp_path / "one") as first_inputs:
         with _launch_inputs(tmp_path / "two") as second_inputs:
             first_launch = _prepare(first_inputs)
             second_launch = _prepare(second_inputs)
-            first = AttestedSupervisorTransport(first_launch)
-            with pytest.raises(AttestationError, match="capacity"):
-                AttestedSupervisorTransport(second_launch)
+            try:
+                first = AttestedSupervisorTransport(first_launch)
+                with pytest.raises(AttestationError, match="capacity"):
+                    AttestedSupervisorTransport(second_launch)
 
-            anyio.run(first.close)
-            second = AttestedSupervisorTransport(second_launch)
-            anyio.run(second.close)
-            first_launch.close()
-            second_launch.close()
+                anyio.run(first.close)
+                second = AttestedSupervisorTransport(second_launch)
+                anyio.run(second.close)
+            finally:
+                first_launch.close()
+                second_launch.close()
 
 
 async def test_transport_attribute_tampering_rejects_before_lock_or_resource(
@@ -1708,6 +1776,28 @@ async def test_transport_attribute_tampering_rejects_before_lock_or_resource(
         finally:
             transport._lock = original_lock
             transport._control = original_control
+            launch.close()
+
+
+async def test_transport_runtime_state_tampering_cannot_enable_or_inject_resources(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        transport._ready = True
+        try:
+            with pytest.raises(AttestationError, match="transport authority"):
+                transport.is_ready()
+        finally:
+            transport._ready = False
+
+        transport._process = _ResourceTouchTrap()  # type: ignore[assignment]
+        try:
+            with pytest.raises(AttestationError, match="transport authority"):
+                await transport.close()
+        finally:
+            transport._process = None
             launch.close()
 
 
@@ -1795,6 +1885,8 @@ def test_fork_child_cannot_rebind_copied_transport_to_child_pid(tmp_path: Path) 
         launch = _prepare(inputs)
         transport = AttestedSupervisorTransport(launch)
         forged = _exact_transport_forge(transport)
+        authority_lock = implementation._LAUNCH_CLAIM_LOCK
+        authority_lock.acquire()
         pid = os.fork()
         if pid == 0:
             _child_alarm()
@@ -1806,7 +1898,10 @@ def test_fork_child_cannot_rebind_copied_transport_to_child_pid(tmp_path: Path) 
             except BaseException:
                 os._exit(2)
             os._exit(3)
-        assert _wait_for_fork_child(pid) == 0
+        try:
+            assert _wait_for_fork_child(pid) == 0
+        finally:
+            authority_lock.release()
 
         assert transport.is_ready() is False
         assert isinstance(
@@ -2318,16 +2413,38 @@ async def _finish_and_close_failed_handshake(
             supervisor_certification=supervisor_certification,
         )
     )
-    transport._handshake_receipt = receipt
-    transport._cleanup_unconfirmed = False
-    await transport.close()
+    _set_transport_runtime(
+        transport,
+        states=("unconfirmed",),
+        handshake_receipt=receipt,
+    )
+    process = transport._process
+    assert isinstance(process, implementation._OwnedSupervisorProcess)
+    await anyio.to_thread.run_sync(
+        implementation._prepare_cleanup,
+        transport._control,
+        transport._journal,
+        transport._nonce,
+    )
+    await anyio.to_thread.run_sync(
+        implementation._observe_successful_unreaped_exit, process.pid
+    )
+    await anyio.to_thread.run_sync(transport._journal.confirm_executor_reaped)
+    process.record_confirmed_exit(0)
+    deletion = await anyio.to_thread.run_sync(transport._journal.certify_done)
+    await anyio.to_thread.run_sync(transport._journal.delete_at, deletion)
+    await process.aclose()
+    transport._control.close()
+    transport.launch._child_control.close()
+    with implementation._LAUNCH_CLAIM_LOCK:
+        implementation._TRANSPORT_AUTHORITIES.pop(id(transport), None)
 
 
 async def test_confirmed_prehandshake_process_is_released(tmp_path: Path) -> None:
     with _launch_inputs(tmp_path) as inputs:
         launch = _prepare(inputs)
         transport = AttestedSupervisorTransport(launch)
-        transport._process = _ImmediateCloseProcess()  # type: ignore[assignment]
+        _set_transport_runtime(transport, process=_ImmediateCloseProcess())
 
         await transport.close()
 
@@ -2341,7 +2458,7 @@ async def test_process_aclose_is_bounded_and_unconfirmed_ownership_is_retained(
         launch = _prepare(inputs)
         transport = AttestedSupervisorTransport(launch)
         process = _HangingCloseProcess()
-        transport._process = process  # type: ignore[assignment]
+        _set_transport_runtime(transport, process=process)
         started = time.monotonic()
 
         with pytest.raises(AttestationError, match="cleanup is unconfirmed"):
@@ -2360,8 +2477,7 @@ async def test_close_from_cancelled_scope_shields_cleanup_transition(
         launch = _prepare(inputs)
         transport = AttestedSupervisorTransport(launch)
         process = _HangingCloseProcess()
-        transport._process = process  # type: ignore[assignment]
-        transport._ready = True
+        _set_transport_runtime(transport, process=process, ready=True)
 
         with anyio.CancelScope() as scope:
             scope.cancel()
