@@ -1498,6 +1498,44 @@ class _BlockingSendStream:
         self.stdin_close_calls += 1
 
 
+class _DuplexMemoryStream:
+    def __init__(self, *, block_send: bool = False) -> None:
+        self.block_send = block_send
+        self.receive_entered = anyio.Event()
+        self.receive_release = anyio.Event()
+        self.send_entered = anyio.Event()
+        self.send_release = anyio.Event()
+        self.sent: list[str] = []
+        self.stdin_close_calls = 0
+        self.stdout_close_calls = 0
+        self.receive_calls = 0
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+        self.send_entered.set()
+        if self.block_send:
+            await self.send_release.wait()
+
+    async def receive(self) -> bytes:
+        self.receive_calls += 1
+        self.receive_entered.set()
+        await self.receive_release.wait()
+        return b""
+
+    async def close_stdin(self) -> None:
+        self.stdin_close_calls += 1
+
+    async def close_stdout(self) -> None:
+        self.stdout_close_calls += 1
+        self.receive_release.set()
+
+
+class _EffectThenRaiseReaderStream(_DuplexMemoryStream):
+    async def close_stdout(self) -> None:
+        self.stdout_close_calls += 1
+        raise RuntimeError("synthetic reader close effect then failure")
+
+
 def _exact_transport_forge(
     transport: AttestedSupervisorTransport,
 ) -> AttestedSupervisorTransport:
@@ -1598,6 +1636,7 @@ async def test_exact_class_forge_rejects_every_surface_before_resource_touch(
                 lambda: AttestedSupervisorTransport.end_input(forged),
                 lambda: AttestedSupervisorTransport.close(forged),
                 lambda: AttestedSupervisorTransport._bounded_stdin_close(forged),
+                lambda: AttestedSupervisorTransport._close_stdout_once(forged),
                 lambda: AttestedSupervisorTransport._bounded_process_aclose(forged),
                 lambda: AttestedSupervisorTransport._close_failed_handshake_process(
                     forged
@@ -1707,6 +1746,247 @@ async def test_close_waits_for_an_already_authorized_write_effect(
             launch.close()
 
 
+async def test_blocked_read_does_not_block_next_authorized_write(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        stream = _DuplexMemoryStream()
+        _set_transport_runtime(
+            transport,
+            stdin=stream,
+            stdout=stream,
+            ready=True,
+        )
+        reader_finished = anyio.Event()
+
+        async def read_until_eof() -> None:
+            messages = transport.read_messages()
+            with pytest.raises(StopAsyncIteration):
+                await anext(messages)
+            reader_finished.set()
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(read_until_eof)
+                await stream.receive_entered.wait()
+                tasks.start_soon(transport.write, _initialize())
+                with anyio.fail_after(0.2):
+                    await stream.send_entered.wait()
+                assert reader_finished.is_set() is False
+                stream.receive_release.set()
+            assert stream.sent == [_initialize()]
+        finally:
+            stream.receive_release.set()
+            stream.send_release.set()
+            await transport.close()
+            launch.close()
+
+
+async def test_blocked_read_is_unblocked_by_close_without_becoming_content(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        stream = _DuplexMemoryStream()
+        _set_transport_runtime(transport, stdout=stream, ready=True)
+        reader_errors: list[BaseException] = []
+        close_finished = anyio.Event()
+
+        async def blocked_reader() -> None:
+            messages = transport.read_messages()
+            try:
+                await anext(messages)
+            except BaseException as error:
+                reader_errors.append(error)
+
+        async def close_transport() -> None:
+            await transport.close()
+            close_finished.set()
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(blocked_reader)
+                await stream.receive_entered.wait()
+                tasks.start_soon(close_transport)
+                with anyio.fail_after(0.2):
+                    await close_finished.wait()
+            assert stream.stdout_close_calls == 1
+            assert len(reader_errors) == 1
+            assert isinstance(reader_errors[0], AttestationError)
+        finally:
+            stream.receive_release.set()
+            launch.close()
+
+
+async def test_two_writes_remain_serialized(tmp_path: Path) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        stream = _DuplexMemoryStream(block_send=True)
+        _set_transport_runtime(transport, stdin=stream, ready=True)
+        second_finished = anyio.Event()
+
+        async def second_write() -> None:
+            await transport.write("buffered next turn")
+            second_finished.set()
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(transport.write, _initialize())
+                await stream.send_entered.wait()
+                tasks.start_soon(second_write)
+                await anyio.sleep(0)
+                assert second_finished.is_set() is False
+                stream.send_release.set()
+            assert second_finished.is_set() is True
+            assert transport.buffered_user_write_count == 1
+        finally:
+            stream.send_release.set()
+            await transport.close()
+            launch.close()
+
+
+async def test_second_reader_serializes_without_blocking_writer(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        stream = _DuplexMemoryStream()
+        _set_transport_runtime(
+            transport,
+            stdin=stream,
+            stdout=stream,
+            ready=True,
+        )
+        readers_finished = 0
+
+        async def read_until_eof() -> None:
+            nonlocal readers_finished
+            messages = transport.read_messages()
+            with pytest.raises(StopAsyncIteration):
+                await anext(messages)
+            readers_finished += 1
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(read_until_eof)
+                await stream.receive_entered.wait()
+                tasks.start_soon(read_until_eof)
+                await anyio.sleep(0)
+                assert stream.receive_calls == 1
+                tasks.start_soon(transport.write, _initialize())
+                with anyio.fail_after(0.2):
+                    await stream.send_entered.wait()
+                stream.receive_release.set()
+            assert readers_finished == 2
+            assert stream.receive_calls == 2
+        finally:
+            stream.receive_release.set()
+            stream.send_release.set()
+            await transport.close()
+            launch.close()
+
+
+async def test_queued_write_fails_after_close_burns_authority(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        stream = _DuplexMemoryStream(block_send=True)
+        _set_transport_runtime(transport, stdin=stream, ready=True)
+        queued_errors: list[BaseException] = []
+        close_finished = anyio.Event()
+
+        async def queued_write() -> None:
+            try:
+                await transport.write("must not be buffered")
+            except BaseException as error:
+                queued_errors.append(error)
+
+        async def close_transport() -> None:
+            await transport.close()
+            close_finished.set()
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(transport.write, _initialize())
+                await stream.send_entered.wait()
+                tasks.start_soon(queued_write)
+                await anyio.sleep(0)
+                tasks.start_soon(close_transport)
+                try:
+                    with anyio.fail_after(0.2):
+                        while transport.is_ready():
+                            await anyio.sleep(0)
+                finally:
+                    stream.send_release.set()
+                await close_finished.wait()
+            assert len(queued_errors) == 1
+            assert isinstance(queued_errors[0], AttestationError)
+            assert transport.buffered_user_write_count == 0
+            assert stream.stdin_close_calls == 1
+        finally:
+            stream.send_release.set()
+            await transport.close()
+            launch.close()
+
+
+async def test_cancelled_reader_releases_reader_serialization(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        stream = _DuplexMemoryStream()
+        _set_transport_runtime(transport, stdout=stream, ready=True)
+
+        async def blocked_reader() -> None:
+            messages = transport.read_messages()
+            await anext(messages)
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(blocked_reader)
+                await stream.receive_entered.wait()
+                tasks.cancel_scope.cancel()
+
+            stream.receive_release.set()
+            messages = transport.read_messages()
+            with anyio.fail_after(0.2):
+                with pytest.raises(StopAsyncIteration):
+                    await anext(messages)
+            assert stream.receive_calls == 2
+        finally:
+            stream.receive_release.set()
+            await transport.close()
+            launch.close()
+
+
+async def test_reader_close_effect_then_raise_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        stream = _EffectThenRaiseReaderStream()
+        _set_transport_runtime(transport, stdout=stream, ready=True)
+        try:
+            with pytest.raises(RuntimeError, match="reader close effect"):
+                await transport.close()
+            assert stream.stdout_close_calls == 1
+            assert transport.cleanup_unconfirmed is True
+            with pytest.raises(AttestationError, match="transport authority"):
+                await transport.close()
+            assert stream.stdout_close_calls == 1
+        finally:
+            launch.close()
+
+
 async def test_successful_close_revokes_all_stale_transport_effects(
     tmp_path: Path,
 ) -> None:
@@ -1767,14 +2047,19 @@ async def test_transport_attribute_tampering_rejects_before_lock_or_resource(
         original_lock = transport._lock
         original_control = transport._control
         transport._lock = _LockTouchTrap()  # type: ignore[assignment]
+        object.__setattr__(transport, "_read_lock", _LockTouchTrap())
         transport._control = _ResourceTouchTrap()  # type: ignore[assignment]
         try:
             with pytest.raises(AttestationError, match="transport authority"):
                 await transport.connect()
             with pytest.raises(AttestationError, match="transport authority"):
                 await transport.close()
+            messages = transport.read_messages()
+            with pytest.raises(AttestationError, match="transport authority"):
+                await anext(messages)
         finally:
             transport._lock = original_lock
+            object.__delattr__(transport, "_read_lock")
             transport._control = original_control
             launch.close()
 
