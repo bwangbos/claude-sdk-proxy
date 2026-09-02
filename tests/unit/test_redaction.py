@@ -593,16 +593,22 @@ def test_probe_cli_redacts_unexpected_exception_messages(
     assert report["evidence"]["reason_code"] == "probe_internal_error"
 
 
-def test_cli_json_serialization_failure_uses_constant_fallback(
+@pytest.mark.parametrize(
+    ("command", "expected_name"),
+    [("prompt-purity", "purity"), ("compaction", "compaction")],
+)
+def test_cli_json_serialization_failure_uses_command_specific_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    command: str,
+    expected_name: str,
 ) -> None:
     def fail(*_args: object, **_kwargs: object) -> None:
         raise KeyboardInterrupt("CLI-JSON-SECRET")
 
     monkeypatch.setattr(probe_cli.json, "dumps", fail)
 
-    status = main(["prompt-purity"])
+    status = main([command])
     captured = capsys.readouterr()
 
     assert status != 0
@@ -610,6 +616,95 @@ def test_cli_json_serialization_failure_uses_constant_fallback(
     assert json.loads(captured.out)["evidence"] == {
         "reason_code": "redaction_failure"
     }
+    assert json.loads(captured.out)["name"] == expected_name
+
+
+@pytest.mark.parametrize(
+    ("command", "runner_name", "expected_name", "wrong_name"),
+    [
+        ("prompt-purity", "run_prompt_purity_probe", "purity", "compaction"),
+        ("compaction", "run_compaction_probe", "compaction", "purity"),
+    ],
+)
+def test_cli_rejects_runner_report_name_mismatch_as_command_specific_internal_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    runner_name: str,
+    expected_name: str,
+    wrong_name: str,
+) -> None:
+    def mismatched() -> ProbeResult:
+        return ProbeResult(
+            wrong_name,
+            False,
+            {"reason_code": "child_attestation_unavailable"},
+        )
+
+    monkeypatch.setattr(probe_cli, runner_name, mismatched)
+
+    status = main([command])
+    report = json.loads(capsys.readouterr().out)
+
+    assert status != 0
+    assert report == {
+        "schema_version": 1,
+        "name": expected_name,
+        "passed": False,
+        "evidence": {"reason_code": "probe_internal_error"},
+    }
+
+
+def test_cli_outer_fallback_derives_compaction_without_hostile_argv_repr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class HostileArgv(Sequence[str]):
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, index: int) -> str:
+            if index == 0:
+                return "compaction"
+            raise IndexError
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            raise KeyboardInterrupt("HOSTILE-ARGV-SECRET")
+
+        def __repr__(self) -> str:
+            raise AssertionError("argv repr must not be used")
+
+    status = main(HostileArgv())
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert status != 0
+    assert "HOSTILE" not in captured.out + captured.err
+    assert report["name"] == "compaction"
+    assert report["evidence"] == {"reason_code": "redaction_failure"}
+
+
+def test_cli_emit_rejects_probe_result_subclasses(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class ProbeResultSubclass(ProbeResult):
+        pass
+
+    def subclass_result() -> ProbeResult:
+        return ProbeResultSubclass(
+            "purity",
+            False,
+            {"reason_code": "child_attestation_unavailable"},
+        )
+
+    monkeypatch.setattr(probe_cli, "run_prompt_purity_probe", subclass_result)
+
+    status = main(["prompt-purity"])
+    report = json.loads(capsys.readouterr().out)
+
+    assert status != 0
+    assert report["name"] == "purity"
+    assert report["evidence"] == {"reason_code": "probe_internal_error"}
 
 
 def test_cli_output_failure_never_escapes(

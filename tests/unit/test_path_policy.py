@@ -263,6 +263,7 @@ def test_snapshot_is_metadata_only_bounded_and_rejects_unknown_paths(
     snapshot = policy.snapshot(root=RootKind.REAL_LOGIN)
 
     assert {entry.relative_path for entry in snapshot} == {
+        ".",
         ".credentials.json",
         "settings.json",
     }
@@ -282,6 +283,154 @@ def test_snapshot_enforces_entry_bound(roots: tuple[Path, Path]) -> None:
 
     with pytest.raises(PathPolicyError, match="snapshot entry limit"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
+
+
+def test_snapshot_returns_certified_root_sentinel_and_counts_it(
+    roots: tuple[Path, Path],
+) -> None:
+    policy = PathPolicy(
+        real_login_root=roots[0],
+        proxy_owned_root=roots[1],
+        max_snapshot_entries=2,
+    )
+
+    empty = policy.snapshot(root=RootKind.REAL_LOGIN)
+    assert len(empty) == 1
+    root = empty[0]
+    value = roots[0].lstat()
+    assert root.relative_path == "."
+    assert (
+        root.st_dev,
+        root.st_ino,
+        root.mode,
+        root.nlink,
+        root.size,
+        root.mtime_ns,
+    ) == (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+    )
+
+    (roots[0] / "settings.json").write_bytes(b"ONE")
+    assert {item.relative_path for item in policy.snapshot()} == {
+        ".",
+        "settings.json",
+    }
+    (roots[0] / "CLAUDE.md").write_bytes(b"TWO")
+    with pytest.raises(PathPolicyError, match="snapshot entry limit"):
+        policy.snapshot()
+
+
+def test_ambiguous_fd_close_poison_is_retained_without_numeric_retry(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = roots[0] / "settings.json"
+    target.write_bytes(b"SAFE")
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        original_close = os.close
+        close_calls = 0
+
+        def effect_then_raise(descriptor: int) -> None:
+            nonlocal close_calls
+            original_close(descriptor)
+            close_calls += 1
+            if close_calls == 1:
+                raise KeyboardInterrupt("AMBIGUOUS-FD-CLOSE")
+
+        monkeypatch.setattr("claude_sdk_proxy.path_policy.os.close", effect_then_raise)
+        poisoned = False
+        try:
+            with pytest.raises(KeyboardInterrupt, match="AMBIGUOUS-FD-CLOSE"):
+                policy.metadata(Path("settings.json"))
+            calls_after_failure = close_calls
+            try:
+                policy.metadata(Path("settings.json"))
+            except PathPolicyError:
+                poisoned = close_calls == calls_after_failure
+            os.write(
+                write_fd,
+                b"1" if poisoned else b"0",
+            )
+            original_close(write_fd)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    result = os.read(read_fd, 1)
+    os.close(read_fd)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert result == b"1"
+
+
+def test_ambiguous_scandir_close_poison_is_retained_without_retry(
+    policy: PathPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        original_scandir = os.scandir
+        injected = False
+        close_calls = 0
+
+        class EffectThenRaiseScandir:
+            def __init__(self, descriptor: int) -> None:
+                self._inner = original_scandir(descriptor)
+
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                self.close()
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return iter(self._inner)
+
+            def __next__(self):  # type: ignore[no-untyped-def]
+                return next(self._inner)
+
+            def close(self) -> None:
+                nonlocal injected, close_calls
+                self._inner.close()
+                close_calls += 1
+                if not injected:
+                    injected = True
+                    raise KeyboardInterrupt("AMBIGUOUS-SCANDIR-CLOSE")
+
+        monkeypatch.setattr(
+            "claude_sdk_proxy.path_policy.os.scandir", EffectThenRaiseScandir
+        )
+        poisoned = False
+        try:
+            with pytest.raises(KeyboardInterrupt, match="AMBIGUOUS-SCANDIR-CLOSE"):
+                policy.snapshot()
+            calls_after_failure = close_calls
+            try:
+                policy.snapshot()
+            except PathPolicyError:
+                poisoned = close_calls == calls_after_failure
+            os.write(write_fd, b"1" if poisoned else b"0")
+            os.close(write_fd)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    result = os.read(read_fd, 1)
+    os.close(read_fd)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert result == b"1"
 
 
 def test_snapshot_rejects_leaf_replacement_before_admitting_metadata(
