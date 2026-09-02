@@ -244,6 +244,64 @@ def test_unavailable_model_probe_fails_its_pending_gate_before_propagating(
         gate.finish()
 
 
+def test_abort_pending_clears_content_and_permanently_fails_the_gate() -> None:
+    gate = identity_gate()
+    assert gate.observe(text_delta("never-release")) == ()
+
+    assert gate.abort_pending() is None
+    assert gate.released_content_count == 0
+    with pytest.raises(ModelIdentityError, match="has failed"):
+        gate.observe(message_start(model=_EXACT_MODEL_ID))
+    with pytest.raises(ModelIdentityError, match="has failed"):
+        gate.finish()
+    with pytest.raises(ModelIdentityError, match="pending"):
+        gate.abort_pending()
+
+
+def test_abort_pending_rejects_verified_gate_without_changing_its_state() -> None:
+    gate = identity_gate()
+    identity = message_start(model=_EXACT_MODEL_ID)
+    assert gate.observe(identity) == (identity,)
+
+    with pytest.raises(ModelIdentityError, match="pending"):
+        gate.abort_pending()
+
+    assert gate.finish() is None
+
+
+def test_unavailable_model_probe_propagates_unexpected_discharge_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unexpected = ModelIdentityError("unexpected cleanup invariant failure")
+
+    class InvariantFailingGate:
+        def finish(self) -> None:
+            raise unexpected
+
+        def abort_pending(self) -> None:
+            raise unexpected
+
+    def return_invariant_failing_gate(
+        *,
+        model_aliases: attestation.ExactModelAliasMap,
+        public_alias: str,
+    ) -> InvariantFailingGate:
+        return InvariantFailingGate()
+
+    monkeypatch.setattr(probes, "ModelIdentityGate", return_invariant_failing_gate)
+
+    with pytest.raises(
+        ModelIdentityError,
+        match="unexpected cleanup invariant failure",
+    ) as captured:
+        probes.run_stream_probe(
+            model_aliases=exact_model_aliases(),
+            public_alias="sonnet",
+        )
+
+    assert captured.value is unexpected
+
+
 def test_gate_accepts_only_a_configured_alias_lookup_not_a_raw_backend_id() -> None:
     aliases = exact_model_aliases()
     gate = identity_gate(aliases=aliases, public_alias="sonnet")
