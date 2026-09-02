@@ -7,6 +7,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 import claude_sdk_proxy.attestation as attestation
+import claude_sdk_proxy.probes as probes
 from claude_sdk_proxy.attestation import (
     CanonicalEvent,
     ModelIdentityError,
@@ -203,15 +204,44 @@ def test_finish_before_identity_clears_pending_content_and_fails_closed() -> Non
         gate.finish()
 
 
-def test_verified_finish_is_one_shot_safe_and_closes_observation() -> None:
+def test_verified_finish_succeeds_once_then_rejects_every_later_action() -> None:
     gate = identity_gate()
     identity = message_start(model="claude-sonnet-4-5-exact")
     assert gate.observe(identity) == (identity,)
 
     assert gate.finish() is None
-    assert gate.finish() is None
+    released_content_count = gate.released_content_count
+    with pytest.raises(ModelIdentityError, match="already finished"):
+        gate.finish()
+    assert gate.released_content_count == released_content_count
     with pytest.raises(ModelIdentityError, match="model identity"):
         gate.observe(text_delta("late"))
+
+
+def test_unavailable_model_probe_fails_its_pending_gate_before_propagating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = identity_gate()
+
+    def return_pending_gate(
+        *,
+        model_aliases: attestation.ExactModelAliasMap,
+        public_alias: str,
+    ) -> ModelIdentityGate:
+        return gate
+
+    monkeypatch.setattr(probes, "ModelIdentityGate", return_pending_gate)
+
+    with pytest.raises(ProbeUnavailable, match="child_attestation_unavailable"):
+        probes.run_stream_probe(
+            model_aliases=exact_model_aliases(),
+            public_alias="sonnet",
+        )
+
+    with pytest.raises(ModelIdentityError, match="has failed"):
+        gate.observe(message_start(model=_EXACT_MODEL_ID))
+    with pytest.raises(ModelIdentityError, match="has failed"):
+        gate.finish()
 
 
 def test_gate_accepts_only_a_configured_alias_lookup_not_a_raw_backend_id() -> None:
