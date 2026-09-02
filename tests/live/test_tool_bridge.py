@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import os
+from typing import Literal, cast
 
 import pytest
 
 from claude_sdk_proxy.attestation import current_attestation_availability
 from claude_sdk_proxy.probes import run_tool_bridge_probe
+from claude_sdk_proxy.usage_evidence import (
+    UsageEvidenceSchema,
+    UsageOperationClass,
+    UsageTupleKey,
+)
 
 pytestmark = [pytest.mark.live, pytest.mark.anyio]
 
@@ -45,9 +51,21 @@ async def test_identical_parallel_calls_correlate_in_reverse() -> None:
 async def test_tool_usage_rows_have_exhaustive_dialect_verdicts(
     operation_class: str,
 ) -> None:
-    result = await run_tool_bridge_probe(_exact_model(), "usage_rows", 1)
-    schema = result.evidence["usage_schema"]
-    row = schema.only_tool_row(operation_class)  # type: ignore[union-attr]
+    model_id = _exact_model()
+    result = await run_tool_bridge_probe(model_id, "usage_rows", 1)
+    schema = cast(UsageEvidenceSchema, result.evidence["usage_schema"])
+    expected_key = UsageTupleKey(
+        runtime_digest=cast(str, result.evidence["runtime_digest"]),
+        backend_model_id=model_id,
+        thinking_mode=cast(
+            Literal["null", "disabled", "adaptive", "enabled"],
+            result.evidence["thinking_mode"],
+        ),
+        effort=cast(str | None, result.evidence["effort"]),
+        budget_tokens=cast(int | None, result.evidence["budget_tokens"]),
+        operation_class=UsageOperationClass(operation_class),
+    )
+    row = schema.only_tool_row(expected_key)
 
     assert row.sdk_shape_passed is True
     assert {mapping.dialect.value for mapping in row.dialect_mappings} == {

@@ -8,9 +8,18 @@ from dataclasses import FrozenInstanceError, dataclass, fields
 import pytest
 
 import claude_sdk_proxy.probes as probes
-from claude_sdk_proxy.attestation import current_attestation_availability
+from claude_sdk_proxy.attestation import (
+    ExactModelAliasMap,
+    ModelIdentityError,
+    current_attestation_availability,
+)
 from claude_sdk_proxy.platform import MountIdentity
 from claude_sdk_proxy.probes import ProbeUnavailable, run_tool_bridge_probe
+from claude_sdk_proxy.usage_evidence import (
+    EvidenceSchemaError,
+    UsageOperationClass,
+    UsageTupleKey,
+)
 from claude_sdk_proxy.validated import (
     REQUIRED_SDK_TOOL_GATES,
     SdkMcpNamingRule,
@@ -367,6 +376,96 @@ def test_runtime_process_model_and_mount_types_fail_closed(
 
     with pytest.raises(SdkToolEvidenceError):
         SdkToolEvidenceRecord.from_json(record)
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "claude-sonnet-4-5-20250929",
+        "claude-opus-4-1-exact",
+        "claude-haiku-3-5-20250101",
+        "backend-model-exact-1",
+    ],
+)
+def test_all_exact_model_schemas_accept_the_same_valid_ids(model_id: str) -> None:
+    aliases = ExactModelAliasMap({"model": model_id})
+    usage_key = UsageTupleKey(
+        runtime_digest="11" * 32,
+        backend_model_id=model_id,
+        thinking_mode="null",
+        effort=None,
+        budget_tokens=None,
+        operation_class=UsageOperationClass.ORDINARY,
+    )
+    record_json = _sdk_tool_record_json()
+    key_json = record_json["key"]
+    assert isinstance(key_json, dict)
+    key_json["backend_model_id"] = model_id
+    record = SdkToolEvidenceRecord.from_json(record_json)
+
+    assert aliases.resolve("model") == model_id
+    assert usage_key.backend_model_id == model_id
+    assert record.key.backend_model_id == model_id
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "claude-sonnet-beta",
+        "claude-opus-4-1-beta",
+        "claude-haiku-alpha",
+        "claude-sonnet-4-5-latest",
+        "claude-3-5-sonnet",
+        "sonnet",
+        "",
+        "claude-sonnet-ß",
+        "x" * 257,
+    ],
+)
+def test_all_exact_model_schemas_reject_the_same_invalid_ids(
+    model_id: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError, ModelIdentityError)):
+        ExactModelAliasMap({"model": model_id})
+    with pytest.raises(EvidenceSchemaError):
+        UsageTupleKey(
+            runtime_digest="11" * 32,
+            backend_model_id=model_id,
+            thinking_mode="null",
+            effort=None,
+            budget_tokens=None,
+            operation_class=UsageOperationClass.ORDINARY,
+        )
+    record_json = _sdk_tool_record_json()
+    key_json = record_json["key"]
+    assert isinstance(key_json, dict)
+    key_json["backend_model_id"] = model_id
+    with pytest.raises(SdkToolEvidenceError):
+        SdkToolEvidenceRecord.from_json(record_json)
+
+
+def test_all_exact_model_schemas_reject_string_subclasses() -> None:
+    class Text(str):
+        pass
+
+    model_id = Text("claude-sonnet-4-5-20250929")
+    with pytest.raises(TypeError, match="exact text"):
+        ExactModelAliasMap({"model": model_id})
+    with pytest.raises(EvidenceSchemaError, match="backend model"):
+        UsageTupleKey(
+            runtime_digest="11" * 32,
+            backend_model_id=model_id,
+            thinking_mode="null",
+            effort=None,
+            budget_tokens=None,
+            operation_class=UsageOperationClass.ORDINARY,
+        )
+    record_json = _sdk_tool_record_json()
+    key_json = record_json["key"]
+    assert isinstance(key_json, dict)
+    key_json["backend_model_id"] = model_id
+    with pytest.raises(SdkToolEvidenceError):
+        SdkToolEvidenceRecord.from_json(record_json)
 
 
 def test_manifest_rejects_duplicate_exact_keys_but_isolates_every_key_dimension(

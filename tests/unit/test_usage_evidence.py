@@ -18,6 +18,7 @@ from claude_sdk_proxy.usage_evidence import (
     UsageMappingFailure,
     UsageOperationClass,
     UsageScalarKind,
+    UsageTupleKey,
 )
 
 
@@ -690,7 +691,15 @@ def test_exact_tool_operation_rows_reuse_the_same_exhaustive_mapping_validator(
     schema = _load(*rows)
 
     for operation_class in ("tool_use_boundary", "post_tool_result"):
-        row = schema.only_tool_row(operation_class)
+        expected_key = UsageTupleKey(
+            runtime_digest="11" * 32,
+            backend_model_id="claude-sonnet-4-5-20250929",
+            thinking_mode="null",
+            effort=None,
+            budget_tokens=None,
+            operation_class=UsageOperationClass(operation_class),
+        )
+        row = schema.only_tool_row(expected_key)
         assert row.key.operation_class.value == operation_class
         assert row.sdk_shape_passed is True
         assert {mapping.dialect.value for mapping in row.dialect_mappings} == {
@@ -712,7 +721,15 @@ def test_false_tool_dialect_mapping_does_not_weaken_the_sdk_shape_or_other_diale
     row["key"]["operation_class"] = "tool_use_boundary"
     _false_mapping(row, "openai", "unrepresentable_sdk_field")
     schema = _load(row)
-    tool_row = schema.only_tool_row(UsageOperationClass.TOOL_USE_BOUNDARY)
+    expected_key = UsageTupleKey(
+        runtime_digest="11" * 32,
+        backend_model_id="claude-sonnet-4-5-20250929",
+        thinking_mode="null",
+        effort=None,
+        budget_tokens=None,
+        operation_class=UsageOperationClass.TOOL_USE_BOUNDARY,
+    )
+    tool_row = schema.only_tool_row(expected_key)
 
     assert tool_row.sdk_shape_passed is True
     assert schema.require_mapping(tool_row.key, UsageDialect.ANTHROPIC)
@@ -727,15 +744,47 @@ def test_only_tool_row_never_falls_back_across_process_model_or_operation(
     assert isinstance(boundary["key"], dict)
     boundary["key"]["operation_class"] = "tool_use_boundary"
     schema = _load(boundary)
+    exact = UsageTupleKey(
+        runtime_digest="11" * 32,
+        backend_model_id="claude-sonnet-4-5-20250929",
+        thinking_mode="null",
+        effort=None,
+        budget_tokens=None,
+        operation_class=UsageOperationClass.TOOL_USE_BOUNDARY,
+    )
 
-    with pytest.raises(EvidenceSchemaError, match="tool operation row"):
-        schema.only_tool_row("post_tool_result")
+    for wrong in (
+        replace(exact, runtime_digest="22" * 32),
+        replace(exact, backend_model_id="claude-opus-4-1-20250805"),
+        replace(exact, thinking_mode="disabled"),
+        replace(
+            exact,
+            thinking_mode="enabled",
+            effort="high",
+            budget_tokens=4096,
+        ),
+        replace(
+            exact,
+            thinking_mode="enabled",
+            effort="high",
+            budget_tokens=4097,
+        ),
+        replace(exact, operation_class=UsageOperationClass.POST_TOOL_RESULT),
+    ):
+        with pytest.raises(EvidenceSchemaError, match="exact tool operation row"):
+            schema.only_tool_row(wrong)
     with pytest.raises(EvidenceSchemaError, match="tool operation class"):
-        schema.only_tool_row("ordinary")
+        schema.only_tool_row(
+            replace(exact, operation_class=UsageOperationClass.ORDINARY)
+        )
+    with pytest.raises(EvidenceSchemaError, match="UsageTupleKey"):
+        schema.only_tool_row("tool_use_boundary")  # type: ignore[arg-type]
 
     other_model = copy.deepcopy(boundary)
     assert isinstance(other_model["key"], dict)
     other_model["key"]["backend_model_id"] = "claude-opus-4-1-20250805"
-    ambiguous = _load(boundary, other_model)
-    with pytest.raises(EvidenceSchemaError, match="exactly one"):
-        ambiguous.only_tool_row("tool_use_boundary")
+    two_models = _load(boundary, other_model)
+    assert two_models.only_tool_row(exact).key == exact
+    assert two_models.only_tool_row(
+        replace(exact, backend_model_id="claude-opus-4-1-20250805")
+    ).key.backend_model_id == "claude-opus-4-1-20250805"
