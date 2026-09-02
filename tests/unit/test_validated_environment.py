@@ -435,6 +435,36 @@ def _load_document(tmp_path: Path, document: dict[str, object]):
     return load_manifest(path)
 
 
+def _complete_synthetic_collection(
+    run: object,
+    document: dict[str, object] | None = None,
+):
+    candidate = copy.deepcopy(document or _manifest_document())
+    candidate["validated_at"] = run.validated_at  # type: ignore[attr-defined]
+    gates = candidate["core_gates"]
+    assert isinstance(gates, dict)
+    observations = tuple(
+        run.observe_gate(  # type: ignore[attr-defined]
+            gate,
+            gates[gate],
+            {"gate": gate, "source": "synthetic_fixture"},
+        )
+        for gate in sorted(CORE_GATES)
+    )
+    return run.complete(candidate, observations)  # type: ignore[attr-defined]
+
+
+def _enable_synthetic_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Available:
+        core_gate_available = True
+
+    monkeypatch.setenv("RUN_LIVE_CLAUDE_TESTS", "1")
+    monkeypatch.setattr(probe_cli, "CURRENT_POLICY_PERSONAL_LOCAL_USE_ALLOWED", True)
+    monkeypatch.setattr(
+        probe_cli, "current_attestation_availability", lambda: Available()
+    )
+
+
 def test_committed_manifest_has_every_core_domain_and_honest_false_verdict() -> None:
     manifest = load_manifest(Path("docs/feasibility/validated-environment.json"))
 
@@ -994,6 +1024,252 @@ def test_caller_policy_acknowledgment_is_not_policy_proof(
     assert not output.exists()
 
 
+def test_current_all_stops_before_collector_writer_or_output_touch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def forbidden_collector(_run: object) -> object:
+        calls.append("collector")
+        raise AssertionError("collector must remain unreachable")
+
+    def forbidden_writer(
+        _path: Path, _document: object, *, authorization: object | None = None
+    ) -> None:
+        del authorization
+        calls.append("writer")
+        raise AssertionError("writer must remain unreachable")
+
+    monkeypatch.setenv("RUN_LIVE_CLAUDE_TESTS", "1")
+    monkeypatch.setattr(
+        probe_cli,
+        "_production_manifest_collector",
+        forbidden_collector,
+        raising=False,
+    )
+    monkeypatch.setattr(validated, "_atomic_write_manifest", forbidden_writer)
+    output = tmp_path / "must-not-exist.json"
+
+    status = probe_cli.main(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert status != 0
+    assert calls == []
+    assert not output.exists()
+
+
+def test_synthetic_affirmative_all_collects_writes_reloads_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_synthetic_all(monkeypatch)
+    calls: list[str] = []
+    real_writer = validated._atomic_write_manifest
+    real_loader = validated.load_manifest
+
+    def collector(run: object):
+        calls.append("collector")
+        return _complete_synthetic_collection(run)
+
+    def observing_writer(
+        path: Path, document: object, *, authorization: object | None = None
+    ) -> None:
+        calls.append("writer")
+        real_writer(path, document, authorization=authorization)
+
+    def observing_loader(path: Path):
+        calls.append("reload")
+        return real_loader(path)
+
+    monkeypatch.setattr(validated, "_atomic_write_manifest", observing_writer)
+    monkeypatch.setattr(validated, "load_manifest", observing_loader)
+    output = tmp_path / "validated.json"
+
+    status = probe_cli._run_all(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(output),
+        ],
+        collector=collector,
+    )
+
+    assert status == 0
+    assert calls == ["collector", "writer", "reload"]
+    manifest = real_loader(output)
+    require_core_gates(manifest)
+    assert output.read_bytes() == canonical_evidence_json(manifest.to_json()) + b"\n"
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_complete_collection_requires_every_gate_from_one_run() -> None:
+    run = validated.ManifestCollectionRun.begin()
+    candidate = _manifest_document()
+    candidate["validated_at"] = run.validated_at
+    gates = candidate["core_gates"]
+    assert isinstance(gates, dict)
+    observations = [
+        run.observe_gate(
+            gate,
+            gates[gate],
+            {"gate": gate, "source": "synthetic_fixture"},
+        )
+        for gate in sorted(CORE_GATES)
+    ]
+
+    with pytest.raises(ManifestError, match="complete gate observation"):
+        run.complete(candidate, tuple(observations[:-1]))
+
+    other = validated.ManifestCollectionRun.begin()
+    observations[-1] = other.observe_gate(
+        observations[-1].gate,
+        observations[-1].passed,
+        {"gate": observations[-1].gate, "source": "synthetic_fixture"},
+    )
+    with pytest.raises(ManifestError, match="collection run"):
+        run.complete(candidate, tuple(observations))
+
+
+def test_atomic_writer_requires_authorization_to_replace_existing_output(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "validated.json"
+    output.write_bytes(b"original\n")
+
+    with pytest.raises(ManifestError, match="replacement authorization"):
+        validated._atomic_write_manifest(output, {"replacement": True})
+
+    assert output.read_bytes() == b"original\n"
+
+
+def test_atomic_writer_rejects_changed_output_after_authorization(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "validated.json"
+    original = _manifest_document()
+    _write_document(output, original)
+    collection = _complete_synthetic_collection(
+        validated.ManifestCollectionRun.begin(),
+        _manifest_document(models={"opus": _OTHER_MODEL}),
+    )
+    authorization = validated._authorize_manifest_output(output, collection)
+    output.write_bytes(b"changed-after-authorization\n")
+
+    with pytest.raises(ManifestError, match="changed after authorization"):
+        validated._atomic_write_manifest(
+            output,
+            collection.manifest.to_json(),
+            authorization=authorization,
+        )
+
+    assert output.read_bytes() == b"changed-after-authorization\n"
+
+
+def test_complete_collection_can_replace_a_mismatched_existing_tuple(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_synthetic_all(monkeypatch)
+    output = tmp_path / "validated.json"
+    _write_document(output, _manifest_document())
+
+    def collector(run: object):
+        return _complete_synthetic_collection(
+            run,
+            _manifest_document(models={"opus": _OTHER_MODEL}),
+        )
+
+    status = probe_cli._run_all(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(output),
+        ],
+        collector=collector,
+    )
+
+    assert status == 0
+    assert load_manifest(output).model_map == {"opus": _OTHER_MODEL}
+
+
+def test_all_rejects_complete_false_core_collection_before_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_synthetic_all(monkeypatch)
+    called = False
+
+    def collector(run: object):
+        return _complete_synthetic_collection(
+            run,
+            _manifest_document(
+                all_core_gates=False,
+                ordinary_usage_passed=False,
+            ),
+        )
+
+    def forbidden_writer(
+        _path: Path, _document: object, *, authorization: object | None = None
+    ) -> None:
+        del authorization
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(validated, "_atomic_write_manifest", forbidden_writer)
+    output = tmp_path / "must-not-exist.json"
+
+    status = probe_cli._run_all(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(output),
+        ],
+        collector=collector,
+    )
+
+    assert status != 0
+    assert called is False
+    assert not output.exists()
+
+
+def test_all_returns_failure_when_post_write_reload_is_not_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_synthetic_all(monkeypatch)
+
+    def collector(run: object):
+        return _complete_synthetic_collection(run)
+
+    def corrupting_writer(
+        path: Path, _document: object, *, authorization: object | None = None
+    ) -> None:
+        del authorization
+        path.write_bytes(b"{}\n")
+        path.chmod(0o600)
+
+    monkeypatch.setattr(validated, "_atomic_write_manifest", corrupting_writer)
+    output = tmp_path / "invalid.json"
+
+    status = probe_cli._run_all(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(output),
+        ],
+        collector=collector,
+    )
+
+    assert status != 0
+    assert output.read_bytes() == b"{}\n"
+
+
 def test_hostile_mapping_subclasses_are_rejected_without_iteration(
     tmp_path: Path,
 ) -> None:
@@ -1099,14 +1375,19 @@ def test_probe_all_rejects_nonexact_invocation_without_writing(tmp_path: Path) -
         assert not output.exists()
 
 
-def test_manifest_file_mode_is_private() -> None:
-    path = Path("docs/feasibility/validated-environment.json")
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-
-
 def test_resolver_rejects_nonexact_digest_values() -> None:
     with pytest.raises(ManifestError, match="prerequisite digest"):
         Phase0PrerequisiteDigestResolver({("sonnet", _MODEL): "not-a-digest"})
+
+
+def test_resolver_constructor_rejects_duplicate_backend_ids() -> None:
+    with pytest.raises(ManifestError, match="ambiguous exact backend model"):
+        Phase0PrerequisiteDigestResolver(
+            {
+                ("first", _MODEL): "aa" * 32,
+                ("second", _MODEL): "bb" * 32,
+            }
+        )
 
 
 def test_canonical_encoder_preserves_array_order() -> None:
@@ -1688,11 +1969,6 @@ def test_sdk_digest_rejects_record_subclasses(tmp_path: Path) -> None:
 
     with pytest.raises(ManifestError, match="SDK tool record schema"):
         sdk_tool_record_digest(record.__class__.__new__(RecordSubclass))
-
-
-def test_manifest_output_file_is_not_world_readable() -> None:
-    mode = Path("docs/feasibility/validated-environment.json").stat().st_mode
-    assert mode & (stat.S_IRWXG | stat.S_IRWXO) == 0
 
 
 def test_all_command_rejects_string_subclasses_without_writing(tmp_path: Path) -> None:
