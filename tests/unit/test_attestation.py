@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import shutil
 import signal
 import socket
 import struct
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -1536,6 +1538,25 @@ class _EffectThenRaiseReaderStream(_DuplexMemoryStream):
         raise RuntimeError("synthetic reader close effect then failure")
 
 
+def _local_pipe_process(
+    tmp_path: Path,
+    program: str,
+) -> implementation._OwnedSupervisorProcess:
+    return implementation._OwnedSupervisorProcess(
+        (sys.executable, "-c", program),
+        cwd=tmp_path,
+        environment={},
+        inherited_fds=(),
+    )
+
+
+async def _close_and_reap_local_pipe_process(
+    process: implementation._OwnedSupervisorProcess,
+) -> None:
+    await process.aclose()
+    await anyio.to_thread.run_sync(lambda: process._popen.wait(timeout=1))
+
+
 def _exact_transport_forge(
     transport: AttestedSupervisorTransport,
 ) -> AttestedSupervisorTransport:
@@ -1984,6 +2005,197 @@ async def test_reader_close_effect_then_raise_is_not_retried(
                 await transport.close()
             assert stream.stdout_close_calls == 1
         finally:
+            launch.close()
+
+
+async def test_cancelled_real_pipe_read_cannot_consume_next_reader_message(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path / "launch") as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        process = _local_pipe_process(
+            tmp_path,
+            "import sys; "
+            "sys.stdin.buffer.read(1); "
+            "sys.stdout.write('{\"next\":1}\\n'); "
+            "sys.stdout.flush()",
+        )
+        _set_transport_runtime(transport, stdout=process, ready=True)
+        first_reader_started = anyio.Event()
+
+        async def cancelled_reader() -> None:
+            messages = transport.read_messages()
+            first_reader_started.set()
+            await anext(messages)
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(cancelled_reader)
+                await first_reader_started.wait()
+                await anyio.sleep(0.05)
+                tasks.cancel_scope.cancel()
+
+            await process.send("x")
+            messages = transport.read_messages()
+            with anyio.fail_after(0.5):
+                assert await anext(messages) == {"next": 1}
+            await messages.aclose()
+        finally:
+            try:
+                await transport.close()
+            finally:
+                await _close_and_reap_local_pipe_process(process)
+                launch.close()
+
+
+async def test_real_pipe_read_retries_readiness_race_after_eagain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _launch_inputs(tmp_path / "launch") as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        process = _local_pipe_process(
+            tmp_path,
+            "import sys; "
+            "sys.stdin.buffer.read(1); "
+            "sys.stdout.write('{\"race\":2}\\n'); "
+            "sys.stdout.flush()",
+        )
+        _set_transport_runtime(transport, stdout=process, ready=True)
+        descriptor = process._stdout.fileno()
+        real_read = os.read
+        injected = False
+
+        def eagain_once(fd: int, size: int) -> bytes:
+            nonlocal injected
+            if fd == descriptor and not injected:
+                injected = True
+                raise BlockingIOError(errno.EAGAIN, "synthetic readiness race")
+            return real_read(fd, size)
+
+        monkeypatch.setattr(implementation.os, "read", eagain_once)
+        try:
+            await process.send("x")
+            messages = transport.read_messages()
+            with anyio.fail_after(0.5):
+                assert await anext(messages) == {"race": 2}
+            await messages.aclose()
+            assert injected is True
+        finally:
+            try:
+                await transport.close()
+            finally:
+                await _close_and_reap_local_pipe_process(process)
+                launch.close()
+
+
+async def test_real_pipe_partial_line_is_assembled_without_blocking_loop(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path / "launch") as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        process = _local_pipe_process(
+            tmp_path,
+            "import sys,time; "
+            "sys.stdin.buffer.read(1); "
+            "sys.stdout.write('{\"partial\":'); sys.stdout.flush(); "
+            "time.sleep(0.05); "
+            "sys.stdout.write('3}\\n'); sys.stdout.flush()",
+        )
+        _set_transport_runtime(transport, stdout=process, ready=True)
+        try:
+            await process.send("x")
+            messages = transport.read_messages()
+            with anyio.fail_after(0.5):
+                assert await anext(messages) == {"partial": 3}
+            await messages.aclose()
+        finally:
+            try:
+                await transport.close()
+            finally:
+                await _close_and_reap_local_pipe_process(process)
+                launch.close()
+
+
+async def test_real_pipe_flags_are_nonblocking_and_restored_before_close(
+    tmp_path: Path,
+) -> None:
+    process = _local_pipe_process(
+        tmp_path,
+        "import sys; sys.stdin.buffer.read()",
+    )
+    descriptor = process._stdout.fileno()
+    observer = os.dup(descriptor)
+    try:
+        assert os.get_blocking(observer) is False
+        await process.close_stdout()
+        assert os.get_blocking(observer) is True
+    finally:
+        os.close(observer)
+        await _close_and_reap_local_pipe_process(process)
+
+
+async def test_registered_stdout_rejects_nonblocking_flag_tampering(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path / "launch") as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        process = _local_pipe_process(
+            tmp_path,
+            "import sys; sys.stdin.buffer.read()",
+        )
+        _set_transport_runtime(transport, stdout=process, ready=True)
+        descriptor = process._stdout.fileno()
+        os.set_blocking(descriptor, True)
+        try:
+            with pytest.raises(AttestationError, match="authority"):
+                transport.is_ready()
+        finally:
+            os.set_blocking(descriptor, False)
+            try:
+                await transport.close()
+            finally:
+                await _close_and_reap_local_pipe_process(process)
+                launch.close()
+
+
+async def test_close_interrupts_real_pipe_read_without_abandoned_consumer(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path / "launch") as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        process = _local_pipe_process(
+            tmp_path,
+            "import sys; sys.stdin.buffer.read()",
+        )
+        _set_transport_runtime(transport, stdout=process, ready=True)
+        reader_started = anyio.Event()
+        reader_errors: list[BaseException] = []
+
+        async def blocked_reader() -> None:
+            messages = transport.read_messages()
+            reader_started.set()
+            try:
+                await anext(messages)
+            except BaseException as error:
+                reader_errors.append(error)
+
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(blocked_reader)
+                await reader_started.wait()
+                await anyio.sleep(0.05)
+                with anyio.fail_after(0.5):
+                    await transport.close()
+            assert len(reader_errors) == 1
+            assert isinstance(reader_errors[0], AttestationError)
+        finally:
+            await _close_and_reap_local_pipe_process(process)
             launch.close()
 
 
