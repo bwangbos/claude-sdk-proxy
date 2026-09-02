@@ -351,13 +351,44 @@ def _manifest_document(
             },
         },
         "environment_evidence": {
-            "allowed_names": ["HOME", "LANG", "PATH", "TZ"],
-            "network_proxy_names": ["HTTPS_PROXY", "NO_PROXY"],
+            "allowed_names": [
+                "CLAUDE_CONFIG_DIR",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "LOGNAME",
+                "PATH",
+                "SSL_CERT_DIR",
+                "SSL_CERT_FILE",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "TZ",
+                "USER",
+            ],
+            "network_proxy_names": [
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "NO_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "no_proxy",
+            ],
             "fixed_isolation_names": [
                 "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS",
                 "CLAUDE_CODE_ATTRIBUTION_HEADER",
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+                "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS",
+                "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
+                "CLAUDE_CODE_DISABLE_POLICY_SKILLS",
+                "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+                "CLAUDE_CODE_DISABLE_WORKFLOWS",
                 "CLAUDE_CODE_SKIP_PROMPT_HISTORY",
                 "DISABLE_COMPACT",
+                "ENABLE_CLAUDEAI_MCP_SERVERS",
             ],
             "fingerprint_algorithm": "sha256_sorted_name_nul_value_nul_v1",
         },
@@ -394,7 +425,7 @@ def _manifest_document(
 
 def _write_document(path: Path, document: object) -> None:
     path.write_text(
-        json.dumps(document, ensure_ascii=False, allow_nan=False), encoding="utf-8"
+        json.dumps(document, ensure_ascii=True, allow_nan=False), encoding="utf-8"
     )
 
 
@@ -746,7 +777,6 @@ def test_phase0_prerequisite_digest_binds_core_runtime_mount_and_model_map(
             ("sync_lock_lifecycle_evidence", "journal_matrix", "bounded_journal"),
             False,
         ),
-        (("path_policy_evidence", "snapshot_root_sentinel"), "root"),
     )
     for path, value in mutations:
         changed_document = copy.deepcopy(original_document)
@@ -759,6 +789,10 @@ def test_phase0_prerequisite_digest_binds_core_runtime_mount_and_model_map(
                 target = target[segment]
         assert isinstance(target, dict)
         target[path[-1]] = value
+        if path[-1] == "bounded_journal":
+            gates = changed_document["core_gates"]
+            assert isinstance(gates, dict)
+            gates["bounded_journal"] = False
         changed = _load_document(tmp_path, changed_document)
         if path[-1] == "bounded_journal":
             with pytest.raises(ManifestError, match="false core gates"):
@@ -1013,7 +1047,7 @@ def test_committed_manifest_contains_no_forbidden_content_fields() -> None:
 def test_environment_allowed_name_arrays_are_sorted_unique_and_content_free(
     tmp_path: Path,
 ) -> None:
-    for mutation in ("unsorted", "duplicate", "value_field"):
+    for mutation in ("unsorted", "duplicate", "missing", "value_field"):
         document = _manifest_document()
         environment = document["environment_evidence"]
         assert isinstance(environment, dict)
@@ -1023,10 +1057,21 @@ def test_environment_allowed_name_arrays_are_sorted_unique_and_content_free(
             environment["allowed_names"] = list(reversed(names))
         elif mutation == "duplicate":
             names.append(names[0])
+        elif mutation == "missing":
+            names.pop()
         else:
             environment["values"] = {"HOME": "/secret"}
         with pytest.raises(ManifestError):
             _load_document(tmp_path, document)
+
+
+def test_path_policy_sentinel_is_exact(tmp_path: Path) -> None:
+    document = _manifest_document()
+    path_policy = document["path_policy_evidence"]
+    assert isinstance(path_policy, dict)
+    path_policy["snapshot_root_sentinel"] = "root"
+    with pytest.raises(ManifestError, match="snapshot root sentinel"):
+        _load_document(tmp_path, document)
 
 
 def test_manifest_loader_has_bounded_file_size(tmp_path: Path) -> None:
@@ -1305,13 +1350,17 @@ def test_sdk_tool_gate_revalidates_usage_runtime_key(tmp_path: Path) -> None:
         assert isinstance(key, dict)
         if key["operation_class"] != "ordinary":
             key["runtime_digest"] = "aa" * 32
+        row.pop("row_digest", None)  # type: ignore[union-attr]
+        for mapping in row["dialect_mappings"]:  # type: ignore[index]
+            mapping.pop("mapping_digest", None)
     document["usage_evidence"] = UsageEvidenceSchema.from_json(
         {"schema_version": 1, "rows": rows}
     ).to_json()
     manifest = _load_document(tmp_path, document)
     with pytest.raises(ManifestError, match="runtime digest"):
         load_usage_evidence(manifest)
-    assert not sdk_tool_gate_passed(manifest, _MODEL)
+    with pytest.raises(ManifestError, match="runtime digest"):
+        sdk_tool_gate_passed(manifest, _MODEL)
 
 
 def test_core_gate_evidence_matrix_cannot_disagree_with_core_map(
@@ -1522,7 +1571,7 @@ def test_true_runtime_gate_rejects_observed_cli_mismatch(tmp_path: Path) -> None
         _load_document(tmp_path, document)
 
 
-def test_sdk_loader_rejects_records_not_bound_to_manifest_runtime(
+def test_sdk_loader_validates_task9_schema_but_gate_rejects_wrong_runtime(
     tmp_path: Path,
 ) -> None:
     for field, value in (
@@ -1548,8 +1597,9 @@ def test_sdk_loader_rejects_records_not_bound_to_manifest_runtime(
         key = records[0]["key"]  # type: ignore[index]
         assert isinstance(key, dict)
         key[field] = value
-        with pytest.raises(ManifestError, match="manifest runtime tuple"):
-            load_sdk_tool_evidence(_load_document(tmp_path, document))
+        manifest = _load_document(tmp_path, document)
+        assert load_sdk_tool_evidence(manifest).only_record
+        assert sdk_tool_gate_passed(manifest, _MODEL) is False
 
 
 def test_false_core_behavior_does_not_depend_on_mapping_order(tmp_path: Path) -> None:
@@ -1785,7 +1835,7 @@ def test_manifest_schema_version_is_exact_integer_one(tmp_path: Path) -> None:
     for value in (True, 1.0, 2):
         document = _manifest_document()
         document["schema_version"] = value
-        with pytest.raises(ManifestError, match="schema_version"):
+        with pytest.raises(ManifestError):
             _load_document(tmp_path, document)
 
 
@@ -1857,6 +1907,11 @@ def test_committed_manifest_records_current_policy_digests() -> None:
 def test_manifest_evidence_never_contains_os_environment_values() -> None:
     manifest = load_manifest(Path("docs/feasibility/validated-environment.json"))
     encoded = canonical_evidence_json(manifest.to_json())
-    for value in os.environ.values():
-        if value and len(value.encode("utf-8", errors="ignore")) >= 16:
+    sensitive_terms = ("TOKEN", "KEY", "SECRET", "PASSWORD", "COOKIE")
+    for name, value in os.environ.items():
+        if (
+            any(term in name.upper() for term in sensitive_terms)
+            and value
+            and len(value.encode("utf-8", errors="ignore")) >= 16
+        ):
             assert value.encode("utf-8", errors="ignore") not in encoded

@@ -50,3 +50,52 @@ offer existing Claude-login subscription access; the overview specifically
 limits unapproved third-party offerings. This fail-closed result disables live
 subscription probes unless current primary policy evidence later supplies an
 affirmative, applicable authorization.
+
+## Final Phase 0 verdict
+
+The committed [`validated-environment.json`](validated-environment.json) is a
+schema-valid, content-free record of the current environment. It is an honest
+negative feasibility result, not passing release evidence:
+
+- the installed CLI is `2.1.252`, while the supported tuple pins `2.1.251`;
+- the personal-subscription policy verdict is non-affirmative;
+- the public SDK/CLI surface does not prove per-child existing-login
+  provenance, a pre-input network boundary, or lifetime/per-turn provenance;
+- prompt isolation, attribution absence, compaction suppression, path-safe
+  live persistence, exact backend identity, native continuity, streaming, and
+  exact usage semantics were not run and remain false;
+- no Task 9 live SDK-tool record exists, so optional tools remain disabled.
+
+The deterministic Darwin/APFS, synchronization, lock, bounded-journal,
+lifecycle, retaining-supervisor, environment-construction, and structured
+string-input facts remain recorded as true. `load_manifest()` accepts this
+record, while `require_core_gates()` deterministically rejects its explicit
+false gate set. Phase 1 is therefore blocked.
+
+The manifest contains only field names, enums, booleans, bounded integers,
+paths and hashes for public executables/packages, policy source metadata,
+typed usage shapes/digests, and the exact configured alias target. It contains
+no prompt, response, observed usage value, session identifier, credential
+path/value, environment value, credential, or transport byte.
+
+## Manifest generation
+
+The only generation command is an explicit live operation:
+
+```console
+RUN_LIVE_CLAUDE_TESTS=1 uv run claude-proxy-probe all \
+  --ack-personal-local-use-policy \
+  --output docs/feasibility/validated-environment.json
+```
+
+Caller acknowledgment is only an invocation guard and never counts as policy
+proof. The command fails before creating or overwriting output while live
+opt-in is absent or any policy/runtime/attestation prerequisite is false. The
+current tuple therefore must not run this command to mint evidence. A future
+affirmative implementation must rerun every gate and may write only by a
+same-directory mode-`0600` temporary file, `F_FULLFSYNC`, descriptor-relative
+rename, and parent-directory `fsync`.
+
+Synthetic all-true manifests in unit tests exercise canonical digest and
+resolver mechanics only. They are never committed evidence and cannot unblock
+Phase 1.

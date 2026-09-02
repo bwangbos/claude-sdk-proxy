@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import json
 import os
 import re
+import secrets
 import stat
 import subprocess
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +23,13 @@ from claude_sdk_proxy.model_validation import (
     require_exact_backend_model,
 )
 from claude_sdk_proxy.platform import MountIdentity
+from claude_sdk_proxy.usage_evidence import (
+    EvidenceSchemaError,
+    UsageDialect,
+    UsageEvidenceSchema,
+    UsageOperationClass,
+    UsageTupleKey,
+)
 
 POLICY_URLS = (
     "https://code.claude.com/docs/en/agent-sdk/overview",
@@ -71,9 +82,7 @@ SDK_MCP_NAMING_RULE_VERSION: Final = 1
 SDK_MCP_SERVER_IDENTITY: Final = "caller_tools_v1"
 SDK_MCP_CALLER_NAME_PATTERN: Final = "[A-Za-z0-9_-]{1,64}"
 SDK_MCP_CALLER_NAME_MAX_BYTES: Final = 64
-SDK_MCP_GENERATED_NAME_ALGORITHM: Final = (
-    "mcp__{server_identity}__{caller_name}"
-)
+SDK_MCP_GENERATED_NAME_ALGORITHM: Final = "mcp__{server_identity}__{caller_name}"
 _SDK_MCP_CALLER_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
 _SDK_MCP_BOUNDARY_NAME: Final = "x" * SDK_MCP_CALLER_NAME_MAX_BYTES
 REQUIRED_SDK_TOOL_REPRESENTATIVE_NAMES: Final = frozenset(
@@ -144,9 +153,7 @@ def _validate_sdk_tool_json_tree(value: object) -> None:
                     "SDK tool evidence string must be valid Unicode"
                 ) from error
             if len(encoded) > _SDK_TOOL_MAX_STRING_BYTES:
-                raise _sdk_tool_error(
-                    "SDK tool evidence string exceeds its byte bound"
-                )
+                raise _sdk_tool_error("SDK tool evidence string exceeds its byte bound")
             continue
         if type(current) not in {list, dict}:
             raise _sdk_tool_error(
@@ -353,18 +360,14 @@ class SdkMcpNamingRule:
         for caller_name in sorted(observations):
             observed = observations[caller_name]
             if type(observed) is not str:
-                raise _sdk_tool_error(
-                    "SDK MCP naming observation must be exact text"
-                )
+                raise _sdk_tool_error("SDK MCP naming observation must be exact text")
             expected = self.derive(caller_name)
             if observed != expected:
                 raise _sdk_tool_error(
                     "SDK MCP naming observation is inconsistent with derivation"
                 )
             if observed in generated_names:
-                raise _sdk_tool_error(
-                    "SDK MCP naming observations must be injective"
-                )
+                raise _sdk_tool_error("SDK MCP naming observations must be injective")
             generated_names.add(observed)
             ordered[caller_name] = observed
         object.__setattr__(
@@ -413,10 +416,7 @@ class SdkMcpNamingRule:
             raise ToolNameError("SDK server must expose the exact public configuration")
         if server["type"] != "sdk" or type(server["type"]) is not str:
             raise ToolNameError("SDK server public configuration type changed")
-        if (
-            type(server["name"]) is not str
-            or server["name"] != self.server_identity
-        ):
+        if type(server["name"]) is not str or server["name"] != self.server_identity:
             raise ToolNameError("SDK server identity does not match naming evidence")
         if type(definitions) is not tuple:
             raise ToolNameError("SDK tool definitions must be an immutable tuple")
@@ -475,9 +475,7 @@ class SdkMcpNamingRule:
             "generated_name_template_or_algorithm": (
                 self.generated_name_template_or_algorithm
             ),
-            "representative_observations": dict(
-                self.representative_observations
-            ),
+            "representative_observations": dict(self.representative_observations),
         }
 
 
@@ -603,7 +601,7 @@ def _immutable_gates(value: object) -> Mapping[str, bool]:
     return MappingProxyType({gate: cast(bool, gates[gate]) for gate in sorted(gates)})
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class SdkToolEvidenceRecord:
     """One exact immutable SDK-tool capability record with boolean gates."""
 
@@ -807,3 +805,1556 @@ def read_cli_identity(path: Path) -> CliIdentity:
 def validate_policy(evidence: PolicyEvidence) -> None:
     """Raise when the policy evidence cannot authorize personal local use."""
     evidence.require_allowed()
+
+
+class ManifestError(ValueError):
+    """Raised when Phase 0 evidence is malformed, stale, or unavailable."""
+
+
+CORE_GATE_NAMES: Final = frozenset(
+    {
+        "personal_subscription_policy",
+        "exact_runtime_tuple",
+        "darwin_local_apfs",
+        "required_sync_primitives",
+        "bsd_flock_model",
+        "bounded_journal",
+        "root_reconciliation_lock",
+        "instance_lifetime_lock",
+        "owner_record_create",
+        "owner_record_replace",
+        "durable_head_certification",
+        "cleanup_automaton",
+        "retaining_supervisor",
+        "anchor_unconfirmed_fallback",
+        "exact_environment",
+        "per_child_auth_attestation",
+        "preinput_network_gate",
+        "auth_source_lifetime",
+        "prompt_isolation",
+        "attribution_absent_observable",
+        "compaction_disabled",
+        "path_safe_persistence",
+        "structured_user_input",
+        "exact_backend_model",
+        "native_session_continuity",
+        "streaming_event_contract",
+        "exact_usage_schema",
+    }
+)
+CURRENT_POLICY_PERSONAL_LOCAL_USE_ALLOWED: Final = False
+_EXPECTED_ALLOWED_ENVIRONMENT_NAMES: Final = (
+    "CLAUDE_CONFIG_DIR",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "USER",
+)
+_EXPECTED_NETWORK_PROXY_NAMES: Final = (
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+_EXPECTED_FIXED_ISOLATION_NAMES: Final = (
+    "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+    "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS",
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
+    "CLAUDE_CODE_DISABLE_POLICY_SKILLS",
+    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+    "CLAUDE_CODE_DISABLE_WORKFLOWS",
+    "CLAUDE_CODE_SKIP_PROMPT_HISTORY",
+    "DISABLE_COMPACT",
+    "ENABLE_CLAUDEAI_MCP_SERVERS",
+)
+_MANIFEST_MAX_BYTES: Final = 1_048_576
+_CANONICAL_MAX_DEPTH: Final = 32
+_CANONICAL_MAX_ITEMS: Final = 100_000
+_CANONICAL_MAX_STRING_BYTES: Final = 1_048_576
+_UTC_SECONDS = re.compile(
+    r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+    r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z\Z"
+)
+_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
+_PUBLIC_ALIAS = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z", re.ASCII)
+_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}\Z", re.ASCII)
+_TOP_LEVEL_FIELDS: Final = frozenset(
+    {
+        "schema_version",
+        "validated_at",
+        "core_gates",
+        "policy_evidence",
+        "runtime_evidence",
+        "mount_identity",
+        "sync_lock_lifecycle_evidence",
+        "environment_evidence",
+        "auth_evidence",
+        "path_policy_evidence",
+        "backend_class",
+        "auth_class",
+        "semantic_class",
+        "model_map",
+        "thinking_tuples",
+        "usage_evidence",
+        "sdk_tool_evidence",
+    }
+)
+_FORBIDDEN_CONTENT_FIELDS: Final = frozenset(
+    {
+        "prompt",
+        "prompts",
+        "response",
+        "responses",
+        "observed_usage_values",
+        "session_id",
+        "session_ids",
+        "credential_path",
+        "credential_paths",
+        "environment_values",
+        "credentials",
+        "transport_bytes",
+    }
+)
+_SYSCALL_CASES: Final = frozenset(
+    {
+        "preallocate",
+        "fullfsync_file",
+        "renameat",
+        "unlinkat",
+        "fsync_directory",
+        "proc_pidinfo",
+    }
+)
+_LOCK_CASES: Final = frozenset({"root_reconciliation_lock", "instance_lifetime_lock"})
+_OWNER_RECORD_CASES: Final = frozenset({"owner_record_create", "owner_record_replace"})
+_JOURNAL_CASES: Final = frozenset(
+    {"bounded_journal", "durable_head_certification", "cleanup_automaton"}
+)
+_SUPERVISOR_CASES: Final = frozenset(
+    {"retaining_supervisor", "anchor_unconfirmed_fallback"}
+)
+_AUTH_REASON_CODES: Final = (
+    "public_auth_provenance_absent_or_unvalidated",
+    "preinput_network_boundary_unproved",
+    "per_turn_fresh_provenance_unavailable",
+)
+_AUTH_SHAPE_FIELDS: Final = frozenset(
+    {
+        "auth_source",
+        "cli_executable_sha256",
+        "endpoint",
+        "environment_fingerprint",
+        "network_submission_count",
+        "provider",
+    }
+)
+
+
+def _manifest_error(message: str) -> ManifestError:
+    return ManifestError(message)
+
+
+def _validate_canonical_tree(value: object) -> None:
+    remaining = _CANONICAL_MAX_ITEMS
+    active: set[int] = set()
+    stack: list[tuple[object, int, bool]] = [(value, 0, False)]
+    while stack:
+        current, depth, leaving = stack.pop()
+        if leaving:
+            active.remove(id(current))
+            continue
+        remaining -= 1
+        if remaining < 0:
+            raise _manifest_error("canonical evidence exceeds its item bound")
+        if depth > _CANONICAL_MAX_DEPTH:
+            raise _manifest_error("canonical evidence exceeds its depth bound")
+        if current is None or type(current) in {bool, int}:
+            continue
+        if type(current) is str:
+            try:
+                encoded = current.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise _manifest_error(
+                    "canonical evidence strings must be valid Unicode"
+                ) from error
+            if len(encoded) > _CANONICAL_MAX_STRING_BYTES:
+                raise _manifest_error(
+                    "canonical evidence string exceeds its byte bound"
+                )
+            continue
+        if type(current) not in {dict, list, tuple, _MAPPING_PROXY_TYPE}:
+            raise _manifest_error("canonical evidence uses a noncanonical JSON type")
+        identity = id(current)
+        if identity in active:
+            raise _manifest_error("canonical evidence contains a cycle")
+        active.add(identity)
+        stack.append((current, depth, True))
+        if type(current) in {list, tuple}:
+            stack.extend(
+                (child, depth + 1, False)
+                for child in reversed(cast(list[object] | tuple[object, ...], current))
+            )
+            continue
+        mapping = cast(Mapping[object, object], current)
+        children: list[tuple[object, int, bool]] = []
+        for key, child in mapping.items():
+            if type(key) is not str:
+                raise _manifest_error(
+                    "canonical evidence object keys must be exact text"
+                )
+            children.append((child, depth + 1, False))
+            children.append((key, depth + 1, False))
+        stack.extend(reversed(children))
+
+
+def _thaw_json(value: object) -> object:
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) in {list, tuple}:
+        return [
+            _thaw_json(item) for item in cast(list[object] | tuple[object, ...], value)
+        ]
+    if type(value) in {dict, _MAPPING_PROXY_TYPE}:
+        return {
+            key: _thaw_json(child)
+            for key, child in cast(Mapping[str, object], value).items()
+        }
+    raise _manifest_error("canonical evidence uses a noncanonical JSON type")
+
+
+def canonical_evidence_json(value: object) -> bytes:
+    """Encode one bounded exact JSON tree for every cross-phase digest."""
+    _validate_canonical_tree(value)
+    try:
+        return json.dumps(
+            _thaw_json(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise _manifest_error("canonical evidence cannot be encoded") from error
+
+
+def _freeze_json(value: object) -> object:
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is list:
+        return tuple(_freeze_json(item) for item in cast(list[object], value))
+    if type(value) is dict:
+        return MappingProxyType(
+            {
+                key: _freeze_json(child)
+                for key, child in cast(dict[str, object], value).items()
+            }
+        )
+    raise _manifest_error("manifest evidence must use exact JSON built-in types")
+
+
+def _object_fields(
+    value: object, *, fields: frozenset[str], label: str
+) -> dict[str, object]:
+    if type(value) is not dict:
+        raise _manifest_error(f"{label} must be an exact JSON object")
+    result = cast(dict[str, object], value)
+    if set(result) != fields:
+        raise _manifest_error(f"{label} field set is invalid")
+    return result
+
+
+def _exact_manifest_bool(value: object, label: str) -> bool:
+    if type(value) is not bool:
+        raise _manifest_error(f"{label} must be a literal boolean")
+    return value
+
+
+def _manifest_text(
+    value: object, label: str, *, maximum: int = 1024, visible: bool = False
+) -> str:
+    if type(value) is not str:
+        raise _manifest_error(f"{label} must be exact text")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise _manifest_error(f"{label} must be valid Unicode") from error
+    if not encoded or len(encoded) > maximum:
+        raise _manifest_error(f"{label} is outside its byte bound")
+    if visible and (
+        not value.isascii()
+        or any(character < "!" or character > "~" for character in value)
+    ):
+        raise _manifest_error(f"{label} must be visible ASCII")
+    return value
+
+
+def _manifest_integer(value: object, label: str) -> int:
+    if type(value) is not int or value < 0 or value > 2**64 - 1:
+        raise _manifest_error(f"{label} must be a nonnegative bounded integer")
+    return value
+
+
+def _manifest_digest(value: object, label: str) -> str:
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
+        raise _manifest_error(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _utc_timestamp(value: object, label: str) -> str:
+    if type(value) is not str or _UTC_SECONDS.fullmatch(value) is None:
+        raise _manifest_error(f"{label} must be a canonical UTC timestamp")
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise _manifest_error(f"{label} must be a canonical UTC timestamp") from error
+    return value
+
+
+def _array(value: object, label: str, *, maximum: int = 4096) -> list[object]:
+    if type(value) is not list:
+        raise _manifest_error(f"{label} must be a JSON array")
+    result = cast(list[object], value)
+    if len(result) > maximum:
+        raise _manifest_error(f"{label} exceeds its item bound")
+    return result
+
+
+def _bool_matrix(
+    value: object, *, names: frozenset[str], label: str
+) -> Mapping[str, bool]:
+    raw = _object_fields(value, fields=names, label=label)
+    output = {
+        name: _exact_manifest_bool(raw[name], f"{label} verdict")
+        for name in sorted(names)
+    }
+    return MappingProxyType(output)
+
+
+def _sorted_name_tuple(value: object, label: str) -> tuple[str, ...]:
+    raw = _array(value, label, maximum=256)
+    names: list[str] = []
+    for item in raw:
+        name = _manifest_text(item, label, maximum=256, visible=True)
+        if _ENVIRONMENT_NAME.fullmatch(name) is None:
+            raise _manifest_error(f"{label} contains an invalid environment name")
+        names.append(name)
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise _manifest_error(f"{label} must be sorted and unique")
+    return tuple(names)
+
+
+def _forbid_content_fields(value: object) -> None:
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if type(current) is dict:
+            mapping = cast(dict[str, object], current)
+            if _FORBIDDEN_CONTENT_FIELDS.intersection(mapping):
+                raise _manifest_error("manifest contains a forbidden content field")
+            stack.extend(mapping.values())
+        elif type(current) is list:
+            stack.extend(cast(list[object], current))
+
+
+def _validate_model_map(value: object) -> Mapping[str, str]:
+    if type(value) is not dict:
+        raise _manifest_error("model map must be an exact JSON object")
+    raw = cast(dict[object, object], value)
+    if not raw or len(raw) > 32:
+        raise _manifest_error("model map count is outside its bound")
+    result: dict[str, str] = {}
+    backend_ids: set[str] = set()
+    for alias_value, backend_value in raw.items():
+        if type(alias_value) is not str or _PUBLIC_ALIAS.fullmatch(alias_value) is None:
+            raise _manifest_error("model map public alias is not canonical")
+        try:
+            backend = require_exact_backend_model(backend_value)
+        except (TypeError, ExactBackendModelError) as error:
+            raise _manifest_error(
+                "model map requires an exact backend model ID"
+            ) from error
+        if backend in backend_ids:
+            raise _manifest_error("model map has an ambiguous exact backend model ID")
+        result[alias_value] = backend
+        backend_ids.add(backend)
+    return MappingProxyType({key: result[key] for key in sorted(result)})
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class FeasibilityManifest:
+    """Immutable, content-free Phase 0 evidence composed from Tasks 1-9."""
+
+    schema_version: Literal[1]
+    validated_at: str
+    core_gates: Mapping[str, bool]
+    policy_evidence: Mapping[str, object]
+    runtime_evidence: Mapping[str, object]
+    mount_identity: MountIdentity
+    sync_lock_lifecycle_evidence: Mapping[str, object]
+    environment_evidence: Mapping[str, object]
+    auth_evidence: Mapping[str, object]
+    path_policy_evidence: Mapping[str, object]
+    backend_class: str
+    auth_class: str
+    semantic_class: str
+    model_map: Mapping[str, str]
+    thinking_tuples: tuple[Mapping[str, object], ...]
+    _usage_evidence: Mapping[str, object]
+    _sdk_tool_evidence: Mapping[str, object]
+
+    @property
+    def policy_sources(self) -> tuple[Mapping[str, object], ...]:
+        return cast(tuple[Mapping[str, object], ...], self.policy_evidence["sources"])
+
+    @property
+    def runtime_digest(self) -> str:
+        return cast(str, self.runtime_evidence["runtime_digest"])
+
+    @property
+    def sdk_version(self) -> str:
+        return cast(str, self.runtime_evidence["sdk_version"])
+
+    @property
+    def cli_version(self) -> str:
+        return cast(str, self.runtime_evidence["cli_version"])
+
+    @property
+    def observed_cli_version(self) -> str:
+        return cast(str, self.runtime_evidence["observed_cli_version"])
+
+    @property
+    def cli_hash(self) -> str:
+        return cast(str, self.runtime_evidence["cli_executable_sha256"])
+
+    @property
+    def os_build(self) -> str:
+        return cast(str, self.runtime_evidence["darwin_build"])
+
+    @property
+    def auth_revalidation(self) -> str:
+        return cast(str, self.auth_evidence["revalidation"])
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "validated_at": self.validated_at,
+            "core_gates": dict(self.core_gates),
+            "policy_evidence": cast(
+                dict[str, object], _thaw_json(self.policy_evidence)
+            ),
+            "runtime_evidence": cast(
+                dict[str, object], _thaw_json(self.runtime_evidence)
+            ),
+            "mount_identity": _mount_identity_to_json(self.mount_identity),
+            "sync_lock_lifecycle_evidence": cast(
+                dict[str, object], _thaw_json(self.sync_lock_lifecycle_evidence)
+            ),
+            "environment_evidence": cast(
+                dict[str, object], _thaw_json(self.environment_evidence)
+            ),
+            "auth_evidence": cast(dict[str, object], _thaw_json(self.auth_evidence)),
+            "path_policy_evidence": cast(
+                dict[str, object], _thaw_json(self.path_policy_evidence)
+            ),
+            "backend_class": self.backend_class,
+            "auth_class": self.auth_class,
+            "semantic_class": self.semantic_class,
+            "model_map": dict(self.model_map),
+            "thinking_tuples": cast(list[object], _thaw_json(self.thinking_tuples)),
+            "usage_evidence": cast(dict[str, object], _thaw_json(self._usage_evidence)),
+            "sdk_tool_evidence": cast(
+                dict[str, object], _thaw_json(self._sdk_tool_evidence)
+            ),
+        }
+
+
+def _parse_policy(value: object, gates: Mapping[str, bool]) -> Mapping[str, object]:
+    raw = _object_fields(
+        value,
+        fields=frozenset({"personal_local_use_allowed", "sources"}),
+        label="policy evidence",
+    )
+    allowed = _exact_manifest_bool(
+        raw["personal_local_use_allowed"], "personal local use policy"
+    )
+    source_items = _array(raw["sources"], "policy sources", maximum=2)
+    sources: list[Mapping[str, object]] = []
+    for item in source_items:
+        source = _object_fields(
+            item,
+            fields=frozenset({"url", "retrieved_at", "sha256"}),
+            label="policy source",
+        )
+        sources.append(
+            MappingProxyType(
+                {
+                    "url": _manifest_text(
+                        source["url"], "policy source URL", maximum=512
+                    ),
+                    "retrieved_at": _utc_timestamp(
+                        source["retrieved_at"], "policy source retrieval"
+                    ),
+                    "sha256": _manifest_digest(
+                        source["sha256"], "policy source digest"
+                    ),
+                }
+            )
+        )
+    if {cast(str, source["url"]) for source in sources} != set(POLICY_URLS):
+        raise _manifest_error("policy sources must be the exact primary URLs")
+    if len(sources) != len(POLICY_URLS):
+        raise _manifest_error("policy source set is incomplete")
+    sources.sort(key=lambda source: cast(str, source["url"]))
+    if gates["personal_subscription_policy"] and not allowed:
+        raise _manifest_error("policy gate cannot exceed its evidence verdict")
+    return MappingProxyType(
+        {
+            "personal_local_use_allowed": allowed,
+            "sources": tuple(sources),
+        }
+    )
+
+
+_RUNTIME_FIELDS: Final = frozenset(
+    {
+        "runtime_digest",
+        "python_version",
+        "python_executable",
+        "python_executable_sha256",
+        "sdk_version",
+        "sdk_path",
+        "sdk_sha256",
+        "cli_version",
+        "observed_cli_version",
+        "cli_path",
+        "cli_path_sha256",
+        "cli_executable_device",
+        "cli_executable_inode",
+        "cli_executable_mode",
+        "cli_executable_sha256",
+        "darwin_version",
+        "darwin_build",
+        "boot_id",
+    }
+)
+
+
+def _parse_runtime(value: object, gates: Mapping[str, bool]) -> Mapping[str, object]:
+    raw = _object_fields(value, fields=_RUNTIME_FIELDS, label="runtime evidence")
+    if any(
+        raw[field] is None
+        for field in (
+            "cli_path",
+            "cli_path_sha256",
+            "cli_executable_device",
+            "cli_executable_inode",
+            "cli_executable_mode",
+            "cli_executable_sha256",
+        )
+    ):
+        raise _manifest_error("CLI identity is incomplete")
+    text_fields = {
+        "python_version": _manifest_text(
+            raw["python_version"], "Python version", maximum=64, visible=True
+        ),
+        "python_executable": _manifest_text(
+            raw["python_executable"], "Python executable", maximum=1024
+        ),
+        "sdk_version": _manifest_text(
+            raw["sdk_version"], "SDK version", maximum=64, visible=True
+        ),
+        "sdk_path": _manifest_text(raw["sdk_path"], "SDK path", maximum=1024),
+        "cli_version": _manifest_text(
+            raw["cli_version"], "CLI version", maximum=64, visible=True
+        ),
+        "observed_cli_version": _manifest_text(
+            raw["observed_cli_version"],
+            "observed CLI version",
+            maximum=64,
+            visible=True,
+        ),
+        "cli_path": _manifest_text(raw["cli_path"], "CLI path", maximum=1024),
+        "darwin_version": _manifest_text(
+            raw["darwin_version"], "Darwin version", maximum=32, visible=True
+        ),
+        "darwin_build": _manifest_text(
+            raw["darwin_build"], "Darwin build", maximum=64, visible=True
+        ),
+    }
+    for field in (
+        "python_version",
+        "sdk_version",
+        "cli_version",
+        "observed_cli_version",
+    ):
+        if _VERSION.fullmatch(text_fields[field]) is None:
+            raise _manifest_error(f"{field} is not a canonical version")
+    if _DARWIN_VERSION.fullmatch(text_fields["darwin_version"]) is None:
+        raise _manifest_error("Darwin version is not canonical")
+    for field in ("python_executable", "sdk_path", "cli_path"):
+        if not Path(text_fields[field]).is_absolute():
+            raise _manifest_error(f"{field} must be absolute")
+    integers = {
+        "cli_executable_device": _manifest_integer(
+            raw["cli_executable_device"], "CLI executable device"
+        ),
+        "cli_executable_inode": _manifest_integer(
+            raw["cli_executable_inode"], "CLI executable inode"
+        ),
+        "cli_executable_mode": _manifest_integer(
+            raw["cli_executable_mode"], "CLI executable mode"
+        ),
+    }
+    if not stat.S_ISREG(integers["cli_executable_mode"]) or not (
+        integers["cli_executable_mode"] & stat.S_IXUSR
+    ):
+        raise _manifest_error("CLI identity must name an executable regular file")
+    digests = {
+        field: _manifest_digest(raw[field], field)
+        for field in (
+            "runtime_digest",
+            "python_executable_sha256",
+            "sdk_sha256",
+            "cli_path_sha256",
+            "cli_executable_sha256",
+            "boot_id",
+        )
+    }
+    if gates["exact_runtime_tuple"] and (
+        text_fields["sdk_version"] != EXPECTED_SDK_VERSION
+        or text_fields["cli_version"] != EXPECTED_CLI_VERSION
+        or text_fields["observed_cli_version"] != EXPECTED_CLI_VERSION
+    ):
+        raise _manifest_error("true exact runtime gate contradicts runtime evidence")
+    return MappingProxyType({**text_fields, **integers, **digests})
+
+
+def _parse_lifecycle(value: object, gates: Mapping[str, bool]) -> Mapping[str, object]:
+    raw = _object_fields(
+        value,
+        fields=frozenset(
+            {
+                "syscall_matrix",
+                "lock_matrix",
+                "owner_record_matrix",
+                "journal_matrix",
+                "supervisor_matrix",
+            }
+        ),
+        label="sync/lock/lifecycle evidence",
+    )
+    syscalls = _bool_matrix(
+        raw["syscall_matrix"], names=_SYSCALL_CASES, label="syscall matrix"
+    )
+    locks = _bool_matrix(raw["lock_matrix"], names=_LOCK_CASES, label="lock matrix")
+    owners = _bool_matrix(
+        raw["owner_record_matrix"],
+        names=_OWNER_RECORD_CASES,
+        label="owner record matrix",
+    )
+    journal = _bool_matrix(
+        raw["journal_matrix"], names=_JOURNAL_CASES, label="journal matrix"
+    )
+    supervisor = _bool_matrix(
+        raw["supervisor_matrix"],
+        names=_SUPERVISOR_CASES,
+        label="supervisor matrix",
+    )
+    expected = {
+        "required_sync_primitives": all(syscalls.values()),
+        "bsd_flock_model": all(locks.values()),
+        **dict(locks),
+        **dict(owners),
+        **dict(journal),
+        **dict(supervisor),
+    }
+    if any(gates[name] and not verdict for name, verdict in expected.items()):
+        raise _manifest_error("core gate evidence mismatch")
+    return MappingProxyType(
+        {
+            "syscall_matrix": syscalls,
+            "lock_matrix": locks,
+            "owner_record_matrix": owners,
+            "journal_matrix": journal,
+            "supervisor_matrix": supervisor,
+        }
+    )
+
+
+def _parse_environment(value: object) -> Mapping[str, object]:
+    raw = _object_fields(
+        value,
+        fields=frozenset(
+            {
+                "allowed_names",
+                "network_proxy_names",
+                "fixed_isolation_names",
+                "fingerprint_algorithm",
+            }
+        ),
+        label="environment evidence",
+    )
+    algorithm = _manifest_text(
+        raw["fingerprint_algorithm"],
+        "environment fingerprint algorithm",
+        maximum=128,
+        visible=True,
+    )
+    if algorithm != "sha256_sorted_name_nul_value_nul_v1":
+        raise _manifest_error("environment fingerprint algorithm is unsupported")
+    allowed_names = _sorted_name_tuple(
+        raw["allowed_names"], "allowed environment names"
+    )
+    network_names = _sorted_name_tuple(
+        raw["network_proxy_names"], "network proxy names"
+    )
+    fixed_names = _sorted_name_tuple(
+        raw["fixed_isolation_names"], "fixed isolation names"
+    )
+    if allowed_names != _EXPECTED_ALLOWED_ENVIRONMENT_NAMES:
+        raise _manifest_error("allowed environment names are not the exact contract")
+    if network_names != _EXPECTED_NETWORK_PROXY_NAMES:
+        raise _manifest_error("network proxy names are not the exact contract")
+    if fixed_names != _EXPECTED_FIXED_ISOLATION_NAMES:
+        raise _manifest_error("fixed isolation names are not the exact contract")
+    return MappingProxyType(
+        {
+            "allowed_names": allowed_names,
+            "network_proxy_names": network_names,
+            "fixed_isolation_names": fixed_names,
+            "fingerprint_algorithm": algorithm,
+        }
+    )
+
+
+def _parse_auth(value: object, gates: Mapping[str, bool]) -> Mapping[str, object]:
+    raw = _object_fields(
+        value,
+        fields=frozenset(
+            {
+                "schema",
+                "version",
+                "accepted_public_shape",
+                "provider",
+                "endpoint",
+                "auth_source",
+                "revalidation",
+                "core_gate_available",
+                "reason_codes",
+            }
+        ),
+        label="auth evidence",
+    )
+    if raw["version"] != 1 or type(raw["version"]) is not int:
+        raise _manifest_error("auth evidence version must be exact integer 1")
+    schema = _manifest_text(raw["schema"], "auth schema", maximum=128, visible=True)
+    if schema != "claude_sdk_proxy.child_attestation_manifest":
+        raise _manifest_error("auth evidence schema is unsupported")
+    provider = _manifest_text(raw["provider"], "auth provider", visible=True)
+    endpoint = _manifest_text(raw["endpoint"], "auth endpoint", visible=True)
+    auth_source = _manifest_text(raw["auth_source"], "auth source", visible=True)
+    if (provider, endpoint, auth_source) != (
+        "anthropic",
+        "default",
+        "existing_claude_login",
+    ):
+        raise _manifest_error("auth evidence identity changed")
+    revalidation = _manifest_text(
+        raw["revalidation"], "auth revalidation", maximum=32, visible=True
+    )
+    if revalidation not in {"unavailable", "fixed_for_lifetime", "each_turn"}:
+        raise _manifest_error("auth revalidation is unsupported")
+    available = _exact_manifest_bool(raw["core_gate_available"], "auth availability")
+    reasons = tuple(
+        _manifest_text(item, "auth reason code", maximum=128, visible=True)
+        for item in _array(raw["reason_codes"], "auth reason codes", maximum=3)
+    )
+    shape_value = raw["accepted_public_shape"]
+    shape: Mapping[str, object] | None
+    if shape_value is None:
+        shape = None
+    else:
+        shape_raw = _object_fields(
+            shape_value,
+            fields=frozenset({"schema", "version", "fields"}),
+            label="accepted public auth shape",
+        )
+        if type(shape_raw["version"]) is not int or shape_raw["version"] != 1:
+            raise _manifest_error("accepted public auth shape version changed")
+        shape_fields = tuple(
+            _manifest_text(item, "accepted auth field", maximum=128, visible=True)
+            for item in _array(shape_raw["fields"], "accepted auth fields", maximum=32)
+        )
+        if (
+            set(shape_fields) != _AUTH_SHAPE_FIELDS
+            or tuple(sorted(shape_fields)) != shape_fields
+        ):
+            raise _manifest_error("accepted public auth shape fields changed")
+        shape = MappingProxyType(
+            {
+                "schema": _manifest_text(
+                    shape_raw["schema"], "accepted auth shape schema", maximum=128
+                ),
+                "version": 1,
+                "fields": shape_fields,
+            }
+        )
+    if available:
+        if shape is None or reasons or revalidation == "unavailable":
+            raise _manifest_error("available auth evidence is incomplete")
+    elif (
+        shape is not None
+        or reasons != _AUTH_REASON_CODES
+        or revalidation != "unavailable"
+    ):
+        raise _manifest_error(
+            "unavailable auth evidence is not the exact false verdict"
+        )
+    for gate in (
+        "per_child_auth_attestation",
+        "preinput_network_gate",
+        "auth_source_lifetime",
+    ):
+        if gates[gate] and not available:
+            raise _manifest_error("attestation gate contradicts false auth evidence")
+    return MappingProxyType(
+        {
+            "schema": schema,
+            "version": 1,
+            "accepted_public_shape": shape,
+            "provider": provider,
+            "endpoint": endpoint,
+            "auth_source": auth_source,
+            "revalidation": revalidation,
+            "core_gate_available": available,
+            "reason_codes": reasons,
+        }
+    )
+
+
+def _parse_path_policy(
+    value: object, gates: Mapping[str, bool]
+) -> Mapping[str, object]:
+    raw = _object_fields(
+        value,
+        fields=frozenset(
+            {"version", "snapshot_root_sentinel", "path_safe_persistence"}
+        ),
+        label="path policy evidence",
+    )
+    if type(raw["version"]) is not int or raw["version"] != 1:
+        raise _manifest_error("path policy version must be exact integer 1")
+    sentinel = _manifest_text(
+        raw["snapshot_root_sentinel"], "snapshot root sentinel", maximum=64
+    )
+    if sentinel != ".":
+        raise _manifest_error("snapshot root sentinel must be exact value '.'")
+    passed = _exact_manifest_bool(raw["path_safe_persistence"], "path safe persistence")
+    if gates["path_safe_persistence"] and not passed:
+        raise _manifest_error("path policy gate contradicts false evidence")
+    return MappingProxyType(
+        {
+            "version": 1,
+            "snapshot_root_sentinel": sentinel,
+            "path_safe_persistence": passed,
+        }
+    )
+
+
+def _parse_thinking_tuples(
+    value: object,
+    *,
+    runtime_digest: str,
+    models: frozenset[str],
+) -> tuple[Mapping[str, object], ...]:
+    raw = _array(value, "thinking tuples", maximum=4096)
+    output: list[Mapping[str, object]] = []
+    identities: set[tuple[object, ...]] = set()
+    for item in raw:
+        entry = _object_fields(
+            item,
+            fields=frozenset(
+                {
+                    "backend_model_id",
+                    "thinking_mode",
+                    "effort",
+                    "budget_tokens",
+                    "passed",
+                }
+            ),
+            label="thinking tuple",
+        )
+        try:
+            key = UsageTupleKey.from_json(
+                {
+                    "runtime_digest": runtime_digest,
+                    "backend_model_id": entry["backend_model_id"],
+                    "thinking_mode": entry["thinking_mode"],
+                    "effort": entry["effort"],
+                    "budget_tokens": entry["budget_tokens"],
+                    "operation_class": "ordinary",
+                }
+            )
+        except EvidenceSchemaError as error:
+            raise _manifest_error("thinking tuple schema is invalid") from error
+        if key.backend_model_id not in models or key.thinking_mode == "null":
+            raise _manifest_error("thinking tuple is not a configured probed tuple")
+        identity = (
+            key.backend_model_id,
+            key.thinking_mode,
+            key.effort,
+            key.budget_tokens,
+        )
+        if identity in identities:
+            raise _manifest_error("thinking tuple evidence is duplicated")
+        identities.add(identity)
+        output.append(
+            MappingProxyType(
+                {
+                    "backend_model_id": key.backend_model_id,
+                    "thinking_mode": key.thinking_mode,
+                    "effort": key.effort,
+                    "budget_tokens": key.budget_tokens,
+                    "passed": _exact_manifest_bool(
+                        entry["passed"], "thinking tuple verdict"
+                    ),
+                }
+            )
+        )
+    output.sort(
+        key=lambda entry: (
+            cast(str, entry["backend_model_id"]),
+            cast(str, entry["thinking_mode"]),
+            entry["effort"] is not None,
+            cast(str | None, entry["effort"]) or "",
+            entry["budget_tokens"] is not None,
+            cast(int | None, entry["budget_tokens"]) or 0,
+        )
+    )
+    return tuple(output)
+
+
+def _manifest_from_json(value: object) -> FeasibilityManifest:
+    if type(value) is not dict:
+        raise _manifest_error("manifest must be an exact JSON object")
+    _validate_canonical_tree(value)
+    _forbid_content_fields(value)
+    raw = _object_fields(value, fields=_TOP_LEVEL_FIELDS, label="manifest")
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
+        raise _manifest_error("manifest schema_version must be exact integer 1")
+    validated_at = _utc_timestamp(raw["validated_at"], "manifest validation time")
+    gates = _bool_matrix(
+        raw["core_gates"], names=CORE_GATE_NAMES, label="core gate map"
+    )
+    policy = _parse_policy(raw["policy_evidence"], gates)
+    runtime = _parse_runtime(raw["runtime_evidence"], gates)
+    try:
+        mount = _mount_identity_from_json(raw["mount_identity"])
+    except SdkToolEvidenceError as error:
+        raise _manifest_error(
+            "manifest mount identity field set or mount flags are invalid"
+        ) from error
+    lifecycle = _parse_lifecycle(raw["sync_lock_lifecycle_evidence"], gates)
+    environment = _parse_environment(raw["environment_evidence"])
+    auth = _parse_auth(raw["auth_evidence"], gates)
+    path_policy = _parse_path_policy(raw["path_policy_evidence"], gates)
+    backend_class = _manifest_text(
+        raw["backend_class"], "backend class", maximum=64, visible=True
+    )
+    auth_class = _manifest_text(
+        raw["auth_class"], "auth class", maximum=64, visible=True
+    )
+    semantic_class = _manifest_text(
+        raw["semantic_class"], "semantic class", maximum=64, visible=True
+    )
+    if (backend_class, auth_class, semantic_class) != (
+        _SDK_TOOL_BACKEND_CLASS,
+        _SDK_TOOL_AUTH_CLASS,
+        _SDK_TOOL_SEMANTIC_CLASS,
+    ):
+        raise _manifest_error("backend/auth/semantic class tuple changed")
+    model_map = _validate_model_map(raw["model_map"])
+    thinking = _parse_thinking_tuples(
+        raw["thinking_tuples"],
+        runtime_digest=cast(str, runtime["runtime_digest"]),
+        models=frozenset(model_map.values()),
+    )
+    usage_raw = raw["usage_evidence"]
+    sdk_raw = raw["sdk_tool_evidence"]
+    if type(usage_raw) is not dict or type(sdk_raw) is not dict:
+        raise _manifest_error("embedded evidence domains must be exact JSON objects")
+    instance = object.__new__(FeasibilityManifest)
+    object.__setattr__(instance, "schema_version", 1)
+    object.__setattr__(instance, "validated_at", validated_at)
+    object.__setattr__(instance, "core_gates", gates)
+    object.__setattr__(instance, "policy_evidence", policy)
+    object.__setattr__(instance, "runtime_evidence", runtime)
+    object.__setattr__(instance, "mount_identity", mount)
+    object.__setattr__(instance, "sync_lock_lifecycle_evidence", lifecycle)
+    object.__setattr__(instance, "environment_evidence", environment)
+    object.__setattr__(instance, "auth_evidence", auth)
+    object.__setattr__(instance, "path_policy_evidence", path_policy)
+    object.__setattr__(instance, "backend_class", backend_class)
+    object.__setattr__(instance, "auth_class", auth_class)
+    object.__setattr__(instance, "semantic_class", semantic_class)
+    object.__setattr__(instance, "model_map", model_map)
+    object.__setattr__(instance, "thinking_tuples", thinking)
+    object.__setattr__(
+        instance, "_usage_evidence", cast(Mapping[str, object], _freeze_json(usage_raw))
+    )
+    object.__setattr__(
+        instance,
+        "_sdk_tool_evidence",
+        cast(Mapping[str, object], _freeze_json(sdk_raw)),
+    )
+    return instance
+
+
+class _DuplicateManifestKey(ValueError):
+    pass
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateManifestKey
+        result[key] = value
+    return result
+
+
+def _reject_json_float(_value: str) -> object:
+    raise _manifest_error("manifest JSON contains a float")
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise _manifest_error("manifest JSON contains a non-finite constant")
+
+
+def load_manifest(path: Path) -> FeasibilityManifest:
+    """Load one bounded duplicate-free immutable Phase 0 manifest."""
+    if type(path) is not type(Path()):
+        raise _manifest_error("manifest file path must be an exact platform Path")
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError
+        if metadata.st_size > _MANIFEST_MAX_BYTES:
+            raise _manifest_error("manifest file exceeds its byte bound")
+        encoded = path.read_bytes()
+    except ManifestError:
+        raise
+    except OSError as error:
+        raise _manifest_error("manifest file is unavailable") from error
+    if len(encoded) > _MANIFEST_MAX_BYTES:
+        raise _manifest_error("manifest file exceeds its byte bound")
+    try:
+        text = encoded.decode("utf-8")
+        value = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_float=_reject_json_float,
+            parse_constant=_reject_json_constant,
+        )
+    except _DuplicateManifestKey as error:
+        raise _manifest_error(
+            "manifest contains a duplicate JSON object key"
+        ) from error
+    except ManifestError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _manifest_error("manifest JSON is invalid") from error
+    return _manifest_from_json(value)
+
+
+def require_core_gates(manifest: FeasibilityManifest) -> None:
+    """Require the exact Phase 0 core conjunction without optional tools."""
+    if type(manifest) is not FeasibilityManifest:
+        raise _manifest_error("core gate check requires a FeasibilityManifest")
+    if set(manifest.core_gates) != CORE_GATE_NAMES:
+        raise _manifest_error("Phase 0 manifest core gate set changed")
+    false_gates = sorted(
+        gate for gate, verdict in manifest.core_gates.items() if verdict is False
+    )
+    if false_gates:
+        raise _manifest_error(
+            "Phase 0 manifest has false core gates: " + ", ".join(false_gates)
+        )
+
+
+def load_usage_evidence(manifest: FeasibilityManifest) -> UsageEvidenceSchema:
+    """Revalidate the embedded Task 8/9 usage schema and exact core rows."""
+    if type(manifest) is not FeasibilityManifest:
+        raise _manifest_error("usage evidence requires a FeasibilityManifest")
+    try:
+        schema = UsageEvidenceSchema.from_json(_thaw_json(manifest._usage_evidence))
+    except (EvidenceSchemaError, TypeError, ValueError) as error:
+        raise _manifest_error("embedded usage evidence is invalid") from error
+    configured_models = frozenset(manifest.model_map.values())
+    for row in schema.rows:
+        if row.key.runtime_digest != manifest.runtime_digest:
+            raise _manifest_error("usage evidence runtime digest does not match")
+        if row.key.backend_model_id not in configured_models:
+            raise _manifest_error(
+                "usage evidence does not name a configured exact backend model"
+            )
+    if manifest.core_gates["exact_usage_schema"]:
+        for model in configured_models:
+            key = UsageTupleKey(
+                runtime_digest=manifest.runtime_digest,
+                backend_model_id=model,
+                thinking_mode="null",
+                effort=None,
+                budget_tokens=None,
+                operation_class=UsageOperationClass.ORDINARY,
+            )
+            try:
+                schema.require_mapping(key, UsageDialect.ANTHROPIC)
+            except EvidenceSchemaError as error:
+                raise _manifest_error(
+                    "exact usage core lacks a passing ordinary Anthropic mapping"
+                ) from error
+    for entry in manifest.thinking_tuples:
+        key = UsageTupleKey(
+            runtime_digest=manifest.runtime_digest,
+            backend_model_id=cast(str, entry["backend_model_id"]),
+            thinking_mode=cast(
+                Literal["null", "disabled", "adaptive", "enabled"],
+                entry["thinking_mode"],
+            ),
+            effort=cast(str | None, entry["effort"]),
+            budget_tokens=cast(int | None, entry["budget_tokens"]),
+            operation_class=UsageOperationClass.ORDINARY,
+        )
+        matching = next((row for row in schema.rows if row.key == key), None)
+        if matching is None:
+            raise _manifest_error("probed thinking tuple lacks its exact usage row")
+        if entry["passed"] is True:
+            try:
+                schema.require_mapping(key, UsageDialect.ANTHROPIC)
+            except EvidenceSchemaError as error:
+                raise _manifest_error(
+                    "passing thinking tuple lacks its exact Anthropic mapping"
+                ) from error
+    return schema
+
+
+_DIGESTIBLE_SDK_RECORDS: dict[int, weakref.ReferenceType[SdkToolEvidenceRecord]] = {}
+
+
+def _mark_digestible_sdk_record(record: SdkToolEvidenceRecord) -> None:
+    identity = id(record)
+
+    def discard(_reference: weakref.ReferenceType[SdkToolEvidenceRecord]) -> None:
+        _DIGESTIBLE_SDK_RECORDS.pop(identity, None)
+
+    _DIGESTIBLE_SDK_RECORDS[identity] = weakref.ref(record, discard)
+
+
+def _record_is_digestible(record: SdkToolEvidenceRecord) -> bool:
+    reference = _DIGESTIBLE_SDK_RECORDS.get(id(record))
+    return reference is not None and reference() is record
+
+
+def load_sdk_tool_evidence(
+    manifest: FeasibilityManifest,
+) -> SdkToolEvidenceManifest:
+    """Load only the exact Task 9 SDK-tool record schema, without supplied digests."""
+    if type(manifest) is not FeasibilityManifest:
+        raise _manifest_error("SDK tool evidence requires a FeasibilityManifest")
+    raw = _thaw_json(manifest._sdk_tool_evidence)
+    try:
+        outer = _object_fields(
+            raw,
+            fields=frozenset({"records"}),
+            label="SDK tool evidence",
+        )
+        records_raw = _array(
+            outer["records"], "SDK tool evidence records", maximum=_SDK_TOOL_MAX_RECORDS
+        )
+        records = tuple(SdkToolEvidenceRecord.from_json(item) for item in records_raw)
+        result = SdkToolEvidenceManifest.from_records(records)
+    except ManifestError:
+        raise
+    except (SdkToolEvidenceError, TypeError, ValueError) as error:
+        raise _manifest_error("SDK tool record schema is invalid") from error
+    for record in result.records:
+        _mark_digestible_sdk_record(record)
+    return result
+
+
+def sdk_tool_record_digest(record: SdkToolEvidenceRecord) -> str:
+    """Return the sole V1 cross-phase identity of one loaded SDK-tool record."""
+    if type(record) is not SdkToolEvidenceRecord or not _record_is_digestible(record):
+        raise _manifest_error("SDK tool record schema provenance is invalid")
+    try:
+        revalidated = SdkToolEvidenceRecord.from_json(record.to_json())
+    except (SdkToolEvidenceError, TypeError, ValueError) as error:
+        raise _manifest_error("SDK tool record schema is invalid") from error
+    if revalidated != record:
+        raise _manifest_error("SDK tool record schema changed after loading")
+    projection = {
+        "digest_schema_version": 1,
+        "record": {
+            "schema_version": record.schema_version,
+            "key": {
+                "runtime_digest": record.key.runtime_digest,
+                "sdk_version": record.key.sdk_version,
+                "cli_version": record.key.cli_version,
+                "cli_executable_device": record.key.cli_executable_device,
+                "cli_executable_inode": record.key.cli_executable_inode,
+                "cli_executable_sha256": record.key.cli_executable_sha256,
+                "darwin_version": record.key.darwin_version,
+                "darwin_build": record.key.darwin_build,
+                "boot_id": record.key.boot_id,
+                "mount_identity": {
+                    "filesystem_type": record.key.mount_identity.filesystem_type,
+                    "is_local": record.key.mount_identity.is_local,
+                    "mount_device": record.key.mount_identity.mount_device,
+                    "mount_fsid": record.key.mount_identity.mount_fsid,
+                    "mount_flags": record.key.mount_identity.mount_flags,
+                    "runtime_root_st_dev": (
+                        record.key.mount_identity.runtime_root_st_dev
+                    ),
+                },
+                "backend_class": record.key.backend_class,
+                "auth_class": record.key.auth_class,
+                "semantic_class": record.key.semantic_class,
+                "backend_model_id": record.key.backend_model_id,
+            },
+            "naming_rule": {
+                "version": record.naming_rule.version,
+                "server_identity": record.naming_rule.server_identity,
+                "caller_name_pattern": record.naming_rule.caller_name_pattern,
+                "caller_name_max_bytes": record.naming_rule.caller_name_max_bytes,
+                "generated_name_template_or_algorithm": (
+                    record.naming_rule.generated_name_template_or_algorithm
+                ),
+                "representative_observations": (
+                    record.naming_rule.representative_observations
+                ),
+            },
+            "gates": record.gates,
+        },
+    }
+    return hashlib.sha256(
+        b"claude-sdk-proxy:sdk-tool-record:v1\0" + canonical_evidence_json(projection)
+    ).hexdigest()
+
+
+def _sdk_record_matches_manifest(
+    manifest: FeasibilityManifest, record: SdkToolEvidenceRecord
+) -> bool:
+    runtime = manifest.runtime_evidence
+    key = record.key
+    return (
+        key.runtime_digest == manifest.runtime_digest
+        and key.sdk_version == manifest.sdk_version
+        and key.cli_version == manifest.cli_version
+        and key.cli_executable_device == runtime["cli_executable_device"]
+        and key.cli_executable_inode == runtime["cli_executable_inode"]
+        and key.cli_executable_sha256 == runtime["cli_executable_sha256"]
+        and key.darwin_version == runtime["darwin_version"]
+        and key.darwin_build == runtime["darwin_build"]
+        and key.boot_id == runtime["boot_id"]
+        and key.mount_identity == manifest.mount_identity
+        and key.backend_class == manifest.backend_class
+        and key.auth_class == manifest.auth_class
+        and key.semantic_class == manifest.semantic_class
+    )
+
+
+def sdk_tool_gate_passed(manifest: FeasibilityManifest, exact_model_id: str) -> bool:
+    """Return the exact optional SDK-tool verdict without dialect admission."""
+    if type(manifest) is not FeasibilityManifest:
+        raise _manifest_error("SDK tool gate requires a FeasibilityManifest")
+    try:
+        model = require_exact_backend_model(exact_model_id)
+    except (TypeError, ExactBackendModelError) as error:
+        raise _manifest_error(
+            "SDK tool gate requires an exact backend model ID"
+        ) from error
+    if model not in manifest.model_map.values():
+        return False
+    evidence = load_sdk_tool_evidence(manifest)
+    matching = tuple(
+        record
+        for record in evidence.records
+        if record.key.backend_model_id == model
+        and _sdk_record_matches_manifest(manifest, record)
+    )
+    if len(matching) != 1 or not all(matching[0].gates.values()):
+        return False
+    schema = load_usage_evidence(manifest)
+    for operation in (
+        UsageOperationClass.TOOL_USE_BOUNDARY,
+        UsageOperationClass.POST_TOOL_RESULT,
+    ):
+        key = UsageTupleKey(
+            runtime_digest=matching[0].key.runtime_digest,
+            backend_model_id=model,
+            thinking_mode="null",
+            effort=None,
+            budget_tokens=None,
+            operation_class=operation,
+        )
+        try:
+            row = schema.only_tool_row(key)
+        except EvidenceSchemaError:
+            return False
+        if not row.sdk_shape_passed:
+            return False
+    return True
+
+
+def _phase0_projection(
+    manifest: FeasibilityManifest,
+    public_alias: str,
+    exact_backend_model_id: str,
+) -> dict[str, object]:
+    return {
+        "digest_schema_version": 1,
+        "manifest_schema_version": manifest.schema_version,
+        "validated_at": manifest.validated_at,
+        "core_gates": dict(manifest.core_gates),
+        "policy_evidence": _thaw_json(manifest.policy_evidence),
+        "runtime_evidence": _thaw_json(manifest.runtime_evidence),
+        "mount_identity": _mount_identity_to_json(manifest.mount_identity),
+        "sync_lock_lifecycle_evidence": _thaw_json(
+            manifest.sync_lock_lifecycle_evidence
+        ),
+        "environment_evidence": _thaw_json(manifest.environment_evidence),
+        "auth_evidence": _thaw_json(manifest.auth_evidence),
+        "path_policy_evidence": _thaw_json(manifest.path_policy_evidence),
+        "backend_class": manifest.backend_class,
+        "auth_class": manifest.auth_class,
+        "semantic_class": manifest.semantic_class,
+        "model_map": dict(manifest.model_map),
+        "selected_model": {
+            "public_alias": public_alias,
+            "exact_backend_model_id": exact_backend_model_id,
+        },
+    }
+
+
+def _exact_alias_model_pair(
+    manifest: FeasibilityManifest,
+    public_alias: object,
+    exact_backend_model_id: object,
+) -> tuple[str, str]:
+    if type(public_alias) is not str or _PUBLIC_ALIAS.fullmatch(public_alias) is None:
+        raise _manifest_error("exact alias/backend model pair is invalid")
+    try:
+        model = require_exact_backend_model(exact_backend_model_id)
+    except (TypeError, ExactBackendModelError) as error:
+        raise _manifest_error("exact alias/backend model pair is invalid") from error
+    if manifest.model_map.get(public_alias) != model:
+        raise _manifest_error("exact alias/backend model pair is not configured")
+    return public_alias, model
+
+
+def phase0_prerequisite_digest(
+    manifest: FeasibilityManifest,
+    public_alias: str,
+    exact_backend_model_id: str,
+) -> str:
+    """Bind every Phase 0 prerequisite for one exact alias/model selection."""
+    if type(manifest) is not FeasibilityManifest:
+        raise _manifest_error("phase0 digest requires a FeasibilityManifest")
+    require_core_gates(manifest)
+    alias, model = _exact_alias_model_pair(
+        manifest, public_alias, exact_backend_model_id
+    )
+    return hashlib.sha256(
+        b"claude-sdk-proxy:phase0-prerequisite:v1\0"
+        + canonical_evidence_json(_phase0_projection(manifest, alias, model))
+    ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class Phase0PrerequisiteDigestResolver:
+    """Immutable exact alias/model to Phase 0 prerequisite digest resolver."""
+
+    digests: Mapping[tuple[str, str], str]
+
+    def __init__(self, digests: Mapping[tuple[str, str], str]) -> None:
+        if type(digests) not in {dict, _MAPPING_PROXY_TYPE}:
+            raise _manifest_error("prerequisite digest map must be an exact mapping")
+        snapshot = dict(digests)
+        output: dict[tuple[str, str], str] = {}
+        for pair, digest in snapshot.items():
+            if (
+                type(pair) is not tuple
+                or len(pair) != 2
+                or type(pair[0]) is not str
+                or type(pair[1]) is not str
+                or _PUBLIC_ALIAS.fullmatch(pair[0]) is None
+            ):
+                raise _manifest_error("prerequisite digest key is invalid")
+            try:
+                require_exact_backend_model(pair[1])
+            except (TypeError, ExactBackendModelError) as error:
+                raise _manifest_error("prerequisite digest key is invalid") from error
+            output[pair] = _manifest_digest(digest, "prerequisite digest")
+        object.__setattr__(
+            self, "digests", MappingProxyType(dict(sorted(output.items())))
+        )
+
+    @classmethod
+    def from_manifest(
+        cls, manifest: FeasibilityManifest
+    ) -> Phase0PrerequisiteDigestResolver:
+        require_core_gates(manifest)
+        return cls(
+            {
+                (alias, model): phase0_prerequisite_digest(manifest, alias, model)
+                for alias, model in manifest.model_map.items()
+            }
+        )
+
+    def resolve(self, public_alias: str, exact_backend_model_id: str) -> str:
+        if type(public_alias) is not str or type(exact_backend_model_id) is not str:
+            raise _manifest_error("exact model prerequisite digest is missing")
+        try:
+            return self.digests[(public_alias, exact_backend_model_id)]
+        except KeyError as error:
+            raise _manifest_error(
+                "exact model prerequisite digest is missing"
+            ) from error
+
+    def validate(self, manifest: FeasibilityManifest) -> None:
+        expected = Phase0PrerequisiteDigestResolver.from_manifest(manifest)
+        if self.digests != expected.digests:
+            raise _manifest_error("exact model prerequisite digest map changed")
+
+
+_F_FULLFSYNC: Final = 51
+
+
+def _fullfsync_fd(descriptor: int) -> None:
+    fcntl.fcntl(descriptor, _F_FULLFSYNC)
+
+
+def _fsync_directory_fd(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _atomic_write_manifest(path: Path, document: object) -> None:
+    """Write canonical evidence by same-directory full-synced rename."""
+    if type(path) is not type(Path()):
+        raise _manifest_error("manifest output path must be an exact platform Path")
+    if not path.is_absolute():
+        raise _manifest_error("manifest output path must be absolute")
+    payload = canonical_evidence_json(document) + b"\n"
+    parent = path.parent
+    parent_fd = -1
+    temp_fd = -1
+    temp_name: str | None = None
+    renamed = False
+    try:
+        parent_fd = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        for _ in range(8):
+            candidate = f".{path.name}.{secrets.token_hex(16)}.tmp"
+            try:
+                temp_fd = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+            except FileExistsError:
+                continue
+            temp_name = candidate
+            break
+        if temp_fd < 0 or temp_name is None:
+            raise OSError
+        os.fchmod(temp_fd, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(temp_fd, view)
+            if written <= 0:
+                raise OSError
+            view = view[written:]
+        _fullfsync_fd(temp_fd)
+        os.close(temp_fd)
+        temp_fd = -1
+        os.rename(
+            temp_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        renamed = True
+        _fsync_directory_fd(parent_fd)
+    except (OSError, ManifestError) as error:
+        if isinstance(error, ManifestError):
+            raise
+        raise _manifest_error("atomic manifest write failed") from error
+    finally:
+        if temp_fd >= 0:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if temp_name is not None and not renamed and parent_fd >= 0:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        if parent_fd >= 0:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
+__all__ = [
+    "CORE_GATE_NAMES",
+    "CliIdentity",
+    "FeasibilityManifest",
+    "ManifestError",
+    "POLICY_URLS",
+    "Phase0PrerequisiteDigestResolver",
+    "PolicyEvidence",
+    "REQUIRED_SDK_TOOL_GATES",
+    "REQUIRED_SDK_TOOL_REPRESENTATIVE_NAMES",
+    "RuntimeMismatch",
+    "RuntimeTuple",
+    "SdkMcpNamingRule",
+    "SdkToolEvidenceError",
+    "SdkToolEvidenceKey",
+    "SdkToolEvidenceManifest",
+    "SdkToolEvidenceRecord",
+    "ToolNameError",
+    "canonical_evidence_json",
+    "load_manifest",
+    "load_sdk_tool_evidence",
+    "load_usage_evidence",
+    "phase0_prerequisite_digest",
+    "read_cli_identity",
+    "require_core_gates",
+    "sdk_tool_gate_passed",
+    "sdk_tool_record_digest",
+    "validate_policy",
+]

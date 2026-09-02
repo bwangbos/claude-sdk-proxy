@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
+from claude_sdk_proxy.attestation import current_attestation_availability
 from claude_sdk_proxy.probes import (
     MAX_REDACTED_REPORT_BYTES,
     ProbeResult,
@@ -13,6 +16,7 @@ from claude_sdk_proxy.probes import (
     run_compaction_probe,
     run_prompt_purity_probe,
 )
+from claude_sdk_proxy.validated import CURRENT_POLICY_PERSONAL_LOCAL_USE_ALLOWED
 
 _FALLBACK_JSON = {
     "purity": (
@@ -149,6 +153,8 @@ def _main(argv: Sequence[str] | None) -> int:
         if not _emit(name, _false_result(name, "invalid_invocation")):
             return 5
         return 2
+    if arguments and arguments[0] == "all":
+        return _run_all(arguments)
     name = _expected_name(arguments)
     if "--claim-live-success" in arguments:
         if not _emit(name, _false_result(name, "live_success_claim_forbidden")):
@@ -187,12 +193,45 @@ def _main(argv: Sequence[str] | None) -> int:
     return 1
 
 
+def _run_all(arguments: list[str]) -> int:
+    """Fail closed before output until every live prerequisite is affirmative."""
+    if (
+        len(arguments) != 4
+        or any(type(argument) is not str for argument in arguments)
+        or arguments[0] != "all"
+        or arguments[1] != "--ack-personal-local-use-policy"
+        or arguments[2] != "--output"
+        or not arguments[3]
+        or "\x00" in arguments[3]
+    ):
+        return 2
+    if os.environ.get("RUN_LIVE_CLAUDE_TESTS") != "1":
+        return 2
+    # The acknowledgment is an invocation guard, never policy evidence.
+    if not CURRENT_POLICY_PERSONAL_LOCAL_USE_ALLOWED:
+        return 3
+    if not current_attestation_availability().core_gate_available:
+        return 3
+    # This branch is deliberately unreachable for the committed Phase 0 tuple.
+    # A future affirmative implementation must rerun and merge every live gate
+    # before calling the atomic writer; no prior or caller-supplied manifest is
+    # accepted here.
+    _ = Path(arguments[3]).resolve()
+    return 4
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one probe, emitting exactly one redacted JSON object."""
     expected_name = _expected_name(argv)
     try:
         return _main(argv)
     except BaseException:
+        try:
+            arguments = list(sys.argv[1:] if argv is None else argv)
+            if arguments and arguments[0] == "all":
+                return 5
+        except BaseException:
+            pass
         _write_fallback(expected_name)
         return 5
 
