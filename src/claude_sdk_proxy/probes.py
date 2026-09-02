@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Final, Never
 
 from claude_sdk_proxy.attestation import (
     ExactModelAliasMap,
-    ModelIdentityError,
     ModelIdentityGate,
     current_attestation_availability,
 )
@@ -194,10 +193,7 @@ def _require_model_probe_prerequisites(
     try:
         _require_live_prerequisites()
     finally:
-        try:
-            gate.finish()
-        except ModelIdentityError:
-            pass
+        gate.abort_pending()
 
 
 def run_prompt_purity_probe() -> ProbeResult:

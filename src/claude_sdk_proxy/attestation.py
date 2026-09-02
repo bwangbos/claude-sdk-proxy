@@ -275,6 +275,14 @@ class ModelIdentityGate:
         self._buffered_content_bytes = 0
         self._state = _ModelIdentityState.FINISHED
 
+    def abort_pending(self) -> None:
+        """Clear and fail exactly one gate that is still awaiting identity."""
+        if self._state is not _ModelIdentityState.PENDING:
+            raise ModelIdentityError("model identity gate is not pending")
+        self._buffer.clear()
+        self._buffered_content_bytes = 0
+        self._state = _ModelIdentityState.FAILED
+
 
 __all__ = (
     *_ATTESTATION_V2_ALL,
