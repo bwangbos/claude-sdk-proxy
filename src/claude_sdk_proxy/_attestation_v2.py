@@ -100,9 +100,31 @@ _EXPECTED_CANONICAL_TYPES = (
     "CLI_ARMED",
     "CLI_RUNNING",
 )
+_LAUNCH_AUTHORITY_PID = os.getpid()
 _LAUNCH_TOKEN = object()
+_LAUNCH_CLAIM_LOCK = threading.RLock()
 _RECEIPT_TOKEN = object()
 _TURN_TOKEN = object()
+
+
+def _invalidate_launch_authority_after_fork() -> None:
+    """Create a fresh child authority without touching inherited resources."""
+    global _LAUNCH_AUTHORITY_PID, _LAUNCH_CLAIM_LOCK, _LAUNCH_TOKEN
+    _LAUNCH_AUTHORITY_PID = os.getpid()
+    _LAUNCH_TOKEN = object()
+    _LAUNCH_CLAIM_LOCK = threading.RLock()
+
+
+os.register_at_fork(after_in_child=_invalidate_launch_authority_after_fork)
+
+
+def _require_launch_authority(token: object) -> None:
+    if (
+        type(_LAUNCH_AUTHORITY_PID) is not int
+        or _LAUNCH_AUTHORITY_PID != os.getpid()
+        or token is not _LAUNCH_TOKEN
+    ):
+        raise AttestationError("launch authority is invalid for creator process")
 
 
 class AttestationError(RuntimeError):
@@ -976,6 +998,7 @@ class PreparedSupervisorLaunch:
         "_cli_identity",
         "_command",
         "_config",
+        "_creator_pid",
         "_descriptors",
         "_fingerprint",
         "_network_proxy_enabled",
@@ -993,6 +1016,7 @@ class PreparedSupervisorLaunch:
     _cli_identity: CliExecutableIdentity
     _command: tuple[str, ...]
     _config: IsolationConfig
+    _creator_pid: int
     _descriptors: SupervisorBootstrapDescriptors
     _fingerprint: str
     _network_proxy_enabled: bool
@@ -1017,10 +1041,12 @@ class PreparedSupervisorLaunch:
         effective_environment: Mapping[str, str],
         network_proxy_enabled: bool,
     ) -> PreparedSupervisorLaunch:
-        if token is not _LAUNCH_TOKEN:
-            raise AttestationError("launch authority is invalid")
+        if cls is not PreparedSupervisorLaunch:
+            raise AttestationError("prepared launch creator process is invalid")
+        _require_launch_authority(token)
         value = object.__new__(cls)
         object.__setattr__(value, "_sealed", False)
+        object.__setattr__(value, "_creator_pid", os.getpid())
         immutable_config = IsolationConfig(
             model_id=config.model_id,
             system_prompt=config.system_prompt,
@@ -1063,57 +1089,84 @@ class PreparedSupervisorLaunch:
         )
         object.__setattr__(value, "_transport_claimed", False)
         object.__setattr__(value, "_transport_identity", None)
-        object.__setattr__(value, "_fingerprint", value._current_fingerprint())
+        object.__setattr__(
+            value,
+            "_fingerprint",
+            PreparedSupervisorLaunch._current_fingerprint(value),
+        )
         object.__setattr__(value, "_sealed", True)
         return value
 
     def __setattr__(self, _name: str, _value: object) -> Never:
         raise AttestationError("prepared launch is sealed")
 
+    def _require_creator_process(self) -> None:
+        if type(self) is not PreparedSupervisorLaunch:
+            raise AttestationError("prepared launch creator process is invalid")
+        try:
+            creator_pid = object.__getattribute__(self, "_creator_pid")
+        except BaseException as error:
+            raise AttestationError(
+                "prepared launch creator process is invalid"
+            ) from error
+        if type(creator_pid) is not int or creator_pid != os.getpid():
+            raise AttestationError("prepared launch creator process is invalid")
+
     def __copy__(self) -> Never:
+        PreparedSupervisorLaunch._require_creator_process(self)
         raise AttestationError("prepared launch cannot be copied")
 
     def __deepcopy__(self, _memo: object) -> Never:
+        PreparedSupervisorLaunch._require_creator_process(self)
         raise AttestationError("prepared launch cannot be copied")
 
     def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        PreparedSupervisorLaunch._require_creator_process(self)
         raise AttestationError("prepared launch cannot be pickled")
 
     @property
     def command(self) -> tuple[str, ...]:
+        PreparedSupervisorLaunch._require_creator_process(self)
         self._validate()
         return self._command
 
     @property
     def options(self) -> ClaudeAgentOptions:
+        PreparedSupervisorLaunch._require_creator_process(self)
         self._validate()
         return build_agent_options(self._config)
 
     @property
     def supervisor_environment(self) -> Mapping[str, str]:
+        PreparedSupervisorLaunch._require_creator_process(self)
         self._validate()
         return MappingProxyType(dict(self._supervisor_environment_items))
 
     @property
     def bootstrap_descriptor_names(self) -> tuple[str, ...]:
+        PreparedSupervisorLaunch._require_creator_process(self)
         self._validate()
         return self._bootstrap_descriptor_names
 
     @property
     def inherited_fds(self) -> tuple[int, ...]:
+        PreparedSupervisorLaunch._require_creator_process(self)
         self._validate()
         return (self._child_control.fileno(),)
 
     @property
     def cli_identity(self) -> CliExecutableIdentity:
+        PreparedSupervisorLaunch._require_creator_process(self)
         self._validate()
         return self._cli_identity
 
     @property
     def supervisor_internal_relay_fd(self) -> int:
+        PreparedSupervisorLaunch._require_creator_process(self)
         return SUPERVISOR_INTERNAL_RELAY_FD
 
     def _current_fingerprint(self) -> str:
+        PreparedSupervisorLaunch._require_creator_process(self)
         return _digest(
             b"claude-sdk-proxy:prepared-launch:v1",
             {
@@ -1125,6 +1178,7 @@ class PreparedSupervisorLaunch:
                 "real_cli": str(self._descriptors.real_cli),
                 "cli_identity": self._cli_identity.digest(),
                 "network_proxy_enabled": self._network_proxy_enabled,
+                "creator_pid": self._creator_pid,
                 "child_control_identity": self._child_control_identity,
                 "parent_control_identity": self._parent_control_identity,
                 "journal_identity": id(self._descriptors.journal),
@@ -1132,8 +1186,13 @@ class PreparedSupervisorLaunch:
         )
 
     def _validate(self) -> None:
+        PreparedSupervisorLaunch._require_creator_process(self)
         if self._authority is not _LAUNCH_TOKEN or not self._sealed:
             raise AttestationError("prepared launch authority is invalid")
+        if type(self._transport_claimed) is not bool:
+            raise AttestationError("prepared launch claim state is invalid")
+        if self._transport_claimed != (self._transport_identity is not None):
+            raise AttestationError("prepared launch claim state is invalid")
         if self._fingerprint != self._current_fingerprint():
             raise AttestationError("prepared launch fields changed")
         if self._child_control.fileno() < 0 or self._parent_control.fileno() < 0:
@@ -1144,20 +1203,34 @@ class PreparedSupervisorLaunch:
             raise AttestationError("parent control FD identity changed")
 
     def _claim(self, token: object, transport: object) -> None:
-        if token is not _LAUNCH_TOKEN:
-            raise AttestationError("transport claim authority is invalid")
+        PreparedSupervisorLaunch._require_creator_process(self)
+        _require_launch_authority(token)
+        if type(transport) is not AttestedSupervisorTransport:
+            raise AttestationError("transport claim creator process is invalid")
+        AttestedSupervisorTransport._require_creator_process(transport)
         self._validate()
-        if self._transport_claimed:
-            raise AttestationError("prepared launch is already claimed")
-        object.__setattr__(self, "_transport_claimed", True)
-        object.__setattr__(self, "_transport_identity", transport)
+        with _LAUNCH_CLAIM_LOCK:
+            PreparedSupervisorLaunch._require_creator_process(self)
+            if self._authority is not _LAUNCH_TOKEN:
+                raise AttestationError("transport claim authority is invalid")
+            if type(self._transport_claimed) is not bool:
+                raise AttestationError("prepared launch claim state is invalid")
+            if self._transport_claimed or self._transport_identity is not None:
+                raise AttestationError("prepared launch is already claimed")
+            object.__setattr__(self, "_transport_claimed", True)
+            object.__setattr__(self, "_transport_identity", transport)
 
     def _require_transport(self, transport: object) -> None:
+        PreparedSupervisorLaunch._require_creator_process(self)
+        if type(transport) is not AttestedSupervisorTransport:
+            raise AttestationError("prepared launch transport identity changed")
+        AttestedSupervisorTransport._require_creator_process(transport)
         self._validate()
         if self._transport_identity is not transport:
             raise AttestationError("prepared launch transport identity changed")
 
     def close(self) -> None:
+        PreparedSupervisorLaunch._require_creator_process(self)
         for control in (self._child_control, self._parent_control):
             try:
                 control.close()
@@ -1901,9 +1974,13 @@ class AttestedSupervisorTransport(Transport):
     """SDK transport with exact env/FD control and an actual Task 5 handshake."""
 
     def __init__(self, launch: PreparedSupervisorLaunch) -> None:
-        if not isinstance(launch, PreparedSupervisorLaunch):
+        if type(self) is not AttestedSupervisorTransport:
+            raise AttestationError("transport creator process is invalid")
+        if type(launch) is not PreparedSupervisorLaunch:
             raise AttestationError("validated supervisor launch is required")
-        launch._claim(_LAUNCH_TOKEN, self)
+        PreparedSupervisorLaunch._require_creator_process(launch)
+        self._creator_pid = os.getpid()
+        PreparedSupervisorLaunch._claim(launch, _LAUNCH_TOKEN, self)
         self.launch = launch
         self._control = launch._parent_control
         self._journal = launch._descriptors.journal
@@ -1921,8 +1998,29 @@ class AttestedSupervisorTransport(Transport):
         self._handshake_receipt: SupervisorHandshakeReceipt | None = None
         self._cleanup_unconfirmed = False
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_creator_pid":
+            try:
+                object.__getattribute__(self, name)
+            except AttributeError:
+                pass
+            else:
+                raise AttestationError("transport creator process is invalid")
+        object.__setattr__(self, name, value)
+
+    def _require_creator_process(self) -> None:
+        if type(self) is not AttestedSupervisorTransport:
+            raise AttestationError("transport creator process is invalid")
+        try:
+            creator_pid = object.__getattribute__(self, "_creator_pid")
+        except BaseException as error:
+            raise AttestationError("transport creator process is invalid") from error
+        if type(creator_pid) is not int or creator_pid != os.getpid():
+            raise AttestationError("transport creator process is invalid")
+
     @property
     def handshake_receipt(self) -> SupervisorHandshakeReceipt | None:
+        AttestedSupervisorTransport._require_creator_process(self)
         receipt = self._handshake_receipt
         if receipt is not None:
             receipt._validate()
@@ -1930,23 +2028,27 @@ class AttestedSupervisorTransport(Transport):
 
     @property
     def cleanup_unconfirmed(self) -> bool:
+        AttestedSupervisorTransport._require_creator_process(self)
         return self._cleanup_unconfirmed
 
     @property
     def buffered_user_write_count(self) -> int:
+        AttestedSupervisorTransport._require_creator_process(self)
         return len(self._buffered)
 
     @property
     def discarded_user_write_count(self) -> int:
+        AttestedSupervisorTransport._require_creator_process(self)
         return self._discarded
 
     async def connect(self) -> None:
+        AttestedSupervisorTransport._require_creator_process(self)
         async with self._lock:
             if self._closed:
                 raise AttestationError("transport is closed")
             if self._process is not None:
                 return
-            self.launch._require_transport(self)
+            PreparedSupervisorLaunch._require_transport(self.launch, self)
             command = self.launch.command
             cli_identity = self.launch.cli_identity
             environment = self.launch.supervisor_environment
@@ -1986,6 +2088,7 @@ class AttestedSupervisorTransport(Transport):
             self._ready = True
 
     async def write(self, data: str) -> None:
+        AttestedSupervisorTransport._require_creator_process(self)
         if not isinstance(data, str):
             raise AttestationError("transport write must be text")
         async with self._lock:
@@ -1998,6 +2101,7 @@ class AttestedSupervisorTransport(Transport):
                 self._buffered.append(str(data))
 
     async def release_buffered(self) -> Never:
+        AttestedSupervisorTransport._require_creator_process(self)
         async with self._lock:
             self._discarded += len(self._buffered)
             self._buffered.clear()
@@ -2005,6 +2109,7 @@ class AttestedSupervisorTransport(Transport):
         raise AttestationError("core attestation gate unavailable")
 
     async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
+        AttestedSupervisorTransport._require_creator_process(self)
         if self._stdout is None:
             raise AttestationError("transport is not connected")
         buffer = ""
@@ -2030,6 +2135,7 @@ class AttestedSupervisorTransport(Transport):
             yield value
 
     def is_ready(self) -> bool:
+        AttestedSupervisorTransport._require_creator_process(self)
         return self._ready and not self._closed
 
     async def _bounded_stdin_close(self) -> bool:
@@ -2045,6 +2151,7 @@ class AttestedSupervisorTransport(Transport):
         return True
 
     async def end_input(self) -> None:
+        AttestedSupervisorTransport._require_creator_process(self)
         async with self._lock:
             if not await self._bounded_stdin_close():
                 raise AttestationError("stdin close timed out; cleanup is unconfirmed")
@@ -2148,6 +2255,7 @@ class AttestedSupervisorTransport(Transport):
         raise AttestationError("transport cleanup is unconfirmed")
 
     async def close(self) -> None:
+        AttestedSupervisorTransport._require_creator_process(self)
         failure: AttestationError | None = None
         with anyio.CancelScope(shield=True):
             try:
@@ -2169,9 +2277,13 @@ def build_attested_sdk_client(
     *,
     transport: AttestedSupervisorTransport | None = None,
 ) -> ClaudeSDKClient:
-    if transport is None or not isinstance(transport, AttestedSupervisorTransport):
+    if type(launch) is not PreparedSupervisorLaunch:
+        raise AttestationError("validated supervisor launch is required")
+    PreparedSupervisorLaunch._require_creator_process(launch)
+    if type(transport) is not AttestedSupervisorTransport:
         raise AttestationError("custom Task 6 transport is mandatory")
-    launch._require_transport(transport)
+    AttestedSupervisorTransport._require_creator_process(transport)
+    PreparedSupervisorLaunch._require_transport(launch, transport)
     return ClaudeSDKClient(options=launch.options, transport=transport)
 
 

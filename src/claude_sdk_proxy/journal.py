@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -641,17 +642,53 @@ def _load_library(path: Path) -> ctypes.CDLL:
 class AdmittedBatch:
     """A native action-lock capability; only its admitting thread may use it."""
 
-    __slots__ = ("_journal", "_owner_thread_id", "_token", "_valid")
+    __slots__ = (
+        "_creator_pid",
+        "_journal",
+        "_owner_thread_id",
+        "_token",
+        "_valid",
+    )
 
     def __init__(self, token: object, journal: Journal, native: _CActionToken) -> None:
+        if type(self) is not AdmittedBatch:
+            raise JournalError(JournalErrorCode.FORK_INHERITED)
         if token is not _BATCH_TOKEN:
             raise TypeError("batch capabilities are created by native admission")
+        Journal._require_creator_process(journal)
+        self._creator_pid = os.getpid()
         self._journal = journal
         self._token = native
         self._owner_thread_id = threading.get_ident()
         self._valid = True
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_creator_pid":
+            try:
+                object.__getattribute__(self, name)
+            except AttributeError:
+                pass
+            else:
+                raise JournalError(JournalErrorCode.FORK_INHERITED)
+        object.__setattr__(self, name, value)
+
+    def _require_creator_process(self) -> None:
+        if type(self) is not AdmittedBatch:
+            raise JournalError(JournalErrorCode.FORK_INHERITED)
+        try:
+            creator_pid = object.__getattribute__(self, "_creator_pid")
+        except BaseException as error:
+            raise JournalError(JournalErrorCode.FORK_INHERITED) from error
+        if type(creator_pid) is not int or creator_pid != os.getpid():
+            raise JournalError(JournalErrorCode.FORK_INHERITED)
+        try:
+            journal = object.__getattribute__(self, "_journal")
+        except BaseException as error:
+            raise JournalError(JournalErrorCode.FORK_INHERITED) from error
+        Journal._require_creator_process(journal)
+
     def execute(self, deadline_ns: int | None = None) -> int:
+        AdmittedBatch._require_creator_process(self)
         completed = ctypes.c_uint64()
         _raise_status(
             self._journal._batch_native_call(
@@ -666,6 +703,7 @@ class AdmittedBatch:
         return completed.value
 
     def complete(self, deadline_ns: int | None = None) -> CanonicalRecord:
+        AdmittedBatch._require_creator_process(self)
         output = _CAppendResult()
         token_state = ctypes.c_uint32()
         status = self._journal._batch_native_call(
@@ -686,6 +724,7 @@ class AdmittedBatch:
         return _canonical(output)
 
     def abandon(self) -> None:
+        AdmittedBatch._require_creator_process(self)
         status = self._journal._batch_native_call(
             self,
             self._journal._library.cpl_journal_abandon_batch,
@@ -711,6 +750,9 @@ class Journal:
         workdir_parent_dirfd: int,
         workdir_name: str,
     ) -> None:
+        if type(self) is not Journal:
+            raise JournalError(JournalErrorCode.FORK_INHERITED)
+        self._creator_pid = os.getpid()
         self._library = library
         self._handle = handle
         self._parent_dirfd = parent_dirfd
@@ -726,6 +768,31 @@ class Journal:
         self._closing_thread_id: int | None = None
         self._outstanding_batch_owner: int | None = None
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_creator_pid":
+            try:
+                object.__getattribute__(self, name)
+            except AttributeError:
+                pass
+            else:
+                raise JournalError(JournalErrorCode.FORK_INHERITED)
+        object.__setattr__(self, name, value)
+
+    def _require_creator_process(self) -> None:
+        if type(self) is not Journal:
+            raise JournalError(JournalErrorCode.FORK_INHERITED)
+        try:
+            creator_pid = object.__getattribute__(self, "_creator_pid")
+        except BaseException as error:
+            raise JournalError(JournalErrorCode.FORK_INHERITED) from error
+        if type(creator_pid) is not int or creator_pid != os.getpid():
+            raise JournalError(JournalErrorCode.FORK_INHERITED)
+
+    @staticmethod
+    def _require_exact_class(cls: type[Journal]) -> None:
+        if cls is not Journal:
+            raise JournalError(JournalErrorCode.FORK_INHERITED)
+
     @classmethod
     def create_at(
         cls,
@@ -738,6 +805,7 @@ class Journal:
         workdir_parent_dirfd: int | None = None,
         workdir_name: str | None = None,
     ) -> tuple[Self, JournalCreateReceipt]:
+        Journal._require_exact_class(cls)
         return cls._create_at_with_library(
             parent_dirfd,
             journal_name,
@@ -762,6 +830,7 @@ class Journal:
         workdir_name: str | None = None,
         library_path: Path,
     ) -> tuple[Self, JournalCreateReceipt]:
+        Journal._require_exact_class(cls)
         return cls._create_at_with_library(
             parent_dirfd,
             journal_name,
@@ -786,6 +855,7 @@ class Journal:
         workdir_name: str | None,
         library_path: Path,
     ) -> tuple[Self, JournalCreateReceipt]:
+        Journal._require_exact_class(cls)
         selected_parent = (
             parent_dirfd if workdir_parent_dirfd is None else workdir_parent_dirfd
         )
@@ -842,6 +912,7 @@ class Journal:
         workdir_parent_dirfd: int | None = None,
         workdir_name: str | None = None,
     ) -> Self:
+        Journal._require_exact_class(cls)
         return cls._open_at_with_library(
             parent_dirfd,
             journal_name,
@@ -866,6 +937,7 @@ class Journal:
         workdir_name: str | None = None,
         library_path: Path,
     ) -> Self:
+        Journal._require_exact_class(cls)
         return cls._open_at_with_library(
             parent_dirfd,
             journal_name,
@@ -890,6 +962,7 @@ class Journal:
         workdir_name: str | None,
         library_path: Path,
     ) -> Self:
+        Journal._require_exact_class(cls)
         selected_parent = (
             parent_dirfd if workdir_parent_dirfd is None else workdir_parent_dirfd
         )
@@ -930,25 +1003,31 @@ class Journal:
 
     @property
     def closed(self) -> bool:
+        Journal._require_creator_process(self)
         with self._operation_condition:
             return self._handle_state is _HandleState.CLOSED
 
     @property
     def unhealthy(self) -> bool:
+        Journal._require_creator_process(self)
         return self.scan().unhealthy
 
     def __copy__(self) -> Self:
+        Journal._require_creator_process(self)
         raise TypeError("Journal is a sole-owner native handle")
 
     def __deepcopy__(self, memo: object) -> Self:
+        Journal._require_creator_process(self)
         del memo
         raise TypeError("Journal is a sole-owner native handle")
 
     def __enter__(self) -> Self:
+        Journal._require_creator_process(self)
         self._require_open()
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        Journal._require_creator_process(self)
         del exc_type, exc, traceback
         self.close()
 
@@ -959,6 +1038,7 @@ class Journal:
             pass
 
     def _finalize_nonblocking(self) -> None:
+        Journal._require_creator_process(self)
         condition = getattr(self, "_operation_condition", None)
         if condition is None or not condition.acquire(blocking=False):
             return
@@ -983,12 +1063,14 @@ class Journal:
             condition.release()
 
     def _require_open(self) -> None:
+        Journal._require_creator_process(self)
         with self._operation_condition:
             if self._handle_state is not _HandleState.OPEN:
                 raise JournalError(JournalErrorCode.CLOSED)
 
     @contextmanager
     def _operation(self) -> Iterator[ctypes.c_void_p]:
+        Journal._require_creator_process(self)
         handle = self._acquire_operation()
         try:
             yield handle
@@ -996,6 +1078,7 @@ class Journal:
             self._release_operation()
 
     def _acquire_operation(self) -> ctypes.c_void_p:
+        Journal._require_creator_process(self)
         with self._operation_condition:
             if self._handle_state is not _HandleState.OPEN:
                 raise JournalError(JournalErrorCode.CLOSED)
@@ -1003,6 +1086,7 @@ class Journal:
             return ctypes.c_void_p(self._handle.value)
 
     def _acquire_batch_lease(self, deadline_ns: int) -> ctypes.c_void_p:
+        Journal._require_creator_process(self)
         current_thread = threading.get_ident()
         with self._operation_condition:
             while True:
@@ -1020,6 +1104,7 @@ class Journal:
                 self._operation_condition.wait(remaining_ns / 1_000_000_000)
 
     def _release_operation(self) -> None:
+        Journal._require_creator_process(self)
         with self._operation_condition:
             self._active_operations -= 1
             if self._active_operations == 0:
@@ -1031,6 +1116,8 @@ class Journal:
         function: Callable[..., int],
         *args: object,
     ) -> int:
+        Journal._require_creator_process(self)
+        AdmittedBatch._require_creator_process(batch)
         with self._operation_condition:
             current_thread = threading.get_ident()
             if (
@@ -1044,6 +1131,8 @@ class Journal:
         return int(function(handle, *args))
 
     def _release_batch_lease(self, batch: AdmittedBatch) -> None:
+        Journal._require_creator_process(self)
+        AdmittedBatch._require_creator_process(batch)
         with self._operation_condition:
             if (
                 not batch._valid
@@ -1056,6 +1145,7 @@ class Journal:
             self._operation_condition.notify_all()
 
     def _rollback_batch_lease(self) -> None:
+        Journal._require_creator_process(self)
         with self._operation_condition:
             if self._outstanding_batch_owner != threading.get_ident():
                 raise JournalError(JournalErrorCode.BATCH_TOKEN)
@@ -1064,12 +1154,14 @@ class Journal:
             self._operation_condition.notify_all()
 
     def _native_call(self, function: Callable[..., int], *args: object) -> int:
+        Journal._require_creator_process(self)
         with self._operation() as handle:
             return int(function(handle, *args))
 
     def _exclusive_pointer_call(
         self, function: Callable[..., int], *args: object
     ) -> int:
+        Journal._require_creator_process(self)
         current_thread = threading.get_ident()
         with self._operation_condition:
             if self._handle_state is not _HandleState.OPEN:
@@ -1093,6 +1185,7 @@ class Journal:
                 self._operation_condition.notify_all()
 
     def close(self) -> None:
+        Journal._require_creator_process(self)
         current_thread = threading.get_ident()
         with self._operation_condition:
             while self._handle_state is _HandleState.CLOSING:
@@ -1120,6 +1213,7 @@ class Journal:
                 self._operation_condition.notify_all()
 
     def scan(self) -> CanonicalChain:
+        Journal._require_creator_process(self)
         chain = _CChain()
         _raise_status(
             self._native_call(self._library.cpl_journal_scan, ctypes.byref(chain))
@@ -1142,6 +1236,7 @@ class Journal:
         *,
         deadline_ns: int | None = None,
     ) -> CanonicalRecord:
+        Journal._require_creator_process(self)
         native_record = _record_to_c(record)
         payload = ctypes.cast(
             ctypes.byref(native_record), ctypes.POINTER(ctypes.c_uint8)
@@ -1164,6 +1259,7 @@ class Journal:
         reason: UnconfirmedReason,
         deadline_ns: int | None = None,
     ) -> CanonicalRecord:
+        Journal._require_creator_process(self)
         if not isinstance(reason, UnconfirmedReason):
             raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
         output = _CAppendResult()
@@ -1178,6 +1274,7 @@ class Journal:
         return _canonical(output)
 
     def certify_head(self, deadline_ns: int | None = None) -> CertifiedHead:
+        Journal._require_creator_process(self)
         native = self._certified_native(deadline_ns)
         return CertifiedHead(
             bytes(native.head_hash),
@@ -1194,6 +1291,7 @@ class Journal:
         payload: bytes,
         deadline_ns: int | None = None,
     ) -> BootstrapHead:
+        Journal._require_creator_process(self)
         if (
             isinstance(message_type, bool)
             or not 1 <= message_type <= 11
@@ -1233,6 +1331,7 @@ class Journal:
         deadline_ns: int | None = None,
     ) -> BootstrapHead:
         """Append one authenticated bootstrap event to the canonical journal."""
+        Journal._require_creator_process(self)
         if (
             isinstance(message_type, bool)
             or not 1 <= message_type <= 11
@@ -1264,6 +1363,7 @@ class Journal:
         )
 
     def _certified_native(self, deadline_ns: int | None = None) -> _CCertifiedHead:
+        Journal._require_creator_process(self)
         native = _CCertifiedHead()
         _raise_status(
             self._native_call(
@@ -1287,6 +1387,7 @@ class Journal:
         receipt: JournalCreateReceipt,
         deadline_ns: int | None = None,
     ) -> JournalWorkdirReceipt:
+        Journal._require_creator_process(self)
         if not isinstance(receipt, JournalCreateReceipt):
             raise TypeError("a native create receipt is required")
         create_receipt = self._create_receipt_to_c(receipt)
@@ -1322,6 +1423,7 @@ class Journal:
         )
 
     def certify_done(self, deadline_ns: int | None = None) -> CertifiedDone:
+        Journal._require_creator_process(self)
         native = _CDeleteAuthority()
         _raise_status(
             self._native_call(
@@ -1339,6 +1441,7 @@ class Journal:
         self,
         deadline_ns: int | None = None,
     ) -> UnreleasedPartialCreate:
+        Journal._require_creator_process(self)
         native = _CDeleteAuthority()
         _raise_status(
             self._native_call(
@@ -1356,6 +1459,7 @@ class Journal:
         self,
         deadline_ns: int | None = None,
     ) -> UnreleasedPartialCreate:
+        Journal._require_creator_process(self)
         return self.certify_no_dependent_artifacts(deadline_ns)
 
     @staticmethod
@@ -1375,6 +1479,7 @@ class Journal:
         authority: CertifiedDone | UnreleasedPartialCreate,
         deadline_ns: int | None,
     ) -> JournalDeleteReceipt:
+        Journal._require_creator_process(self)
         native_authority = self._authority_to_c(authority)
         native = _CDeleteReceipt()
         _raise_status(
@@ -1398,6 +1503,7 @@ class Journal:
         authority: CertifiedDone | UnreleasedPartialCreate,
         deadline_ns: int | None = None,
     ) -> JournalDeleteReceipt:
+        Journal._require_creator_process(self)
         return self._delete_common(
             self._library.cpl_journal_delete_at, authority, deadline_ns
         )
@@ -1407,6 +1513,7 @@ class Journal:
         authority: CertifiedDone | UnreleasedPartialCreate,
         deadline_ns: int | None = None,
     ) -> JournalDeleteReceipt:
+        Journal._require_creator_process(self)
         return self._delete_common(
             self._library.cpl_journal_reconcile_absent_after_crash,
             authority,
@@ -1414,6 +1521,7 @@ class Journal:
         )
 
     def observe_process(self, pid: int) -> ProcessIdentity:
+        Journal._require_creator_process(self)
         native = _CProcessIdentity()
         _raise_status(int(self._library.cpl_process_observe(pid, ctypes.byref(native))))
         return _identity_from_c(native)
@@ -1443,6 +1551,7 @@ class Journal:
         lease_deadline_ns: int,
         deadline_ns: int | None = None,
     ) -> CanonicalRecord:
+        Journal._require_creator_process(self)
         output = _CAppendResult()
         _raise_status(
             self._native_call(
@@ -1466,6 +1575,7 @@ class Journal:
         *,
         deadline_ns: int | None = None,
     ) -> AdmittedBatch:
+        Journal._require_creator_process(self)
         if not descriptors:
             raise JournalError(JournalErrorCode.INVALID_ARGUMENT)
         array_type = _CBatchDescriptor * len(descriptors)
@@ -1512,6 +1622,7 @@ class Journal:
         executor: str,
         deadline_ns: int | None = None,
     ) -> CanonicalRecord:
+        Journal._require_creator_process(self)
         output = _CAppendResult()
         _raise_status(
             self._native_call(
@@ -1532,6 +1643,7 @@ class Journal:
         authority_deadline_ns: int,
         deadline_ns: int | None = None,
     ) -> CanonicalRecord:
+        Journal._require_creator_process(self)
         output = _CAppendResult()
         _raise_status(
             self._native_call(
@@ -1553,6 +1665,7 @@ class Journal:
         authority_deadline_ns: int,
         deadline_ns: int | None = None,
     ) -> CanonicalRecord:
+        Journal._require_creator_process(self)
         output = _CAppendResult()
         _raise_status(
             self._native_call(
@@ -1570,6 +1683,7 @@ class Journal:
         self,
         deadline_ns: int | None = None,
     ) -> ReapProof:
+        Journal._require_creator_process(self)
         native = _CReapProof()
         _raise_status(
             self._native_call(
@@ -1591,6 +1705,7 @@ class Journal:
         self,
         deadline_ns: int | None = None,
     ) -> ReapProof:
+        Journal._require_creator_process(self)
         native = _CReapProof()
         _raise_status(
             self._native_call(
@@ -1626,6 +1741,7 @@ class Journal:
         proof: ReapProof,
         deadline_ns: int | None = None,
     ) -> CanonicalRecord:
+        Journal._require_creator_process(self)
         native_proof = self._proof_to_c(proof)
         output = _CAppendResult()
         _raise_status(
@@ -1647,6 +1763,7 @@ class Journal:
         claim_deadline_ns: int,
         deadline_ns: int | None = None,
     ) -> CanonicalRecord:
+        Journal._require_creator_process(self)
         native_proof = self._proof_to_c(proof)
         output = _CAppendResult()
         _raise_status(
@@ -1663,6 +1780,7 @@ class Journal:
         return _canonical(output)
 
     def _fault(self, name: str) -> Any:
+        Journal._require_creator_process(self)
         self._require_open()
         try:
             return getattr(self._library, name)
@@ -1685,6 +1803,7 @@ class Journal:
     def configure_lifecycle_pause_for_test(
         self, point: str, notify_fd: int, wait_fd: int
     ) -> None:
+        Journal._require_creator_process(self)
         points = {
             "before_workdir_bound_append": 1,
             "before_retirement_expiry_check": 2,
@@ -1747,24 +1866,28 @@ class Journal:
         )
 
     def fail_batch_after_step_for_test(self, step: int) -> None:
+        Journal._require_creator_process(self)
         function = self._fault("cpl_fault_fail_batch_after_step")
         function.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         function.restype = ctypes.c_int
         _raise_status(self._native_call(function, step))
 
     def fail_batch_after_effect_for_test(self, step: int) -> None:
+        Journal._require_creator_process(self)
         function = self._fault("cpl_fault_fail_batch_after_effect")
         function.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         function.restype = ctypes.c_int
         _raise_status(self._native_call(function, step))
 
     def fail_next_workdir_parent_fsync_for_test(self) -> None:
+        Journal._require_creator_process(self)
         function = self._fault("cpl_fault_fail_next_workdir_parent_fsync")
         function.argtypes = [ctypes.c_void_p]
         function.restype = ctypes.c_int
         _raise_status(self._native_call(function))
 
     def raw_append_for_test(self, encoded: bytes) -> None:
+        Journal._require_creator_process(self)
         function = self._fault("cpl_fault_append_bytes")
         function.argtypes = [
             ctypes.c_void_p,
@@ -1776,6 +1899,7 @@ class Journal:
         _raise_status(self._native_call(function, payload, len(encoded)))
 
     def encode_physical_for_test(self, record: Record) -> bytes:
+        Journal._require_creator_process(self)
         function = self._fault("cpl_fault_encode_record")
         function.argtypes = [
             ctypes.c_void_p,
@@ -1806,6 +1930,7 @@ class Journal:
         return bytes(output[: length.value])
 
     def inject_header_mismatch_for_test(self, record: Record, field: str) -> None:
+        Journal._require_creator_process(self)
         mismatches = {"cleanup_epoch": 1, "payload_type": 2, "duplicate_parent": 3}
         try:
             mismatch = mismatches[field]
@@ -1838,6 +1963,7 @@ class Journal:
         wait_fd: int,
         deadline_ns: int | None = None,
     ) -> None:
+        Journal._require_creator_process(self)
         function = self._fault("cpl_fault_hold_append_lock")
         function.argtypes = [
             ctypes.c_void_p,
@@ -1858,6 +1984,7 @@ class Journal:
         wait_fd: int,
         deadline_ns: int | None = None,
     ) -> None:
+        Journal._require_creator_process(self)
         function = self._fault("cpl_fault_hold_action_lock")
         function.argtypes = [
             ctypes.c_void_p,
@@ -1873,6 +2000,7 @@ class Journal:
         )
 
     def probe_action_lock_for_test(self, deadline_ns: int | None = None) -> None:
+        Journal._require_creator_process(self)
         function = self._fault("cpl_fault_probe_action_lock")
         function.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
         function.restype = ctypes.c_int
@@ -1884,6 +2012,7 @@ class Journal:
         wait_fd: int,
         deadline_ns: int | None = None,
     ) -> CertifiedHead:
+        Journal._require_creator_process(self)
         function = self._fault("cpl_fault_configure_certify_pause")
         function.argtypes = [ctypes.c_int, ctypes.c_int]
         function.restype = ctypes.c_int
@@ -1897,6 +2026,7 @@ class Journal:
         marker_parent_dirfd: int,
         marker_name: str,
     ) -> bool:
+        Journal._require_creator_process(self)
         gates = {"spawn": 1, "execute": 2}
         try:
             kind = gates[gate_kind]

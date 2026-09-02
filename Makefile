@@ -39,10 +39,10 @@ build/bin/claude-proxy-probe-child: native/claude_probe_child.c | build/bin
 build/bin/claude-proxy-task6-test-cli: native/claude_task6_test_cli.c | build/bin
 	$(CLANG) $(C17_FLAGS) -isysroot $(SDKROOT) native/claude_task6_test_cli.c -o $@
 
-unit:
+unit: native
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/unit
 
-darwin:
+darwin: native
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/darwin
 
 live-core:
@@ -51,6 +51,6 @@ live-core:
 live-tools:
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/live -m live -k tool
 
-check: native unit
+check: unit darwin
 	uv run ruff check .
 	uv run mypy src/claude_sdk_proxy

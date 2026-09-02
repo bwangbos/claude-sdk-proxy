@@ -21,8 +21,9 @@ they are never release evidence.
 ## Runtime and policy inputs
 
 The supported runtime tuple is Claude Agent SDK `0.2.148`, Claude CLI
-`2.1.251`, Darwin major version `14`, and a local `apfs` mount. The probe
-resolves and hashes one regular executable before accepting its version.
+`2.1.251`, macOS 14 or newer (Darwin 23 or newer), and a local `apfs` mount.
+The probe resolves and hashes one regular executable before accepting its
+version.
 
 Before any subscription-backed check, obtain both official primary pages:
 

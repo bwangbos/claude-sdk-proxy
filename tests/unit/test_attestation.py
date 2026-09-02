@@ -1477,7 +1477,9 @@ def test_launch_and_transport_creator_guards_reject_tampering_and_hostile_subcla
                 raise AssertionError("hostile launch attributes were traversed")
 
         forged_launch = object.__new__(HostileLaunch)
-        command_getter = PreparedSupervisorLaunch.command.fget
+        command_descriptor = vars(PreparedSupervisorLaunch)["command"]
+        assert isinstance(command_descriptor, property)
+        command_getter = command_descriptor.fget
         assert command_getter is not None
         with pytest.raises(AttestationError, match="creator process"):
             command_getter(forged_launch)
