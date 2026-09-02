@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-sdk-proxy"
+version = "0.0.0"
+description = "Trusted-local Claude Agent SDK feasibility probes"
+readme = "docs/feasibility/README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "claude-agent-sdk==0.2.148",
+]
+
+[project.scripts]
+claude-proxy-probe = "claude_sdk_proxy.probe_cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18,<2",
+    "pytest>=8.4,<10",
+    "pytest-anyio>=0.0.0",
+    "ruff>=0.12,<1",
+]
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+testpaths = ["tests"]
+markers = [
+    "anyio: asynchronous test executed by the single asyncio backend",
+    "live: opt-in test requiring the existing local Claude login",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+files = ["src/claude_sdk_proxy"]
