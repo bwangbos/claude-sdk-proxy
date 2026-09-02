@@ -1191,6 +1191,16 @@ def test_collection_consumption_rejects_copied_run_without_burning_owner() -> No
     assert consumed.manifest is collection.manifest
 
 
+def test_manifest_collection_capabilities_have_no_public_constructor() -> None:
+    for capability_type in (
+        validated.ManifestCollectionRun,
+        validated.ManifestGateObservation,
+        validated.CompleteManifestCollection,
+    ):
+        with pytest.raises(TypeError):
+            capability_type()
+
+
 def test_collection_consumption_is_one_shot_under_concurrency() -> None:
     run = validated.ManifestCollectionRun.begin()
     collection = _complete_synthetic_collection(run)
