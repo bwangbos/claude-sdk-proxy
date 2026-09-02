@@ -118,6 +118,7 @@ class _TransportAuthority:
     key: object
     launch: PreparedSupervisorLaunch
     lock: Any
+    read_lock: Any
     control: socket.socket
     journal: Journal
     nonce: bytes
@@ -1300,6 +1301,7 @@ class PreparedSupervisorLaunch:
             try:
                 launch = object.__getattribute__(transport, "launch")
                 lock = object.__getattribute__(transport, "_lock")
+                read_lock = object.__getattribute__(transport, "_read_lock")
                 control = object.__getattribute__(transport, "_control")
                 journal = object.__getattribute__(transport, "_journal")
                 nonce = object.__getattribute__(transport, "_nonce")
@@ -1349,6 +1351,7 @@ class PreparedSupervisorLaunch:
                 key=_TRANSPORT_AUTHORITY_KEY,
                 launch=self,
                 lock=lock,
+                read_lock=read_lock,
                 control=control,
                 journal=journal,
                 nonce=nonce,
@@ -2017,6 +2020,12 @@ class _OwnedSupervisorProcess:
             await anyio.to_thread.run_sync(stream.close, abandon_on_cancel=True)
             self._stdin = None
 
+    async def close_stdout(self) -> None:
+        stream = self._stdout
+        if stream is not None:
+            await anyio.to_thread.run_sync(stream.close, abandon_on_cancel=True)
+            self._stdout = None
+
     def record_confirmed_exit(self, status: int) -> None:
         if self._popen.returncode is not None:
             raise AttestationError("supervisor was reaped outside Task 4")
@@ -2168,6 +2177,8 @@ def _require_transport_authority_locked(
         structure_is_valid = (
             object.__getattribute__(transport, "launch") is authority.launch
             and object.__getattribute__(transport, "_lock") is authority.lock
+            and object.__getattribute__(transport, "_read_lock")
+            is authority.read_lock
             and object.__getattribute__(transport, "_control") is authority.control
             and object.__getattribute__(transport, "_journal") is authority.journal
             and object.__getattribute__(transport, "_nonce") is authority.nonce
@@ -2355,6 +2366,7 @@ class AttestedSupervisorTransport(Transport):
     _network_proxy_enabled: bool
     _nonce: bytes
     _process: Any | None
+    _read_lock: Any
     _ready: bool
     _stdin: _OwnedSupervisorProcess | None
     _stdout: _OwnedSupervisorProcess | None
@@ -2380,6 +2392,7 @@ class AttestedSupervisorTransport(Transport):
         object.__setattr__(self, "_stdin", None)
         object.__setattr__(self, "_stdout", None)
         object.__setattr__(self, "_lock", anyio.Lock())
+        object.__setattr__(self, "_read_lock", anyio.Lock())
         object.__setattr__(self, "_ready", False)
         object.__setattr__(self, "_closed", False)
         object.__setattr__(self, "_initialize_seen", False)
@@ -2478,10 +2491,18 @@ class AttestedSupervisorTransport(Transport):
                     inherited_fds=inherited_fds,
                 )
             )
-            _update_transport_runtime(self, authority, process=process)
+            _update_transport_runtime(
+                self,
+                authority,
+                states=("active", "closing"),
+                process=process,
+            )
             if not process.pipes_available:
                 _update_transport_runtime(
-                    self, authority, cleanup_unconfirmed=True
+                    self,
+                    authority,
+                    states=("active", "closing"),
+                    cleanup_unconfirmed=True,
                 )
                 raise AttestationError("supervisor pipes are unavailable")
             launch._child_control.close()
@@ -2496,11 +2517,17 @@ class AttestedSupervisorTransport(Transport):
                     process.pid,
                 )
                 _update_transport_runtime(
-                    self, authority, handshake_receipt=receipt
+                    self,
+                    authority,
+                    states=("active", "closing"),
+                    handshake_receipt=receipt,
                 )
             except BaseException as error:
                 _update_transport_runtime(
-                    self, authority, cleanup_unconfirmed=True
+                    self,
+                    authority,
+                    states=("active", "closing"),
+                    cleanup_unconfirmed=True,
                 )
                 if isinstance(error, Exception):
                     raise AttestationError(
@@ -2510,9 +2537,10 @@ class AttestedSupervisorTransport(Transport):
             _update_transport_runtime(
                 self,
                 authority,
+                states=("active", "closing"),
                 stdin=process,
                 stdout=process,
-                ready=True,
+                ready=authority.state == "active",
             )
 
     async def write(self, data: str) -> None:
@@ -2545,33 +2573,46 @@ class AttestedSupervisorTransport(Transport):
         authority = _require_transport_authority(self)
         buffer = ""
         decoder = codecs.getincrementaldecoder("utf-8")()
-        while True:
-            async with authority.lock:
+        async with authority.read_lock:
+            _require_transport_authority(self, expected=authority)
+            while True:
                 _require_transport_authority(self, expected=authority)
                 stream = authority.stdout
                 if stream is None:
                     raise AttestationError("transport is not connected")
-                chunk_bytes = await stream.receive()
-            if not chunk_bytes:
-                break
-            chunk = decoder.decode(chunk_bytes)
-            buffer += chunk
-            if len(buffer.encode("utf-8")) > 1024 * 1024:
-                raise AttestationError("supervisor output exceeded transport bound")
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                if not line.strip():
-                    continue
-                value = json.loads(line)
+                try:
+                    chunk_bytes = await stream.receive()
+                except Exception as error:
+                    try:
+                        _require_transport_authority(self, expected=authority)
+                    except AttestationError as authority_error:
+                        raise authority_error from error
+                    raise
+                _require_transport_authority(self, expected=authority)
+                if not chunk_bytes:
+                    break
+                chunk = decoder.decode(chunk_bytes)
+                buffer += chunk
+                if len(buffer.encode("utf-8")) > 1024 * 1024:
+                    raise AttestationError(
+                        "supervisor output exceeded transport bound"
+                    )
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if not line.strip():
+                        continue
+                    value = json.loads(line)
+                    if not isinstance(value, dict):
+                        raise AttestationError(
+                            "supervisor message must be an object"
+                        )
+                    yield value
+            buffer += decoder.decode(b"", final=True)
+            if buffer.strip():
+                value = json.loads(buffer)
                 if not isinstance(value, dict):
                     raise AttestationError("supervisor message must be an object")
                 yield value
-        buffer += decoder.decode(b"", final=True)
-        if buffer.strip():
-            value = json.loads(buffer)
-            if not isinstance(value, dict):
-                raise AttestationError("supervisor message must be an object")
-            yield value
 
     def is_ready(self) -> bool:
         authority = _require_transport_authority(
@@ -2601,6 +2642,18 @@ class AttestedSupervisorTransport(Transport):
         )
         return True
 
+    async def _close_stdout_once(
+        self, authority: _TransportAuthority | None = None
+    ) -> None:
+        current = _require_internal_closing_transport_authority(self, authority)
+        stream = current.stdout
+        if stream is None:
+            return
+        await stream.close_stdout()
+        _update_transport_runtime(
+            self, current, states=("closing",), stdout=None
+        )
+
     async def end_input(self) -> None:
         authority = _require_transport_authority(self)
         async with authority.lock:
@@ -2612,10 +2665,18 @@ class AttestedSupervisorTransport(Transport):
                 await stream.close_stdin()
             if scope.cancel_called:
                 _update_transport_runtime(
-                    self, authority, cleanup_unconfirmed=True
+                    self,
+                    authority,
+                    states=("active", "closing"),
+                    cleanup_unconfirmed=True,
                 )
                 raise AttestationError("stdin close timed out; cleanup is unconfirmed")
-            _update_transport_runtime(self, authority, stdin=None)
+            _update_transport_runtime(
+                self,
+                authority,
+                states=("active", "closing"),
+                stdin=None,
+            )
 
     async def _bounded_process_aclose(
         self, authority: _TransportAuthority | None = None
@@ -2712,9 +2773,8 @@ class AttestedSupervisorTransport(Transport):
 
     async def _close_transition(self) -> None:
         authority = _require_transport_authority(self)
-        async with authority.lock:
-            _require_transport_authority(self, expected=authority)
-            _begin_transport_close(self, authority)
+        _begin_transport_close(self, authority)
+        try:
             discarded = authority.discarded + len(authority.buffered)
             _update_transport_runtime(
                 self,
@@ -2725,7 +2785,20 @@ class AttestedSupervisorTransport(Transport):
                 discarded=discarded,
             )
             authority.buffered.clear()
+            reader_close_error: BaseException | None = None
             try:
+                await self._close_stdout_once(authority)
+            except BaseException as error:
+                reader_close_error = error
+            async with authority.lock:
+                _require_transport_authority(
+                    self, ("closing",), expected=authority
+                )
+                if reader_close_error is not None:
+                    raise reader_close_error
+                # A connect that already owned the writer lease when close
+                # began may have installed stdout while close waited.
+                await self._close_stdout_once(authority)
                 stdin_closed = await self._bounded_stdin_close(authority)
                 receipt = authority.handshake_receipt
                 if receipt is None:
@@ -2750,29 +2823,22 @@ class AttestedSupervisorTransport(Transport):
                     launch._child_control.close()
                     _finish_transport_close(self, authority)
                     return
+            raise AttestationError("transport cleanup is unconfirmed")
+        except BaseException:
+            try:
                 _update_transport_runtime(
                     self,
                     authority,
                     states=("closing",),
                     cleanup_unconfirmed=True,
                 )
+            except AttestationError:
+                pass
+            try:
                 _mark_transport_cleanup_unconfirmed(self, authority)
-            except BaseException:
-                try:
-                    _update_transport_runtime(
-                        self,
-                        authority,
-                        states=("closing",),
-                        cleanup_unconfirmed=True,
-                    )
-                except AttestationError:
-                    pass
-                try:
-                    _mark_transport_cleanup_unconfirmed(self, authority)
-                except AttestationError:
-                    pass
-                raise
-        raise AttestationError("transport cleanup is unconfirmed")
+            except AttestationError:
+                pass
+            raise
 
     async def close(self) -> None:
         authority = _require_transport_authority(self, ("active", "closed"))

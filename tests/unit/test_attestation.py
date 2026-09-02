@@ -2045,6 +2045,7 @@ async def test_transport_attribute_tampering_rejects_before_lock_or_resource(
         launch = _prepare(inputs)
         transport = AttestedSupervisorTransport(launch)
         original_lock = transport._lock
+        original_read_lock = transport._read_lock
         original_control = transport._control
         transport._lock = _LockTouchTrap()  # type: ignore[assignment]
         object.__setattr__(transport, "_read_lock", _LockTouchTrap())
@@ -2059,7 +2060,7 @@ async def test_transport_attribute_tampering_rejects_before_lock_or_resource(
                 await anext(messages)
         finally:
             transport._lock = original_lock
-            object.__delattr__(transport, "_read_lock")
+            transport._read_lock = original_read_lock
             transport._control = original_control
             launch.close()
 
