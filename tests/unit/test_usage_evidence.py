@@ -676,3 +676,66 @@ def test_unknown_fields_oversized_unicode_and_hostile_mappings_fail_closed(
 
     with pytest.raises(EvidenceSchemaError, match="JSON object"):
         UsageEvidenceSchema.from_json(HostileMapping())
+
+
+def test_exact_tool_operation_rows_reuse_the_same_exhaustive_mapping_validator(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    rows: list[dict[str, object]] = []
+    for operation_class in ("tool_use_boundary", "post_tool_result"):
+        row = copy.deepcopy(valid_usage_row_json)
+        assert isinstance(row["key"], dict)
+        row["key"]["operation_class"] = operation_class
+        rows.append(row)
+    schema = _load(*rows)
+
+    for operation_class in ("tool_use_boundary", "post_tool_result"):
+        row = schema.only_tool_row(operation_class)
+        assert row.key.operation_class.value == operation_class
+        assert row.sdk_shape_passed is True
+        assert {mapping.dialect.value for mapping in row.dialect_mappings} == {
+            "anthropic",
+            "openai",
+        }
+        for mapping in row.dialect_mappings:
+            if mapping.passed:
+                assert {binding.sdk_path for binding in mapping.identity_bindings} == {
+                    field.sdk_path for field in row.fields
+                }
+
+
+def test_false_tool_dialect_mapping_does_not_weaken_the_sdk_shape_or_other_dialect(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    row = copy.deepcopy(valid_usage_row_json)
+    assert isinstance(row["key"], dict)
+    row["key"]["operation_class"] = "tool_use_boundary"
+    _false_mapping(row, "openai", "unrepresentable_sdk_field")
+    schema = _load(row)
+    tool_row = schema.only_tool_row(UsageOperationClass.TOOL_USE_BOUNDARY)
+
+    assert tool_row.sdk_shape_passed is True
+    assert schema.require_mapping(tool_row.key, UsageDialect.ANTHROPIC)
+    with pytest.raises(EvidenceSchemaError, match="mapping is false"):
+        schema.require_mapping(tool_row.key, UsageDialect.OPENAI)
+
+
+def test_only_tool_row_never_falls_back_across_process_model_or_operation(
+    valid_usage_row_json: dict[str, object],
+) -> None:
+    boundary = copy.deepcopy(valid_usage_row_json)
+    assert isinstance(boundary["key"], dict)
+    boundary["key"]["operation_class"] = "tool_use_boundary"
+    schema = _load(boundary)
+
+    with pytest.raises(EvidenceSchemaError, match="tool operation row"):
+        schema.only_tool_row("post_tool_result")
+    with pytest.raises(EvidenceSchemaError, match="tool operation class"):
+        schema.only_tool_row("ordinary")
+
+    other_model = copy.deepcopy(boundary)
+    assert isinstance(other_model["key"], dict)
+    other_model["key"]["backend_model_id"] = "claude-opus-4-1-20250805"
+    ambiguous = _load(boundary, other_model)
+    with pytest.raises(EvidenceSchemaError, match="exactly one"):
+        ambiguous.only_tool_row("tool_use_boundary")
