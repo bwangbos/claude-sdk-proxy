@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
+import claude_sdk_proxy.path_policy as path_policy_impl
 from claude_sdk_proxy.path_policy import (
     PathClass,
     PathPolicy,
@@ -325,6 +327,427 @@ def test_snapshot_returns_certified_root_sentinel_and_counts_it(
         policy.snapshot()
 
 
+@pytest.mark.parametrize(
+    ("kind", "operation"),
+    [
+        ("validation_root", "construct"),
+        ("ancestor_dup", "construct"),
+        ("ancestor_parent", "construct"),
+        ("reopened_root", "metadata"),
+        ("component_dup", "metadata"),
+        ("component_child", "nested_metadata"),
+        ("content_file", "content_scan"),
+        ("snapshot_child", "snapshot"),
+        ("snapshot_scandir", "snapshot"),
+    ],
+)
+def test_every_owned_resource_close_is_one_shot_and_owner_scoped(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    operation: str,
+) -> None:
+    (roots[0] / "settings.json").write_bytes(b"SAFE")
+    plugins = roots[0] / "plugins"
+    plugins.mkdir(mode=0o700)
+    (plugins / "settings.json").write_bytes(b"NESTED")
+    canaries = roots[1] / "canaries"
+    canaries.mkdir(mode=0o700)
+    canary_path = canaries / "purity.txt"
+    canary = b"SAFE-CANARY"
+    canary_path.write_bytes(canary)
+    canary_path.chmod(0o600)
+    canary_metadata = policy.metadata(
+        "canaries/purity.txt", root=RootKind.PROXY_OWNED
+    )
+
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        original_close = os.close
+        original_scandir = os.scandir
+        target_token: object | None = None
+        target_resource: object | None = None
+        target_close_calls = 0
+
+        def ambiguous_record_for(resource: object):  # type: ignore[no-untyped-def]
+            matches = [
+                record
+                for record in path_policy_impl._RESOURCE_REGISTRY.values()
+                if record.resource is resource
+                or (
+                    type(resource) is int
+                    and type(record.resource) is int
+                    and record.resource == resource
+                )
+            ]
+            return matches[-1] if matches else None
+
+        def effect_then_raise_close(descriptor: int) -> None:
+            nonlocal target_close_calls, target_resource, target_token
+            record = ambiguous_record_for(descriptor)
+            if (
+                target_token is None
+                and record is not None
+                and record.kind == kind
+            ):
+                target_token = record.token
+                target_resource = descriptor
+            if record is not None and record.token is target_token:
+                target_close_calls += 1
+                original_close(descriptor)
+                raise KeyboardInterrupt("AMBIGUOUS-RESOURCE-CLOSE")
+            original_close(descriptor)
+
+        class EffectThenRaiseScandir:
+            def __init__(self, descriptor: int) -> None:
+                self._inner = original_scandir(descriptor)
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return iter(self._inner)
+
+            def __next__(self):  # type: ignore[no-untyped-def]
+                return next(self._inner)
+
+            def close(self) -> None:
+                nonlocal target_close_calls, target_resource, target_token
+                record = ambiguous_record_for(self)
+                if (
+                    target_token is None
+                    and record is not None
+                    and record.kind == kind
+                ):
+                    target_token = record.token
+                    target_resource = self
+                self._inner.close()
+                if record is not None and record.token is target_token:
+                    target_close_calls += 1
+                    raise KeyboardInterrupt("AMBIGUOUS-RESOURCE-CLOSE")
+
+        monkeypatch.setattr(
+            "claude_sdk_proxy.path_policy.os.close", effect_then_raise_close
+        )
+        monkeypatch.setattr(
+            "claude_sdk_proxy.path_policy.os.scandir", EffectThenRaiseScandir
+        )
+        verified = False
+        try:
+            with pytest.raises(
+                KeyboardInterrupt, match="AMBIGUOUS-RESOURCE-CLOSE"
+            ):
+                if operation == "construct":
+                    PathPolicy(
+                        real_login_root=roots[0],
+                        proxy_owned_root=roots[1],
+                    )
+                elif operation == "metadata":
+                    policy.metadata("settings.json")
+                elif operation == "nested_metadata":
+                    policy.metadata("plugins/settings.json")
+                elif operation == "content_scan":
+                    policy.scan_for_canary(
+                        "canaries/purity.txt",
+                        canary,
+                        expected=canary_metadata,
+                        root=RootKind.PROXY_OWNED,
+                    )
+                else:
+                    policy.snapshot()
+
+            retained = path_policy_impl._RESOURCE_REGISTRY[target_token]
+            calls_after_failure = target_close_calls
+            if type(target_resource) is int:
+                with pytest.raises(PathPolicyError):
+                    path_policy_impl._close_fd(retained.owner, target_resource)
+            else:
+                with pytest.raises(PathPolicyError):
+                    path_policy_impl._close_closeable(
+                        retained.owner, target_resource
+                    )
+            independent = PathPolicy(
+                real_login_root=roots[0], proxy_owned_root=roots[1]
+            )
+            independent.metadata("settings.json")
+            verified = (
+                retained.state is path_policy_impl._ResourceState.AMBIGUOUS
+                and target_close_calls == calls_after_failure == 1
+            )
+            os.write(write_fd, b"1" if verified else b"0")
+            original_close(write_fd)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    result = os.read(read_fd, 1)
+    os.close(read_fd)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert result == b"1"
+
+
+def test_fd_capacity_is_bounded_per_owner_and_globally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner_one = object()
+    owner_two = object()
+    owner_three = object()
+    monkeypatch.setattr(path_policy_impl, "_MAX_OWNER_RESOURCES", 1)
+    monkeypatch.setattr(path_policy_impl, "_MAX_GLOBAL_RESOURCES", 2)
+    first = path_policy_impl._acquire_fd(
+        owner_one, "capacity", lambda: os.open("/dev/null", os.O_RDONLY)
+    )
+    second: int | None = None
+    try:
+        with pytest.raises(PathPolicyError, match="capacity exceeded"):
+            path_policy_impl._acquire_fd(
+                owner_one,
+                "capacity",
+                lambda: os.open("/dev/null", os.O_RDONLY),
+            )
+        second = path_policy_impl._acquire_fd(
+            owner_two, "capacity", lambda: os.open("/dev/null", os.O_RDONLY)
+        )
+        with pytest.raises(PathPolicyError, match="capacity exceeded"):
+            path_policy_impl._acquire_fd(
+                owner_three,
+                "capacity",
+                lambda: os.open("/dev/null", os.O_RDONLY),
+            )
+    finally:
+        if second is not None:
+            path_policy_impl._close_fd(owner_two, second)
+        path_policy_impl._close_fd(owner_one, first)
+
+
+def test_acquisition_preregistration_rejects_same_owner_reentrancy(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (roots[0] / "settings.json").write_bytes(b"SAFE")
+    original_open = os.open
+    inspected = False
+    reentry_rejected = False
+
+    def inspecting_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal inspected, reentry_rejected
+        if path == roots[0] and not inspected:
+            inspected = any(
+                record.owner is policy._resource_owner
+                and record.kind == "reopened_root"
+                and record.state is path_policy_impl._ResourceState.RESERVED
+                for record in path_policy_impl._RESOURCE_REGISTRY.values()
+            )
+            try:
+                policy.metadata("settings.json")
+            except PathPolicyError:
+                reentry_rejected = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.open", inspecting_open)
+
+    policy.metadata("settings.json")
+
+    assert inspected
+    assert reentry_rejected
+
+
+def test_forked_pending_resource_becomes_nonactionable_in_child(
+    policy: PathPolicy,
+) -> None:
+    descriptor = path_policy_impl._acquire_fd(
+        policy._resource_owner,
+        "fork_pending",
+        lambda: os.open("/dev/null", os.O_RDONLY),
+    )
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        original_close = os.close
+        close_calls = 0
+
+        def tracking_close(value: int) -> None:
+            nonlocal close_calls
+            if value == descriptor:
+                close_calls += 1
+            original_close(value)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr("claude_sdk_proxy.path_policy.os.close", tracking_close)
+        verified = False
+        try:
+            with pytest.raises(PathPolicyError, match="ownership is ambiguous"):
+                policy.classify("settings.json")
+            with pytest.raises(PathPolicyError):
+                path_policy_impl._close_fd(policy._resource_owner, descriptor)
+            verified = close_calls == 0
+            os.write(write_fd, b"1" if verified else b"0")
+            original_close(write_fd)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    result = os.read(read_fd, 1)
+    os.close(read_fd)
+    waited, status = os.waitpid(child, 0)
+    path_policy_impl._close_fd(policy._resource_owner, descriptor)
+    assert waited == child
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert result == b"1"
+
+
+def test_fork_inside_close_cannot_certify_inherited_obligation_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = object()
+    descriptor = path_policy_impl._acquire_fd(
+        owner,
+        "fork_during_close",
+        lambda: os.open("/dev/null", os.O_RDONLY),
+    )
+    record = next(
+        item
+        for item in path_policy_impl._RESOURCE_REGISTRY.values()
+        if item.owner is owner and item.resource == descriptor
+    )
+    read_fd, write_fd = os.pipe()
+    original_close = os.close
+    nested_child = False
+    nested_pid: int | None = None
+
+    def forking_close(value: int) -> None:
+        nonlocal nested_child, nested_pid
+        if value != descriptor:
+            original_close(value)
+            return
+        nested_pid = os.fork()
+        if nested_pid == 0:
+            nested_child = True
+            return
+        original_close(value)
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.close", forking_close)
+
+    try:
+        path_policy_impl._close_fd(owner, descriptor)
+    except PathPolicyError:
+        pass
+    if nested_child:
+        retained = path_policy_impl._RESOURCE_REGISTRY.get(record.token)
+        verified = (
+            retained is record
+            and retained.state is path_policy_impl._ResourceState.AMBIGUOUS
+        )
+        os.write(write_fd, b"1" if verified else b"0")
+        original_close(write_fd)
+        os._exit(0)
+
+    assert nested_pid is not None
+    original_close(write_fd)
+    result = os.read(read_fd, 1)
+    original_close(read_fd)
+    waited, status = os.waitpid(nested_pid, 0)
+    assert waited == nested_pid
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert result == b"1"
+
+
+def test_concurrent_operation_waits_for_close_disposition_then_fails_closed(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (roots[0] / "settings.json").write_bytes(b"SAFE")
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        original_close = os.close
+        entered_close = threading.Event()
+        release_close = threading.Event()
+        second_started = threading.Event()
+        target_token: object | None = None
+        target_close_calls = 0
+        outcomes: list[str] = []
+
+        def effect_then_raise_close(descriptor: int) -> None:
+            nonlocal target_close_calls, target_token
+            matches = [
+                record
+                for record in path_policy_impl._RESOURCE_REGISTRY.values()
+                if type(record.resource) is int
+                and record.resource == descriptor
+            ]
+            record = matches[-1] if matches else None
+            if (
+                target_token is None
+                and record is not None
+                and record.kind == "component_dup"
+            ):
+                target_token = record.token
+            if record is not None and record.token is target_token:
+                target_close_calls += 1
+                entered_close.set()
+                if not release_close.wait(2):
+                    raise AssertionError("concurrent close release timed out")
+                original_close(descriptor)
+                raise KeyboardInterrupt("CONCURRENT-AMBIGUOUS-CLOSE")
+            original_close(descriptor)
+
+        monkeypatch.setattr(
+            "claude_sdk_proxy.path_policy.os.close", effect_then_raise_close
+        )
+
+        def first_operation() -> None:
+            try:
+                policy.metadata("settings.json")
+            except KeyboardInterrupt:
+                outcomes.append("first_ambiguous")
+
+        def second_operation() -> None:
+            second_started.set()
+            try:
+                policy.metadata("settings.json")
+            except PathPolicyError:
+                outcomes.append("second_failed_closed")
+
+        first = threading.Thread(target=first_operation)
+        second = threading.Thread(target=second_operation)
+        first.start()
+        verified = entered_close.wait(2)
+        second.start()
+        verified = verified and second_started.wait(2)
+        second.join(0.05)
+        verified = verified and second.is_alive()
+        release_close.set()
+        first.join(2)
+        second.join(2)
+        verified = verified and not first.is_alive() and not second.is_alive()
+        verified = verified and sorted(outcomes) == [
+            "first_ambiguous",
+            "second_failed_closed",
+        ]
+        verified = verified and target_close_calls == 1
+        os.write(write_fd, b"1" if verified else b"0")
+        original_close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    result = os.read(read_fd, 1)
+    os.close(read_fd)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert result == b"1"
+
+
 def test_ambiguous_fd_close_poison_is_retained_without_numeric_retry(
     policy: PathPolicy,
     roots: tuple[Path, Path],
@@ -526,6 +949,45 @@ def test_snapshot_certifies_root_across_descendant_scan_churn(
                 target.write_bytes(b"REPLACEMENT-LONGER")
             else:
                 target.rename(roots[0] / "settings.local.json")
+        return original_scandir(path)
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", churning_scandir)
+
+    with pytest.raises(PathPolicyError, match="changed during snapshot"):
+        policy.snapshot(root=RootKind.REAL_LOGIN)
+
+
+def test_snapshot_root_sentinel_detects_transient_root_create_delete(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descendant = roots[0] / "plugins"
+    descendant.mkdir(mode=0o700)
+    descendant_inode = descendant.stat().st_ino
+    original_scandir = os.scandir
+    mutated = False
+
+    def churning_scandir(
+        path: os.PathLike[str] | str | bytes | int = ".",
+    ) -> os.ScandirIterator[str]:
+        nonlocal mutated
+        if (
+            isinstance(path, int)
+            and os.fstat(path).st_ino == descendant_inode
+            and not mutated
+        ):
+            mutated = True
+            transient = roots[0] / "CLAUDE.md"
+            before = roots[0].stat()
+            transient.write_bytes(b"TRANSIENT")
+            transient.unlink()
+            after = roots[0].stat()
+            if after.st_mtime_ns == before.st_mtime_ns:
+                os.utime(
+                    roots[0],
+                    ns=(after.st_atime_ns, after.st_mtime_ns + 1_000_000),
+                )
         return original_scandir(path)
 
     monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", churning_scandir)

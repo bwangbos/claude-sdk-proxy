@@ -7,8 +7,9 @@ import hmac
 import os
 import secrets
 import stat
+import threading
 import weakref
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -17,11 +18,14 @@ from pathlib import Path
 from typing import Final, Never, SupportsIndex, cast
 
 PATH_POLICY_VERSION: Final = 1
+SNAPSHOT_ROOT_SENTINEL: Final = "."
 _DEFAULT_MAX_SNAPSHOT_ENTRIES: Final = 2_048
 _DEFAULT_MAX_DEPTH: Final = 16
 _DEFAULT_MAX_CONTENT_BYTES: Final = 1_048_576
 _MAX_ROOT_PARENT_WALK: Final = 256
 _MAX_SNAPSHOT_DEPTH: Final = 64
+_MAX_GLOBAL_RESOURCES: Final = 4_096
+_MAX_OWNER_RESOURCES: Final = 128
 
 _CREDENTIAL_FILES = frozenset(
     {
@@ -81,6 +85,189 @@ class PathClass(StrEnum):
     UNKNOWN = "unknown"
 
 
+class _ResourceState(StrEnum):
+    RESERVED = "reserved"
+    PENDING = "pending"
+    AMBIGUOUS = "ambiguous"
+    CLOSED = "closed"
+
+
+@dataclass(slots=True)
+class _OwnedResource:
+    token: object
+    owner: object
+    kind: str
+    creator_pid: int
+    owner_pid: int
+    state: _ResourceState
+    resource: object | None = None
+    identity: tuple[int, int, int] | None = None
+
+
+_RESOURCE_LOCK = threading.RLock()
+_RESOURCE_PROCESS_PID = os.getpid()
+_RESOURCE_REGISTRY: dict[object, _OwnedResource] = {}
+
+
+def _synchronize_resource_pid() -> None:
+    global _RESOURCE_LOCK, _RESOURCE_PROCESS_PID
+    current_pid = os.getpid()
+    if current_pid == _RESOURCE_PROCESS_PID:
+        return
+    _RESOURCE_LOCK = threading.RLock()
+    _RESOURCE_PROCESS_PID = current_pid
+    for record in _RESOURCE_REGISTRY.values():
+        if record.state is not _ResourceState.CLOSED:
+            record.owner_pid = current_pid
+            record.state = _ResourceState.AMBIGUOUS
+
+
+def _require_resource_health(owner: object) -> None:
+    _synchronize_resource_pid()
+    with _RESOURCE_LOCK:
+        if any(
+            record.owner is owner
+            and record.state in {_ResourceState.RESERVED, _ResourceState.AMBIGUOUS}
+            for record in _RESOURCE_REGISTRY.values()
+        ):
+            raise PathPolicyError("path-policy resource ownership is ambiguous")
+
+
+def _reserve_resource(owner: object, kind: str) -> _OwnedResource:
+    _require_resource_health(owner)
+    with _RESOURCE_LOCK:
+        owner_count = sum(
+            record.owner is owner for record in _RESOURCE_REGISTRY.values()
+        )
+        if (
+            len(_RESOURCE_REGISTRY) >= _MAX_GLOBAL_RESOURCES
+            or owner_count >= _MAX_OWNER_RESOURCES
+        ):
+            raise PathPolicyError("path-policy resource capacity exceeded")
+        token = object()
+        record = _OwnedResource(
+            token=token,
+            owner=owner,
+            kind=kind,
+            creator_pid=os.getpid(),
+            owner_pid=os.getpid(),
+            state=_ResourceState.RESERVED,
+        )
+        _RESOURCE_REGISTRY[token] = record
+        return record
+
+
+def _mark_acquisition_ambiguous(record: _OwnedResource) -> None:
+    with _RESOURCE_LOCK:
+        record.state = _ResourceState.AMBIGUOUS
+
+
+def _acquire_fd(owner: object, kind: str, opener: Callable[[], int]) -> int:
+    record = _reserve_resource(owner, kind)
+    try:
+        descriptor = opener()
+    except BaseException:
+        _mark_acquisition_ambiguous(record)
+        raise
+    try:
+        if type(descriptor) is not int or descriptor < 0:
+            raise PathPolicyError("path-policy fd acquisition is invalid")
+        with _RESOURCE_LOCK:
+            record.resource = descriptor
+            record.state = _ResourceState.PENDING
+        value = os.fstat(descriptor)
+        with _RESOURCE_LOCK:
+            record.identity = (value.st_dev, value.st_ino, value.st_mode)
+        return descriptor
+    except BaseException:
+        if record.state is _ResourceState.PENDING:
+            _close_fd(owner, descriptor)
+        else:
+            _mark_acquisition_ambiguous(record)
+        raise
+
+
+def _acquire_closeable[T](
+    owner: object, kind: str, opener: Callable[[], T]
+) -> T:
+    record = _reserve_resource(owner, kind)
+    try:
+        resource = opener()
+    except BaseException:
+        _mark_acquisition_ambiguous(record)
+        raise
+    with _RESOURCE_LOCK:
+        record.resource = resource
+        record.state = _ResourceState.PENDING
+    return resource
+
+
+def _find_fd_record(owner: object, descriptor: int) -> _OwnedResource:
+    matches = [
+        record
+        for record in _RESOURCE_REGISTRY.values()
+        if record.owner is owner
+        and type(record.resource) is int
+        and record.resource == descriptor
+        and record.state is _ResourceState.PENDING
+    ]
+    if len(matches) != 1:
+        raise PathPolicyError("path-policy fd ownership is invalid")
+    return matches[0]
+
+
+def _find_closeable_record(owner: object, resource: object) -> _OwnedResource:
+    matches = [
+        record
+        for record in _RESOURCE_REGISTRY.values()
+        if record.owner is owner
+        and record.resource is resource
+        and record.state is _ResourceState.PENDING
+    ]
+    if len(matches) != 1:
+        raise PathPolicyError("path-policy closeable ownership is invalid")
+    return matches[0]
+
+
+def _one_shot_close(record: _OwnedResource, closer: Callable[[], None]) -> None:
+    _synchronize_resource_pid()
+    with _RESOURCE_LOCK:
+        action_pid = os.getpid()
+        if (
+            record.owner_pid != action_pid
+            or record.state is not _ResourceState.PENDING
+        ):
+            raise PathPolicyError("path-policy resource close is not authorized")
+        record.state = _ResourceState.AMBIGUOUS
+        try:
+            closer()
+        except BaseException:
+            raise
+        if (
+            os.getpid() != action_pid
+            or record.owner_pid != action_pid
+            or record.state is not _ResourceState.AMBIGUOUS
+            or _RESOURCE_REGISTRY.get(record.token) is not record
+        ):
+            raise PathPolicyError(
+                "path-policy resource close crossed an authority boundary"
+            )
+        record.state = _ResourceState.CLOSED
+        del _RESOURCE_REGISTRY[record.token]
+
+
+def _close_fd(owner: object, descriptor: int) -> None:
+    with _RESOURCE_LOCK:
+        record = _find_fd_record(owner, descriptor)
+    _one_shot_close(record, lambda: os.close(descriptor))
+
+
+def _close_closeable(owner: object, resource: object) -> None:
+    with _RESOURCE_LOCK:
+        record = _find_closeable_record(owner, resource)
+    _one_shot_close(record, lambda: resource.close())  # type: ignore[attr-defined]
+
+
 @dataclass(frozen=True, slots=True)
 class PathMetadata:
     relative_path: str
@@ -134,22 +321,44 @@ class _SafeCanaryReceipt:
 _CANARY_POLICIES: weakref.WeakSet[PathPolicy] = weakref.WeakSet()
 
 
-def _invalidate_canary_authority_after_fork() -> None:
+def _before_path_policy_fork() -> None:
+    _synchronize_resource_pid()
+    _RESOURCE_LOCK.acquire()
+
+
+def _after_path_policy_fork_parent() -> None:
+    _RESOURCE_LOCK.release()
+
+
+def _after_path_policy_fork_child() -> None:
+    global _RESOURCE_PROCESS_PID
     child_pid = os.getpid()
+    _RESOURCE_PROCESS_PID = child_pid
     try:
-        for policy in _CANARY_POLICIES:
-            try:
-                policy._rotate_canary_authority(child_pid)
-            except BaseException:
-                # Lazy PID validation repeats fail-closed on first child use.
-                pass
-    except BaseException:
-        # Weak-set iteration failure is also covered by lazy PID validation.
-        pass
+        for record in _RESOURCE_REGISTRY.values():
+            if record.state is not _ResourceState.CLOSED:
+                record.owner_pid = child_pid
+                record.state = _ResourceState.AMBIGUOUS
+        try:
+            for policy in _CANARY_POLICIES:
+                try:
+                    policy._rotate_canary_authority(child_pid)
+                except BaseException:
+                    # Lazy PID validation repeats fail-closed on first child use.
+                    pass
+        except BaseException:
+            # Weak-set iteration failure is also covered by lazy PID validation.
+            pass
+    finally:
+        _RESOURCE_LOCK.release()
 
 
 try:
-    os.register_at_fork(after_in_child=_invalidate_canary_authority_after_fork)
+    os.register_at_fork(
+        before=_before_path_policy_fork,
+        after_in_parent=_after_path_policy_fork_parent,
+        after_in_child=_after_path_policy_fork_child,
+    )
 except (AttributeError, OSError):
     # Non-POSIX or registration-denied runtimes use the lazy PID boundary.
     pass
@@ -215,6 +424,8 @@ class PathPolicy:
         max_depth: int = _DEFAULT_MAX_DEPTH,
         max_content_bytes: int = _DEFAULT_MAX_CONTENT_BYTES,
     ) -> None:
+        self._resource_owner = object()
+        _require_resource_health(self._resource_owner)
         for value, label in (
             (max_snapshot_entries, "snapshot entry limit"),
             (max_depth, "snapshot depth limit"),
@@ -246,9 +457,9 @@ class PathPolicy:
                 ):
                     raise PathPolicyError("policy roots must be disjoint")
             finally:
-                os.close(proxy_fd)
+                _close_fd(self._resource_owner, proxy_fd)
         finally:
-            os.close(login_fd)
+            _close_fd(self._resource_owner, login_fd)
         self._roots = {
             RootKind.REAL_LOGIN: login_root,
             RootKind.PROXY_OWNED: proxy_root,
@@ -294,7 +505,11 @@ class PathPolicy:
         if not isinstance(path, Path) or not path.is_absolute():
             raise PathPolicyError("policy roots must be absolute paths")
         try:
-            descriptor = os.open(path, self._root_flags())
+            descriptor = _acquire_fd(
+                self._resource_owner,
+                "validation_root",
+                lambda: os.open(path, self._root_flags()),
+            )
         except OSError as error:
             raise PathPolicyError(
                 "policy root cannot be opened without following"
@@ -302,26 +517,30 @@ class PathPolicy:
         try:
             value = os.fstat(descriptor)
         except BaseException:
-            os.close(descriptor)
+            _close_fd(self._resource_owner, descriptor)
             raise
         if not stat.S_ISDIR(value.st_mode) or value.st_uid != os.getuid():
-            os.close(descriptor)
+            _close_fd(self._resource_owner, descriptor)
             raise PathPolicyError("policy root must be a current-user directory")
         permissions = stat.S_IMODE(value.st_mode)
         if kind is RootKind.PROXY_OWNED and permissions != 0o700:
-            os.close(descriptor)
+            _close_fd(self._resource_owner, descriptor)
             raise PathPolicyError("proxy-owned root mode must be 0700")
         if kind is RootKind.REAL_LOGIN and permissions & 0o022:
-            os.close(descriptor)
+            _close_fd(self._resource_owner, descriptor)
             raise PathPolicyError("real login root cannot be group/world writable")
         return descriptor, (
             path,
             _RootIdentity(value.st_dev, value.st_ino, value.st_mode, value.st_uid),
         )
 
-    @classmethod
-    def _is_ancestor(cls, ancestor: _RootIdentity, descendant_fd: int) -> bool:
-        current = os.dup(descendant_fd)
+    def _is_ancestor(self, ancestor: _RootIdentity, descendant_fd: int) -> bool:
+        current = _acquire_fd(
+            self._resource_owner,
+            "ancestor_dup",
+            lambda: os.dup(descendant_fd),
+        )
+        current_close_pending = True
         try:
             for _ in range(_MAX_ROOT_PARENT_WALK):
                 value = os.fstat(current)
@@ -330,22 +549,29 @@ class PathPolicy:
                     ancestor.st_ino,
                 ):
                     return True
-                parent = os.open("..", cls._root_flags(), dir_fd=current)
+                parent = _acquire_fd(
+                    self._resource_owner,
+                    "ancestor_parent",
+                    lambda: os.open("..", self._root_flags(), dir_fd=current),
+                )
                 try:
                     parent_value = os.fstat(parent)
                 except BaseException:
-                    os.close(parent)
+                    _close_fd(self._resource_owner, parent)
                     raise
                 if (parent_value.st_dev, parent_value.st_ino) == (
                     value.st_dev,
                     value.st_ino,
                 ):
-                    os.close(parent)
+                    _close_fd(self._resource_owner, parent)
                     return False
-                os.close(current)
+                current_close_pending = False
+                _close_fd(self._resource_owner, current)
                 current = parent
+                current_close_pending = True
         finally:
-            os.close(current)
+            if current_close_pending:
+                _close_fd(self._resource_owner, current)
         raise PathPolicyError("policy root disjointness could not be proved")
 
     @contextmanager
@@ -354,7 +580,11 @@ class PathPolicy:
             raise PathPolicyError("unknown path-policy root")
         path, expected = self._roots[kind]
         try:
-            descriptor = os.open(path, self._root_flags())
+            descriptor = _acquire_fd(
+                self._resource_owner,
+                "reopened_root",
+                lambda: os.open(path, self._root_flags()),
+            )
         except OSError as error:
             raise PathPolicyError("policy root identity changed") from error
         try:
@@ -368,7 +598,7 @@ class PathPolicy:
                 raise PathPolicyError("policy root identity changed")
             yield descriptor, expected
         finally:
-            os.close(descriptor)
+            _close_fd(self._resource_owner, descriptor)
 
     @staticmethod
     def _components(path: Path | str) -> tuple[str, ...]:
@@ -433,6 +663,7 @@ class PathPolicy:
     def classify(
         self, path: Path | str, *, root: RootKind = RootKind.REAL_LOGIN
     ) -> PathClass:
+        _require_resource_health(self._resource_owner)
         self._require_root(root)
         components = self._components(path)
         if (root, components) in self._approved_new:
@@ -458,7 +689,11 @@ class PathPolicy:
         root_identity: _RootIdentity,
         components: tuple[str, ...],
     ) -> tuple[int, str]:
-        current = os.dup(root_fd)
+        current = _acquire_fd(
+            self._resource_owner,
+            "component_dup",
+            lambda: os.dup(root_fd),
+        )
         try:
             for component in components[:-1]:
                 before = os.stat(component, dir_fd=current, follow_symlinks=False)
@@ -468,24 +703,36 @@ class PathPolicy:
                     )
                 if before.st_dev != root_identity.st_dev:
                     raise PathPolicyError("path crossed the verified root device")
-                child = os.open(
-                    component,
-                    self._component_flags(directory=True),
-                    dir_fd=current,
+                child = _acquire_fd(
+                    self._resource_owner,
+                    "component_child",
+                    lambda: os.open(
+                        component,
+                        self._component_flags(directory=True),
+                        dir_fd=current,
+                    ),
                 )
-                after = os.fstat(child)
-                if (after.st_dev, after.st_ino, after.st_mode) != (
-                    before.st_dev,
-                    before.st_ino,
-                    before.st_mode,
-                ):
-                    os.close(child)
-                    raise PathPolicyError("path identity changed during traversal")
-                os.close(current)
+                try:
+                    after = os.fstat(child)
+                    if (after.st_dev, after.st_ino, after.st_mode) != (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_mode,
+                    ):
+                        raise PathPolicyError(
+                            "path identity changed during traversal"
+                        )
+                except BaseException:
+                    _close_fd(self._resource_owner, child)
+                    raise
+                _close_fd(self._resource_owner, current)
                 current = child
             return current, components[-1]
         except BaseException:
-            os.close(current)
+            try:
+                _close_fd(self._resource_owner, current)
+            except PathPolicyError:
+                pass
             raise
 
     def _stat(
@@ -496,7 +743,7 @@ class PathPolicy:
             try:
                 value = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             finally:
-                os.close(parent_fd)
+                _close_fd(self._resource_owner, parent_fd)
         if stat.S_ISLNK(value.st_mode):
             raise PathPolicyError("symlinks are forbidden")
         if not (stat.S_ISREG(value.st_mode) or stat.S_ISDIR(value.st_mode)):
@@ -510,6 +757,7 @@ class PathPolicy:
     def metadata(
         self, path: Path | str, *, root: RootKind = RootKind.REAL_LOGIN
     ) -> PathMetadata:
+        _require_resource_health(self._resource_owner)
         components = self._components(path)
         value = self._stat(components, root=root)
         return _metadata("/".join(components), value)
@@ -527,6 +775,7 @@ class PathPolicy:
     def may_open_content(
         self, path: Path | str, *, root: RootKind = RootKind.REAL_LOGIN
     ) -> bool:
+        _require_resource_health(self._resource_owner)
         components = self._components(path)
         classification = self.classify(path, root=root)
         if root is not RootKind.PROXY_OWNED or classification not in {
@@ -541,7 +790,7 @@ class PathPolicy:
                 return False
             with self._open_root(root) as (root_fd, identity):
                 parent_fd, _ = self._walk_parent(root_fd, identity, components)
-                os.close(parent_fd)
+                _close_fd(self._resource_owner, parent_fd)
             return True
         self._verify_proxy_file(value)
         return True
@@ -549,6 +798,7 @@ class PathPolicy:
     def approve_new_noncredential(
         self, path: Path | str, *, root: RootKind = RootKind.PROXY_OWNED
     ) -> None:
+        _require_resource_health(self._resource_owner)
         self._require_root(root)
         components = self._components(path)
         if root is RootKind.REAL_LOGIN:
@@ -564,7 +814,7 @@ class PathPolicy:
             raise PathPolicyError("new noncredential path must not already exist")
         with self._open_root(root) as (root_fd, identity):
             parent_fd, _ = self._walk_parent(root_fd, identity, components)
-            os.close(parent_fd)
+            _close_fd(self._resource_owner, parent_fd)
         if len(self._approved_new) >= self._max_snapshot_entries:
             raise PathPolicyError("new path classification limit exceeded")
         self._approved_new.add((root, components))
@@ -577,6 +827,7 @@ class PathPolicy:
         expected: PathMetadata,
         root: RootKind = RootKind.PROXY_OWNED,
     ) -> bool:
+        _require_resource_health(self._resource_owner)
         components = self._components(path)
         if not isinstance(canary, bytes) or not canary or len(canary) > 256:
             raise PathPolicyError("canary must be 1..256 bytes")
@@ -590,13 +841,17 @@ class PathPolicy:
         with self._open_root(root) as (root_fd, root_identity):
             parent_fd, name = self._walk_parent(root_fd, root_identity, components)
             try:
-                descriptor = os.open(
-                    name,
-                    self._component_flags(directory=False),
-                    dir_fd=parent_fd,
+                descriptor = _acquire_fd(
+                    self._resource_owner,
+                    "content_file",
+                    lambda: os.open(
+                        name,
+                        self._component_flags(directory=False),
+                        dir_fd=parent_fd,
+                    ),
                 )
             finally:
-                os.close(parent_fd)
+                _close_fd(self._resource_owner, parent_fd)
             try:
                 opened = os.fstat(descriptor)
                 opened_metadata = _metadata("/".join(components), opened)
@@ -622,7 +877,7 @@ class PathPolicy:
                     raise PathPolicyError("path identity changed during content scan")
                 return canary in b"".join(chunks)
             finally:
-                os.close(descriptor)
+                _close_fd(self._resource_owner, descriptor)
 
     def _canary_fingerprint(
         self,
@@ -656,6 +911,7 @@ class PathPolicy:
         expected: PathMetadata,
         root: RootKind,
     ) -> object:
+        _require_resource_health(self._resource_owner)
         self._require_canary_creator()
         if root is not RootKind.PROXY_OWNED:
             raise PathPolicyError("safe canary requires the proxy-owned root")
@@ -700,6 +956,7 @@ class PathPolicy:
 
     def _consume_safe_canary_receipt(self, receipt: object) -> str:
         try:
+            _require_resource_health(self._resource_owner)
             self._require_canary_creator()
             if type(receipt) is not _SafeCanaryReceipt:
                 raise PathPolicyError("safe canary receipt is invalid")
@@ -766,12 +1023,18 @@ class PathPolicy:
         except BaseException as error:
             raise PathPolicyError("safe canary receipt is invalid") from error
 
-    @staticmethod
     def _snapshot_names(
-        directory_fd: int, *, limit: int, overflow_message: str
+        self, directory_fd: int, *, limit: int, overflow_message: str
     ) -> tuple[str, ...]:
-        with os.scandir(directory_fd) as entries:
+        entries = _acquire_closeable(
+            self._resource_owner,
+            "snapshot_scandir",
+            lambda: os.scandir(directory_fd),
+        )
+        try:
             captured = list(islice(entries, limit + 1))
+        finally:
+            _close_closeable(self._resource_owner, entries)
         if len(captured) > limit:
             raise PathPolicyError(overflow_message)
         names: list[str] = []
@@ -855,10 +1118,14 @@ class PathPolicy:
                 continue
 
             try:
-                child = os.open(
-                    name,
-                    self._component_flags(directory=True),
-                    dir_fd=directory_fd,
+                child = _acquire_fd(
+                    self._resource_owner,
+                    "snapshot_child",
+                    lambda: os.open(
+                        name,
+                        self._component_flags(directory=True),
+                        dir_fd=directory_fd,
+                    ),
                 )
             except OSError as error:
                 raise PathPolicyError(
@@ -884,7 +1151,7 @@ class PathPolicy:
                 output[index] = _metadata(relative, certified)
                 admitted[name] = certified
             finally:
-                os.close(child)
+                _close_fd(self._resource_owner, child)
 
         after_names = self._snapshot_names(
             directory_fd,
@@ -904,9 +1171,11 @@ class PathPolicy:
     def snapshot(
         self, *, root: RootKind = RootKind.REAL_LOGIN
     ) -> tuple[PathMetadata, ...]:
+        _require_resource_health(self._resource_owner)
         output: list[PathMetadata] = []
         with self._open_root(root) as (root_fd, root_identity):
-            self._snapshot_directory(
+            output.append(_metadata(SNAPSHOT_ROOT_SENTINEL, os.fstat(root_fd)))
+            certified_root = self._snapshot_directory(
                 root_fd,
                 prefix=(),
                 depth=0,
@@ -914,11 +1183,13 @@ class PathPolicy:
                 root_identity=root_identity,
                 output=output,
             )
+            output[0] = _metadata(SNAPSHOT_ROOT_SENTINEL, certified_root)
         return tuple(sorted(output, key=lambda item: item.relative_path))
 
 
 __all__ = [
     "PATH_POLICY_VERSION",
+    "SNAPSHOT_ROOT_SENTINEL",
     "PathClass",
     "PathMetadata",
     "PathPolicy",
