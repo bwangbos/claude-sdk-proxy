@@ -9,7 +9,7 @@ import pytest
 from claude_sdk_proxy.attestation import current_attestation_availability
 from claude_sdk_proxy.probes import run_tool_bridge_probe
 
-pytestmark = (pytest.mark.live, pytest.mark.anyio)
+pytestmark = [pytest.mark.live, pytest.mark.anyio]
 
 
 def _exact_model() -> str:
