@@ -1200,6 +1200,12 @@ def test_manifest_collection_capabilities_have_no_public_constructor() -> None:
         with pytest.raises(TypeError):
             capability_type()
 
+    class ForgedRun(validated.ManifestCollectionRun):
+        pass
+
+    with pytest.raises(ManifestError, match="run type"):
+        ForgedRun.begin()
+
 
 def test_collection_consumption_is_one_shot_under_concurrency() -> None:
     run = validated.ManifestCollectionRun.begin()
