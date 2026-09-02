@@ -108,6 +108,6 @@ Committed-artifact checks therefore verify canonical bytes, schema, and
 content exclusions rather than checkout permissions. Every generated output
 is independently created and verified as `0600` by the atomic writer.
 
-Synthetic all-true manifests in unit tests exercise canonical digest and
-resolver mechanics only. They are never committed evidence and cannot unblock
-Phase 1.
+Synthetic all-true manifests in unit tests exercise canonical digest, resolver,
+and fail-closed collection-to-output orchestration mechanics. They are never
+committed evidence and cannot unblock Phase 1.

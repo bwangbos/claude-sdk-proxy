@@ -250,17 +250,24 @@ def _run_all(
     try:
         run = ManifestCollectionRun.begin()
         collection = selected_collector(run)
+        consumed = run.consume(collection)
         output = Path(os.path.abspath(arguments[3]))
-        authorization = validated_evidence._authorize_manifest_output(
-            output, collection
-        )
-        document = collection.manifest.to_json()
+        try:
+            authorization = validated_evidence._authorize_manifest_output(
+                output, consumed
+            )
+        finally:
+            validated_evidence._burn_consumed_collection(consumed)
+        document = authorization.manifest.to_json()
         expected = canonical_evidence_json(document) + b"\n"
-        validated_evidence._atomic_write_manifest(
-            output,
-            document,
-            authorization=authorization,
-        )
+        try:
+            validated_evidence._atomic_write_manifest(
+                output,
+                document,
+                authorization=authorization,
+            )
+        finally:
+            validated_evidence._revoke_manifest_output_authorization(authorization)
         reloaded = validated_evidence.load_manifest(output)
         require_core_gates(reloaded)
         load_usage_evidence(reloaded)

@@ -898,8 +898,13 @@ _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}\Z", re.ASCII)
 _COLLECTION_RUN_ID = re.compile(r"[0-9a-f]{64}\Z")
 _COLLECTION_GATE_DOMAIN: Final = b"claude-sdk-proxy:manifest-gate-run:v1\0"
 _COLLECTION_COMPLETE_DOMAIN: Final = b"claude-sdk-proxy:manifest-collection:v1\0"
+_COLLECTION_INVOCATION_DOMAIN: Final = (
+    b"claude-sdk-proxy:manifest-collection-invocation:v1\0"
+)
 _OUTPUT_AUTHORIZATION_DOMAIN: Final = b"claude-sdk-proxy:manifest-output-auth:v1\0"
-_OUTPUT_AUTHORIZATION_KEY: Final = secrets.token_bytes(32)
+_OUTPUT_AUTHORIZATION_KEY = secrets.token_bytes(32)
+_COLLECTION_AUTHORITY_KEY = secrets.token_bytes(32)
+_MAX_LIVE_MANIFEST_AUTHORITIES: Final = 128
 _TOP_LEVEL_FIELDS: Final = frozenset(
     {
         "schema_version",
@@ -1300,6 +1305,9 @@ class ManifestGateObservation:
     evidence_digest: str
     receipt_digest: str
 
+    def __init__(self) -> None:
+        raise TypeError("manifest gate observations have no public constructor")
+
 
 @dataclass(frozen=True, slots=True, init=False, weakref_slot=True)
 class CompleteManifestCollection:
@@ -1313,42 +1321,251 @@ class CompleteManifestCollection:
     gate_observations: tuple[ManifestGateObservation, ...]
     collection_digest: str
 
-
-_COMPLETE_COLLECTIONS: dict[
-    int, tuple[weakref.ReferenceType[CompleteManifestCollection], str, str]
-] = {}
-_COMPLETE_COLLECTIONS_LOCK = threading.Lock()
+    def __init__(self) -> None:
+        raise TypeError("complete manifest collections have no public constructor")
 
 
-def _mark_complete_collection(
-    collection: CompleteManifestCollection, projection: Mapping[str, object]
-) -> None:
-    identity = id(collection)
+@dataclass(frozen=True, slots=True, init=False, weakref_slot=True)
+class _ConsumedManifestCollection:
+    """One-shot bridge from an exact collection invocation to its output."""
 
-    def discard(_reference: weakref.ReferenceType[CompleteManifestCollection]) -> None:
-        with _COMPLETE_COLLECTIONS_LOCK:
-            current = _COMPLETE_COLLECTIONS.get(identity)
-            if current is not None and current[0] is _reference:
-                _COMPLETE_COLLECTIONS.pop(identity, None)
+    manifest: FeasibilityManifest
+    run_id: str
+    candidate_digest: str
+    collection_digest: str
+    invocation_digest: str
+    creator_pid: int
+    _authorization_issued: bool
 
-    reference = weakref.ref(collection, discard)
-    fingerprint = hashlib.sha256(canonical_evidence_json(projection)).hexdigest()
-    with _COMPLETE_COLLECTIONS_LOCK:
-        _COMPLETE_COLLECTIONS[identity] = (
-            reference,
-            fingerprint,
-            collection.collection_digest,
+
+@dataclass(slots=True)
+class _RunAuthority:
+    reference: weakref.ReferenceType[object]
+    creator_pid: int
+    nonce: bytes
+    run_id: str
+    validated_at: str
+    challenge_digest: str
+    lock: object
+    state: Literal["collecting", "complete"]
+    collection_reference: weakref.ReferenceType[object] | None = None
+    collection_fingerprint: str | None = None
+    collection_digest: str | None = None
+
+
+@dataclass(slots=True)
+class _ConsumedAuthority:
+    reference: weakref.ReferenceType[object]
+    creator_pid: int
+    manifest: FeasibilityManifest
+    run_id: str
+    candidate_digest: str
+    collection_digest: str
+    invocation_digest: str
+    authorization_issuing: bool = False
+
+
+@dataclass(slots=True)
+class _OutputAuthority:
+    reference: weakref.ReferenceType[object]
+    creator_pid: int
+    invocation_digest: str
+
+
+_MANIFEST_AUTHORITY_PID = os.getpid()
+_MANIFEST_AUTHORITY_LOCK = threading.Lock()
+_RUN_AUTHORITIES: dict[int, _RunAuthority] = {}
+_CONSUMED_AUTHORITIES: dict[int, _ConsumedAuthority] = {}
+_OUTPUT_AUTHORITIES: dict[int, _OutputAuthority] = {}
+
+
+def _reset_manifest_authority_after_fork() -> None:
+    global _COLLECTION_AUTHORITY_KEY
+    global _MANIFEST_AUTHORITY_LOCK
+    global _MANIFEST_AUTHORITY_PID
+    global _OUTPUT_AUTHORIZATION_KEY
+
+    _RUN_AUTHORITIES.clear()
+    _CONSUMED_AUTHORITIES.clear()
+    _OUTPUT_AUTHORITIES.clear()
+    _MANIFEST_AUTHORITY_PID = os.getpid()
+    _COLLECTION_AUTHORITY_KEY = secrets.token_bytes(32)
+    _OUTPUT_AUTHORIZATION_KEY = secrets.token_bytes(32)
+    _MANIFEST_AUTHORITY_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_manifest_authority_after_fork)
+
+
+def _authority_count_locked() -> int:
+    return (
+        len(_RUN_AUTHORITIES)
+        + len(_CONSUMED_AUTHORITIES)
+        + len(_OUTPUT_AUTHORITIES)
+    )
+
+
+def _register_collection_run(run: ManifestCollectionRun) -> None:
+    if type(run) is not ManifestCollectionRun:
+        raise _manifest_error("collection run type is invalid")
+    identity = id(run)
+
+    def discard(reference: weakref.ReferenceType[ManifestCollectionRun]) -> None:
+        with _MANIFEST_AUTHORITY_LOCK:
+            current = _RUN_AUTHORITIES.get(identity)
+            if current is not None and current.reference is reference:
+                _RUN_AUTHORITIES.pop(identity, None)
+
+    reference = weakref.ref(run, discard)
+    with _MANIFEST_AUTHORITY_LOCK:
+        if _MANIFEST_AUTHORITY_PID != os.getpid():
+            raise _manifest_error("collection run belongs to another process")
+        if _authority_count_locked() >= _MAX_LIVE_MANIFEST_AUTHORITIES:
+            raise _manifest_error("live collection run authority bound exceeded")
+        _RUN_AUTHORITIES[identity] = _RunAuthority(
+            reference=cast(weakref.ReferenceType[object], reference),
+            creator_pid=os.getpid(),
+            nonce=secrets.token_bytes(32),
+            run_id=run.run_id,
+            validated_at=run.validated_at,
+            challenge_digest=hashlib.sha256(run._challenge).hexdigest(),
+            lock=run._lock,
+            state="collecting",
         )
 
 
-def _collection_provenance(
+def _require_run_authority(
+    run: ManifestCollectionRun, state: Literal["collecting", "complete"]
+) -> _RunAuthority:
+    if type(run) is not ManifestCollectionRun:
+        raise _manifest_error("collection run type is invalid")
+    if run._creator_pid != os.getpid():
+        raise _manifest_error("collection run belongs to another process")
+    with _MANIFEST_AUTHORITY_LOCK:
+        entry = _RUN_AUTHORITIES.get(id(run))
+        if (
+            entry is None
+            or entry.reference() is not run
+            or entry.creator_pid != os.getpid()
+            or entry.state != state
+            or run.run_id != entry.run_id
+            or run.validated_at != entry.validated_at
+            or type(run._challenge) is not bytes
+            or hashlib.sha256(run._challenge).hexdigest()
+            != entry.challenge_digest
+            or run._lock is not entry.lock
+        ):
+            raise _manifest_error("collection run authority is invalid")
+        return entry
+
+
+def _mark_complete_collection(
+    run: ManifestCollectionRun,
     collection: CompleteManifestCollection,
-) -> tuple[str, str] | None:
-    with _COMPLETE_COLLECTIONS_LOCK:
-        entry = _COMPLETE_COLLECTIONS.get(id(collection))
-        if entry is None or entry[0]() is not collection:
-            return None
-        return entry[1], entry[2]
+    projection: Mapping[str, object],
+) -> None:
+    fingerprint = hashlib.sha256(canonical_evidence_json(projection)).hexdigest()
+    with _MANIFEST_AUTHORITY_LOCK:
+        entry = _RUN_AUTHORITIES.get(id(run))
+        if (
+            entry is None
+            or entry.reference() is not run
+            or entry.creator_pid != os.getpid()
+            or entry.state != "collecting"
+        ):
+            raise _manifest_error("collection run authority is invalid")
+        entry.state = "complete"
+        entry.collection_reference = cast(
+            weakref.ReferenceType[object], weakref.ref(collection)
+        )
+        entry.collection_fingerprint = fingerprint
+        entry.collection_digest = collection.collection_digest
+
+
+def _collection_provenance_for_run(
+    run: ManifestCollectionRun, collection: CompleteManifestCollection
+) -> tuple[_RunAuthority, tuple[str, str]]:
+    entry = _require_run_authority(run, "complete")
+    if (
+        entry.collection_reference is None
+        or entry.collection_reference() is not collection
+        or entry.collection_fingerprint is None
+        or entry.collection_digest is None
+    ):
+        raise _manifest_error("collection run binding is invalid")
+    return entry, (entry.collection_fingerprint, entry.collection_digest)
+
+
+def _consume_collection_authority(
+    run: ManifestCollectionRun,
+    collection: CompleteManifestCollection,
+    entry: _RunAuthority,
+    consumed: _ConsumedManifestCollection,
+) -> None:
+    identity = id(consumed)
+
+    def discard(reference: weakref.ReferenceType[_ConsumedManifestCollection]) -> None:
+        with _MANIFEST_AUTHORITY_LOCK:
+            current = _CONSUMED_AUTHORITIES.get(identity)
+            if current is not None and current.reference is reference:
+                _CONSUMED_AUTHORITIES.pop(identity, None)
+
+    reference = weakref.ref(consumed, discard)
+    with _MANIFEST_AUTHORITY_LOCK:
+        current = _RUN_AUTHORITIES.get(id(run))
+        if (
+            current is not entry
+            or current.reference() is not run
+            or current.state != "complete"
+            or current.collection_reference is None
+            or current.collection_reference() is not collection
+        ):
+            raise _manifest_error("collection run was already consumed")
+        _RUN_AUTHORITIES.pop(id(run), None)
+        _CONSUMED_AUTHORITIES[identity] = _ConsumedAuthority(
+            reference=cast(weakref.ReferenceType[object], reference),
+            creator_pid=consumed.creator_pid,
+            manifest=consumed.manifest,
+            run_id=consumed.run_id,
+            candidate_digest=consumed.candidate_digest,
+            collection_digest=consumed.collection_digest,
+            invocation_digest=consumed.invocation_digest,
+        )
+
+
+def _claim_consumed_collection(
+    consumed: _ConsumedManifestCollection,
+) -> _ConsumedAuthority:
+    if consumed.creator_pid != os.getpid():
+        raise _manifest_error("manifest collection belongs to another process")
+    with _MANIFEST_AUTHORITY_LOCK:
+        if consumed._authorization_issued:
+            raise _manifest_error("manifest output authorization was already issued")
+        entry = _CONSUMED_AUTHORITIES.get(id(consumed))
+        if (
+            entry is None
+            or entry.reference() is not consumed
+            or entry.creator_pid != os.getpid()
+            or consumed.manifest is not entry.manifest
+            or consumed.run_id != entry.run_id
+            or consumed.candidate_digest != entry.candidate_digest
+            or consumed.collection_digest != entry.collection_digest
+            or consumed.invocation_digest != entry.invocation_digest
+        ):
+            raise _manifest_error("consumed manifest collection provenance is invalid")
+        if entry.authorization_issuing:
+            raise _manifest_error("manifest output authorization was already issued")
+        entry.authorization_issuing = True
+        object.__setattr__(consumed, "_authorization_issued", True)
+        return entry
+
+
+def _burn_consumed_collection(consumed: _ConsumedManifestCollection) -> None:
+    with _MANIFEST_AUTHORITY_LOCK:
+        entry = _CONSUMED_AUTHORITIES.get(id(consumed))
+        if entry is not None and entry.reference() is consumed:
+            _CONSUMED_AUTHORITIES.pop(id(consumed), None)
 
 
 def _gate_observation_projection(
@@ -1387,18 +1604,24 @@ def _complete_collection_projection(
     }
 
 
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True, init=False, weakref_slot=True)
 class ManifestCollectionRun:
     """One-use challenge used by a typed live evidence collector."""
 
     run_id: str
     validated_at: str
     _challenge: bytes
+    _creator_pid: int
     _lock: object
     _completed: bool
 
+    def __init__(self) -> None:
+        raise TypeError("manifest collection runs must be created with begin()")
+
     @classmethod
     def begin(cls) -> ManifestCollectionRun:
+        if cls is not ManifestCollectionRun:
+            raise _manifest_error("collection run type is invalid")
         challenge = secrets.token_bytes(32)
         instance = object.__new__(cls)
         object.__setattr__(instance, "run_id", hashlib.sha256(challenge).hexdigest())
@@ -1408,8 +1631,10 @@ class ManifestCollectionRun:
             datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         object.__setattr__(instance, "_challenge", challenge)
+        object.__setattr__(instance, "_creator_pid", os.getpid())
         object.__setattr__(instance, "_lock", threading.Lock())
         object.__setattr__(instance, "_completed", False)
+        _register_collection_run(instance)
         return instance
 
     def observe_gate(
@@ -1428,6 +1653,7 @@ class ManifestCollectionRun:
         _forbid_content_fields(redacted_evidence)
         lock = cast(threading.Lock, self._lock)
         with lock:
+            _require_run_authority(self, "collecting")
             if self._completed:
                 raise _manifest_error("collection run is already complete")
             evidence_digest = hashlib.sha256(
@@ -1459,6 +1685,7 @@ class ManifestCollectionRun:
             raise _manifest_error("complete gate observations must be a tuple")
         lock = cast(threading.Lock, self._lock)
         with lock:
+            _require_run_authority(self, "collecting")
             if self._completed:
                 raise _manifest_error("collection run is already complete")
             manifest = _manifest_from_json(candidate)
@@ -1521,8 +1748,46 @@ class ManifestCollectionRun:
             object.__setattr__(instance, "candidate_digest", candidate_digest)
             object.__setattr__(instance, "gate_observations", ordered)
             object.__setattr__(instance, "collection_digest", collection_digest)
+            _mark_complete_collection(self, instance, collection_projection)
             object.__setattr__(self, "_completed", True)
-            _mark_complete_collection(instance, collection_projection)
+            return instance
+
+    def consume(
+        self, collection: CompleteManifestCollection
+    ) -> _ConsumedManifestCollection:
+        """Burn this exact completed run and return one output capability."""
+        if type(collection) is not CompleteManifestCollection:
+            raise _manifest_error("collection run binding is invalid")
+        lock = cast(threading.Lock, self._lock)
+        with lock:
+            entry, provenance = _collection_provenance_for_run(self, collection)
+            _verify_complete_manifest_collection(collection, provenance)
+            invocation_projection = {
+                "schema_version": 1,
+                "run_id": self.run_id,
+                "collection_digest": collection.collection_digest,
+                "creator_pid": self._creator_pid,
+                "authority_nonce": entry.nonce.hex(),
+            }
+            invocation_digest = hmac.new(
+                _COLLECTION_AUTHORITY_KEY,
+                _COLLECTION_INVOCATION_DOMAIN
+                + canonical_evidence_json(invocation_projection),
+                hashlib.sha256,
+            ).hexdigest()
+            instance = object.__new__(_ConsumedManifestCollection)
+            object.__setattr__(instance, "manifest", collection.manifest)
+            object.__setattr__(instance, "run_id", collection.run_id)
+            object.__setattr__(
+                instance, "candidate_digest", collection.candidate_digest
+            )
+            object.__setattr__(
+                instance, "collection_digest", collection.collection_digest
+            )
+            object.__setattr__(instance, "invocation_digest", invocation_digest)
+            object.__setattr__(instance, "creator_pid", self._creator_pid)
+            object.__setattr__(instance, "_authorization_issued", False)
+            _consume_collection_authority(self, collection, entry, instance)
             return instance
 
 
@@ -2500,11 +2765,9 @@ class Phase0PrerequisiteDigestResolver:
 
 def _verify_complete_manifest_collection(
     collection: CompleteManifestCollection,
+    provenance: tuple[str, str],
 ) -> FeasibilityManifest:
     if type(collection) is not CompleteManifestCollection:
-        raise _manifest_error("complete manifest collection provenance is invalid")
-    provenance = _collection_provenance(collection)
-    if provenance is None:
         raise _manifest_error("complete manifest collection provenance is invalid")
     if (
         type(collection.run_id) is not str
@@ -2570,15 +2833,18 @@ class _ExistingManifestIdentity:
     sha256: str
 
 
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True, init=False, weakref_slot=True)
 class _ManifestOutputAuthorization:
+    manifest: FeasibilityManifest
     path: str
     candidate_digest: str
     expected_existing: _ExistingManifestIdentity | None
     existing_tuple_mismatch: bool
     collection_run_id: str
+    collection_digest: str
+    invocation_digest: str
+    creator_pid: int
     _authenticator: str
-    _lock: object
     _used: bool
 
 
@@ -2603,7 +2869,90 @@ def _output_authorization_projection(
         ),
         "existing_tuple_mismatch": authorization.existing_tuple_mismatch,
         "collection_run_id": authorization.collection_run_id,
+        "collection_digest": authorization.collection_digest,
+        "invocation_digest": authorization.invocation_digest,
+        "creator_pid": authorization.creator_pid,
     }
+
+
+def _finish_output_authorization(
+    consumed: _ConsumedManifestCollection,
+    consumed_entry: _ConsumedAuthority,
+    authorization: _ManifestOutputAuthorization,
+) -> None:
+    identity = id(authorization)
+
+    def discard(reference: weakref.ReferenceType[_ManifestOutputAuthorization]) -> None:
+        with _MANIFEST_AUTHORITY_LOCK:
+            current = _OUTPUT_AUTHORITIES.get(identity)
+            if current is not None and current.reference is reference:
+                _OUTPUT_AUTHORITIES.pop(identity, None)
+
+    reference = weakref.ref(authorization, discard)
+    with _MANIFEST_AUTHORITY_LOCK:
+        current = _CONSUMED_AUTHORITIES.get(id(consumed))
+        if (
+            current is not consumed_entry
+            or current.reference() is not consumed
+            or not current.authorization_issuing
+        ):
+            raise _manifest_error("manifest output authorization was already issued")
+        _CONSUMED_AUTHORITIES.pop(id(consumed), None)
+        _OUTPUT_AUTHORITIES[identity] = _OutputAuthority(
+            reference=cast(weakref.ReferenceType[object], reference),
+            creator_pid=authorization.creator_pid,
+            invocation_digest=authorization.invocation_digest,
+        )
+
+
+def _consume_output_authorization(
+    authorization: _ManifestOutputAuthorization,
+    *,
+    path: Path,
+    candidate_digest: str,
+) -> None:
+    with _MANIFEST_AUTHORITY_LOCK:
+        entry = _OUTPUT_AUTHORITIES.get(id(authorization))
+        if entry is None or entry.reference() is not authorization:
+            raise _manifest_error("manifest replacement authorization is invalid")
+        _OUTPUT_AUTHORITIES.pop(id(authorization), None)
+        object.__setattr__(authorization, "_used", True)
+        expected_authenticator = hmac.new(
+            _OUTPUT_AUTHORIZATION_KEY,
+            _OUTPUT_AUTHORIZATION_DOMAIN
+            + canonical_evidence_json(
+                _output_authorization_projection(authorization)
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+        if (
+            entry.creator_pid != os.getpid()
+            or authorization.creator_pid != os.getpid()
+            or entry.invocation_digest != authorization.invocation_digest
+            or not hmac.compare_digest(
+                authorization._authenticator, expected_authenticator
+            )
+        ):
+            raise _manifest_error("manifest replacement authorization is invalid")
+        if (
+            authorization.path != os.fspath(path)
+            or authorization.candidate_digest != candidate_digest
+        ):
+            raise _manifest_error(
+                "manifest replacement authorization does not match output"
+            )
+
+
+def _revoke_manifest_output_authorization(
+    authorization: _ManifestOutputAuthorization,
+) -> None:
+    if type(authorization) is not _ManifestOutputAuthorization:
+        return
+    with _MANIFEST_AUTHORITY_LOCK:
+        entry = _OUTPUT_AUTHORITIES.get(id(authorization))
+        if entry is not None and entry.reference() is authorization:
+            _OUTPUT_AUTHORITIES.pop(id(authorization), None)
+            object.__setattr__(authorization, "_used", True)
 
 
 def _read_existing_manifest_at(
@@ -2689,47 +3038,71 @@ def _open_manifest_parent(path: Path) -> int:
 
 
 def _authorize_manifest_output(
-    path: Path, collection: CompleteManifestCollection
+    path: Path, consumed: _ConsumedManifestCollection
 ) -> _ManifestOutputAuthorization:
-    """Bind one complete collection to the exact current destination state."""
-    if type(path) is not type(Path()) or not path.is_absolute():
-        raise _manifest_error("manifest output path must be an exact absolute Path")
-    manifest = _verify_complete_manifest_collection(collection)
-    require_core_gates(manifest)
-    parent_fd = _open_manifest_parent(path)
+    """Burn one invocation and bind it to the exact destination state."""
+    if type(consumed) is not _ConsumedManifestCollection:
+        raise _manifest_error("consumed manifest collection provenance is invalid")
+    consumed_entry = _claim_consumed_collection(consumed)
     try:
-        current = _read_existing_manifest_at(parent_fd, path.name)
-    finally:
+        if type(path) is not type(Path()) or not path.is_absolute():
+            raise _manifest_error("manifest output path must be an exact absolute Path")
+        manifest = _manifest_from_json(consumed.manifest.to_json())
+        load_usage_evidence(manifest)
+        load_sdk_tool_evidence(manifest)
+        candidate_digest = hashlib.sha256(
+            canonical_evidence_json(manifest.to_json())
+        ).hexdigest()
+        if candidate_digest != consumed.candidate_digest:
+            raise _manifest_error("consumed manifest collection candidate changed")
+        require_core_gates(manifest)
+        parent_fd = _open_manifest_parent(path)
         try:
-            os.close(parent_fd)
-        except OSError:
-            pass
-    existing_identity: _ExistingManifestIdentity | None = None
-    mismatch = False
-    if current is not None:
-        existing_identity, encoded = current
-        existing = _load_manifest_bytes(encoded)
-        load_usage_evidence(existing)
-        load_sdk_tool_evidence(existing)
-        mismatch = _manifest_replacement_tuple_digest(
-            existing
-        ) != _manifest_replacement_tuple_digest(manifest)
-    instance = object.__new__(_ManifestOutputAuthorization)
-    object.__setattr__(instance, "path", os.fspath(path))
-    object.__setattr__(instance, "candidate_digest", collection.candidate_digest)
-    object.__setattr__(instance, "expected_existing", existing_identity)
-    object.__setattr__(instance, "existing_tuple_mismatch", mismatch)
-    object.__setattr__(instance, "collection_run_id", collection.run_id)
-    authenticator = hmac.new(
-        _OUTPUT_AUTHORIZATION_KEY,
-        _OUTPUT_AUTHORIZATION_DOMAIN
-        + canonical_evidence_json(_output_authorization_projection(instance)),
-        hashlib.sha256,
-    ).hexdigest()
-    object.__setattr__(instance, "_authenticator", authenticator)
-    object.__setattr__(instance, "_lock", threading.Lock())
-    object.__setattr__(instance, "_used", False)
-    return instance
+            current = _read_existing_manifest_at(parent_fd, path.name)
+        finally:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+        existing_identity: _ExistingManifestIdentity | None = None
+        mismatch = False
+        if current is not None:
+            existing_identity, encoded = current
+            existing = _load_manifest_bytes(encoded)
+            load_usage_evidence(existing)
+            load_sdk_tool_evidence(existing)
+            mismatch = _manifest_replacement_tuple_digest(
+                existing
+            ) != _manifest_replacement_tuple_digest(manifest)
+        instance = object.__new__(_ManifestOutputAuthorization)
+        object.__setattr__(instance, "manifest", manifest)
+        object.__setattr__(instance, "path", os.fspath(path))
+        object.__setattr__(
+            instance, "candidate_digest", consumed.candidate_digest
+        )
+        object.__setattr__(instance, "expected_existing", existing_identity)
+        object.__setattr__(instance, "existing_tuple_mismatch", mismatch)
+        object.__setattr__(instance, "collection_run_id", consumed.run_id)
+        object.__setattr__(
+            instance, "collection_digest", consumed.collection_digest
+        )
+        object.__setattr__(
+            instance, "invocation_digest", consumed.invocation_digest
+        )
+        object.__setattr__(instance, "creator_pid", consumed.creator_pid)
+        authenticator = hmac.new(
+            _OUTPUT_AUTHORIZATION_KEY,
+            _OUTPUT_AUTHORIZATION_DOMAIN
+            + canonical_evidence_json(_output_authorization_projection(instance)),
+            hashlib.sha256,
+        ).hexdigest()
+        object.__setattr__(instance, "_authenticator", authenticator)
+        object.__setattr__(instance, "_used", False)
+        _finish_output_authorization(consumed, consumed_entry, instance)
+        return instance
+    except BaseException:
+        _burn_consumed_collection(consumed)
+        raise
 
 
 _F_FULLFSYNC: Final = 51
@@ -2756,6 +3129,14 @@ def _atomic_write_manifest(
         raise _manifest_error("manifest output path must be absolute")
     payload = canonical_evidence_json(document) + b"\n"
     candidate_digest = hashlib.sha256(payload[:-1]).hexdigest()
+    if authorization is not None:
+        if type(authorization) is not _ManifestOutputAuthorization:
+            raise _manifest_error("manifest replacement authorization is invalid")
+        _consume_output_authorization(
+            authorization,
+            path=path,
+            candidate_digest=candidate_digest,
+        )
     parent = path.parent
     parent_fd = -1
     temp_fd = -1
@@ -2773,40 +3154,8 @@ def _atomic_write_manifest(
         initial_identity = initial[0] if initial is not None else None
         unauthorized_existing = authorization is None and initial is not None
         if authorization is not None:
-            if type(authorization) is not _ManifestOutputAuthorization:
-                raise _manifest_error("manifest replacement authorization is invalid")
-            lock = cast(threading.Lock, authorization._lock)
-            with lock:
-                if authorization._used:
-                    raise _manifest_error(
-                        "manifest replacement authorization was already used"
-                    )
-                expected_authenticator = hmac.new(
-                    _OUTPUT_AUTHORIZATION_KEY,
-                    _OUTPUT_AUTHORIZATION_DOMAIN
-                    + canonical_evidence_json(
-                        _output_authorization_projection(authorization)
-                    ),
-                    hashlib.sha256,
-                ).hexdigest()
-                if not hmac.compare_digest(
-                    authorization._authenticator, expected_authenticator
-                ):
-                    raise _manifest_error(
-                        "manifest replacement authorization is invalid"
-                    )
-                if (
-                    authorization.path != os.fspath(path)
-                    or authorization.candidate_digest != candidate_digest
-                ):
-                    raise _manifest_error(
-                        "manifest replacement authorization does not match output"
-                    )
-                if authorization.expected_existing != initial_identity:
-                    raise _manifest_error(
-                        "manifest output changed after authorization"
-                    )
-                object.__setattr__(authorization, "_used", True)
+            if authorization.expected_existing != initial_identity:
+                raise _manifest_error("manifest output changed after authorization")
         for _ in range(8):
             candidate = f".{path.name}.{secrets.token_hex(16)}.tmp"
             try:
