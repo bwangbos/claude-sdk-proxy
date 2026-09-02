@@ -1378,7 +1378,7 @@ def test_executor_death_interrupts_only_the_admitted_batch(tmp_path: Path) -> No
     executor_pid = os.fork()
     if executor_pid == 0:
         os.close(notified_read)
-        journal.close()
+        # The native at-fork hook already invalidated and closed this handle.
         executor = _open(parent_dirfd, fault=True)
         executor.activate_executor(
             1,

@@ -259,7 +259,7 @@ def test_delete_crash_releases_slot_only_after_fresh_absent_reconciliation(
     pid = os.fork()
     if pid == 0:
         os.environ["CPL_FAULT_POINT"] = point
-        retained.close()
+        # The native at-fork hook already invalidated and closed this handle.
         child = _open(parent_dirfd, library_path=_fault_library())
         child_authority = child.certify_unreleased_partial_create()
         child.delete_at(child_authority)
@@ -317,7 +317,7 @@ def test_certified_done_delete_crash_never_returns_slot_receipt(
         executor_pid = os.fork()
         if executor_pid == 0:
             os.close(ready_read)
-            journal.close()
+            # The native at-fork hook already invalidated and closed this handle.
             executor = _open(parent_dirfd, library_path=_fault_library())
             executor.activate_executor(
                 1,
@@ -442,7 +442,7 @@ def test_done_authority_denies_live_executor_and_missing_reap(
     if executor_pid == 0:
         os.close(ready_read)
         os.close(release_write)
-        journal.close()
+        # The native at-fork hook already invalidated and closed this handle.
         executor = _open(parent_dirfd, library_path=_fault_library())
         executor.activate_executor(
             1,
@@ -794,7 +794,7 @@ def test_real_executor_identity_batches_reap_and_done_authority(
     executor_pid = os.fork()
     if executor_pid == 0:
         os.close(ready_read)
-        journal.close()
+        # The native at-fork hook already invalidated and closed this handle.
         executor = _open(parent_dirfd, library_path=_fault_library())
         executor.activate_executor(
             1,
@@ -1011,7 +1011,7 @@ def test_exact_recovery_tail_completes_four_batches_and_rejects_fifth(
     executor_pid = os.fork()
     if executor_pid == 0:
         os.close(admitted_read)
-        journal.close()
+        # The native at-fork hook already invalidated and closed this handle.
         executor = Journal._open_at_for_test(
             parent_dirfd,
             "allocation.journal",
