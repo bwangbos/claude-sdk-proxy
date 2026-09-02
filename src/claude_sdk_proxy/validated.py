@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
 import stat
 import subprocess
+import threading
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal, cast
@@ -893,6 +895,11 @@ _UTC_SECONDS = re.compile(
 _VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
 _PUBLIC_ALIAS = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z", re.ASCII)
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}\Z", re.ASCII)
+_COLLECTION_RUN_ID = re.compile(r"[0-9a-f]{64}\Z")
+_COLLECTION_GATE_DOMAIN: Final = b"claude-sdk-proxy:manifest-gate-run:v1\0"
+_COLLECTION_COMPLETE_DOMAIN: Final = b"claude-sdk-proxy:manifest-collection:v1\0"
+_OUTPUT_AUTHORIZATION_DOMAIN: Final = b"claude-sdk-proxy:manifest-output-auth:v1\0"
+_OUTPUT_AUTHORIZATION_KEY: Final = secrets.token_bytes(32)
 _TOP_LEVEL_FIELDS: Final = frozenset(
     {
         "schema_version",
@@ -1281,6 +1288,242 @@ class FeasibilityManifest:
                 dict[str, object], _thaw_json(self._sdk_tool_evidence)
             ),
         }
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ManifestGateObservation:
+    """One content-free gate receipt bound to one collection run."""
+
+    gate: str
+    passed: bool
+    run_id: str
+    evidence_digest: str
+    receipt_digest: str
+
+
+@dataclass(frozen=True, slots=True, init=False, weakref_slot=True)
+class CompleteManifestCollection:
+    """A schema-validated complete Tasks 1-9 candidate from one run."""
+
+    manifest: FeasibilityManifest
+    run_id: str
+    validated_at: str
+    runtime_digest: str
+    candidate_digest: str
+    gate_observations: tuple[ManifestGateObservation, ...]
+    collection_digest: str
+
+
+_COMPLETE_COLLECTIONS: dict[
+    int, tuple[weakref.ReferenceType[CompleteManifestCollection], str, str]
+] = {}
+_COMPLETE_COLLECTIONS_LOCK = threading.Lock()
+
+
+def _mark_complete_collection(
+    collection: CompleteManifestCollection, projection: Mapping[str, object]
+) -> None:
+    identity = id(collection)
+
+    def discard(_reference: weakref.ReferenceType[CompleteManifestCollection]) -> None:
+        with _COMPLETE_COLLECTIONS_LOCK:
+            current = _COMPLETE_COLLECTIONS.get(identity)
+            if current is not None and current[0] is _reference:
+                _COMPLETE_COLLECTIONS.pop(identity, None)
+
+    reference = weakref.ref(collection, discard)
+    fingerprint = hashlib.sha256(canonical_evidence_json(projection)).hexdigest()
+    with _COMPLETE_COLLECTIONS_LOCK:
+        _COMPLETE_COLLECTIONS[identity] = (
+            reference,
+            fingerprint,
+            collection.collection_digest,
+        )
+
+
+def _collection_provenance(
+    collection: CompleteManifestCollection,
+) -> tuple[str, str] | None:
+    with _COMPLETE_COLLECTIONS_LOCK:
+        entry = _COMPLETE_COLLECTIONS.get(id(collection))
+        if entry is None or entry[0]() is not collection:
+            return None
+        return entry[1], entry[2]
+
+
+def _gate_observation_projection(
+    observation: ManifestGateObservation,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": observation.run_id,
+        "gate": observation.gate,
+        "passed": observation.passed,
+        "evidence_digest": observation.evidence_digest,
+    }
+
+
+def _complete_collection_projection(
+    *,
+    run_id: str,
+    validated_at: str,
+    runtime_digest: str,
+    candidate_digest: str,
+    observations: tuple[ManifestGateObservation, ...],
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "validated_at": validated_at,
+        "runtime_digest": runtime_digest,
+        "candidate_digest": candidate_digest,
+        "gate_observations": [
+            {
+                **_gate_observation_projection(observation),
+                "receipt_digest": observation.receipt_digest,
+            }
+            for observation in observations
+        ],
+    }
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ManifestCollectionRun:
+    """One-use challenge used by a typed live evidence collector."""
+
+    run_id: str
+    validated_at: str
+    _challenge: bytes
+    _lock: object
+    _completed: bool
+
+    @classmethod
+    def begin(cls) -> ManifestCollectionRun:
+        challenge = secrets.token_bytes(32)
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "run_id", hashlib.sha256(challenge).hexdigest())
+        object.__setattr__(
+            instance,
+            "validated_at",
+            datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        object.__setattr__(instance, "_challenge", challenge)
+        object.__setattr__(instance, "_lock", threading.Lock())
+        object.__setattr__(instance, "_completed", False)
+        return instance
+
+    def observe_gate(
+        self, gate: str, passed: bool, redacted_evidence: object
+    ) -> ManifestGateObservation:
+        """Seal one bounded redacted observation under this run challenge."""
+        if type(gate) is not str or gate not in CORE_GATE_NAMES:
+            raise _manifest_error("collection gate observation name is invalid")
+        if type(passed) is not bool:
+            raise _manifest_error("collection gate observation must be boolean")
+        if type(redacted_evidence) is not dict:
+            raise _manifest_error(
+                "collection gate observation evidence must be an exact object"
+            )
+        _validate_canonical_tree(redacted_evidence)
+        _forbid_content_fields(redacted_evidence)
+        lock = cast(threading.Lock, self._lock)
+        with lock:
+            if self._completed:
+                raise _manifest_error("collection run is already complete")
+            evidence_digest = hashlib.sha256(
+                canonical_evidence_json(redacted_evidence)
+            ).hexdigest()
+            instance = object.__new__(ManifestGateObservation)
+            object.__setattr__(instance, "gate", gate)
+            object.__setattr__(instance, "passed", passed)
+            object.__setattr__(instance, "run_id", self.run_id)
+            object.__setattr__(instance, "evidence_digest", evidence_digest)
+            projection = _gate_observation_projection(instance)
+            receipt = hmac.new(
+                self._challenge,
+                _COLLECTION_GATE_DOMAIN + canonical_evidence_json(projection),
+                hashlib.sha256,
+            ).hexdigest()
+            object.__setattr__(instance, "receipt_digest", receipt)
+            return instance
+
+    def complete(
+        self,
+        candidate: object,
+        observations: tuple[ManifestGateObservation, ...],
+    ) -> CompleteManifestCollection:
+        """Validate and seal exactly one complete candidate for this run."""
+        if type(candidate) is not dict:
+            raise _manifest_error("collection candidate must be an exact object")
+        if type(observations) is not tuple:
+            raise _manifest_error("complete gate observations must be a tuple")
+        lock = cast(threading.Lock, self._lock)
+        with lock:
+            if self._completed:
+                raise _manifest_error("collection run is already complete")
+            manifest = _manifest_from_json(candidate)
+            load_usage_evidence(manifest)
+            load_sdk_tool_evidence(manifest)
+            if manifest.validated_at != self.validated_at:
+                raise _manifest_error(
+                    "collection candidate time is not bound to its run"
+                )
+            if len(observations) != len(CORE_GATE_NAMES):
+                raise _manifest_error("complete gate observation set is incomplete")
+            observed: dict[str, ManifestGateObservation] = {}
+            for observation in observations:
+                if type(observation) is not ManifestGateObservation:
+                    raise _manifest_error("complete gate observation type is invalid")
+                if observation.gate in observed:
+                    raise _manifest_error("complete gate observation is duplicated")
+                if observation.run_id != self.run_id:
+                    raise _manifest_error("collection run binding is invalid")
+                if manifest.core_gates.get(observation.gate) is not observation.passed:
+                    raise _manifest_error(
+                        "collection gate observation contradicts the candidate"
+                    )
+                projection = _gate_observation_projection(observation)
+                expected_receipt = hmac.new(
+                    self._challenge,
+                    _COLLECTION_GATE_DOMAIN + canonical_evidence_json(projection),
+                    hashlib.sha256,
+                ).hexdigest()
+                if not hmac.compare_digest(
+                    observation.receipt_digest, expected_receipt
+                ):
+                    raise _manifest_error("collection gate observation is unsealed")
+                observed[observation.gate] = observation
+            if set(observed) != CORE_GATE_NAMES:
+                raise _manifest_error("complete gate observation set is incomplete")
+            document = manifest.to_json()
+            candidate_digest = hashlib.sha256(
+                canonical_evidence_json(document)
+            ).hexdigest()
+            ordered = tuple(observed[gate] for gate in sorted(observed))
+            collection_projection = _complete_collection_projection(
+                run_id=self.run_id,
+                validated_at=self.validated_at,
+                runtime_digest=manifest.runtime_digest,
+                candidate_digest=candidate_digest,
+                observations=ordered,
+            )
+            collection_digest = hmac.new(
+                self._challenge,
+                _COLLECTION_COMPLETE_DOMAIN
+                + canonical_evidence_json(collection_projection),
+                hashlib.sha256,
+            ).hexdigest()
+            instance = object.__new__(CompleteManifestCollection)
+            object.__setattr__(instance, "manifest", manifest)
+            object.__setattr__(instance, "run_id", self.run_id)
+            object.__setattr__(instance, "validated_at", self.validated_at)
+            object.__setattr__(instance, "runtime_digest", manifest.runtime_digest)
+            object.__setattr__(instance, "candidate_digest", candidate_digest)
+            object.__setattr__(instance, "gate_observations", ordered)
+            object.__setattr__(instance, "collection_digest", collection_digest)
+            object.__setattr__(self, "_completed", True)
+            _mark_complete_collection(instance, collection_projection)
+            return instance
 
 
 def _parse_policy(value: object, gates: Mapping[str, bool]) -> Mapping[str, object]:
@@ -1846,21 +2089,9 @@ def _reject_json_constant(_value: str) -> object:
     raise _manifest_error("manifest JSON contains a non-finite constant")
 
 
-def load_manifest(path: Path) -> FeasibilityManifest:
-    """Load one bounded duplicate-free immutable Phase 0 manifest."""
-    if type(path) is not type(Path()):
-        raise _manifest_error("manifest file path must be an exact platform Path")
-    try:
-        metadata = path.stat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise OSError
-        if metadata.st_size > _MANIFEST_MAX_BYTES:
-            raise _manifest_error("manifest file exceeds its byte bound")
-        encoded = path.read_bytes()
-    except ManifestError:
-        raise
-    except OSError as error:
-        raise _manifest_error("manifest file is unavailable") from error
+def _load_manifest_bytes(encoded: bytes) -> FeasibilityManifest:
+    if type(encoded) is not bytes:
+        raise _manifest_error("manifest bytes must be exact bytes")
     if len(encoded) > _MANIFEST_MAX_BYTES:
         raise _manifest_error("manifest file exceeds its byte bound")
     try:
@@ -1880,6 +2111,24 @@ def load_manifest(path: Path) -> FeasibilityManifest:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise _manifest_error("manifest JSON is invalid") from error
     return _manifest_from_json(value)
+
+
+def load_manifest(path: Path) -> FeasibilityManifest:
+    """Load one bounded duplicate-free immutable Phase 0 manifest."""
+    if type(path) is not type(Path()):
+        raise _manifest_error("manifest file path must be an exact platform Path")
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError
+        if metadata.st_size > _MANIFEST_MAX_BYTES:
+            raise _manifest_error("manifest file exceeds its byte bound")
+        encoded = path.read_bytes()
+    except ManifestError:
+        raise
+    except OSError as error:
+        raise _manifest_error("manifest file is unavailable") from error
+    return _load_manifest_bytes(encoded)
 
 
 def require_core_gates(manifest: FeasibilityManifest) -> None:
@@ -2197,6 +2446,7 @@ class Phase0PrerequisiteDigestResolver:
             raise _manifest_error("prerequisite digest map must be an exact mapping")
         snapshot = dict(digests)
         output: dict[tuple[str, str], str] = {}
+        backend_ids: set[str] = set()
         for pair, digest in snapshot.items():
             if (
                 type(pair) is not tuple
@@ -2210,7 +2460,12 @@ class Phase0PrerequisiteDigestResolver:
                 require_exact_backend_model(pair[1])
             except (TypeError, ExactBackendModelError) as error:
                 raise _manifest_error("prerequisite digest key is invalid") from error
+            if pair[1] in backend_ids:
+                raise _manifest_error(
+                    "prerequisite digest map has an ambiguous exact backend model ID"
+                )
             output[pair] = _manifest_digest(digest, "prerequisite digest")
+            backend_ids.add(pair[1])
         object.__setattr__(
             self, "digests", MappingProxyType(dict(sorted(output.items())))
         )
@@ -2243,6 +2498,240 @@ class Phase0PrerequisiteDigestResolver:
             raise _manifest_error("exact model prerequisite digest map changed")
 
 
+def _verify_complete_manifest_collection(
+    collection: CompleteManifestCollection,
+) -> FeasibilityManifest:
+    if type(collection) is not CompleteManifestCollection:
+        raise _manifest_error("complete manifest collection provenance is invalid")
+    provenance = _collection_provenance(collection)
+    if provenance is None:
+        raise _manifest_error("complete manifest collection provenance is invalid")
+    if (
+        type(collection.run_id) is not str
+        or _COLLECTION_RUN_ID.fullmatch(collection.run_id) is None
+        or type(collection.collection_digest) is not str
+        or _SHA256.fullmatch(collection.collection_digest) is None
+    ):
+        raise _manifest_error("complete manifest collection binding is invalid")
+    manifest = _manifest_from_json(collection.manifest.to_json())
+    load_usage_evidence(manifest)
+    load_sdk_tool_evidence(manifest)
+    candidate_digest = hashlib.sha256(
+        canonical_evidence_json(manifest.to_json())
+    ).hexdigest()
+    if (
+        collection.validated_at != manifest.validated_at
+        or collection.runtime_digest != manifest.runtime_digest
+        or collection.candidate_digest != candidate_digest
+    ):
+        raise _manifest_error("complete manifest collection candidate changed")
+    observations = collection.gate_observations
+    if (
+        type(observations) is not tuple
+        or len(observations) != len(CORE_GATE_NAMES)
+    ):
+        raise _manifest_error("complete gate observation set is incomplete")
+    seen: set[str] = set()
+    for observation in observations:
+        if (
+            type(observation) is not ManifestGateObservation
+            or observation.gate in seen
+            or observation.run_id != collection.run_id
+            or manifest.core_gates.get(observation.gate) is not observation.passed
+            or _SHA256.fullmatch(observation.evidence_digest) is None
+            or _SHA256.fullmatch(observation.receipt_digest) is None
+        ):
+            raise _manifest_error("complete gate observation binding is invalid")
+        seen.add(observation.gate)
+    if seen != CORE_GATE_NAMES:
+        raise _manifest_error("complete gate observation set is incomplete")
+    projection = _complete_collection_projection(
+        run_id=collection.run_id,
+        validated_at=collection.validated_at,
+        runtime_digest=collection.runtime_digest,
+        candidate_digest=collection.candidate_digest,
+        observations=observations,
+    )
+    fingerprint = hashlib.sha256(canonical_evidence_json(projection)).hexdigest()
+    if (
+        not hmac.compare_digest(fingerprint, provenance[0])
+        or not hmac.compare_digest(collection.collection_digest, provenance[1])
+    ):
+        raise _manifest_error("complete manifest collection seal changed")
+    return manifest
+
+
+@dataclass(frozen=True, slots=True)
+class _ExistingManifestIdentity:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _ManifestOutputAuthorization:
+    path: str
+    candidate_digest: str
+    expected_existing: _ExistingManifestIdentity | None
+    existing_tuple_mismatch: bool
+    collection_run_id: str
+    _authenticator: str
+    _lock: object
+    _used: bool
+
+
+def _output_authorization_projection(
+    authorization: _ManifestOutputAuthorization,
+) -> dict[str, object]:
+    existing = authorization.expected_existing
+    return {
+        "schema_version": 1,
+        "path": authorization.path,
+        "candidate_digest": authorization.candidate_digest,
+        "existing_identity": (
+            None
+            if existing is None
+            else {
+                "device": existing.device,
+                "inode": existing.inode,
+                "mode": existing.mode,
+                "size": existing.size,
+                "sha256": existing.sha256,
+            }
+        ),
+        "existing_tuple_mismatch": authorization.existing_tuple_mismatch,
+        "collection_run_id": authorization.collection_run_id,
+    }
+
+
+def _read_existing_manifest_at(
+    parent_fd: int, name: str
+) -> tuple[_ExistingManifestIdentity, bytes] | None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise _manifest_error("existing manifest output is unavailable") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > _MANIFEST_MAX_BYTES:
+            raise _manifest_error("existing manifest output is not a bounded file")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 65_536))
+            if not chunk:
+                raise _manifest_error("existing manifest output changed while read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise _manifest_error("existing manifest output changed while read")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+        ) != (after.st_dev, after.st_ino, after.st_mode, after.st_size):
+            raise _manifest_error("existing manifest output changed while read")
+        encoded = b"".join(chunks)
+        return (
+            _ExistingManifestIdentity(
+                device=before.st_dev,
+                inode=before.st_ino,
+                mode=before.st_mode,
+                size=before.st_size,
+                sha256=hashlib.sha256(encoded).hexdigest(),
+            ),
+            encoded,
+        )
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _manifest_replacement_tuple_digest(manifest: FeasibilityManifest) -> str:
+    projection = {
+        "schema_version": manifest.schema_version,
+        "policy_evidence": _thaw_json(manifest.policy_evidence),
+        "runtime_evidence": _thaw_json(manifest.runtime_evidence),
+        "mount_identity": _mount_identity_to_json(manifest.mount_identity),
+        "backend_class": manifest.backend_class,
+        "auth_class": manifest.auth_class,
+        "semantic_class": manifest.semantic_class,
+        "model_map": dict(manifest.model_map),
+    }
+    return hashlib.sha256(canonical_evidence_json(projection)).hexdigest()
+
+
+def _open_manifest_parent(path: Path) -> int:
+    try:
+        return os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise _manifest_error("manifest output parent is unavailable") from error
+
+
+def _authorize_manifest_output(
+    path: Path, collection: CompleteManifestCollection
+) -> _ManifestOutputAuthorization:
+    """Bind one complete collection to the exact current destination state."""
+    if type(path) is not type(Path()) or not path.is_absolute():
+        raise _manifest_error("manifest output path must be an exact absolute Path")
+    manifest = _verify_complete_manifest_collection(collection)
+    require_core_gates(manifest)
+    parent_fd = _open_manifest_parent(path)
+    try:
+        current = _read_existing_manifest_at(parent_fd, path.name)
+    finally:
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
+    existing_identity: _ExistingManifestIdentity | None = None
+    mismatch = False
+    if current is not None:
+        existing_identity, encoded = current
+        existing = _load_manifest_bytes(encoded)
+        load_usage_evidence(existing)
+        load_sdk_tool_evidence(existing)
+        mismatch = _manifest_replacement_tuple_digest(
+            existing
+        ) != _manifest_replacement_tuple_digest(manifest)
+    instance = object.__new__(_ManifestOutputAuthorization)
+    object.__setattr__(instance, "path", os.fspath(path))
+    object.__setattr__(instance, "candidate_digest", collection.candidate_digest)
+    object.__setattr__(instance, "expected_existing", existing_identity)
+    object.__setattr__(instance, "existing_tuple_mismatch", mismatch)
+    object.__setattr__(instance, "collection_run_id", collection.run_id)
+    authenticator = hmac.new(
+        _OUTPUT_AUTHORIZATION_KEY,
+        _OUTPUT_AUTHORIZATION_DOMAIN
+        + canonical_evidence_json(_output_authorization_projection(instance)),
+        hashlib.sha256,
+    ).hexdigest()
+    object.__setattr__(instance, "_authenticator", authenticator)
+    object.__setattr__(instance, "_lock", threading.Lock())
+    object.__setattr__(instance, "_used", False)
+    return instance
+
+
 _F_FULLFSYNC: Final = 51
 
 
@@ -2254,13 +2743,19 @@ def _fsync_directory_fd(descriptor: int) -> None:
     os.fsync(descriptor)
 
 
-def _atomic_write_manifest(path: Path, document: object) -> None:
-    """Write canonical evidence by same-directory full-synced rename."""
+def _atomic_write_manifest(
+    path: Path,
+    document: object,
+    *,
+    authorization: _ManifestOutputAuthorization | None = None,
+) -> None:
+    """Write canonical evidence without unauthorized destination replacement."""
     if type(path) is not type(Path()):
         raise _manifest_error("manifest output path must be an exact platform Path")
     if not path.is_absolute():
         raise _manifest_error("manifest output path must be absolute")
     payload = canonical_evidence_json(document) + b"\n"
+    candidate_digest = hashlib.sha256(payload[:-1]).hexdigest()
     parent = path.parent
     parent_fd = -1
     temp_fd = -1
@@ -2274,6 +2769,44 @@ def _atomic_write_manifest(path: Path, document: object) -> None:
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
         )
+        initial = _read_existing_manifest_at(parent_fd, path.name)
+        initial_identity = initial[0] if initial is not None else None
+        unauthorized_existing = authorization is None and initial is not None
+        if authorization is not None:
+            if type(authorization) is not _ManifestOutputAuthorization:
+                raise _manifest_error("manifest replacement authorization is invalid")
+            lock = cast(threading.Lock, authorization._lock)
+            with lock:
+                if authorization._used:
+                    raise _manifest_error(
+                        "manifest replacement authorization was already used"
+                    )
+                expected_authenticator = hmac.new(
+                    _OUTPUT_AUTHORIZATION_KEY,
+                    _OUTPUT_AUTHORIZATION_DOMAIN
+                    + canonical_evidence_json(
+                        _output_authorization_projection(authorization)
+                    ),
+                    hashlib.sha256,
+                ).hexdigest()
+                if not hmac.compare_digest(
+                    authorization._authenticator, expected_authenticator
+                ):
+                    raise _manifest_error(
+                        "manifest replacement authorization is invalid"
+                    )
+                if (
+                    authorization.path != os.fspath(path)
+                    or authorization.candidate_digest != candidate_digest
+                ):
+                    raise _manifest_error(
+                        "manifest replacement authorization does not match output"
+                    )
+                if authorization.expected_existing != initial_identity:
+                    raise _manifest_error(
+                        "manifest output changed after authorization"
+                    )
+                object.__setattr__(authorization, "_used", True)
         for _ in range(8):
             candidate = f".{path.name}.{secrets.token_hex(16)}.tmp"
             try:
@@ -2299,6 +2832,15 @@ def _atomic_write_manifest(path: Path, document: object) -> None:
         _fullfsync_fd(temp_fd)
         os.close(temp_fd)
         temp_fd = -1
+        final = _read_existing_manifest_at(parent_fd, path.name)
+        final_identity = final[0] if final is not None else None
+        if authorization is None:
+            if unauthorized_existing or final_identity is not None:
+                raise _manifest_error(
+                    "manifest replacement authorization is required"
+                )
+        elif final_identity != authorization.expected_existing:
+            raise _manifest_error("manifest output changed after authorization")
         os.rename(
             temp_name,
             path.name,
@@ -2332,8 +2874,11 @@ def _atomic_write_manifest(path: Path, document: object) -> None:
 __all__ = [
     "CORE_GATE_NAMES",
     "CliIdentity",
+    "CompleteManifestCollection",
     "FeasibilityManifest",
+    "ManifestCollectionRun",
     "ManifestError",
+    "ManifestGateObservation",
     "POLICY_URLS",
     "Phase0PrerequisiteDigestResolver",
     "PolicyEvidence",

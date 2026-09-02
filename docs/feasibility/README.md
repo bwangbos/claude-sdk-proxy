@@ -92,9 +92,21 @@ Caller acknowledgment is only an invocation guard and never counts as policy
 proof. The command fails before creating or overwriting output while live
 opt-in is absent or any policy/runtime/attestation prerequisite is false. The
 current tuple therefore must not run this command to mint evidence. A future
-affirmative implementation must rerun every gate and may write only by a
-same-directory mode-`0600` temporary file, `F_FULLFSYNC`, descriptor-relative
-rename, and parent-directory `fsync`.
+affirmative collector must return one run-bound, exact 27-gate Tasks 1–9
+candidate. The command validates that candidate through the manifest, usage,
+and SDK schemas; authorizes the exact existing-output identity; writes through
+a same-directory mode-`0600` temporary file, `F_FULLFSYNC`,
+descriptor-relative rename, and parent-directory `fsync`; then reloads and
+rechecks exact bytes, schemas, core gates, and mode before returning success.
+The default production collector remains unavailable until the existing probe
+surfaces can provide that complete candidate; it never rebuilds one from a
+prior manifest.
+
+Git records a regular non-executable blob only as mode `100644`, so a fresh
+checkout cannot preserve the working file's owner-only `0600` permission.
+Committed-artifact checks therefore verify canonical bytes, schema, and
+content exclusions rather than checkout permissions. Every generated output
+is independently created and verified as `0600` by the atomic writer.
 
 Synthetic all-true manifests in unit tests exercise canonical digest and
 resolver mechanics only. They are never committed evidence and cannot unblock

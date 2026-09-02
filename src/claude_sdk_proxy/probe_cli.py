@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import claude_sdk_proxy.validated as validated_evidence
 from claude_sdk_proxy.attestation import current_attestation_availability
 from claude_sdk_proxy.probes import (
     MAX_REDACTED_REPORT_BYTES,
@@ -16,7 +18,19 @@ from claude_sdk_proxy.probes import (
     run_compaction_probe,
     run_prompt_purity_probe,
 )
-from claude_sdk_proxy.validated import CURRENT_POLICY_PERSONAL_LOCAL_USE_ALLOWED
+from claude_sdk_proxy.validated import (
+    CURRENT_POLICY_PERSONAL_LOCAL_USE_ALLOWED,
+    CompleteManifestCollection,
+    ManifestCollectionRun,
+    canonical_evidence_json,
+    load_sdk_tool_evidence,
+    load_usage_evidence,
+    require_core_gates,
+)
+
+type ManifestEvidenceCollector = Callable[
+    [ManifestCollectionRun], CompleteManifestCollection
+]
 
 _FALLBACK_JSON = {
     "purity": (
@@ -193,8 +207,26 @@ def _main(argv: Sequence[str] | None) -> int:
     return 1
 
 
-def _run_all(arguments: list[str]) -> int:
-    """Fail closed before output until every live prerequisite is affirmative."""
+def _production_manifest_collector(
+    run: ManifestCollectionRun,
+) -> CompleteManifestCollection:
+    """Fail at the first unavailable typed production collection boundary."""
+    if type(run) is not ManifestCollectionRun:
+        raise ProbeUnavailable("manifest collection run is invalid")
+    if not CURRENT_POLICY_PERSONAL_LOCAL_USE_ALLOWED:
+        raise ProbeUnavailable("personal subscription policy is unavailable")
+    if not current_attestation_availability().core_gate_available:
+        raise ProbeUnavailable("child attestation is unavailable")
+    # The current probe APIs expose individual unavailable live gates, not one
+    # complete Tasks 1-9 candidate. Never assemble production evidence from a
+    # prior manifest or partially run probes.
+    raise ProbeUnavailable("complete Tasks 1-9 collection is unavailable")
+
+
+def _run_all(
+    arguments: list[str], *, collector: ManifestEvidenceCollector | None = None
+) -> int:
+    """Collect, authorize, persist, and reload one complete Phase 0 manifest."""
     if (
         len(arguments) != 4
         or any(type(argument) is not str for argument in arguments)
@@ -212,12 +244,38 @@ def _run_all(arguments: list[str]) -> int:
         return 3
     if not current_attestation_availability().core_gate_available:
         return 3
-    # This branch is deliberately unreachable for the committed Phase 0 tuple.
-    # A future affirmative implementation must rerun and merge every live gate
-    # before calling the atomic writer; no prior or caller-supplied manifest is
-    # accepted here.
-    _ = Path(arguments[3]).resolve()
-    return 4
+    selected_collector = (
+        _production_manifest_collector if collector is None else collector
+    )
+    try:
+        run = ManifestCollectionRun.begin()
+        collection = selected_collector(run)
+        output = Path(os.path.abspath(arguments[3]))
+        authorization = validated_evidence._authorize_manifest_output(
+            output, collection
+        )
+        document = collection.manifest.to_json()
+        expected = canonical_evidence_json(document) + b"\n"
+        validated_evidence._atomic_write_manifest(
+            output,
+            document,
+            authorization=authorization,
+        )
+        reloaded = validated_evidence.load_manifest(output)
+        require_core_gates(reloaded)
+        load_usage_evidence(reloaded)
+        load_sdk_tool_evidence(reloaded)
+        if (
+            output.read_bytes() != expected
+            or canonical_evidence_json(reloaded.to_json()) + b"\n" != expected
+            or stat.S_IMODE(output.stat().st_mode) != 0o600
+        ):
+            return 4
+        return 0
+    except ProbeUnavailable:
+        return 3
+    except BaseException:
+        return 4
 
 
 def main(argv: Sequence[str] | None = None) -> int:
