@@ -268,7 +268,7 @@ class ModelIdentityGate:
         if self._state is _ModelIdentityState.FAILED:
             raise ModelIdentityError("model identity gate has failed")
         if self._state is _ModelIdentityState.FINISHED:
-            return
+            raise ModelIdentityError("model identity gate is already finished")
         if self._state is _ModelIdentityState.PENDING:
             self._fail("stream ended before model identity was verified")
         self._buffer.clear()
