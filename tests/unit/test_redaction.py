@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Sequence
 from io import StringIO
+from pathlib import Path
 
 import pytest
 
 from claude_sdk_proxy.attestation import current_attestation_availability
+from claude_sdk_proxy.path_policy import PathPolicy, RootKind
 from claude_sdk_proxy.probe_cli import main
 from claude_sdk_proxy.probes import (
     MAX_REDACTED_REPORT_BYTES,
     REDACTION_MARKER,
     ProbeResult,
     ProbeUnavailable,
+    SafeCanaryDigest,
     run_prompt_purity_probe,
     safe_canary_digest,
 )
@@ -154,8 +158,32 @@ def test_report_depth_item_and_byte_limits_are_hard_bounds() -> None:
     assert REDACTION_MARKER.encode() in serialized
 
 
-def test_only_explicit_safe_canary_hash_type_can_preserve_a_digest() -> None:
-    digest = safe_canary_digest(b"proxy-owned-harmless-canary")
+def test_only_verified_proxy_owned_canary_can_preserve_a_digest(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real"
+    proxy_root = tmp_path / "proxy"
+    real_root.mkdir(mode=0o700)
+    proxy_root.mkdir(mode=0o700)
+    canary_dir = proxy_root / "canaries"
+    canary_dir.mkdir(mode=0o700)
+    canary_path = canary_dir / "purity.txt"
+    canary = b"proxy-owned-harmless-canary"
+    canary_path.write_bytes(canary)
+    canary_path.chmod(0o600)
+    policy = PathPolicy(real_login_root=real_root, proxy_owned_root=proxy_root)
+    observation = policy.metadata(
+        Path("canaries/purity.txt"), root=RootKind.PROXY_OWNED
+    )
+
+    with pytest.raises(TypeError):
+        safe_canary_digest(canary)  # type: ignore[call-arg]
+    digest = safe_canary_digest(
+        canary,
+        policy=policy,
+        path=Path("canaries/purity.txt"),
+        expected=observation,
+    )
     raw_digest = "a" * 64
     report = ProbeResult(
         "path_persistence",
@@ -168,6 +196,40 @@ def test_only_explicit_safe_canary_hash_type_can_preserve_a_digest() -> None:
 
     assert report["evidence"]["safe_canary_sha256"] == digest.value
     assert report["evidence"]["untrusted_sha256"] == REDACTION_MARKER
+
+
+def test_hostile_sequence_protocol_fails_closed_without_calling_repr() -> None:
+    class HostileSequence(Sequence[object]):
+        def __len__(self) -> int:
+            raise RuntimeError("HOSTILE-LENGTH-SECRET")
+
+        def __getitem__(self, index: int) -> object:
+            raise RuntimeError(f"HOSTILE-ITEM-SECRET-{index}")
+
+        def __repr__(self) -> str:
+            raise AssertionError("redactor must not stringify hostile sequences")
+
+    result = ProbeResult(
+        "purity", False, {"shape": {"event_counts": HostileSequence()}}
+    )
+
+    serialized = encoded(result)
+
+    assert "HOSTILE" not in serialized
+    assert REDACTION_MARKER in serialized
+
+
+def test_forged_safe_canary_receipt_fails_closed() -> None:
+    forged = object.__new__(SafeCanaryDigest)
+    forged._permit = object()
+    forged._value = "a" * 64
+    result = ProbeResult(
+        "path_persistence", False, {"safe_canary_sha256": forged}
+    )
+
+    report = result.redacted_dict()
+
+    assert report["evidence"]["safe_canary_sha256"] == REDACTION_MARKER
 
 
 def test_prompt_purity_probe_is_unavailable_before_any_live_action() -> None:
@@ -206,3 +268,20 @@ def test_probe_cli_rejects_a_requested_live_success_claim(
     assert report["passed"] is False
     assert report["evidence"]["reason_code"] == "live_success_claim_forbidden"
 
+
+def test_probe_cli_redacts_unexpected_exception_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail() -> ProbeResult:
+        raise RuntimeError("EXCEPTION-MESSAGE-SECRET")
+
+    monkeypatch.setattr("claude_sdk_proxy.probe_cli.run_prompt_purity_probe", fail)
+
+    status = main(["prompt-purity"])
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert status != 0
+    assert "EXCEPTION-MESSAGE-SECRET" not in captured.out + captured.err
+    assert report["evidence"]["reason_code"] == "probe_internal_error"

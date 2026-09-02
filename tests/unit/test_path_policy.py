@@ -102,6 +102,15 @@ def test_ambiguous_and_escaping_paths_are_rejected(
         policy.classify(relative)  # type: ignore[arg-type]
 
 
+def test_invalid_root_selector_and_overlong_component_sets_are_rejected(
+    policy: PathPolicy,
+) -> None:
+    with pytest.raises(PathPolicyError, match="root"):
+        policy.classify(Path("settings.json"), root="real_login")  # type: ignore[arg-type]
+    with pytest.raises(PathPolicyError, match="relative path"):
+        policy.classify(Path(*(["component"] * 65)))
+
+
 def test_unknown_existing_or_new_paths_are_never_openable(
     policy: PathPolicy, roots: tuple[Path, Path]
 ) -> None:
@@ -172,6 +181,8 @@ def test_symlink_traversal_and_special_files_are_rejected(
     os.mkfifo(fifo, 0o600)
 
     for relative in (Path("canaries/link"), Path("canaries/fifo")):
+        with pytest.raises(PathPolicyError):
+            policy.classify(relative, root=RootKind.PROXY_OWNED)
         with pytest.raises(PathPolicyError):
             policy.may_open_content(relative, root=RootKind.PROXY_OWNED)
 
@@ -245,4 +256,3 @@ def test_snapshot_enforces_entry_bound(roots: tuple[Path, Path]) -> None:
 
     with pytest.raises(PathPolicyError, match="snapshot entry limit"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
-
