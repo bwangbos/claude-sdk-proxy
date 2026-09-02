@@ -1435,13 +1435,24 @@ def _register_collection_run(run: ManifestCollectionRun) -> None:
         )
 
 
+def _require_run_creator_process(run: ManifestCollectionRun) -> None:
+    """Reject forged or inherited runs without touching synchronization."""
+    if type(run) is not ManifestCollectionRun:
+        raise _manifest_error("collection run type is invalid")
+    try:
+        creator_pid = object.__getattribute__(run, "_creator_pid")
+    except AttributeError as error:
+        raise _manifest_error("collection run creator process is invalid") from error
+    if type(creator_pid) is not int:
+        raise _manifest_error("collection run creator process is invalid")
+    if creator_pid != os.getpid():
+        raise _manifest_error("collection run belongs to another process")
+
+
 def _require_run_authority(
     run: ManifestCollectionRun, state: Literal["collecting", "complete"]
 ) -> _RunAuthority:
-    if type(run) is not ManifestCollectionRun:
-        raise _manifest_error("collection run type is invalid")
-    if run._creator_pid != os.getpid():
-        raise _manifest_error("collection run belongs to another process")
+    _require_run_creator_process(run)
     with _MANIFEST_AUTHORITY_LOCK:
         entry = _RUN_AUTHORITIES.get(id(run))
         if (
@@ -1641,6 +1652,7 @@ class ManifestCollectionRun:
         self, gate: str, passed: bool, redacted_evidence: object
     ) -> ManifestGateObservation:
         """Seal one bounded redacted observation under this run challenge."""
+        _require_run_creator_process(self)
         if type(gate) is not str or gate not in CORE_GATE_NAMES:
             raise _manifest_error("collection gate observation name is invalid")
         if type(passed) is not bool:
@@ -1679,6 +1691,7 @@ class ManifestCollectionRun:
         observations: tuple[ManifestGateObservation, ...],
     ) -> CompleteManifestCollection:
         """Validate and seal exactly one complete candidate for this run."""
+        _require_run_creator_process(self)
         if type(candidate) is not dict:
             raise _manifest_error("collection candidate must be an exact object")
         if type(observations) is not tuple:
@@ -1756,6 +1769,7 @@ class ManifestCollectionRun:
         self, collection: CompleteManifestCollection
     ) -> _ConsumedManifestCollection:
         """Burn this exact completed run and return one output capability."""
+        _require_run_creator_process(self)
         if type(collection) is not CompleteManifestCollection:
             raise _manifest_error("collection run binding is invalid")
         lock = cast(threading.Lock, self._lock)
