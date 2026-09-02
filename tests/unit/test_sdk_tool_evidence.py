@@ -403,7 +403,7 @@ def test_manifest_and_direct_aggregate_construction_reject_mutable_aliases(
         SdkToolEvidenceManifest(records=[valid_sdk_tool_record])  # type: ignore[arg-type]
 
 
-def test_hostile_mapping_cycle_and_oversized_tree_fail_without_rendering_values() -> None:
+def test_hostile_cycle_and_oversized_tree_fail_without_rendering_values() -> None:
     class HostileMapping(Mapping[str, object]):
         def __getitem__(self, key: str) -> object:
             raise AssertionError("must not read hostile mapping")

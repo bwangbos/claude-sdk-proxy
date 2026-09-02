@@ -999,6 +999,31 @@ class UsageEvidenceSchema:
                 break
         raise _error("exact usage tuple dialect mapping is missing")
 
+    def only_tool_row(
+        self, operation_class: UsageOperationClass | str
+    ) -> UsageEvidenceRow:
+        """Return one exact tool-operation row without tuple fallback."""
+        if type(operation_class) is str:
+            try:
+                selected = UsageOperationClass(operation_class)
+            except ValueError as error:
+                raise _error("tool operation class is not supported") from error
+        elif type(operation_class) is UsageOperationClass:
+            selected = operation_class
+        else:
+            raise _error("tool operation class must be exact text or enum")
+        if selected not in {
+            UsageOperationClass.TOOL_USE_BOUNDARY,
+            UsageOperationClass.POST_TOOL_RESULT,
+        }:
+            raise _error("tool operation class must name a tool result context")
+        matches = tuple(
+            row for row in self.rows if row.key.operation_class is selected
+        )
+        if len(matches) != 1:
+            raise _error("tool operation row must resolve to exactly one exact tuple")
+        return matches[0]
+
 
 __all__ = [
     "DialectUsageMapping",

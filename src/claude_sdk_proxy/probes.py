@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Final, Never
 
 from claude_sdk_proxy.attestation import (
     ExactModelAliasMap,
+    ModelIdentityError,
     ModelIdentityGate,
     current_attestation_availability,
 )
@@ -24,6 +25,14 @@ MAX_REDACTED_REPORT_BYTES: Final = 16_384
 _MAX_ITEMS: Final = 1
 _MAX_CANARY_BYTES: Final = 256
 _REPORT_NAMES = frozenset({"purity", "compaction", "path_persistence"})
+_TOOL_BRIDGE_SCENARIOS = frozenset(
+    {
+        "delayed_sdk_callback",
+        "parallel_reverse",
+        "usage_rows",
+        "generated_name_rule",
+    }
+)
 
 
 class _ProbeReasonCode(StrEnum):
@@ -254,6 +263,22 @@ def run_usage_probe(
     )
 
 
+async def run_tool_bridge_probe(
+    model_id: str, scenario: str, delay_seconds: int
+) -> ProbeResult:
+    """Run an SDK-tool scenario only after the false core gate becomes true."""
+    try:
+        aliases = ExactModelAliasMap({"tool-probe": model_id})
+    except ModelIdentityError as error:
+        raise ValueError("tool bridge model ID must be exact") from error
+    aliases.resolve("tool-probe")
+    if type(scenario) is not str or scenario not in _TOOL_BRIDGE_SCENARIOS:
+        raise ValueError("tool bridge scenario is not supported")
+    if type(delay_seconds) is not int or not 1 <= delay_seconds <= 600:
+        raise ValueError("tool bridge delay must be an integer from 1 through 600")
+    _require_live_prerequisites()
+
+
 __all__ = [
     "MAX_REDACTED_REPORT_BYTES",
     "REDACTION_MARKER",
@@ -264,6 +289,7 @@ __all__ = [
     "run_session_probe",
     "run_stream_probe",
     "run_thinking_probe",
+    "run_tool_bridge_probe",
     "run_usage_probe",
     "safe_canary_digest",
 ]
