@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -9,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
+import claude_sdk_proxy.journal as journal_implementation
 from claude_sdk_proxy.journal import (
+    AdmittedBatch,
     Journal,
     JournalError,
     JournalErrorCode,
@@ -204,6 +207,145 @@ def test_forked_child_rejects_inherited_handle(tmp_path: Path) -> None:
     try:
         assert os.waitstatus_to_exitcode(status) == 0
         assert journal.scan().head.sequence == 1
+    finally:
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def _wait_for_child_bounded(pid: int, timeout: float = 2.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.005)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    raise AssertionError("fork child did not reject the inherited object promptly")
+
+
+@pytest.mark.parametrize(
+    ("handle_state", "operation"),
+    [
+        ("active", "scan"),
+        ("open", "append"),
+        ("pending", "close"),
+        ("closed", "closed_property"),
+        ("open", "unhealthy_property"),
+        ("open", "admit_batch"),
+        ("open", "batch_execute"),
+        ("open", "batch_complete"),
+        ("open", "batch_abandon"),
+    ],
+)
+def test_fork_child_rejects_before_held_python_condition_for_every_operation_kind(
+    tmp_path: Path,
+    handle_state: str,
+    operation: str,
+) -> None:
+    """A child must not wait on or release a lock belonging to the parent."""
+    journal, parent_dirfd = _make_journal(tmp_path)
+    if handle_state == "closed":
+        journal.close()
+    elif handle_state == "pending":
+        journal._handle_state = journal_implementation._HandleState.CLOSING
+        journal._closing_thread_id = -1
+    elif handle_state == "active":
+        journal._active_operations = 1
+
+    batch = AdmittedBatch(
+        journal_implementation._BATCH_TOKEN,
+        journal,
+        journal_implementation._CActionToken(),
+    )
+    condition_held = threading.Event()
+    release_condition = threading.Event()
+
+    def hold_condition() -> None:
+        with journal._operation_condition:
+            condition_held.set()
+            release_condition.wait()
+
+    holder = threading.Thread(target=hold_condition)
+    holder.start()
+    assert condition_held.wait(timeout=1)
+    pid = os.fork()
+    if pid == 0:
+        signal.signal(signal.SIGALRM, lambda _signum, _frame: os._exit(124))
+        signal.alarm(1)
+        try:
+            if operation == "scan":
+                journal.scan()
+            elif operation == "append":
+                journal.append(
+                    Record.prepared(1, "candidate-1", claim_deadline_ns=_future()),
+                    RecordClass.NORMAL,
+                )
+            elif operation == "close":
+                journal.close()
+            elif operation == "closed_property":
+                _ = journal.closed
+            elif operation == "unhealthy_property":
+                _ = journal.unhealthy
+            elif operation == "admit_batch":
+                journal.admit_batch(
+                    1,
+                    "executor-1",
+                    "batch-1",
+                    (Journal.terminal_checks_descriptor(),),
+                )
+            elif operation == "batch_execute":
+                batch.execute()
+            elif operation == "batch_complete":
+                batch.complete()
+            elif operation == "batch_abandon":
+                batch.abandon()
+            else:
+                os._exit(125)
+        except JournalError as error:
+            os._exit(0 if error.code is JournalErrorCode.FORK_INHERITED else 2)
+        except BaseException:
+            os._exit(3)
+        os._exit(4)
+
+    try:
+        assert _wait_for_child_bounded(pid) == 0
+        assert holder.is_alive()
+    finally:
+        release_condition.set()
+        holder.join(timeout=1)
+        assert not holder.is_alive()
+        if handle_state == "pending":
+            journal._handle_state = journal_implementation._HandleState.OPEN
+            journal._closing_thread_id = None
+        elif handle_state == "active":
+            journal._active_operations = 0
+        journal.close()
+        os.close(parent_dirfd)
+
+
+def test_journal_creator_guard_is_exact_type_and_tamper_fail_closed(
+    tmp_path: Path,
+) -> None:
+    journal, parent_dirfd = _make_journal(tmp_path)
+    creator_pid = os.getpid()
+    object.__setattr__(journal, "_creator_pid", "hostile")
+    try:
+        with pytest.raises(JournalError) as caught:
+            journal.scan()
+        assert caught.value.code is JournalErrorCode.FORK_INHERITED
+    finally:
+        object.__setattr__(journal, "_creator_pid", creator_pid)
+
+    class HostileJournal(Journal):
+        def __getattribute__(self, _name: str) -> object:
+            raise AssertionError("subclass attributes must not be traversed")
+
+    forged = object.__new__(HostileJournal)
+    try:
+        with pytest.raises(JournalError) as caught:
+            Journal.scan(forged)
+        assert caught.value.code is JournalErrorCode.FORK_INHERITED
     finally:
         journal.close()
         os.close(parent_dirfd)

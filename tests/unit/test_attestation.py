@@ -246,6 +246,23 @@ def _prepare(inputs: _LaunchInputs) -> PreparedSupervisorLaunch:
     )
 
 
+def _wait_for_fork_child(pid: int, timeout: float = 2.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.005)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    raise AssertionError("fork child did not fail closed within the bound")
+
+
+def _child_alarm() -> None:
+    signal.signal(signal.SIGALRM, lambda _signum, _frame: os._exit(124))
+    signal.alarm(1)
+
+
 def _raw_sdk_init(**changes: object) -> SystemMessage:
     data: dict[str, object] = {
         "type": "system",
@@ -1325,6 +1342,189 @@ def test_prepared_launch_is_opaque_sealed_single_use_and_not_picklable(
             )
         finally:
             launch.close()
+
+
+def test_fork_child_cannot_claim_prepared_launch_while_parent_claim_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        parent_fds = tuple(control.fileno() for control in (
+            launch._child_control,
+            launch._parent_control,
+        ))
+        claim_lock = getattr(implementation, "_LAUNCH_CLAIM_LOCK", threading.RLock())
+        claim_lock.acquire()
+        pid = os.fork()
+        if pid == 0:
+            _child_alarm()
+            try:
+                AttestedSupervisorTransport(launch)
+            except AttestationError:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(3)
+        try:
+            assert _wait_for_fork_child(pid) == 0
+        finally:
+            claim_lock.release()
+
+        assert tuple(control.fileno() for control in (
+            launch._child_control,
+            launch._parent_control,
+        )) == parent_fds
+        transport = AttestedSupervisorTransport(launch)
+        assert isinstance(
+            build_attested_sdk_client(launch, transport=transport), ClaudeSDKClient
+        )
+        launch.close()
+
+
+def test_stale_global_launch_authority_is_invalidated_in_fork_child(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        inherited_authority = implementation._LAUNCH_TOKEN
+        effective_environment = build_child_environment(
+            inputs.source, inputs.environment_config
+        )
+        pid = os.fork()
+        if pid == 0:
+            _child_alarm()
+            try:
+                PreparedSupervisorLaunch._create(
+                    inherited_authority,
+                    config=inputs.config,
+                    descriptors=inputs.descriptors,
+                    cli_identity=inputs.manifest.cli_executable,
+                    effective_environment=effective_environment,
+                    network_proxy_enabled=False,
+                )
+            except AttestationError:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(3)
+        assert _wait_for_fork_child(pid) == 0
+
+
+class _InheritedBlockingAsyncLock:
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor = descriptor
+
+    async def __aenter__(self) -> None:
+        os.read(self._descriptor, 1)
+
+    async def __aexit__(
+        self,
+        _exc_type: object,
+        _exc: object,
+        _traceback: object,
+    ) -> None:
+        return None
+
+
+def test_claimed_transport_rejects_fork_child_before_inherited_async_lock(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        transport = AttestedSupervisorTransport(launch)
+        original_lock = transport._lock
+        blocked_read, blocked_write = os.pipe()
+        transport._lock = _InheritedBlockingAsyncLock(blocked_read)  # type: ignore[assignment]
+        pid = os.fork()
+        if pid == 0:
+            os.close(blocked_write)
+            _child_alarm()
+            try:
+                anyio.run(transport.connect)
+            except AttestationError:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+            os._exit(3)
+        try:
+            assert _wait_for_fork_child(pid) == 0
+        finally:
+            os.close(blocked_read)
+            os.close(blocked_write)
+            transport._lock = original_lock
+
+        assert transport.is_ready() is False
+        assert isinstance(
+            build_attested_sdk_client(launch, transport=transport), ClaudeSDKClient
+        )
+        launch.close()
+
+
+def test_launch_and_transport_creator_guards_reject_tampering_and_hostile_subclasses(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        creator_pid = os.getpid()
+        object.__setattr__(launch, "_creator_pid", "hostile")
+        try:
+            with pytest.raises(AttestationError, match="creator process"):
+                _ = launch.command
+        finally:
+            object.__setattr__(launch, "_creator_pid", creator_pid)
+
+        class HostileLaunch(PreparedSupervisorLaunch):
+            def __getattribute__(self, _name: str) -> object:
+                raise AssertionError("hostile launch attributes were traversed")
+
+        forged_launch = object.__new__(HostileLaunch)
+        command_getter = PreparedSupervisorLaunch.command.fget
+        assert command_getter is not None
+        with pytest.raises(AttestationError, match="creator process"):
+            command_getter(forged_launch)
+
+        transport = AttestedSupervisorTransport(launch)
+        object.__setattr__(transport, "_creator_pid", "hostile")
+        with pytest.raises(AttestationError, match="creator process"):
+            transport.is_ready()
+        object.__setattr__(transport, "_creator_pid", creator_pid)
+
+        class HostileTransport(AttestedSupervisorTransport):
+            def __getattribute__(self, _name: str) -> object:
+                raise AssertionError("hostile transport attributes were traversed")
+
+        forged_transport = object.__new__(HostileTransport)
+        with pytest.raises(AttestationError, match="creator process"):
+            AttestedSupervisorTransport.is_ready(forged_transport)
+        launch.close()
+
+
+def test_concurrent_prepared_launch_claims_have_exactly_one_winner(
+    tmp_path: Path,
+) -> None:
+    with _launch_inputs(tmp_path) as inputs:
+        launch = _prepare(inputs)
+        start = threading.Barrier(3)
+        transports: list[AttestedSupervisorTransport] = []
+        failures: list[AttestationError] = []
+
+        def claim() -> None:
+            start.wait()
+            try:
+                transports.append(AttestedSupervisorTransport(launch))
+            except AttestationError as error:
+                failures.append(error)
+
+        claimers = [threading.Thread(target=claim) for _ in range(2)]
+        for claimer in claimers:
+            claimer.start()
+        start.wait()
+        for claimer in claimers:
+            claimer.join(timeout=1)
+            assert not claimer.is_alive()
+        assert len(transports) == 1
+        assert len(failures) == 1
+        assert "already claimed" in str(failures[0])
+        launch.close()
 
 
 def test_prepared_launch_fingerprint_binds_immutable_workdir(tmp_path: Path) -> None:
