@@ -341,3 +341,88 @@ def test_snapshot_binds_complete_opened_directory_metadata(
 
     with pytest.raises(PathPolicyError, match="identity changed"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
+
+
+@pytest.mark.parametrize("mutation", ["insert", "delete", "replace", "rename"])
+def test_snapshot_certifies_root_across_descendant_scan_churn(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    descendant = roots[0] / "plugins"
+    descendant.mkdir(mode=0o700)
+    target = roots[0] / "settings.json"
+    target.write_bytes(b"ORIGINAL")
+    descendant_inode = descendant.stat().st_ino
+    original_scandir = os.scandir
+    mutated = False
+
+    def churning_scandir(
+        path: os.PathLike[str] | str | bytes | int = ".",
+    ) -> os.ScandirIterator[str]:
+        nonlocal mutated
+        if (
+            isinstance(path, int)
+            and os.fstat(path).st_ino == descendant_inode
+            and not mutated
+        ):
+            mutated = True
+            if mutation == "insert":
+                (roots[0] / "CLAUDE.md").write_bytes(b"INSERTED")
+            elif mutation == "delete":
+                target.unlink()
+            elif mutation == "replace":
+                target.unlink()
+                target.write_bytes(b"REPLACEMENT-LONGER")
+            else:
+                target.rename(roots[0] / "settings.local.json")
+        return original_scandir(path)
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", churning_scandir)
+
+    with pytest.raises(PathPolicyError, match="changed during snapshot"):
+        policy.snapshot(root=RootKind.REAL_LOGIN)
+
+
+def test_snapshot_certifies_each_nested_directory_across_its_descendants(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = roots[0] / "plugins"
+    parent.mkdir(mode=0o700)
+    descendant = parent / "nested"
+    descendant.mkdir(mode=0o700)
+    descendant_inode = descendant.stat().st_ino
+    original_scandir = os.scandir
+    mutated = False
+
+    def churning_scandir(
+        path: os.PathLike[str] | str | bytes | int = ".",
+    ) -> os.ScandirIterator[str]:
+        nonlocal mutated
+        if (
+            isinstance(path, int)
+            and os.fstat(path).st_ino == descendant_inode
+            and not mutated
+        ):
+            mutated = True
+            (parent / "hooks").mkdir(mode=0o700)
+        return original_scandir(path)
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", churning_scandir)
+
+    with pytest.raises(PathPolicyError, match="changed during snapshot"):
+        policy.snapshot(root=RootKind.REAL_LOGIN)
+
+
+def test_snapshot_depth_is_capped_for_bounded_descriptor_recursion(
+    roots: tuple[Path, Path],
+) -> None:
+    with pytest.raises(PathPolicyError, match="depth limit.*at most"):
+        PathPolicy(
+            real_login_root=roots[0],
+            proxy_owned_root=roots[1],
+            max_depth=65,
+        )

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import json
 import math
+import os
 import pickle
+import weakref
 from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
@@ -14,15 +17,28 @@ import pytest
 import claude_sdk_proxy.probe_cli as probe_cli
 import claude_sdk_proxy.probes as probes
 from claude_sdk_proxy.attestation import current_attestation_availability
-from claude_sdk_proxy.path_policy import PathPolicy, RootKind
+from claude_sdk_proxy.path_policy import (
+    PathPolicy,
+    RootKind,
+    _consume_safe_canary_receipt,
+)
 from claude_sdk_proxy.probe_cli import main
 from claude_sdk_proxy.probes import (
     MAX_REDACTED_REPORT_BYTES,
-    REDACTION_MARKER,
     ProbeResult,
     ProbeUnavailable,
     run_prompt_purity_probe,
     safe_canary_digest,
+)
+
+REPORT_NAMES = ("purity", "compaction", "path_persistence")
+FAILURE_REASONS = (
+    "child_attestation_unavailable",
+    "live_success_claim_forbidden",
+    "invalid_invocation",
+    "probe_internal_error",
+    "live_probe_harness_unavailable",
+    "redaction_failure",
 )
 
 
@@ -58,48 +74,49 @@ def test_report_never_contains_content_or_credentials() -> None:
     assert report["schema_version"] == 1
     assert report["name"] == "purity"
     assert report["passed"] is False
-    assert report["evidence"]["reason_code"] == "redaction_failure"
-    assert REDACTION_MARKER in report["evidence"].values()
+    assert report["evidence"] == {"reason_code": "redaction_failure"}
 
 
-def test_exact_report_schemas_admit_only_declared_paths_and_exact_types() -> None:
-    valid = {
-        "purity": {
-            "reason_code": "child_attestation_unavailable",
-            "shape": {"blocks": 1},
-            "attribution_absent_observable": False,
-            "ambient_capability_absent": False,
-            "structured_user_input": False,
-            "advertised_tool_count": 0,
-        },
-        "compaction": {
-            "reason_code": "child_attestation_unavailable",
-            "auto_compaction_disabled": False,
-            "compact_boundary_count": 0,
-            "summary_event_count": 0,
-            "context_exhausted": False,
-        },
-        "path_persistence": {
-            "reason_code": "child_attestation_unavailable",
-            "persistence_absent": False,
-            "path_count": 0,
-            "modified_path_count": 0,
-            "unknown_path_count": 0,
-        },
-    }
+def test_current_false_tuple_admits_only_exact_failure_variants() -> None:
+    for name in REPORT_NAMES:
+        for reason in FAILURE_REASONS:
+            report = ProbeResult(name, False, {"reason_code": reason}).redacted_dict()
+            assert report == {
+                "schema_version": 1,
+                "name": name,
+                "passed": False,
+                "evidence": {"reason_code": reason},
+            }
 
-    for name, evidence in valid.items():
-        report = ProbeResult(name, False, evidence).redacted_dict()
-        assert report["evidence"] == evidence
 
-    for value in (True, 1, [1], "invented", {"nested": 1}):
+@pytest.mark.parametrize(
+    ("name", "extra"),
+    [
+        ("purity", {"shape": {"blocks": 0}}),
+        ("purity", {"ambient_capability_absent": True}),
+        ("purity", {"advertised_tool_count": 0}),
+        ("compaction", {"auto_compaction_disabled": True}),
+        ("compaction", {"compact_boundary_count": 0}),
+        ("path_persistence", {"persistence_absent": True}),
+        ("path_persistence", {"modified_path_count": 0}),
+    ],
+)
+def test_success_and_contradictory_optional_facts_collapse_to_fixed_false(
+    name: str,
+    extra: dict[str, object],
+) -> None:
+    for passed, evidence in (
+        (True, {"reason_code": "child_attestation_unavailable"}),
+        (False, {}),
+        (False, {"reason_code": "child_attestation_unavailable", **extra}),
+    ):
         report = ProbeResult(
-            "purity",
-            True,
-            {"reason_code": "child_attestation_unavailable", "undeclared": value},
+            name,
+            passed,
+            evidence,
         ).redacted_dict()
         assert report["passed"] is False
-        assert report["evidence"]["reason_code"] == "redaction_failure"
+        assert report["evidence"] == {"reason_code": "redaction_failure"}
 
 
 def test_exact_name_bool_and_reason_types_reject_subclasses_or_unknown_values() -> None:
@@ -194,7 +211,7 @@ def test_exceptions_unknown_objects_cycles_and_nonfinite_values_fail_closed() ->
     assert "Hostile" not in serialized
     assert "NaN" not in serialized
     assert "Infinity" not in serialized
-    assert serialized.count(REDACTION_MARKER) == 1
+    assert json.loads(serialized)["evidence"] == {"reason_code": "redaction_failure"}
 
 
 def test_confusable_duplicate_keys_fail_closed_without_preserving_values() -> None:
@@ -208,6 +225,7 @@ def test_confusable_duplicate_keys_fail_closed_without_preserving_values() -> No
 
     assert report["passed"] is False
     assert report["evidence"]["reason_code"] == "redaction_failure"
+
 
 def test_report_depth_item_and_byte_limits_are_hard_bounds() -> None:
     nested: object = {"blocks": 1}
@@ -226,10 +244,10 @@ def test_report_depth_item_and_byte_limits_are_hard_bounds() -> None:
     serialized = encoded(result).encode("utf-8")
 
     assert len(serialized) <= MAX_REDACTED_REPORT_BYTES
-    assert REDACTION_MARKER.encode() in serialized
+    assert b'"reason_code":"redaction_failure"' in serialized
 
 
-def test_only_verified_proxy_owned_canary_can_preserve_a_digest(
+def test_only_verified_proxy_owned_canary_can_mint_a_one_use_digest_receipt(
     tmp_path: Path,
 ) -> None:
     real_root = tmp_path / "real"
@@ -255,35 +273,17 @@ def test_only_verified_proxy_owned_canary_can_preserve_a_digest(
         path=Path("canaries/purity.txt"),
         expected=observation,
     )
-    raw_digest = "a" * 64
-    report = ProbeResult(
-        "path_persistence",
-        False,
-        {
-            "reason_code": "child_attestation_unavailable",
-            "safe_canary_sha256": receipt,
-        },
-    ).redacted_dict()
-
-    assert report["evidence"]["safe_canary_sha256"] == hashlib.sha256(
-        canary
-    ).hexdigest()
+    assert object.__getattribute__(receipt, "_creator_pid") == os.getpid()
     assert "SafeCanaryDigest" not in probes.__all__
     assert not hasattr(receipt, "value")
     for operation in (copy.copy, copy.deepcopy, pickle.dumps):
         with pytest.raises((TypeError, ValueError, pickle.PicklingError)):
             operation(receipt)
-    reused = ProbeResult(
-        "path_persistence",
-        False,
-        {
-            "reason_code": "child_attestation_unavailable",
-            "safe_canary_sha256": receipt,
-        },
-    ).redacted_dict()
-    assert reused["passed"] is False
-    assert reused["evidence"]["reason_code"] == "redaction_failure"
+    assert _consume_safe_canary_receipt(receipt) == hashlib.sha256(canary).hexdigest()
+    with pytest.raises(RuntimeError, match="receipt"):
+        _consume_safe_canary_receipt(receipt)
 
+    raw_digest = "a" * 64
     raw = ProbeResult(
         "path_persistence",
         False,
@@ -294,6 +294,71 @@ def test_only_verified_proxy_owned_canary_can_preserve_a_digest(
     ).redacted_dict()
     assert raw["passed"] is False
     assert raw["evidence"]["reason_code"] == "redaction_failure"
+
+
+def test_forked_children_invalidate_inherited_canary_authority_repeatedly(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real"
+    proxy_root = tmp_path / "proxy"
+    real_root.mkdir(mode=0o700)
+    proxy_root.mkdir(mode=0o700)
+    canary_dir = proxy_root / "canaries"
+    canary_dir.mkdir(mode=0o700)
+    target = canary_dir / "purity.txt"
+    canary = b"FORK-BOUND-SAFE-CANARY"
+    target.write_bytes(canary)
+    target.chmod(0o600)
+    policy = PathPolicy(real_login_root=real_root, proxy_owned_root=proxy_root)
+    metadata = policy.metadata(Path("canaries/purity.txt"), root=RootKind.PROXY_OWNED)
+    receipt = safe_canary_digest(
+        canary,
+        policy=policy,
+        path=Path("canaries/purity.txt"),
+        expected=metadata,
+    )
+
+    for _ in range(3):
+        read_fd, write_fd = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(read_fd)
+            valid = False
+            try:
+                try:
+                    _consume_safe_canary_receipt(receipt)
+                except RuntimeError:
+                    valid = (
+                        len(policy._canary_records) == 0
+                        and policy._canary_creator_pid == os.getpid()
+                    )
+                os.write(write_fd, b"1" if valid else b"0")
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        result = os.read(read_fd, 1)
+        os.close(read_fd)
+        waited, status = os.waitpid(child, 0)
+        assert waited == child
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert result == b"1"
+
+    assert _consume_safe_canary_receipt(receipt) == hashlib.sha256(canary).hexdigest()
+
+
+def test_canary_policy_registry_does_not_retain_policies(tmp_path: Path) -> None:
+    real_root = tmp_path / "real"
+    proxy_root = tmp_path / "proxy"
+    real_root.mkdir(mode=0o700)
+    proxy_root.mkdir(mode=0o700)
+    policy = PathPolicy(real_login_root=real_root, proxy_owned_root=proxy_root)
+    reference = weakref.ref(policy)
+
+    del policy
+    gc.collect()
+
+    assert reference() is None
 
 
 def test_hostile_sequence_protocol_fails_closed_without_calling_repr() -> None:
@@ -314,7 +379,7 @@ def test_hostile_sequence_protocol_fails_closed_without_calling_repr() -> None:
     serialized = encoded(result)
 
     assert "HOSTILE" not in serialized
-    assert REDACTION_MARKER in serialized
+    assert json.loads(serialized)["evidence"] == {"reason_code": "redaction_failure"}
 
 
 def test_mutated_or_forged_safe_canary_receipt_fails_closed(tmp_path: Path) -> None:
@@ -337,31 +402,12 @@ def test_mutated_or_forged_safe_canary_receipt_fails_closed(tmp_path: Path) -> N
     )
     digest_field = "_digest" if hasattr(receipt, "_digest") else "_value"
     object.__setattr__(receipt, digest_field, "a" * 64)
-    result = ProbeResult(
-        "path_persistence",
-        True,
-        {
-            "reason_code": "child_attestation_unavailable",
-            "safe_canary_sha256": receipt,
-        },
-    )
-
-    report = result.redacted_dict()
-
-    assert report["passed"] is False
-    assert report["evidence"]["reason_code"] == "redaction_failure"
+    with pytest.raises(RuntimeError, match="receipt"):
+        _consume_safe_canary_receipt(receipt)
 
     forged = object.__new__(type(receipt))
-    forged_report = ProbeResult(
-        "path_persistence",
-        True,
-        {
-            "reason_code": "child_attestation_unavailable",
-            "safe_canary_sha256": forged,
-        },
-    ).redacted_dict()
-    assert forged_report["passed"] is False
-    assert forged_report["evidence"]["reason_code"] == "redaction_failure"
+    with pytest.raises(RuntimeError, match="receipt"):
+        _consume_safe_canary_receipt(forged)
 
 
 class HostileMapping(dict[str, object]):
@@ -407,10 +453,7 @@ def test_hostile_mapping_materialization_unpack_hash_and_eq_are_constant_false(
     report = result.redacted_dict()
 
     assert report["passed"] is False
-    assert report["evidence"] == {
-        "reason_code": "redaction_failure",
-        "redaction": REDACTION_MARKER,
-    }
+    assert report["evidence"] == {"reason_code": "redaction_failure"}
 
 
 def test_redacted_dict_json_failure_returns_fixed_minimal_false_record(
@@ -429,10 +472,7 @@ def test_redacted_dict_json_failure_returns_fixed_minimal_false_record(
         "schema_version": 1,
         "name": "purity",
         "passed": False,
-        "evidence": {
-            "reason_code": "redaction_failure",
-            "redaction": REDACTION_MARKER,
-        },
+        "evidence": {"reason_code": "redaction_failure"},
     }
 
 
@@ -473,6 +513,27 @@ def test_probe_cli_rejects_a_requested_live_success_claim(
     assert report["evidence"]["reason_code"] == "live_success_claim_forbidden"
 
 
+def test_probe_cli_can_never_emit_or_exit_with_current_tuple_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def impossible_success() -> ProbeResult:
+        return ProbeResult(
+            "purity", True, {"reason_code": "child_attestation_unavailable"}
+        )
+
+    monkeypatch.setattr(
+        "claude_sdk_proxy.probe_cli.run_prompt_purity_probe", impossible_success
+    )
+
+    status = main(["prompt-purity"])
+    report = json.loads(capsys.readouterr().out)
+
+    assert status != 0
+    assert report["passed"] is False
+    assert report["evidence"] == {"reason_code": "redaction_failure"}
+
+
 def test_probe_cli_redacts_unexpected_exception_messages(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -505,7 +566,9 @@ def test_cli_json_serialization_failure_uses_constant_fallback(
 
     assert status != 0
     assert "CLI-JSON-SECRET" not in captured.out + captured.err
-    assert json.loads(captured.out)["evidence"]["reason_code"] == "redaction_failure"
+    assert json.loads(captured.out)["evidence"] == {
+        "reason_code": "redaction_failure"
+    }
 
 
 def test_cli_output_failure_never_escapes(
