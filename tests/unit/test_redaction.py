@@ -111,7 +111,9 @@ def test_exact_name_bool_and_reason_types_reject_subclasses_or_unknown_values() 
     with pytest.raises(TypeError):
         ProbeResult("purity", 0, {})  # type: ignore[arg-type]
 
-    report = ProbeResult("purity", True, {"reason_code": "future_reason"}).redacted_dict()
+    report = ProbeResult(
+        "purity", True, {"reason_code": "future_reason"}
+    ).redacted_dict()
     assert report["passed"] is False
     assert report["evidence"]["reason_code"] == "redaction_failure"
 
@@ -192,7 +194,7 @@ def test_exceptions_unknown_objects_cycles_and_nonfinite_values_fail_closed() ->
     assert "Hostile" not in serialized
     assert "NaN" not in serialized
     assert "Infinity" not in serialized
-    assert serialized.count(REDACTION_MARKER) >= 5
+    assert serialized.count(REDACTION_MARKER) == 1
 
 
 def test_confusable_duplicate_keys_fail_closed_without_preserving_values() -> None:
@@ -206,7 +208,6 @@ def test_confusable_duplicate_keys_fail_closed_without_preserving_values() -> No
 
     assert report["passed"] is False
     assert report["evidence"]["reason_code"] == "redaction_failure"
-
 
 def test_report_depth_item_and_byte_limits_are_hard_bounds() -> None:
     nested: object = {"blocks": 1}
@@ -349,6 +350,18 @@ def test_mutated_or_forged_safe_canary_receipt_fails_closed(tmp_path: Path) -> N
 
     assert report["passed"] is False
     assert report["evidence"]["reason_code"] == "redaction_failure"
+
+    forged = object.__new__(type(receipt))
+    forged_report = ProbeResult(
+        "path_persistence",
+        True,
+        {
+            "reason_code": "child_attestation_unavailable",
+            "safe_canary_sha256": forged,
+        },
+    ).redacted_dict()
+    assert forged_report["passed"] is False
+    assert forged_report["evidence"]["reason_code"] == "redaction_failure"
 
 
 class HostileMapping(dict[str, object]):

@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
-import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
-from itertools import islice
+from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Never, SupportsIndex
+from typing import TYPE_CHECKING, Final, Never, cast
 
 from claude_sdk_proxy.attestation import current_attestation_availability
 
@@ -19,100 +17,56 @@ if TYPE_CHECKING:
 
 REDACTION_MARKER: Final = "__redacted__"
 MAX_REDACTED_REPORT_BYTES: Final = 16_384
-_MAX_DEPTH: Final = 8
 _MAX_ITEMS: Final = 128
-_MAX_ENUM_LENGTH: Final = 64
+_MAX_COUNT: Final = 1_000_000
 _MAX_CANARY_BYTES: Final = 256
+_CANONICAL_KEY = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_REPORT_NAMES = frozenset({"purity", "compaction", "path_persistence"})
 
-_REPORT_NAMES = frozenset(
-    {"purity", "compaction", "path_persistence", "prompt_purity"}
-)
-_CONTENT_KEYS = frozenset(
-    {"system", "systemprompt", "messages", "prompt", "text", "toolinput", "toolresult"}
-)
-_SECRET_FRAGMENTS = (
-    "authorization",
-    "bearer",
-    "token",
-    "secret",
-    "password",
-    "apikey",
-    "cookie",
-    "session",
-    "credential",
-)
-_CONTAINER_KEYS = frozenset(
-    {
-        "shape",
-        "nested",
-        "counts",
-        "eventcounts",
-        "pathclasscounts",
-        "gates",
-    }
-)
-_INTEGER_KEYS = frozenset({"blocks", "items", "paths", "events"})
-_ENUM_KEYS = frozenset(
-    {"reason", "reasoncode", "status", "outcome", "state", "eventtype", "pathclass"}
-)
-_BOOLEAN_SUFFIXES = (
-    "available",
-    "passed",
-    "enabled",
-    "disabled",
-    "present",
-    "observed",
-    "succeeded",
-    "exhausted",
-)
-_SAFE_ENUM = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
-_SAFE_OUTPUT_KEY = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+
+class _ProbeReasonCode(StrEnum):
+    CHILD_ATTESTATION_UNAVAILABLE = "child_attestation_unavailable"
+    LIVE_SUCCESS_CLAIM_FORBIDDEN = "live_success_claim_forbidden"
+    INVALID_INVOCATION = "invalid_invocation"
+    PROBE_INTERNAL_ERROR = "probe_internal_error"
+    LIVE_PROBE_HARNESS_UNAVAILABLE = "live_probe_harness_unavailable"
+    REDACTION_FAILURE = "redaction_failure"
+
+
+_REASON_CODES = frozenset(reason.value for reason in _ProbeReasonCode)
+_SCHEMAS: Final[dict[str, dict[str, str]]] = {
+    "purity": {
+        "reason_code": "reason",
+        "shape": "shape",
+        "attribution_absent_observable": "bool",
+        "ambient_capability_absent": "bool",
+        "structured_user_input": "bool",
+        "advertised_tool_count": "count",
+    },
+    "compaction": {
+        "reason_code": "reason",
+        "auto_compaction_disabled": "bool",
+        "compact_boundary_count": "count",
+        "summary_event_count": "count",
+        "context_exhausted": "bool",
+    },
+    "path_persistence": {
+        "reason_code": "reason",
+        "persistence_absent": "bool",
+        "path_count": "count",
+        "modified_path_count": "count",
+        "unknown_path_count": "count",
+        "safe_canary_sha256": "canary_receipt",
+    },
+}
 
 
 class ProbeUnavailable(RuntimeError):
     """Raised when a live probe's prerequisite gate is not affirmative."""
 
 
-class SafeCanaryDigest:
-    """Digest explicitly derived from a small proxy-owned benign canary."""
-
-    __slots__ = ("_permit", "_value")
-    _permit: object
-    _value: str
-
-    def __new__(cls, *_args: object, **_kwargs: object) -> SafeCanaryDigest:
-        raise TypeError("SafeCanaryDigest cannot be constructed publicly")
-
-    @classmethod
-    def _create(cls, permit: object, value: str) -> SafeCanaryDigest:
-        if permit is not _SAFE_CANARY_PERMIT or not re.fullmatch(
-            r"[0-9a-f]{64}", value
-        ):
-            raise ValueError("safe canary digest must be lowercase SHA-256")
-        instance = object.__new__(cls)
-        instance._permit = permit
-        instance._value = value
-        return instance
-
-    @property
-    def value(self) -> str:
-        if self._permit is not _SAFE_CANARY_PERMIT or not re.fullmatch(
-            r"[0-9a-f]{64}", self._value
-        ):
-            raise ValueError("safe canary digest is invalid")
-        return self._value
-
-    def __copy__(self) -> Never:
-        raise TypeError("SafeCanaryDigest cannot be copied")
-
-    def __deepcopy__(self, _memo: object) -> Never:
-        raise TypeError("SafeCanaryDigest cannot be copied")
-
-    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
-        raise TypeError("SafeCanaryDigest cannot be pickled")
-
-
-_SAFE_CANARY_PERMIT = object()
+class _RedactionFailure(RuntimeError):
+    """Internal sentinel whose details are never exposed."""
 
 
 def safe_canary_digest(
@@ -122,209 +76,131 @@ def safe_canary_digest(
     path: Path,
     expected: PathMetadata,
     root: RootKind | None = None,
-) -> SafeCanaryDigest:
-    """Hash a canary only after a no-follow scan of its proxy-owned file."""
+) -> object:
+    """Mint a one-use receipt for a verified proxy-owned benign canary."""
     from claude_sdk_proxy.path_policy import PathPolicy, RootKind
 
-    if not isinstance(canary, bytes) or not canary or len(canary) > _MAX_CANARY_BYTES:
+    if type(canary) is not bytes or not canary or len(canary) > _MAX_CANARY_BYTES:
         raise ValueError("safe canary must be 1..256 bytes")
-    if not isinstance(policy, PathPolicy):
+    if type(policy) is not PathPolicy:
         raise TypeError("safe canary digest requires a PathPolicy")
     selected_root = RootKind.PROXY_OWNED if root is None else root
     if selected_root is not RootKind.PROXY_OWNED:
         raise ValueError("safe canary digest requires the proxy-owned root")
-    if not policy.scan_for_canary(
-        path, canary, expected=expected, root=selected_root
-    ):
-        raise ValueError("safe canary was not present in the verified proxy path")
-    return SafeCanaryDigest._create(
-        _SAFE_CANARY_PERMIT, hashlib.sha256(canary).hexdigest()
-    )
-
-
-def _normalized_key(key: str) -> str:
-    normalized = unicodedata.normalize("NFKC", key).casefold()
-    return "".join(character for character in normalized if character.isalnum())
-
-
-def _is_sensitive_key(normalized: str) -> bool:
-    return normalized in _CONTENT_KEYS or any(
-        fragment in normalized for fragment in _SECRET_FRAGMENTS
-    )
-
-
-def _is_integer_key(normalized: str) -> bool:
-    return (
-        normalized in _INTEGER_KEYS
-        or normalized.endswith("count")
-        or normalized.endswith("counts")
-    )
-
-
-def _is_boolean_key(normalized: str) -> bool:
-    return normalized in _BOOLEAN_SUFFIXES or normalized.endswith(_BOOLEAN_SUFFIXES)
-
-
-def _safe_digest_value(value: SafeCanaryDigest) -> str | None:
     try:
-        return value.value
-    except (AttributeError, ValueError):
-        return None
+        return policy._mint_safe_canary_receipt(
+            path,
+            canary,
+            expected=expected,
+            root=selected_root,
+        )
+    except BaseException as error:
+        if isinstance(error, (TypeError, ValueError)):
+            raise
+        raise ValueError("safe canary verification failed") from error
 
 
-def _redacted_mapping(
-    value: Mapping[Any, Any], *, depth: int, seen: set[int]
-) -> dict[str, object] | str:
-    if depth > _MAX_DEPTH or id(value) in seen:
-        return REDACTION_MARKER
-    seen.add(id(value))
+def _fixed_false(name: object) -> dict[str, object]:
+    safe_name = name if type(name) is str and name in _REPORT_NAMES else "purity"
+    return {
+        "schema_version": 1,
+        "name": safe_name,
+        "passed": False,
+        "evidence": {
+            "reason_code": _ProbeReasonCode.REDACTION_FAILURE.value,
+            "redaction": REDACTION_MARKER,
+        },
+    }
+
+
+def _materialize_mapping(value: Mapping[str, object]) -> dict[str, object]:
     try:
-        try:
-            entries = list(islice(iter(value.items()), _MAX_ITEMS + 1))
-        except BaseException:
-            return REDACTION_MARKER
-        if len(entries) > _MAX_ITEMS:
-            return REDACTION_MARKER
-        normalized_entries: list[tuple[str, str, object]] = []
-        normalized_seen: set[str] = set()
-        for raw_key, child in entries:
-            if not isinstance(raw_key, str) or len(raw_key) > _MAX_ENUM_LENGTH:
-                return REDACTION_MARKER
-            normalized = _normalized_key(raw_key)
-            if not normalized or normalized in normalized_seen:
-                return REDACTION_MARKER
-            normalized_seen.add(normalized)
-            normalized_entries.append((raw_key, normalized, child))
-
+        entries_method = value.items
+        iterator = iter(entries_method())
+        entries: list[tuple[str, object]] = []
+        for _ in range(_MAX_ITEMS + 1):
+            try:
+                entry = next(iterator)
+            except StopIteration:
+                break
+            if type(entry) is not tuple or len(entry) != 2:
+                raise _RedactionFailure()
+            raw_key = entry[0]
+            if type(raw_key) is not str or _CANONICAL_KEY.fullmatch(raw_key) is None:
+                raise _RedactionFailure()
+            entries.append((raw_key, entry[1]))
+        else:
+            raise _RedactionFailure()
         output: dict[str, object] = {}
-        redacted_index = 0
-        for raw_key, normalized, child in sorted(
-            normalized_entries, key=lambda item: item[1]
-        ):
-            recognized = (
-                _is_sensitive_key(normalized)
-                or normalized in _CONTAINER_KEYS
-                or _is_integer_key(normalized)
-                or _is_boolean_key(normalized)
-                or normalized in _ENUM_KEYS
-                or normalized.endswith("canarysha256")
-                or normalized.endswith("sha256")
-            )
-            if recognized and _SAFE_OUTPUT_KEY.fullmatch(raw_key):
-                output_key = raw_key
-            elif recognized:
-                output_key = f"redacted_field_{redacted_index}"
-                redacted_index += 1
-            else:
-                output_key = f"redacted_field_{redacted_index}"
-                redacted_index += 1
-
-            if _is_sensitive_key(normalized):
-                output[output_key] = REDACTION_MARKER
-            elif normalized in _CONTAINER_KEYS:
-                output[output_key] = _redacted_value(
-                    child,
-                    normalized=normalized,
-                    depth=depth + 1,
-                    seen=seen,
-                    sequence_item=False,
-                )
-            elif isinstance(child, SafeCanaryDigest) and normalized.endswith(
-                "canarysha256"
-            ):
-                output[output_key] = _safe_digest_value(child) or REDACTION_MARKER
-            elif _is_integer_key(normalized):
-                output[output_key] = _redacted_value(
-                    child,
-                    normalized=normalized,
-                    depth=depth + 1,
-                    seen=seen,
-                    sequence_item=False,
-                )
-            elif _is_boolean_key(normalized) and type(child) is bool:
-                output[output_key] = child
-            elif normalized in _ENUM_KEYS:
-                output[output_key] = (
-                    child
-                    if isinstance(child, str) and _SAFE_ENUM.fullmatch(child)
-                    else REDACTION_MARKER
-                )
-            else:
-                output[output_key] = REDACTION_MARKER
+        for key, child in entries:
+            if key in output:
+                raise _RedactionFailure()
+            output[key] = child
         return output
-    finally:
-        seen.discard(id(value))
+    except _RedactionFailure:
+        raise
+    except BaseException as error:
+        raise _RedactionFailure() from error
 
 
-def _redacted_sequence(
-    value: Sequence[object], *, depth: int, seen: set[int]
-) -> list[object] | str:
+def _exact_bool(value: object) -> bool:
+    if type(value) is not bool:
+        raise _RedactionFailure()
+    return value
+
+
+def _exact_count(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= _MAX_COUNT:
+        raise _RedactionFailure()
+    return value
+
+
+def _exact_reason(value: object) -> str:
+    if type(value) is not str or value not in _REASON_CODES:
+        raise _RedactionFailure()
+    return value
+
+
+def _exact_shape(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise _RedactionFailure()
+    materialized = _materialize_mapping(cast("Mapping[str, object]", value))
+    if set(materialized) != {"blocks"}:
+        raise _RedactionFailure()
+    return {"blocks": _exact_count(materialized["blocks"])}
+
+
+def _consume_canary_receipt(value: object) -> str:
     try:
-        length = len(value)
-    except BaseException:
-        return REDACTION_MARKER
-    if depth > _MAX_DEPTH or id(value) in seen or length > _MAX_ITEMS:
-        return REDACTION_MARKER
-    seen.add(id(value))
-    try:
-        try:
-            return [
-                _redacted_value(
-                    value[index],
-                    normalized="",
-                    depth=depth + 1,
-                    seen=seen,
-                    sequence_item=True,
-                )
-                for index in range(length)
-            ]
-        except BaseException:
-            return REDACTION_MARKER
-    finally:
-        seen.discard(id(value))
+        from claude_sdk_proxy.path_policy import _consume_safe_canary_receipt
+
+        return _consume_safe_canary_receipt(value)
+    except BaseException as error:
+        raise _RedactionFailure() from error
 
 
-def _redacted_value(
-    value: object,
-    *,
-    normalized: str,
-    depth: int,
-    seen: set[int],
-    sequence_item: bool,
-) -> object:
-    if depth > _MAX_DEPTH:
-        return REDACTION_MARKER
-    if isinstance(value, BaseException):
-        return REDACTION_MARKER
-    if isinstance(value, SafeCanaryDigest):
-        digest = _safe_digest_value(value)
-        return (
-            digest
-            if digest is not None and normalized.endswith("canarysha256")
-            else REDACTION_MARKER
-        )
-    if isinstance(value, Mapping):
-        return _redacted_mapping(value, depth=depth, seen=seen)
-    if isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray, memoryview)
-    ):
-        return _redacted_sequence(value, depth=depth, seen=seen)
-    if type(value) is bool:
-        return (
-            value
-            if sequence_item or _is_boolean_key(normalized)
-            else REDACTION_MARKER
-        )
-    if type(value) is int:
-        if (sequence_item or _is_integer_key(normalized)) and 0 <= value <= 2**63 - 1:
-            return value
-        return REDACTION_MARKER
-    if type(value) is float:
-        # Floats are never part of the typed evidence schema, including finite ones.
-        return REDACTION_MARKER
-    if isinstance(value, str) and normalized in _ENUM_KEYS:
-        return value if _SAFE_ENUM.fullmatch(value) else REDACTION_MARKER
-    return REDACTION_MARKER
+def _typed_evidence(name: str, evidence: Mapping[str, object]) -> dict[str, object]:
+    materialized = _materialize_mapping(evidence)
+    schema = _SCHEMAS[name]
+    if not set(materialized).issubset(schema) or "reason_code" not in materialized:
+        raise _RedactionFailure()
+    output: dict[str, object] = {}
+    for key in sorted(materialized):
+        kind = schema[key]
+        value = materialized[key]
+        if kind == "reason":
+            output[key] = _exact_reason(value)
+        elif kind == "bool":
+            output[key] = _exact_bool(value)
+        elif kind == "count":
+            output[key] = _exact_count(value)
+        elif kind == "shape":
+            output[key] = _exact_shape(value)
+        elif kind == "canary_receipt":
+            output[key] = _consume_canary_receipt(value)
+        else:
+            raise _RedactionFailure()
+    return output
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +212,8 @@ class ProbeResult:
     evidence: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        if type(self.name) is not str:
+            raise TypeError("probe result name must be exact text")
         if self.name not in _REPORT_NAMES:
             raise ValueError("unsupported probe result name")
         if type(self.passed) is not bool:
@@ -344,33 +222,34 @@ class ProbeResult:
             raise TypeError("probe evidence must be a mapping")
 
     def redacted_dict(self) -> dict[str, object]:
-        """Return the stable bounded V1 report schema."""
-        evidence = _redacted_mapping(self.evidence, depth=0, seen=set())
-        report: dict[str, object] = {
-            "schema_version": 1,
-            "name": self.name,
-            "passed": self.passed,
-            "evidence": evidence,
-        }
-        encoded = json.dumps(
-            report,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(encoded) > MAX_REDACTED_REPORT_BYTES:
-            report["evidence"] = REDACTION_MARKER
-        return report
+        """Return a bounded V1 report or the fixed false failure record."""
+        try:
+            evidence = _typed_evidence(self.name, self.evidence)
+            report: dict[str, object] = {
+                "schema_version": 1,
+                "name": self.name,
+                "passed": self.passed,
+                "evidence": evidence,
+            }
+            encoded = json.dumps(
+                report,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(encoded) > MAX_REDACTED_REPORT_BYTES:
+                raise _RedactionFailure()
+            return report
+        except BaseException:
+            return _fixed_false(self.name)
 
 
 def _require_live_prerequisites() -> Never:
     availability = current_attestation_availability()
     if not availability.core_gate_available:
-        raise ProbeUnavailable("child_attestation_unavailable")
-    # The false Task 6 tuple has no live implementation. A future affirmative
-    # tuple must replace this branch with its reviewed attested-client harness.
-    raise ProbeUnavailable("live_probe_harness_unavailable")
+        raise ProbeUnavailable(_ProbeReasonCode.CHILD_ATTESTATION_UNAVAILABLE.value)
+    raise ProbeUnavailable(_ProbeReasonCode.LIVE_PROBE_HARNESS_UNAVAILABLE.value)
 
 
 def run_prompt_purity_probe() -> ProbeResult:
@@ -388,7 +267,6 @@ __all__ = [
     "REDACTION_MARKER",
     "ProbeResult",
     "ProbeUnavailable",
-    "SafeCanaryDigest",
     "run_compaction_probe",
     "run_prompt_purity_probe",
     "safe_canary_digest",
