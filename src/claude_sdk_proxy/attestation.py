@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Final
 
 from claude_sdk_proxy._attestation_v2 import *  # noqa: F403
@@ -14,6 +16,11 @@ _MAX_MODEL_ID_BYTES: Final = 256
 _MAX_EVENT_CONTENT_BYTES: Final = 1024 * 1024
 _MAX_BUFFERED_EVENTS: Final = 4096
 _MAX_BUFFERED_CONTENT_BYTES: Final = 4 * 1024 * 1024
+_MAX_MODEL_ALIAS_ENTRIES: Final = 32
+_MAX_PUBLIC_ALIAS_BYTES: Final = 64
+_PUBLIC_ALIAS_CHARACTERS: Final = frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 _EVENT_TYPES: Final = frozenset(
     {
         "message_start",
@@ -44,6 +51,7 @@ class ModelIdentityError(RuntimeError):
 class _ModelIdentityState(StrEnum):
     PENDING = "pending"
     VERIFIED = "verified"
+    FINISHED = "finished"
     FAILED = "failed"
 
 
@@ -91,6 +99,55 @@ def _require_exact_backend_model(value: object) -> str:
     return model
 
 
+def _public_model_alias(value: object) -> str:
+    alias = _bounded_text(value, "public model alias", _MAX_PUBLIC_ALIAS_BYTES)
+    if alias[0] not in "abcdefghijklmnopqrstuvwxyz" or any(
+        character not in _PUBLIC_ALIAS_CHARACTERS for character in alias
+    ):
+        raise ValueError("public model alias must be canonical lowercase ASCII")
+    return alias
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ExactModelAliasMap:
+    """Immutable, bounded public-alias to exact-backend-model configuration."""
+
+    _aliases: Mapping[str, str]
+
+    def __init__(self, aliases: dict[str, str]) -> None:
+        if type(aliases) is not dict:
+            raise TypeError("model aliases must be an exact dictionary")
+        snapshot = dict.copy(aliases)
+        if not snapshot or len(snapshot) > _MAX_MODEL_ALIAS_ENTRIES:
+            raise ValueError("model alias count is outside its bound")
+
+        validated: dict[str, str] = {}
+        backend_ids: set[str] = set()
+        for raw_alias, raw_backend_id in snapshot.items():
+            alias = _public_model_alias(raw_alias)
+            backend_id = _require_exact_backend_model(raw_backend_id)
+            if backend_id in backend_ids:
+                raise ModelIdentityError(
+                    "model alias map has an ambiguous exact backend model ID"
+                )
+            validated[alias] = backend_id
+            backend_ids.add(backend_id)
+        object.__setattr__(self, "_aliases", MappingProxyType(validated))
+
+    @property
+    def aliases(self) -> Mapping[str, str]:
+        """Expose only the immutable validated snapshot."""
+        return self._aliases
+
+    def resolve(self, public_alias: str) -> str:
+        """Resolve exactly one configured alias without any fallback behavior."""
+        alias = _public_model_alias(public_alias)
+        try:
+            return self._aliases[alias]
+        except KeyError as error:
+            raise ModelIdentityError("configured model alias was not found") from error
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalEvent:
     """One immutable, bounded event snapshot retained only for stream release."""
@@ -134,8 +191,15 @@ class ModelIdentityGate:
         "_state",
     )
 
-    def __init__(self, *, expected: str) -> None:
-        self._expected = _require_exact_backend_model(expected)
+    def __init__(
+        self,
+        *,
+        model_aliases: ExactModelAliasMap,
+        public_alias: str,
+    ) -> None:
+        if type(model_aliases) is not ExactModelAliasMap:
+            raise TypeError("model identity gate requires exact model aliases")
+        self._expected = model_aliases.resolve(public_alias)
         self._state = _ModelIdentityState.PENDING
         self._buffer: list[CanonicalEvent] = []
         self._buffered_content_bytes = 0
@@ -160,6 +224,8 @@ class ModelIdentityGate:
         """Observe one event and return only events safe to release now."""
         if self._state is _ModelIdentityState.FAILED:
             raise ModelIdentityError("model identity gate has failed")
+        if self._state is _ModelIdentityState.FINISHED:
+            raise ModelIdentityError("model identity gate is finished")
         if type(event) is not CanonicalEvent:
             self._fail("event is not an immutable canonical event")
 
@@ -179,7 +245,7 @@ class ModelIdentityGate:
         if event.event_type in _AUTHORITATIVE_EVENT_TYPES:
             if event.model is None:
                 self._fail("authoritative event omitted model identity")
-            released = (*self._buffer, event)
+            released = (event, *self._buffer)
             self._buffer.clear()
             self._buffered_content_bytes = 0
             self._state = _ModelIdentityState.VERIFIED
@@ -197,10 +263,23 @@ class ModelIdentityGate:
         self._buffered_content_bytes += content_bytes
         return ()
 
+    def finish(self) -> None:
+        """Finalize the stream, failing if exact identity was never established."""
+        if self._state is _ModelIdentityState.FAILED:
+            raise ModelIdentityError("model identity gate has failed")
+        if self._state is _ModelIdentityState.FINISHED:
+            return
+        if self._state is _ModelIdentityState.PENDING:
+            self._fail("stream ended before model identity was verified")
+        self._buffer.clear()
+        self._buffered_content_bytes = 0
+        self._state = _ModelIdentityState.FINISHED
+
 
 __all__ = (
     *_ATTESTATION_V2_ALL,
     "CanonicalEvent",
+    "ExactModelAliasMap",
     "ModelIdentityError",
     "ModelIdentityGate",
 )

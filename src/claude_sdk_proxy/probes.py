@@ -9,7 +9,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Never
 
-from claude_sdk_proxy.attestation import current_attestation_availability
+from claude_sdk_proxy.attestation import (
+    ExactModelAliasMap,
+    ModelIdentityGate,
+    current_attestation_availability,
+)
 
 if TYPE_CHECKING:
     from claude_sdk_proxy.path_policy import PathMetadata, PathPolicy, RootKind
@@ -177,6 +181,15 @@ def _require_live_prerequisites() -> Never:
     raise ProbeUnavailable(_ProbeReasonCode.LIVE_PROBE_HARNESS_UNAVAILABLE.value)
 
 
+def _require_model_probe_prerequisites(
+    *,
+    model_aliases: ExactModelAliasMap,
+    public_alias: str,
+) -> Never:
+    ModelIdentityGate(model_aliases=model_aliases, public_alias=public_alias)
+    _require_live_prerequisites()
+
+
 def run_prompt_purity_probe() -> ProbeResult:
     """Run the live purity gate only after all Task 6 prerequisites pass."""
     _require_live_prerequisites()
@@ -187,24 +200,52 @@ def run_compaction_probe() -> ProbeResult:
     _require_live_prerequisites()
 
 
-def run_session_probe() -> ProbeResult:
+def run_session_probe(
+    *,
+    model_aliases: ExactModelAliasMap,
+    public_alias: str,
+) -> ProbeResult:
     """Run native-session evidence only after the attestation gate is affirmative."""
-    _require_live_prerequisites()
+    _require_model_probe_prerequisites(
+        model_aliases=model_aliases,
+        public_alias=public_alias,
+    )
 
 
-def run_stream_probe() -> ProbeResult:
+def run_stream_probe(
+    *,
+    model_aliases: ExactModelAliasMap,
+    public_alias: str,
+) -> ProbeResult:
     """Run exact-model/stream evidence only after attestation is affirmative."""
-    _require_live_prerequisites()
+    _require_model_probe_prerequisites(
+        model_aliases=model_aliases,
+        public_alias=public_alias,
+    )
 
 
-def run_thinking_probe() -> ProbeResult:
+def run_thinking_probe(
+    *,
+    model_aliases: ExactModelAliasMap,
+    public_alias: str,
+) -> ProbeResult:
     """Run the exact thinking-tuple matrix only after attestation is affirmative."""
-    _require_live_prerequisites()
+    _require_model_probe_prerequisites(
+        model_aliases=model_aliases,
+        public_alias=public_alias,
+    )
 
 
-def run_usage_probe() -> UsageEvidenceSchema:
+def run_usage_probe(
+    *,
+    model_aliases: ExactModelAliasMap,
+    public_alias: str,
+) -> UsageEvidenceSchema:
     """Build typed usage evidence only after attestation is affirmative."""
-    _require_live_prerequisites()
+    _require_model_probe_prerequisites(
+        model_aliases=model_aliases,
+        public_alias=public_alias,
+    )
 
 
 __all__ = [

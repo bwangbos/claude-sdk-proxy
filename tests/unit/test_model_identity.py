@@ -178,7 +178,7 @@ def test_all_semantic_probe_entry_points_fail_before_any_live_action() -> None:
             runner(model_aliases=exact_model_aliases(), public_alias="sonnet")
 
 
-def test_matching_identity_is_released_before_buffered_content_in_original_order() -> None:
+def test_identity_releases_before_buffered_content_in_original_order() -> None:
     gate = identity_gate()
     first = CanonicalEvent(event_type="content_block_start")
     second = text_delta("second")
@@ -261,6 +261,24 @@ def test_exact_alias_map_rejects_hostile_containers_and_unbounded_input() -> Non
         exact_model_aliases(
             {f"model-{index}": f"backend-model-exact-{index}" for index in range(33)}
         )
+    bounded = exact_model_aliases(
+        {f"model-{index}": f"backend-model-exact-{index}" for index in range(32)}
+    )
+    assert bounded.resolve("model-31") == "backend-model-exact-31"
+
+
+def test_exact_alias_map_requires_exact_builtin_strings_at_every_boundary() -> None:
+    class Text(str):
+        pass
+
+    with pytest.raises(TypeError, match="exact text"):
+        exact_model_aliases({Text("sonnet"): _EXACT_MODEL_ID})  # type: ignore[dict-item]
+    with pytest.raises(TypeError, match="exact text"):
+        exact_model_aliases({"sonnet": Text(_EXACT_MODEL_ID)})
+
+    aliases = exact_model_aliases()
+    with pytest.raises(TypeError, match="exact text"):
+        aliases.resolve(Text("sonnet"))
 
 
 @pytest.mark.parametrize(

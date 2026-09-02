@@ -4,7 +4,10 @@ import os
 
 import pytest
 
-from claude_sdk_proxy.attestation import current_attestation_availability
+from claude_sdk_proxy.attestation import (
+    ExactModelAliasMap,
+    current_attestation_availability,
+)
 from claude_sdk_proxy.probes import run_stream_probe
 
 pytestmark = pytest.mark.live
@@ -17,5 +20,11 @@ def test_live_exact_model_identity_is_available_before_content() -> None:
         pytest.fail(
             "exact model identity unavailable because Task 6 core gate is false"
         )
-    result = run_stream_probe()
+    model_id = os.environ.get("CLAUDE_PROXY_TEST_MODEL_ID")
+    if model_id is None:
+        pytest.fail("CLAUDE_PROXY_TEST_MODEL_ID must be configured")
+    result = run_stream_probe(
+        model_aliases=ExactModelAliasMap({"test-model": model_id}),
+        public_alias="test-model",
+    )
     assert result.passed is True
