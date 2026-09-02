@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
@@ -1136,6 +1137,137 @@ def test_complete_collection_requires_every_gate_from_one_run() -> None:
         run.complete(candidate, tuple(observations))
 
 
+def test_all_rejects_a_collection_from_any_prior_run_before_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_synthetic_all(monkeypatch)
+    stale_run = validated.ManifestCollectionRun.begin()
+    stale = _complete_synthetic_collection(
+        stale_run,
+        _manifest_document(models={"opus": _OTHER_MODEL}),
+    )
+    output = tmp_path / "validated.json"
+    original = canonical_evidence_json(_manifest_document()) + b"\n"
+    output.write_bytes(original)
+    writer_called = False
+
+    def stale_collector(_fresh_run: object):
+        return stale
+
+    def forbidden_writer(
+        _path: Path, _document: object, *, authorization: object | None = None
+    ) -> None:
+        del authorization
+        nonlocal writer_called
+        writer_called = True
+
+    monkeypatch.setattr(validated, "_atomic_write_manifest", forbidden_writer)
+
+    status = probe_cli._run_all(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(output),
+        ],
+        collector=stale_collector,
+    )
+
+    assert status != 0
+    assert writer_called is False
+    assert output.read_bytes() == original
+
+
+def test_collection_consumption_rejects_copied_run_without_burning_owner() -> None:
+    run = validated.ManifestCollectionRun.begin()
+    collection = _complete_synthetic_collection(run)
+    copied_run = copy.copy(run)
+    assert copied_run is not run
+
+    with pytest.raises(ManifestError, match="collection run"):
+        copied_run.consume(collection)
+
+    consumed = run.consume(collection)
+    assert consumed.manifest is collection.manifest
+
+
+def test_collection_consumption_is_one_shot_under_concurrency() -> None:
+    run = validated.ManifestCollectionRun.begin()
+    collection = _complete_synthetic_collection(run)
+    barrier = threading.Barrier(3)
+    results: list[str] = []
+    results_lock = threading.Lock()
+
+    def consume() -> None:
+        barrier.wait()
+        try:
+            run.consume(collection)
+        except ManifestError:
+            result = "rejected"
+        except BaseException:
+            result = "unexpected"
+        else:
+            result = "accepted"
+        with results_lock:
+            results.append(result)
+
+    threads = [threading.Thread(target=consume) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(results) == ["accepted", "rejected"]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_collection_authority_is_rejected_after_fork() -> None:
+    run = validated.ManifestCollectionRun.begin()
+    collection = _complete_synthetic_collection(run)
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        try:
+            run.consume(collection)
+        except ManifestError:
+            result = b"rejected"
+        except BaseException:
+            result = b"unexpected"
+        else:
+            result = b"accepted"
+        os.write(write_fd, result)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        result = os.read(read_fd, 32)
+    finally:
+        os.close(read_fd)
+        _, status = os.waitpid(child, 0)
+
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 0
+    assert result == b"rejected"
+
+
+def test_collection_run_authority_has_a_finite_live_bound() -> None:
+    runs: list[object] = []
+
+    for _ in range(4096):
+        try:
+            runs.append(validated.ManifestCollectionRun.begin())
+        except ManifestError:
+            break
+    else:
+        pytest.fail("collection run authority accepted an unbounded live set")
+
+    assert runs
+
+
 def test_atomic_writer_requires_authorization_to_replace_existing_output(
     tmp_path: Path,
 ) -> None:
@@ -1154,11 +1286,13 @@ def test_atomic_writer_rejects_changed_output_after_authorization(
     output = tmp_path / "validated.json"
     original = _manifest_document()
     _write_document(output, original)
+    run = validated.ManifestCollectionRun.begin()
     collection = _complete_synthetic_collection(
-        validated.ManifestCollectionRun.begin(),
+        run,
         _manifest_document(models={"opus": _OTHER_MODEL}),
     )
-    authorization = validated._authorize_manifest_output(output, collection)
+    consumed = run.consume(collection)
+    authorization = validated._authorize_manifest_output(output, consumed)
     output.write_bytes(b"changed-after-authorization\n")
 
     with pytest.raises(ManifestError, match="changed after authorization"):
@@ -1169,6 +1303,137 @@ def test_atomic_writer_rejects_changed_output_after_authorization(
         )
 
     assert output.read_bytes() == b"changed-after-authorization\n"
+
+
+def test_consumed_collection_can_issue_output_authorization_only_once(
+    tmp_path: Path,
+) -> None:
+    run = validated.ManifestCollectionRun.begin()
+    collection = _complete_synthetic_collection(run)
+    consumed = run.consume(collection)
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+
+    authorization = validated._authorize_manifest_output(first, consumed)
+
+    with pytest.raises(ManifestError, match="authorization.*already"):
+        validated._authorize_manifest_output(second, consumed)
+    validated._atomic_write_manifest(
+        first,
+        collection.manifest.to_json(),
+        authorization=authorization,
+    )
+    assert not second.exists()
+
+
+def test_all_burns_collection_before_overridable_authorizer_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_synthetic_all(monkeypatch)
+    saved: dict[str, object] = {}
+    authorization_calls = 0
+
+    def collector(run: object):
+        collection = _complete_synthetic_collection(run)
+        saved["collection"] = collection
+        return collection
+
+    def failing_authorizer(_path: Path, _consumed: object) -> object:
+        nonlocal authorization_calls
+        authorization_calls += 1
+        raise RuntimeError("ambiguous authorization failure")
+
+    monkeypatch.setattr(validated, "_authorize_manifest_output", failing_authorizer)
+    first = tmp_path / "first.json"
+    first_status = probe_cli._run_all(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(first),
+        ],
+        collector=collector,
+    )
+
+    def replay_collector(_fresh_run: object):
+        return saved["collection"]
+
+    second = tmp_path / "second.json"
+    second_status = probe_cli._run_all(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(second),
+        ],
+        collector=replay_collector,
+    )
+
+    assert first_status != 0
+    assert second_status != 0
+    assert authorization_calls == 1
+    assert not first.exists()
+    assert not second.exists()
+
+
+def test_all_never_retries_collection_after_writer_effect_then_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable_synthetic_all(monkeypatch)
+    saved: dict[str, object] = {}
+    writer_calls = 0
+    real_writer = validated._atomic_write_manifest
+
+    def collector(run: object):
+        collection = _complete_synthetic_collection(run)
+        saved["collection"] = collection
+        return collection
+
+    def effect_then_raise(
+        path: Path, document: object, *, authorization: object | None = None
+    ) -> None:
+        nonlocal writer_calls
+        writer_calls += 1
+        real_writer(path, document, authorization=authorization)
+        raise RuntimeError("ambiguous writer failure")
+
+    monkeypatch.setattr(validated, "_atomic_write_manifest", effect_then_raise)
+    first = tmp_path / "first.json"
+    first_status = probe_cli._run_all(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(first),
+        ],
+        collector=collector,
+    )
+    assert first_status != 0
+    assert first.exists()
+
+    second = tmp_path / "second.json"
+    _write_document(
+        second,
+        _manifest_document(models={"opus": _OTHER_MODEL}),
+    )
+    original = second.read_bytes()
+
+    def replay_collector(_fresh_run: object):
+        return saved["collection"]
+
+    second_status = probe_cli._run_all(
+        [
+            "all",
+            "--ack-personal-local-use-policy",
+            "--output",
+            str(second),
+        ],
+        collector=replay_collector,
+    )
+
+    assert second_status != 0
+    assert writer_calls == 1
+    assert second.read_bytes() == original
 
 
 def test_complete_collection_can_replace_a_mismatched_existing_tuple(
