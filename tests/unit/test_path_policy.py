@@ -27,6 +27,32 @@ def policy(roots: tuple[Path, Path]) -> PathPolicy:
     return PathPolicy(real_login_root=roots[0], proxy_owned_root=roots[1])
 
 
+def test_roots_must_be_descriptor_proved_disjoint(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    child = root / "child"
+    child.mkdir(mode=0o700)
+    sibling = tmp_path / "sibling"
+    sibling.mkdir(mode=0o700)
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(tmp_path, target_is_directory=True)
+    alias = alias_parent / "root"
+
+    for real_login, proxy_owned in (
+        (root, root),
+        (root, child),
+        (child, root),
+        (root, alias),
+    ):
+        with pytest.raises(PathPolicyError, match="disjoint"):
+            PathPolicy(
+                real_login_root=real_login,
+                proxy_owned_root=proxy_owned,
+            )
+
+    PathPolicy(real_login_root=root, proxy_owned_root=sibling)
+
+
 def test_credential_paths_are_metadata_only(
     policy: PathPolicy, roots: tuple[Path, Path]
 ) -> None:
@@ -255,4 +281,63 @@ def test_snapshot_enforces_entry_bound(roots: tuple[Path, Path]) -> None:
         (roots[0] / name).write_bytes(b"PROHIBITED")
 
     with pytest.raises(PathPolicyError, match="snapshot entry limit"):
+        policy.snapshot(root=RootKind.REAL_LOGIN)
+
+
+def test_snapshot_rejects_leaf_replacement_before_admitting_metadata(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = roots[0] / "settings.json"
+    target.write_bytes(b"FIRST")
+    original_stat = os.stat
+    calls = 0
+
+    def swapping_stat(
+        path: os.PathLike[str] | str | int,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal calls
+        if path == "settings.json":
+            calls += 1
+            if calls == 2:
+                target.unlink()
+                target.write_bytes(b"SECOND-LONGER")
+        return original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.stat", swapping_stat)
+
+    with pytest.raises(PathPolicyError, match="identity changed"):
+        policy.snapshot(root=RootKind.REAL_LOGIN)
+
+
+def test_snapshot_binds_complete_opened_directory_metadata(
+    policy: PathPolicy,
+    roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = roots[0] / "plugins"
+    directory.mkdir(mode=0o700)
+    original_open = os.open
+    changed = False
+
+    def changing_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal changed
+        if path == "plugins" and dir_fd is not None and not changed:
+            changed = True
+            current = directory.stat().st_mtime_ns
+            os.utime(directory, ns=(current + 1_000_000, current + 1_000_000))
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.open", changing_open)
+
+    with pytest.raises(PathPolicyError, match="identity changed"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
