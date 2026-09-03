@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import signal
 from pathlib import Path
 
 import pytest
@@ -267,6 +269,36 @@ def test_stream_cancellation_terminates_child(
     asyncio.run(cancel_stream())
 
     assert marker.exists()
+
+
+def test_stream_aclose_terminates_and_reaps_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "capture.json"
+    marker = tmp_path / "terminated"
+    monkeypatch.setenv("FAKE_CLAUDE_CAPTURE", str(capture))
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "hang")
+    monkeypatch.setenv("FAKE_CLAUDE_TERM_MARKER", str(marker))
+
+    async def close_stream() -> None:
+        events = ClaudePBackend(FAKE_CLAUDE).stream(request())
+        assert await anext(events) == TextDelta("hel")
+        await asyncio.wait_for(events.aclose(), timeout=2.0)
+
+    try:
+        asyncio.run(close_stream())
+        assert marker.exists()
+    finally:
+        if capture.exists():
+            pid = json.loads(capture.read_text(encoding="utf-8"))["pid"]
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
 
 
 def test_structural_report_describes_only_documented_capabilities() -> None:

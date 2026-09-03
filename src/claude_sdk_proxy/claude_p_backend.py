@@ -70,15 +70,27 @@ async def _drain_stderr(stderr: asyncio.StreamReader) -> bytes:
     return bytes(captured)
 
 
-async def _terminate_after_failure(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
-        return
-    process.terminate()
+async def _terminate_and_wait(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
     try:
         await asyncio.wait_for(process.wait(), timeout=1.0)
     except TimeoutError:
-        process.kill()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
         await process.wait()
+
+
+async def _cleanup_process(
+    process: asyncio.subprocess.Process, stderr_task: asyncio.Task[bytes]
+) -> None:
+    await _terminate_and_wait(process)
+    await stderr_task
 
 
 class ClaudePBackend:
@@ -168,7 +180,7 @@ class ClaudePBackend:
                 or process.stdout is None
                 or process.stderr is None
             ):
-                await _terminate_after_failure(process)
+                await _terminate_and_wait(process)
                 raise BackendFailure("unable to create claude -p pipes")
             stderr_task = asyncio.create_task(_drain_stderr(process.stderr))
             try:
@@ -185,22 +197,10 @@ class ClaudePBackend:
                     elif isinstance(event, Completed):
                         completed = event
                 return_code = await process.wait()
-                await stderr_task
-            except asyncio.CancelledError:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=1.0)
-                except TimeoutError:
-                    process.kill()
-                    await process.wait()
-                await stderr_task
-                raise
-            except Exception:
-                await _terminate_after_failure(process)
-                await stderr_task
-                raise
-            if return_code != 0:
-                raise BackendFailure("claude -p query failed")
-            if completed is None:
-                raise BackendFailure("claude -p stream ended without result")
+                if return_code != 0:
+                    raise BackendFailure("claude -p query failed")
+                if completed is None:
+                    raise BackendFailure("claude -p stream ended without result")
+            finally:
+                await _cleanup_process(process, stderr_task)
         yield completed

@@ -14,6 +14,7 @@ capture_path.write_text(
             "cwd": os.getcwd(),
             "cwd_entries": sorted(os.listdir()),
             "environment_names": sorted(os.environ),
+            "pid": os.getpid(),
         }
     ),
     encoding="utf-8",
