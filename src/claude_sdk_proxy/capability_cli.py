@@ -20,7 +20,6 @@ from claude_sdk_proxy.domain import (
     CapabilityReport,
     Completed,
     TextDelta,
-    UnsupportedFeature,
 )
 
 _BACKENDS = ("agent-sdk", "claude-p")
@@ -69,6 +68,20 @@ def _milliseconds(start: float, end: float) -> int:
     return round((end - start) * 1000)
 
 
+def _fail_closed_payload(backend: str, error: Exception) -> dict[str, object]:
+    return report_payload(
+        CapabilityReport(
+            backend=backend,
+            authentication="fail",
+            streaming="fail",
+            prompt_construction="fail",
+            multi_turn="fail",
+            structured_tools="fail",
+            evidence=(type(error).__name__,),
+        )
+    )
+
+
 async def _live_payload(
     backend: CapabilityBackend,
     report: CapabilityReport,
@@ -98,7 +111,7 @@ async def _live_payload(
                 finished = clock()
         if finished is None:
             raise BackendFailure("backend stream ended without completion")
-    except (BackendFailure, UnsupportedFeature) as error:
+    except Exception as error:
         failed_at = clock()
         failed = replace(
             report,
@@ -158,24 +171,32 @@ def main(
     parser = _parser()
     args = parser.parse_args(argv)
     if args.live and not (
-        os.environ.get("CLAUDE_PROXY_LIVE") == "1" and args.model is not None
+        os.environ.get("CLAUDE_PROXY_LIVE") == "1"
+        and args.model is not None
+        and args.model.strip()
     ):
-        parser.error("--live requires CLAUDE_PROXY_LIVE=1 and --model")
+        parser.error(
+            "--live requires CLAUDE_PROXY_LIVE=1 and a non-whitespace --model"
+        )
 
     names = _BACKENDS if args.backend == "all" else (args.backend,)
-    backends = [backend_factory(name, args.claude_path) for name in names]
     failed = False
     if args.live:
         results = []
-        for backend in backends:
-            payload, backend_failed = asyncio.run(
-                _live_payload(
-                    backend, backend.structural_report(), args.model, clock
+        for name in names:
+            try:
+                backend = backend_factory(name, args.claude_path)
+                payload, backend_failed = asyncio.run(
+                    _live_payload(
+                        backend, backend.structural_report(), args.model, clock
+                    )
                 )
-            )
+            except Exception as error:
+                payload, backend_failed = _fail_closed_payload(name, error), True
             results.append(payload)
             failed = failed or backend_failed
     else:
+        backends = [backend_factory(name, args.claude_path) for name in names]
         results = [report_payload(backend.structural_report()) for backend in backends]
 
     output: object = results if args.backend == "all" else results[0]
