@@ -89,9 +89,12 @@ class AgentSdkBackend:
     async def stream(self, request: CanonicalRequest) -> AsyncIterator[BackendEvent]:
         prompt = self.prompt_for(request)
         terminal_seen = False
+        completed: Completed | None = None
         with TemporaryDirectory(prefix="claude-proxy-") as directory:
             options = self.build_options(request, Path(directory))
             async for message in self._query(prompt=prompt, options=options):
+                if terminal_seen:
+                    raise BackendFailure("Agent SDK message after result")
                 if isinstance(message, StreamEvent):
                     event = message.event
                     if event.get("type") != "content_block_delta":
@@ -111,11 +114,12 @@ class AgentSdkBackend:
                 ):
                     raise UnsupportedFeature("tools", "Claude built-in tool event")
                 elif isinstance(message, ResultMessage):
-                    if terminal_seen:
-                        raise BackendFailure("duplicate Agent SDK result")
-                    terminal_seen = True
                     if message.is_error:
                         raise BackendFailure("Agent SDK query failed")
-                    yield Completed(message.stop_reason, message.usage)
+                    terminal_seen = True
+                    completed = Completed(message.stop_reason, message.usage)
             if not terminal_seen:
                 raise BackendFailure("Agent SDK stream ended without result")
+        if completed is None:
+            raise BackendFailure("invalid Agent SDK result")
+        yield completed

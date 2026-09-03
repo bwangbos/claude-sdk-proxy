@@ -14,6 +14,7 @@ from claude_agent_sdk import (
 from claude_sdk_proxy.agent_sdk_backend import AgentSdkBackend
 from claude_sdk_proxy.domain import (
     BackendEvent,
+    BackendFailure,
     CanonicalMessage,
     CanonicalRequest,
     Completed,
@@ -147,6 +148,111 @@ def test_stream_maps_text_deltas_and_result_from_injected_query() -> None:
     ]
     assert observed["prompt"] == "caller-message"
     assert observed["options"].system_prompt == "caller-system"
+
+
+def test_stream_rejects_post_result_message_without_exposing_completed() -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+    received: list[BackendEvent] = []
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        del prompt, options
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=False,
+            num_turns=1,
+            session_id="session-1",
+            stop_reason="end_turn",
+            usage={"output_tokens": 1},
+        )
+        yield StreamEvent(
+            uuid="event-1",
+            session_id="session-1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "late"},
+            },
+        )
+
+    async def consume() -> None:
+        async for event in AgentSdkBackend(fake_query).stream(request):
+            received.append(event)
+
+    with pytest.raises(BackendFailure, match="after result"):
+        asyncio.run(consume())
+
+    assert received == []
+
+
+def test_stream_rejects_duplicate_result_without_exposing_completed() -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+    received: list[BackendEvent] = []
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        del prompt, options
+        for session_id in ("session-1", "session-2"):
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=0,
+                duration_api_ms=0,
+                is_error=False,
+                num_turns=1,
+                session_id=session_id,
+                stop_reason="end_turn",
+                usage={"output_tokens": 1},
+            )
+
+    async def consume() -> None:
+        async for event in AgentSdkBackend(fake_query).stream(request):
+            received.append(event)
+
+    with pytest.raises(BackendFailure, match="after result"):
+        asyncio.run(consume())
+
+    assert received == []
+
+
+def test_stream_cleans_temporary_directory_before_exposing_completed() -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+    temporary_directory: Path | None = None
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        nonlocal temporary_directory
+        del prompt
+        temporary_directory = Path(options.cwd)
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=False,
+            num_turns=1,
+            session_id="session-1",
+            stop_reason="end_turn",
+            usage={"output_tokens": 1},
+        )
+
+    async def consume() -> list[BackendEvent]:
+        received: list[BackendEvent] = []
+        async for event in AgentSdkBackend(fake_query).stream(request):
+            assert temporary_directory is not None
+            assert not temporary_directory.exists()
+            received.append(event)
+        return received
+
+    assert asyncio.run(consume()) == [Completed("end_turn", {"output_tokens": 1})]
 
 
 def test_stream_rejects_agent_tool_use_from_injected_query() -> None:
