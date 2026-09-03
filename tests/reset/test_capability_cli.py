@@ -343,3 +343,89 @@ def test_live_setup_exception_becomes_stable_fail_closed_json(
             "output_exact": None,
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "exception_name"),
+    [("factory", "OSError"), ("structural-report", "RuntimeError")],
+)
+def test_structural_setup_exception_becomes_stable_fail_closed_json(
+    failure_stage: str,
+    exception_name: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "structural-setup-secret"
+
+    class FailingReportBackend:
+        def structural_report(self) -> CapabilityReport:
+            raise RuntimeError(secret)
+
+        async def stream(self, request: object) -> AsyncIterator[BackendEvent]:
+            raise AssertionError("structural mode must not invoke stream")
+            yield
+
+    def factory(name: str, path: Path) -> FailingReportBackend:
+        del name, path
+        if failure_stage == "factory":
+            raise OSError(secret)
+        return FailingReportBackend()
+
+    assert (
+        capability_cli.main(
+            ["--backend", "agent-sdk", "--json"], backend_factory=factory
+        )
+        == 1
+    )
+
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "backend": "agent-sdk",
+        "authentication": "fail",
+        "streaming": "fail",
+        "prompt_construction": "fail",
+        "multi_turn": "fail",
+        "structured_tools": "fail",
+        "single_turn_text_viable": False,
+        "compatibility_proxy_viable": False,
+        "agent_harness_viable": False,
+        "evidence": [exception_name],
+        "metrics": {
+            "latency_ms": None,
+            "time_to_first_delta_ms": None,
+            "text_delta_count": 0,
+            "subprocess_count": None,
+            "output_exact": None,
+        },
+    }
+
+
+def test_all_structural_reports_continue_in_order_after_redacted_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class StructuralBackend:
+        def structural_report(self) -> CapabilityReport:
+            return structural_report("claude-p")
+
+        async def stream(self, request: object) -> AsyncIterator[BackendEvent]:
+            raise AssertionError("structural mode must not invoke stream")
+            yield
+
+    def factory(name: str, path: Path) -> StructuralBackend:
+        del path
+        if name == "agent-sdk":
+            raise OSError("first-backend-secret")
+        return StructuralBackend()
+
+    assert (
+        capability_cli.main(
+            ["--backend", "all", "--json"], backend_factory=factory
+        )
+        == 1
+    )
+
+    reports = json.loads(capsys.readouterr().out)
+    assert [report["backend"] for report in reports] == ["agent-sdk", "claude-p"]
+    assert reports[0]["evidence"] == ["OSError"]
+    assert reports[1]["authentication"] == "untested"

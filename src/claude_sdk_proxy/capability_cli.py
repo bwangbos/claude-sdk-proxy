@@ -196,8 +196,18 @@ def main(
             results.append(payload)
             failed = failed or backend_failed
     else:
-        backends = [backend_factory(name, args.claude_path) for name in names]
-        results = [report_payload(backend.structural_report()) for backend in backends]
+        results = []
+        for name in names:
+            try:
+                backend = backend_factory(name, args.claude_path)
+                payload, backend_failed = (
+                    report_payload(backend.structural_report()),
+                    False,
+                )
+            except Exception as error:
+                payload, backend_failed = _fail_closed_payload(name, error), True
+            results.append(payload)
+            failed = failed or backend_failed
 
     output: object = results if args.backend == "all" else results[0]
     print(json.dumps(output, indent=None if args.json else 2))
