@@ -10,8 +10,12 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
+    ServerToolResultBlock,
+    ServerToolUseBlock,
     StreamEvent,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
 from claude_sdk_proxy.domain import (
@@ -42,6 +46,20 @@ class SessionDirectoryProtocol(Protocol):
 type ClientFactory = Callable[[ClaudeAgentOptions], SdkClientProtocol]
 type DirectoryFactory = Callable[[], SessionDirectoryProtocol]
 
+_TOOL_BLOCK_TYPES = {
+    "tool_use",
+    "server_tool_use",
+    "tool_result",
+    "server_tool_result",
+}
+_TOOL_DELTA_TYPES = _TOOL_BLOCK_TYPES | {"input_json_delta"}
+_TOOL_BLOCK_CLASSES = (
+    ToolUseBlock,
+    ServerToolUseBlock,
+    ToolResultBlock,
+    ServerToolResultBlock,
+)
+
 
 class SdkSession:
     def __init__(
@@ -57,12 +75,15 @@ class SdkSession:
         self._client_factory = client_factory
         self._directory: SessionDirectoryProtocol | None = None
         self._client: SdkClientProtocol | None = None
+        self._closed = False
 
     @staticmethod
     def _new_directory() -> TemporaryDirectory[str]:
         return TemporaryDirectory(prefix="claude-proxy-")
 
     async def start(self) -> None:
+        if self._closed:
+            raise RuntimeError("SDK session is closed")
         if self._client is not None:
             return
         directory = self._directory_factory()
@@ -100,6 +121,7 @@ class SdkSession:
 
     async def close(self) -> None:
         client, directory = self._client, self._directory
+        self._closed = True
         self._client = None
         self._directory = None
         try:
@@ -127,6 +149,7 @@ class SdkSession:
                     raise BackendFailure("Agent SDK message after result")
                 if isinstance(message, StreamEvent):
                     event = message.event
+                    self._reject_tool_event(event)
                     if event.get("type") != "content_block_delta":
                         continue
                     delta = event.get("delta")
@@ -137,10 +160,9 @@ class SdkSession:
                         if not isinstance(text, str):
                             raise BackendFailure("invalid Agent SDK text delta")
                         yield TextDelta(text)
-                    elif delta.get("type") in {"input_json_delta", "tool_use"}:
-                        raise UnsupportedFeature("tools", "Claude built-in tool event")
-                elif isinstance(message, AssistantMessage) and any(
-                    isinstance(block, ToolUseBlock) for block in message.content
+                elif (
+                    isinstance(message, (AssistantMessage, UserMessage))
+                    and self._has_tool_block(message.content)
                 ):
                     raise UnsupportedFeature("tools", "Claude built-in tool event")
                 elif isinstance(message, ResultMessage):
@@ -157,3 +179,18 @@ class SdkSession:
         if completed is None:
             raise BackendFailure("Agent SDK stream ended without result")
         yield completed
+
+    @staticmethod
+    def _reject_tool_event(event: dict[str, Any]) -> None:
+        if event.get("type") in _TOOL_DELTA_TYPES:
+            raise UnsupportedFeature("tools", "Claude built-in tool event")
+        for field in ("content_block", "delta"):
+            value = event.get(field)
+            if isinstance(value, dict) and value.get("type") in _TOOL_DELTA_TYPES:
+                raise UnsupportedFeature("tools", "Claude built-in tool event")
+
+    @staticmethod
+    def _has_tool_block(content: object) -> bool:
+        return isinstance(content, list) and any(
+            isinstance(block, _TOOL_BLOCK_CLASSES) for block in content
+        )
