@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
+claude-proxy = "claude_sdk_proxy.cli:main"
 claude-proxy-capabilities = "claude_sdk_proxy.capability_cli:main"
 claude-proxy-probe = "claude_sdk_proxy.probe_cli:main"
 
