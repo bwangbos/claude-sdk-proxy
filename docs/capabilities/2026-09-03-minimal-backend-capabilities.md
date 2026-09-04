@@ -2,6 +2,12 @@
 
 Date: 2026-09-03
 
+> **Superseded:** The Agent SDK authentication/streaming failure and blanket
+> structured-tools verdict below were invalidated by host-context probes and
+> current SDK research later the same day. See the
+> [fresh reassessment](../research/2026-09-03-subscription-proxy-reassessment.md).
+> This file is retained as the historical checkpoint that led to the new work.
+
 This checkpoint evaluates Claude Agent SDK 0.2.148, its bundled Claude CLI
 2.1.251, and the installed Claude CLI 2.1.258 as possible trusted-local
 transports. It is a capability result, not an HTTP server authorization.
