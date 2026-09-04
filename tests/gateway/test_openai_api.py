@@ -175,6 +175,8 @@ def test_openai_parser_rejects_unknown_fields_and_nonboolean_stream(
 
 
 def test_openai_start_and_delta_use_literal_chunk_order() -> None:
+    from claude_sdk_proxy.domain import InputUsage
+
     start = encode_openai_start("chatcmpl_test", "sonnet")
     delta = encode_openai_event(
         request_id="chatcmpl_test",
@@ -198,6 +200,12 @@ def test_openai_start_and_delta_use_literal_chunk_order() -> None:
         ],
     }
     assert payload(delta[0])["choices"][0]["delta"] == {"content": "hello"}
+    assert (
+        encode_openai_event(
+            "chatcmpl_test", "sonnet", InputUsage(7), include_usage=False
+        )
+        == ()
+    )
 
 
 def test_openai_completed_event_emits_requested_usage_then_done() -> None:

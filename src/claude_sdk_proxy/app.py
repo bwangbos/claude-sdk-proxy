@@ -20,10 +20,19 @@ from claude_sdk_proxy.anthropic_api import (
     parse_anthropic_request,
     render_anthropic_response,
 )
-from claude_sdk_proxy.asgi_stream import ClosableEventStream, EventStreamResponse
+from claude_sdk_proxy.asgi_stream import (
+    ClosableEventStream,
+    DisconnectMonitor,
+    EventStreamResponse,
+    abort_best_effort,
+    cancellation_pending,
+    cleanup_best_effort,
+    close_best_effort,
+)
 from claude_sdk_proxy.domain import (
     BackendFailure,
     Completed,
+    InputUsage,
     RequestValidationError,
     SdkSessionFactory,
     TextDelta,
@@ -112,7 +121,13 @@ async def _anthropic(request: Request) -> Response:
 
 
 async def _handle(request: Request, *, dialect: str) -> Response:
+    monitor: DisconnectMonitor | None = None
     try:
+        media_type = request.headers.get("content-type", "").partition(";")[0]
+        if media_type.strip().lower() != "application/json":
+            raise RequestValidationError(
+                "body", "content type must be application/json"
+            )
         body = await request.json()
         if not isinstance(body, Mapping):
             raise RequestValidationError("body", "must be a JSON object")
@@ -121,38 +136,51 @@ async def _handle(request: Request, *, dialect: str) -> Response:
             parse_openai_request if dialect == "openai" else parse_anthropic_request
         )
         parsed = parser(cast(Mapping[str, object], body), allowed)
+        monitor = DisconnectMonitor(request.receive)
+        await monitor.start()
         registry = cast(SessionRegistry, request.state.registry)
         lease = await registry.open_turn(
             parsed, request.headers.get("x-claude-proxy-session")
         )
     except asyncio.CancelledError:
+        if monitor is not None and monitor.disconnected:
+            return cast(Response, monitor.wrap(None))
+        if monitor is not None:
+            await monitor.close()
         raise
     except Exception as error:
-        return _error_response(dialect, error)
+        response = _error_response(dialect, error)
+        return response if monitor is None else cast(Response, monitor.wrap(response))
     request_id = ("chatcmpl_" if dialect == "openai" else "msg_") + uuid.uuid4().hex
     if parsed.stream:
-        return await _stream_response(dialect, request_id, parsed, lease)
-    return await _nonstream_response(dialect, request_id, parsed, lease)
+        return await _stream_response(dialect, request_id, parsed, lease, monitor)
+    return await _nonstream_response(dialect, request_id, parsed, lease, monitor)
 
 
 async def _stream_response(
-    dialect: str, request_id: str, request: TextRequest, lease: TurnLease
+    dialect: str,
+    request_id: str,
+    request: TextRequest,
+    lease: TurnLease,
+    monitor: DisconnectMonitor,
 ) -> Response:
     stream = cast(ClosableEventStream, lease.stream())
     try:
         first = await anext(stream)
     except asyncio.CancelledError:
-        await _cleanup_best_effort(lease, stream)
+        await cleanup_best_effort(lease, stream)
+        if monitor.disconnected:
+            return cast(Response, monitor.wrap(None))
+        await monitor.close()
         raise
     except Exception as error:
-        await _cleanup_best_effort(lease, stream)
-        if _cancellation_pending():
+        await cleanup_best_effort(lease, stream)
+        if cancellation_pending():
             raise asyncio.CancelledError from None
-        return _error_response(dialect, error, lease.response_headers)
+        response = _error_response(dialect, error, lease.response_headers)
+        return cast(Response, monitor.wrap(response))
     if dialect == "openai":
-        return cast(
-            Response,
-            EventStreamResponse(
+        stream_response = EventStreamResponse(
                 lease,
                 stream,
                 first,
@@ -163,25 +191,31 @@ async def _stream_response(
                 lambda error: encode_openai_error(
                     _error_detail(error).code, _error_detail(error).message
                 ),
-            ),
-        )
-    return cast(
-        Response,
-        EventStreamResponse(
+            )
+        return cast(Response, monitor.wrap(stream_response))
+    stream_response = EventStreamResponse(
             lease,
             stream,
             first,
-            encode_anthropic_start(request_id, request.model),
+            encode_anthropic_start(
+                request_id,
+                request.model,
+                first.input_tokens if isinstance(first, InputUsage) else 0,
+            ),
             lambda event: encode_anthropic_event(request_id, request.model, event),
             lambda error: encode_anthropic_error(
                 _error_detail(error).code, _error_detail(error).message
             ),
-        ),
-    )
+        )
+    return cast(Response, monitor.wrap(stream_response))
 
 
 async def _nonstream_response(
-    dialect: str, request_id: str, request: TextRequest, lease: TurnLease
+    dialect: str,
+    request_id: str,
+    request: TextRequest,
+    lease: TurnLease,
+    monitor: DisconnectMonitor,
 ) -> Response:
     stream = cast(ClosableEventStream, lease.stream())
     text: list[str] = []
@@ -193,50 +227,29 @@ async def _nonstream_response(
             elif isinstance(event, Completed):
                 completed = event
     except asyncio.CancelledError:
-        await _cleanup_best_effort(lease, stream)
+        await cleanup_best_effort(lease, stream)
+        if monitor.disconnected:
+            return cast(Response, monitor.wrap(None))
+        await monitor.close()
         raise
     except Exception as error:
-        await _cleanup_best_effort(lease, stream)
-        if _cancellation_pending():
+        await cleanup_best_effort(lease, stream)
+        if cancellation_pending():
             raise asyncio.CancelledError from None
-        return _error_response(dialect, error, lease.response_headers)
+        response = _error_response(dialect, error, lease.response_headers)
+        return cast(Response, monitor.wrap(response))
     finally:
-        await _close_best_effort(stream)
+        await close_best_effort(stream)
     if completed is None:
-        await _abort_best_effort(lease)
-        return _error_response(dialect, BackendFailure("missing completion"))
+        await abort_best_effort(lease)
+        response = _error_response(dialect, BackendFailure("missing completion"))
+        return cast(Response, monitor.wrap(response))
     renderer = (
         render_openai_response if dialect == "openai" else render_anthropic_response
     )
     payload = renderer(request_id, request.model, "".join(text), completed)
-    return JSONResponse(payload, headers=lease.response_headers)
-
-
-async def _cleanup_best_effort(
-    lease: TurnLease, stream: ClosableEventStream
-) -> None:
-    await _abort_best_effort(lease)
-    await _close_best_effort(stream)
-
-
-async def _abort_best_effort(lease: TurnLease) -> None:
-    try:
-        await lease.abort()
-    except BaseException:
-        pass
-
-
-async def _close_best_effort(stream: ClosableEventStream) -> None:
-    try:
-        await stream.aclose()
-    except BaseException:
-        pass
-
-
-def _cancellation_pending() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
+    response = JSONResponse(payload, headers=lease.response_headers)
+    return cast(Response, monitor.wrap(response))
 
 def _error_detail(error: Exception) -> _Error:
     if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):

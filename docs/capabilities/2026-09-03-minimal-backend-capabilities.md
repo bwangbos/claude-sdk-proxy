@@ -14,7 +14,7 @@ The narrow Agent SDK path from the reassessment is now implemented. The
 production backend keeps one persistent `ClaudeSDKClient` per fresh, linear
 conversation. OpenAI Chat Completions and Anthropic Messages share the same
 strict transcript registry, while each dialect retains its own response and
-SSE framing.
+SSE framing. Both POST routes require an `application/json` content type.
 
 A black-box fixture imports Pi 0.84.4's real `openai-completions` provider,
 calls its ordinary `streamSimple` path, and runs it through actual Uvicorn on a

@@ -67,11 +67,11 @@ class TurnLease:
     _aborted: bool = False
     _replay_released: bool = False
     _abort_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _invalidation: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
-        conversation = self._conversation
-        self.response_headers = {"X-Claude-Proxy-Session": conversation.external_id}
-
+        sid = self._conversation.external_id
+        self.response_headers = {"X-Claude-Proxy-Session": sid}
     def stream(self) -> AsyncIterator[ConversationEvent]:
         if self._stream_started:
             raise RuntimeError("turn stream can only be consumed once")
@@ -104,33 +104,47 @@ class TurnLease:
                                 raise RuntimeError("turn was aborted")
                             await self._registry._commit(
                                 self._conversation, self._request, self._fingerprint,
-                                tuple(events), "".join(assistant_parts),
-                            )
+                                tuple(events), "".join(assistant_parts))
                             self._committed = True
                         yield event
                         return
+                    yield event
                 raise RuntimeError("backend stream ended without completion")
         except TimeoutError:
+            await self._invalidate_best_effort()
             raise SessionTimeout("SDK turn timed out") from None
-        finally:
-            if not self._committed:
-                await self._registry._invalidate(self._conversation)
-
+        except BaseException:
+            await self._invalidate_best_effort()
+            raise
+    async def _invalidate_best_effort(self) -> None:
+        if self._committed:
+            return
+        try:
+            await self._registry._invalidate(self._conversation)
+        except BaseException:
+            pass
     async def abort(self) -> None:
         async with self._abort_lock:
             if self._aborted or self._committed:
                 return
             if self._replay is None:
+                if self._invalidation is None:
+                    self._invalidation = asyncio.create_task(
+                        self._registry._invalidate(self._conversation))
+                try:
+                    await asyncio.shield(self._invalidation)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    self._invalidation = None
+                    raise
                 self._aborted = True
-                await self._registry._invalidate(self._conversation)
             else:
                 await self._release_replay_locked()
                 self._aborted = True
-
     async def _release_replay(self) -> None:
         async with self._abort_lock:
             await self._release_replay_locked()
-
     async def _release_replay_locked(self) -> None:
         if self._replay_released:
             return
@@ -139,7 +153,8 @@ class TurnLease:
 
 
 class SessionRegistry:
-    def __init__(self, session_factory: SdkSessionFactory,
+    def __init__(
+        self, session_factory: SdkSessionFactory,
         turn_timeout_seconds: float = 300.0,
     ) -> None:
         if turn_timeout_seconds <= 0:
@@ -150,7 +165,6 @@ class SessionRegistry:
         self._explicit: dict[str, _Conversation] = {}
         self._implicit: dict[str, _Conversation] = {}
         self._closed = False
-
     async def open_turn(
         self, request: TextRequest, explicit_id: str | None
     ) -> TurnLease:
@@ -163,7 +177,6 @@ class SessionRegistry:
             if explicit_id is not None:
                 return self._open_explicit(request, explicit_id, fingerprint)
             return self._open_implicit(request, fingerprint)
-
     def _open_explicit(
         self, request: TextRequest, explicit_id: str, fingerprint: str
     ) -> TurnLease:
@@ -174,7 +187,6 @@ class SessionRegistry:
             conversation = self._create(request, explicit_id, explicit=True)
             self._explicit[explicit_id] = conversation
             return self._new_lease(conversation, request, fingerprint)
-
         if request.model != conversation.model:
             raise SessionMismatch("session model does not match")
         if request.system != conversation.system:
@@ -186,7 +198,6 @@ class SessionRegistry:
         if not self._is_continuation(conversation, request):
             raise SessionMismatch("request transcript does not match conversation")
         return self._new_lease(conversation, request, fingerprint)
-
     def _open_implicit(self, request: TextRequest, fingerprint: str) -> TurnLease:
         exact = [
             conversation
@@ -201,7 +212,6 @@ class SessionRegistry:
             self._reject_busy(conversation, fingerprint)
             replay = conversation.replay[fingerprint]
             return self._new_lease(conversation, request, fingerprint, replay)
-
         continuations = [
             conversation
             for conversation in self._implicit.values()
@@ -217,32 +227,27 @@ class SessionRegistry:
             return self._new_lease(conversation, request, fingerprint)
         if len(request.messages) != 1:
             raise SessionMismatch("request transcript does not match a conversation")
-
         conversation = self._create(request, uuid.uuid4().hex, explicit=False)
         self._implicit[conversation.external_id] = conversation
         return self._new_lease(conversation, request, fingerprint)
-
-    def _create(self, request: TextRequest, sid: str, explicit: bool) -> _Conversation:
+    def _create(
+        self, request: TextRequest, sid: str, explicit: bool
+    ) -> _Conversation:
         backend = self._session_factory(request.model, request.system)
         return _Conversation(sid, explicit, request.model, request.system, (), backend)
-
     def _new_lease(
-        self, conversation: _Conversation, request: TextRequest,
-        fingerprint: str,
+        self, conversation: _Conversation, request: TextRequest, fingerprint: str,
         replay: tuple[ConversationEvent, ...] | None = None,
     ) -> TurnLease:
-        deadline = None
         conversation.in_flight_fingerprint = fingerprint
-        if replay is None:
-            deadline = asyncio.get_running_loop().time() + self._turn_timeout_seconds
+        now = asyncio.get_running_loop().time()
+        deadline = None if replay is not None else now + self._turn_timeout_seconds
         return TurnLease(self, conversation, request, fingerprint, deadline, replay)
-
     @staticmethod
     def _is_continuation(conversation: _Conversation, request: TextRequest) -> bool:
         transcript = conversation.transcript
-        expected = transcript + (request.messages[-1],)
-        return bool(transcript) and request.messages == expected
-
+        return bool(transcript) and request.messages == transcript + (
+            request.messages[-1],)
     @staticmethod
     def _reject_busy(conversation: _Conversation, fingerprint: str) -> None:
         active = conversation.in_flight_fingerprint
@@ -250,7 +255,6 @@ class SessionRegistry:
             raise SessionConflict("request is already in flight")
         if active is not None:
             raise SessionConflict("conversation is busy")
-
     async def _commit(
         self, conversation: _Conversation, request: TextRequest,
         fingerprint: str, events: tuple[ConversationEvent, ...],
@@ -266,7 +270,6 @@ class SessionRegistry:
             conversation.transcript = request.messages + (assistant,)
             conversation.replay[fingerprint] = events
             conversation.in_flight_fingerprint = None
-
     async def _invalidate(self, conversation: _Conversation) -> None:
         should_close = False
         async with self._lock:
@@ -277,12 +280,10 @@ class SessionRegistry:
                 should_close = True
         if should_close:
             await conversation.backend.close()
-
     async def _release(self, conversation: _Conversation, fingerprint: str) -> None:
         async with self._lock:
             if conversation.in_flight_fingerprint == fingerprint:
                 conversation.in_flight_fingerprint = None
-
     async def close(self) -> None:
         async with self._lock:
             if self._closed:
@@ -291,10 +292,8 @@ class SessionRegistry:
             conversations = [*self._explicit.values(), *self._implicit.values()]
             self._explicit.clear()
             self._implicit.clear()
-        results = await asyncio.gather(
-            *(conversation.backend.close() for conversation in conversations),
-            return_exceptions=True,
-        )
+        closes = (conversation.backend.close() for conversation in conversations)
+        results = await asyncio.gather(*closes, return_exceptions=True)
         for result in results:
             if isinstance(result, BaseException):
                 raise result

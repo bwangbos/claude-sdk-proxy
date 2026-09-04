@@ -168,7 +168,7 @@ def test_anthropic_parser_rejects_unknown_fields_and_nonboolean_stream(
 
 
 def test_anthropic_stream_uses_message_content_and_stop_order() -> None:
-    start = encode_anthropic_start("msg_test", "sonnet")
+    start = encode_anthropic_start("msg_test", "sonnet", input_tokens=7)
     delta = encode_anthropic_event("msg_test", "sonnet", TextDelta("hello"))
     completed = encode_anthropic_event(
         "msg_test",
@@ -185,6 +185,10 @@ def test_anthropic_stream_uses_message_content_and_stop_order() -> None:
         "message_stop",
     ]
     assert payload(start[0])["message"]["id"] == "msg_test"
+    assert payload(start[0])["message"]["usage"] == {
+        "input_tokens": 7,
+        "output_tokens": 0,
+    }
     assert payload(delta[0])["delta"] == {"type": "text_delta", "text": "hello"}
     assert payload(completed[1]) == {
         "type": "message_delta",

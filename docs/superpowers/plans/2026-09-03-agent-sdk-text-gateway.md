@@ -25,7 +25,11 @@
 - Keep tools disabled in this plan. External tools remain a separate experimental increment.
 - Do not use `--safe-mode`; it disables MCP/hooks needed by the later tool increment.
 - Disable built-in tools and ambient settings with `tools=[]`, `allowed_tools=[]`, `setting_sources=[]`, `skills=[]`, `agents={}`, `plugins=[]`, `strict_mcp_config=True`, restricted mode, an empty per-session working directory, and disabled auto-memory/session persistence.
-- Keep each production module at or below 300 lines and this increment at or below 1,500 non-test Python lines.
+- Keep each production module at or below 300 lines. The original 1,500-line
+  increment estimate is amended to 1,800 net non-test Python lines for the
+  final-review safety scope: strict SDK protocol normalization and full
+  request-lifetime disconnect handling. Remove obvious duplication, but keep
+  lifecycle and fail-closed validation code auditable.
 
 ---
 

@@ -25,7 +25,9 @@ uv run claude-proxy --model sonnet
 The server listens at `http://127.0.0.1:8317`. It exposes
 `POST /v1/chat/completions`, `POST /v1/messages`, `GET /v1/models`, and
 `GET /health`. `--host` accepts loopback IP addresses only. Repeat `--model`
-to expose more than one configured Agent SDK model alias.
+to expose more than one configured Agent SDK model alias. Both POST endpoints
+require `Content-Type: application/json`; normal media-type parameters such as
+`charset=utf-8` are accepted.
 
 ### Pi configuration
 

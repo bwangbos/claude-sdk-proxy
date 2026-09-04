@@ -521,6 +521,29 @@ async def test_abort_is_idempotent_and_invalidates_uncommitted_turn() -> None:
 
 
 @pytest.mark.anyio
+async def test_cancelled_active_abort_can_be_retried() -> None:
+    factory = FakeSessionFactory(outputs=("unused", "retry"))
+    registry = SessionRegistry(factory)
+    lease = await registry.open_turn(first_request("hello"), explicit_id="lineage")
+
+    await registry._lock.acquire()
+    try:
+        abort = asyncio.create_task(lease.abort())
+        await asyncio.sleep(0)
+        assert not abort.done()
+        abort.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await abort
+    finally:
+        registry._lock.release()
+
+    await lease.abort()
+    retry = await registry.open_turn(first_request("hello"), explicit_id="lineage")
+    assert await collect(retry.stream()) == completed_events("retry")
+    assert factory.sessions[0].close_count == 1
+
+
+@pytest.mark.anyio
 async def test_incomplete_backend_stream_invalidates_session() -> None:
     sessions: list[IncompleteSession] = []
 

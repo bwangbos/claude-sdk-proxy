@@ -5,6 +5,7 @@ import json
 from collections.abc import AsyncIterator
 
 import pytest
+from claude_agent_sdk import ResultMessage, StreamEvent
 
 from claude_sdk_proxy.app import create_app
 from claude_sdk_proxy.domain import (
@@ -13,8 +14,19 @@ from claude_sdk_proxy.domain import (
     ConversationEvent,
     TextDelta,
 )
-from tests.gateway.asgi_client import lifespan_app, post_json, request
-from tests.gateway.fakes import FakeConversationSession, FakeSessionFactory
+from claude_sdk_proxy.sdk_session import SdkSession
+from tests.gateway.asgi_client import (
+    lifespan_app,
+    post_json,
+    post_json_then_disconnect,
+    request,
+)
+from tests.gateway.fakes import (
+    FakeConversationSession,
+    FakeSdkClient,
+    FakeSessionFactory,
+    FixedTemporaryDirectory,
+)
 
 
 def openai_body(text: str = "hello", *, stream: bool = False) -> dict[str, object]:
@@ -75,6 +87,12 @@ class SlowAfterDeltaSession(FakeConversationSession):
         yield Completed("end_turn", None)  # pragma: no cover
 
 
+class SlowAfterDeltaFailingCloseSession(SlowAfterDeltaSession):
+    async def close(self) -> None:
+        self.close_count += 1
+        raise BackendFailure("cleanup leaked /Users/alice/.claude credential")
+
+
 class FailingCloseSession(BlockingStreamSession):
     async def close(self) -> None:
         self.close_count += 1
@@ -100,6 +118,16 @@ class SequentialSession(FakeConversationSession):
         self.prompts.append(prompt)
         yield TextDelta(next(self._outputs))
         yield Completed("end_turn", {"output_tokens": 1})
+
+
+class InputUsageSession(FakeConversationSession):
+    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+        from claude_sdk_proxy.domain import InputUsage
+
+        self.prompts.append(prompt)
+        yield InputUsage(7)
+        yield TextDelta(self._text)
+        yield Completed("end_turn", {"input_tokens": 7, "output_tokens": 1})
 
 
 def one_session_factory(session: FakeConversationSession):
@@ -285,6 +313,26 @@ async def test_preheader_timeout_is_http_504() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_preheader_timeout_survives_failing_backend_close(stream: bool) -> None:
+    session = BlockingStartFailingCloseSession()
+    app = create_app(
+        models=("sonnet",),
+        session_factory=one_session_factory(session),
+        turn_timeout_seconds=0.01,
+    )
+    async with lifespan_app(app):
+        response = await post_json(
+            app, "/v1/chat/completions", openai_body(stream=stream)
+        )
+
+    assert response.status == 504
+    assert response.json["error"]["code"] == "backend_timeout"
+    assert b"credential" not in response.body
+    assert session.close_count >= 1
+
+
+@pytest.mark.anyio
 async def test_midstream_backend_failure_is_redacted_openai_sse_error() -> None:
     session = FailingSession(after_delta=True)
     app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
@@ -327,6 +375,26 @@ async def test_midstream_timeout_is_anthropic_sse_error_with_http_200() -> None:
 
 
 @pytest.mark.anyio
+async def test_midstream_timeout_survives_failing_backend_close() -> None:
+    session = SlowAfterDeltaFailingCloseSession("unused")
+    app = create_app(
+        models=("sonnet",),
+        session_factory=one_session_factory(session),
+        turn_timeout_seconds=0.01,
+    )
+    async with lifespan_app(app):
+        response = await post_json(
+            app, "/v1/messages", anthropic_body(stream=True)
+        )
+
+    assert response.status == 200
+    assert b'"type":"backend_timeout"' in response.body
+    assert b'"type":"backend_error"' not in response.body
+    assert b"credential" not in response.body
+    assert session.close_count >= 1
+
+
+@pytest.mark.anyio
 async def test_anthropic_stream_primes_backend_event_before_protocol_start() -> None:
     factory = FakeSessionFactory(outputs=("answer",))
     app = create_app(models=("sonnet",), session_factory=factory)
@@ -339,6 +407,23 @@ async def test_anthropic_stream_primes_backend_event_before_protocol_start() -> 
     assert response.body.endswith(
         b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
     )
+
+
+@pytest.mark.anyio
+async def test_anthropic_stream_replays_actual_input_usage() -> None:
+    session = InputUsageSession("answer")
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        first = await post_json(app, "/v1/messages", anthropic_body(stream=True))
+        replay = await post_json(app, "/v1/messages", anthropic_body(stream=True))
+
+    for response in (first, replay):
+        first_data = response.body.split(b"data: ", maxsplit=1)[1].splitlines()[0]
+        assert json.loads(first_data)["message"]["usage"] == {
+            "input_tokens": 7,
+            "output_tokens": 0,
+        }
+    assert session.prompts == ["hello"]
 
 
 @pytest.mark.anyio
@@ -400,6 +485,44 @@ async def test_explicit_http_disconnect_aborts_without_waiting_for_backend() -> 
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_queued_disconnect_cancels_preheader_backend_work(stream: bool) -> None:
+    session = BlockingStartFailingCloseSession()
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        response = await asyncio.wait_for(
+            post_json_then_disconnect(
+                app, "/v1/chat/completions", openai_body(stream=stream)
+            ),
+            timeout=0.5,
+        )
+
+    assert response is None
+    assert session.start_count == 0
+    assert session.close_count == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_http_disconnect_during_backend_start_closes_turn(stream: bool) -> None:
+    session = BlockingStartFailingCloseSession()
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        response = await asyncio.wait_for(
+            post_json_then_disconnect(
+                app,
+                "/v1/chat/completions",
+                openai_body(stream=stream),
+                after=session.start_entered,
+            ),
+            timeout=0.5,
+        )
+
+    assert response is None
+    assert session.close_count == 1
+
+
+@pytest.mark.anyio
 async def test_disconnect_cancels_sender_even_when_backend_close_fails() -> None:
     session = FailingCloseSession()
     app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
@@ -415,6 +538,28 @@ async def test_disconnect_cancels_sender_even_when_backend_close_fails() -> None
         )
 
     assert response.status == 200
+    assert session.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_nonstream_disconnect_is_watched_through_response_send() -> None:
+    session = FakeConversationSession("answer")
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        response = await asyncio.wait_for(
+            post_json(
+                app,
+                "/v1/chat/completions",
+                openai_body(),
+                disconnect_after_start=True,
+                block_body_after_start=True,
+            ),
+            timeout=0.5,
+        )
+        assert session.close_count == 0
+
+    assert response.status == 200
+    assert response.body == b""
     assert session.close_count == 1
 
 
@@ -523,6 +668,92 @@ async def test_nonstream_backend_failure_is_redacted_http_error() -> None:
         "message": "Backend request failed",
     }
     assert b"secret-token" not in response.body
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/v1/chat/completions", openai_body()),
+        ("/v1/messages", anthropic_body()),
+    ],
+)
+@pytest.mark.parametrize("content_type", [None, "text/plain"])
+async def test_post_routes_require_json_content_type(
+    path: str, body: dict[str, object], content_type: str | None
+) -> None:
+    app = create_app(models=("sonnet",), session_factory=FakeSessionFactory(()))
+    headers = {} if content_type is None else {"content-type": content_type}
+    encoded = json.dumps(body, separators=(",", ":")).encode()
+    async with lifespan_app(app):
+        response = await request(app, "POST", path, encoded, headers)
+
+    assert response.status == 400
+    if path.endswith("completions"):
+        assert response.json["error"]["code"] == "invalid_request"
+    else:
+        assert response.json["error"]["type"] == "invalid_request"
+
+
+@pytest.mark.anyio
+async def test_json_content_type_allows_parameters() -> None:
+    app = create_app(
+        models=("sonnet",), session_factory=FakeSessionFactory(("answer",))
+    )
+    body = json.dumps(openai_body(), separators=(",", ":")).encode()
+    async with lifespan_app(app):
+        response = await request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            body,
+            {"content-type": "application/json; charset=utf-8"},
+        )
+    assert response.status == 200
+
+
+@pytest.mark.anyio
+async def test_backend_tool_protocol_violation_is_http_502(tmp_path) -> None:
+    client = FakeSdkClient(
+        responses=(
+            (
+                StreamEvent(
+                    uuid="event-1",
+                    session_id="sdk-1",
+                    event={
+                        "type": "content_block_start",
+                        "content_block": {"type": "tool_use", "name": "secret"},
+                    },
+                ),
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=0,
+                    duration_api_ms=0,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="sdk-1",
+                    stop_reason="end_turn",
+                    usage={"output_tokens": 1},
+                ),
+            ),
+        )
+    )
+
+    def factory(model: str, system: str) -> SdkSession:
+        return SdkSession(
+            model,
+            system,
+            directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+            client_factory=lambda options: client.capture_options(options),
+        )
+
+    app = create_app(models=("sonnet",), session_factory=factory)
+    async with lifespan_app(app):
+        response = await post_json(app, "/v1/chat/completions", openai_body())
+
+    assert response.status == 502
+    assert response.json["error"]["code"] == "backend_error"
+    assert b"secret" not in response.body
 
 
 @pytest.mark.anyio

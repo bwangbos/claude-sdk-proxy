@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from typing import Protocol
 
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from claude_sdk_proxy.domain import ConversationEvent
 from claude_sdk_proxy.sessions import TurnLease
@@ -15,6 +15,47 @@ type ErrorEncoder = Callable[[Exception], tuple[bytes, ...]]
 
 class ClosableEventStream(AsyncIterator[ConversationEvent], Protocol):
     async def aclose(self) -> None: ...
+
+
+class DisconnectMonitor:
+    def __init__(self, receive: Receive) -> None:
+        self._receive = receive
+        self._task: asyncio.Task[None] | None = None
+        self._response: ASGIApp | None = None
+        self.disconnected = False
+
+    async def start(self) -> None:
+        owner = asyncio.current_task()
+        if owner is None:  # pragma: no cover - asyncio always owns an ASGI task
+            raise RuntimeError("ASGI request has no owner task")
+        self._task = asyncio.create_task(self._listen(owner))
+        await asyncio.sleep(0)
+
+    async def _listen(self, owner: asyncio.Task[object]) -> None:
+        while (await self._receive())["type"] != "http.disconnect":
+            pass
+        self.disconnected = True
+        owner.cancel()
+
+    def wrap(self, response: ASGIApp | None) -> DisconnectMonitor:
+        self._response = response
+        return self
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            if not self.disconnected and self._response is not None:
+                await self._response(scope, receive, send)
+        except asyncio.CancelledError:
+            if not self.disconnected:
+                raise
+        finally:
+            await self.close()
+
+    async def close(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
 
 
 class EventStreamResponse:
@@ -35,36 +76,8 @@ class EventStreamResponse:
         self._encode_error = encode_error
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        del scope
-        owner = asyncio.current_task()
-        if owner is None:  # pragma: no cover - asyncio always owns an ASGI task
-            raise RuntimeError("ASGI response has no owner task")
-        disconnected = asyncio.Event()
-        listener = asyncio.create_task(
-            self._listen_for_disconnect(receive, owner, disconnected)
-        )
-        try:
-            await self._send_response(send)
-        except asyncio.CancelledError:
-            if disconnected.is_set():
-                return
-            raise
-        finally:
-            listener.cancel()
-            await asyncio.gather(listener, return_exceptions=True)
-
-    async def _listen_for_disconnect(
-        self,
-        receive: Receive,
-        owner: asyncio.Task[object],
-        disconnected: asyncio.Event,
-    ) -> None:
-        while True:
-            if (await receive())["type"] == "http.disconnect":
-                disconnected.set()
-                owner.cancel()
-                await self._abort_best_effort()
-                return
+        del scope, receive
+        await self._send_response(send)
 
     async def _send_response(self, send: Send) -> None:
         headers = [
@@ -86,19 +99,19 @@ class EventStreamResponse:
                 await self._send_event(send, event)
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         except asyncio.CancelledError:
-            await self._cleanup_failed_send()
+            await cleanup_best_effort(self._lease, self._stream)
             raise
         except ConnectionError, BrokenPipeError:
-            await self._cleanup_failed_send()
+            await cleanup_best_effort(self._lease, self._stream)
             raise
         except Exception as error:
-            if self._cancellation_pending():
-                await self._cleanup_failed_send()
+            if cancellation_pending():
+                await cleanup_best_effort(self._lease, self._stream)
                 raise asyncio.CancelledError from None
             await self._send_stream_error(send, error)
             return
         finally:
-            await self._close_best_effort()
+            await close_best_effort(self._stream)
 
     async def _send_event(self, send: Send, event: ConversationEvent) -> None:
         for chunk in self._encode_event(event):
@@ -108,29 +121,33 @@ class EventStreamResponse:
     async def _send_chunk(send: Send, chunk: bytes) -> None:
         await send({"type": "http.response.body", "body": chunk, "more_body": True})
 
-    async def _cleanup_failed_send(self) -> None:
-        await self._abort_best_effort()
-        await self._close_best_effort()
-
     async def _send_stream_error(self, send: Send, error: Exception) -> None:
-        await self._cleanup_failed_send()
+        await cleanup_best_effort(self._lease, self._stream)
         for chunk in self._encode_error(error):
             await self._send_chunk(send, chunk)
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
-    async def _abort_best_effort(self) -> None:
-        try:
-            await self._lease.abort()
-        except BaseException:
-            pass
+async def abort_best_effort(lease: TurnLease) -> None:
+    try:
+        await lease.abort()
+    except BaseException:
+        pass
 
-    async def _close_best_effort(self) -> None:
-        try:
-            await self._stream.aclose()
-        except BaseException:
-            pass
 
-    @staticmethod
-    def _cancellation_pending() -> bool:
-        task = asyncio.current_task()
-        return task is not None and task.cancelling() > 0
+async def close_best_effort(stream: ClosableEventStream) -> None:
+    try:
+        await stream.aclose()
+    except BaseException:
+        pass
+
+
+async def cleanup_best_effort(
+    lease: TurnLease, stream: ClosableEventStream
+) -> None:
+    await abort_best_effort(lease)
+    await close_best_effort(stream)
+
+
+def cancellation_pending() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0

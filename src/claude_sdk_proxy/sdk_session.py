@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Protocol
+from typing import Any, Never, Protocol
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -22,8 +22,8 @@ from claude_sdk_proxy.domain import (
     BackendFailure,
     Completed,
     ConversationEvent,
+    InputUsage,
     TextDelta,
-    UnsupportedFeature,
 )
 
 
@@ -47,10 +47,7 @@ type ClientFactory = Callable[[ClaudeAgentOptions], SdkClientProtocol]
 type DirectoryFactory = Callable[[], SessionDirectoryProtocol]
 
 _TOOL_BLOCK_TYPES = {
-    "tool_use",
-    "server_tool_use",
-    "tool_result",
-    "server_tool_result",
+    "tool_use", "server_tool_use", "tool_result", "server_tool_result"
 }
 _TOOL_DELTA_TYPES = _TOOL_BLOCK_TYPES | {"input_json_delta"}
 _TOOL_BLOCK_CLASSES = (
@@ -59,13 +56,13 @@ _TOOL_BLOCK_CLASSES = (
     ToolResultBlock,
     ServerToolResultBlock,
 )
+_PROTOCOL_ERROR = "Agent SDK protocol failure"
+_STOP_REASONS = {"end_turn", "max_tokens"}
 
 
 class SdkSession:
     def __init__(
-        self,
-        model: str,
-        system: str,
+        self, model: str, system: str,
         directory_factory: DirectoryFactory | None = None,
         client_factory: ClientFactory = ClaudeSDKClient,
     ) -> None:
@@ -76,6 +73,7 @@ class SdkSession:
         self._directory: SessionDirectoryProtocol | None = None
         self._client: SdkClientProtocol | None = None
         self._closed = False
+        self._sdk_session_id: str | None = None
 
     @staticmethod
     def _new_directory() -> TemporaryDirectory[str]:
@@ -91,15 +89,11 @@ class SdkSession:
         options = ClaudeAgentOptions(
             model=self._model,
             system_prompt=self._system,
-            tools=[],
-            allowed_tools=[],
-            skills=[],
-            setting_sources=[],
+            tools=[], allowed_tools=[], skills=[], setting_sources=[],
             mcp_servers={},
             strict_mcp_config=True,
             permission_mode="dontAsk",
-            agents={},
-            plugins=[],
+            agents={}, plugins=[],
             cwd=Path(directory.__enter__()),
             include_partial_messages=True,
             stderr=_discard_stderr,
@@ -139,6 +133,8 @@ class SdkSession:
             raise BackendFailure("Agent SDK query failed")
         completed: Completed | None = None
         failure: str | None = None
+        start_input: int | None = None
+        saw_text = False
         try:
             await client.query(prompt)
             async for message in client.receive_response():
@@ -148,29 +144,54 @@ class SdkSession:
                         continue
                     raise BackendFailure("Agent SDK message after result")
                 if isinstance(message, StreamEvent):
+                    self._observe_session_id(message.session_id)
+                    if message.parent_tool_use_id is not None:
+                        self._fail_protocol()
                     event = message.event
+                    if not isinstance(event, Mapping):
+                        self._fail_protocol()
+                    event_type = event.get("type")
+                    if not isinstance(event_type, str):
+                        self._fail_protocol()
                     self._reject_tool_event(event)
-                    if event.get("type") != "content_block_delta":
+                    if event_type == "message_start":
+                        if start_input is not None or saw_text:
+                            self._fail_protocol()
+                        start_input = self._message_start_input(event)
+                        yield InputUsage(start_input)
                         continue
-                    delta = event.get("delta")
-                    if not isinstance(delta, dict):
-                        raise BackendFailure("invalid Agent SDK delta")
-                    if delta.get("type") == "text_delta":
+                    if event_type == "content_block_start":
+                        block = event.get("content_block")
+                        if (
+                            not isinstance(block, Mapping)
+                            or block.get("type") != "text"
+                        ):
+                            self._fail_protocol()
+                    elif event_type == "content_block_delta":
+                        delta = event.get("delta")
+                        if (
+                            not isinstance(delta, Mapping)
+                            or delta.get("type") != "text_delta"
+                        ):
+                            self._fail_protocol()
                         text = delta.get("text")
                         if not isinstance(text, str):
-                            raise BackendFailure("invalid Agent SDK text delta")
+                            self._fail_protocol()
+                        saw_text = True
                         yield TextDelta(text)
-                elif (
-                    isinstance(message, (AssistantMessage, UserMessage))
-                    and self._has_tool_block(message.content)
-                ):
-                    raise UnsupportedFeature("tools", "Claude built-in tool event")
+                elif isinstance(message, AssistantMessage):
+                    self._validate_assistant(message)
+                elif isinstance(message, UserMessage):
+                    self._validate_user(message)
                 elif isinstance(message, ResultMessage):
-                    if message.is_error:
+                    self._observe_session_id(message.session_id)
+                    if type(message.is_error) is not bool:
+                        self._fail_protocol()
+                    if message.is_error is True:
                         failure = "Agent SDK query failed"
                     else:
-                        completed = Completed(message.stop_reason, message.usage)
-        except (BackendFailure, UnsupportedFeature):
+                        completed = self._normalize_result(message, start_input)
+        except BackendFailure:
             raise
         except Exception:
             raise BackendFailure("Agent SDK query failed") from None
@@ -180,17 +201,100 @@ class SdkSession:
             raise BackendFailure("Agent SDK stream ended without result")
         yield completed
 
-    @staticmethod
-    def _reject_tool_event(event: dict[str, Any]) -> None:
+    def _observe_session_id(self, value: object) -> None:
+        if not isinstance(value, str) or not value:
+            self._fail_protocol()
+        if self._sdk_session_id is None:
+            self._sdk_session_id = value
+        elif value != self._sdk_session_id:
+            self._fail_protocol()
+
+    def _normalize_result(
+        self, message: ResultMessage, start_input: int | None
+    ) -> Completed:
+        if (
+            message.subtype != "success"
+            or message.stop_reason not in _STOP_REASONS
+            or message.deferred_tool_use is not None
+            or message.permission_denials not in (None, [])
+            or message.errors not in (None, [])
+            or message.api_error_status is not None
+            or message.terminal_reason not in (None, "completed")
+        ):
+            self._fail_protocol()
+        origin = message.origin
+        if origin is not None and not self._human_origin(origin):
+            self._fail_protocol()
+        usage = self._normalize_usage(message.usage, ("input_tokens", "output_tokens"))
+        if start_input is not None and usage is not None:
+            final_input = usage.get("input_tokens")
+            if final_input is not None and final_input != start_input:
+                self._fail_protocol()
+        return Completed(message.stop_reason, usage)
+    @classmethod
+    def _message_start_input(cls, event: Mapping[str, Any]) -> int:
+        message = event.get("message")
+        if not isinstance(message, Mapping):
+            cls._fail_protocol()
+        usage = cls._normalize_usage(message.get("usage"), ("input_tokens",))
+        if usage is None or "input_tokens" not in usage:
+            cls._fail_protocol()
+        return usage["input_tokens"]
+    @classmethod
+    def _normalize_usage(
+        cls, usage: object, fields: tuple[str, ...]
+    ) -> dict[str, int] | None:
+        if usage is None:
+            return None
+        if not isinstance(usage, Mapping):
+            cls._fail_protocol()
+        normalized: dict[str, int] = {}
+        for field in fields:
+            if field not in usage:
+                continue
+            value = usage[field]
+            if type(value) is not int or value < 0:
+                cls._fail_protocol()
+            normalized[field] = value
+        return normalized
+    def _validate_assistant(self, message: AssistantMessage) -> None:
+        if message.parent_tool_use_id is not None or message.error is not None:
+            self._fail_protocol()
+        if message.session_id is not None:
+            self._observe_session_id(message.session_id)
+        if self._has_tool_block(message.content):
+            self._fail_protocol()
+
+    @classmethod
+    def _validate_user(cls, message: UserMessage) -> None:
+        if (
+            message.parent_tool_use_id is not None
+            or message.tool_use_result is not None
+            or cls._has_tool_block(message.content)
+        ):
+            cls._fail_protocol()
+        origin = message.origin
+        if origin is not None and not cls._human_origin(origin):
+            cls._fail_protocol()
+
+    @classmethod
+    def _reject_tool_event(cls, event: Mapping[str, Any]) -> None:
         if event.get("type") in _TOOL_DELTA_TYPES:
-            raise UnsupportedFeature("tools", "Claude built-in tool event")
+            cls._fail_protocol()
         for field in ("content_block", "delta"):
             value = event.get(field)
-            if isinstance(value, dict) and value.get("type") in _TOOL_DELTA_TYPES:
-                raise UnsupportedFeature("tools", "Claude built-in tool event")
+            if isinstance(value, Mapping) and value.get("type") in _TOOL_DELTA_TYPES:
+                cls._fail_protocol()
 
     @staticmethod
     def _has_tool_block(content: object) -> bool:
         return isinstance(content, list) and any(
             isinstance(block, _TOOL_BLOCK_CLASSES) for block in content
         )
+
+    @staticmethod
+    def _human_origin(origin: object) -> bool:
+        return isinstance(origin, Mapping) and origin.get("kind") == "human"
+    @staticmethod
+    def _fail_protocol() -> Never:
+        raise BackendFailure(_PROTOCOL_ERROR)

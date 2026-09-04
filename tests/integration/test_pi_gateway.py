@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 
 import pytest
 
@@ -13,6 +14,30 @@ from tests.integration.pi_gateway_support import (
     run_pi,
     serve,
 )
+
+
+@pytest.mark.anyio
+async def test_server_socket_closes_when_bind_fails(monkeypatch) -> None:
+    class FailingSocket:
+        closed = False
+
+        def setsockopt(self, *args: object) -> None:
+            pass
+
+        def bind(self, address: object) -> None:
+            raise OSError("bind denied")
+
+        def close(self) -> None:
+            self.closed = True
+
+    sock = FailingSocket()
+    monkeypatch.setattr(socket, "socket", lambda *args: sock)
+
+    with pytest.raises(OSError, match="bind denied"):
+        async with serve(object()):
+            pass
+
+    assert sock.closed
 
 
 @pytest.mark.anyio

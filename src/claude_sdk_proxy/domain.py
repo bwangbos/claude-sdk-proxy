@@ -49,6 +49,11 @@ class TextDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class InputUsage:
+    input_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
 class Completed:
     stop_reason: str | None
     usage: dict[str, Any] | None
@@ -90,7 +95,7 @@ class TextRequest:
         return self.messages[-1].content
 
 
-type ConversationEvent = TextDelta | Completed
+type ConversationEvent = InputUsage | TextDelta | Completed
 
 
 class SdkSessionProtocol(Protocol):

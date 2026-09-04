@@ -71,25 +71,26 @@ def pi_ai_module() -> Path:
 @asynccontextmanager
 async def serve(app: Any) -> AsyncIterator[str]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", 0))
-    host, port = sock.getsockname()
-    config = uvicorn.Config(app, log_level="error", lifespan="on")
-    server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve(sockets=[sock]))
     try:
-        async with asyncio.timeout(2):
-            while not server.started:
-                if task.done():
-                    await task
-                await asyncio.sleep(0.01)
-        yield f"http://{host}:{port}/v1"
-    finally:
-        server.should_exit = True
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+        server = uvicorn.Server(
+            uvicorn.Config(app, log_level="error", lifespan="on")
+        )
+        task = asyncio.create_task(server.serve(sockets=[sock]))
         try:
-            await asyncio.wait_for(task, timeout=2)
+            async with asyncio.timeout(2):
+                while not server.started:
+                    if task.done():
+                        await task
+                    await asyncio.sleep(0.01)
+            yield f"http://{host}:{port}/v1"
         finally:
-            sock.close()
+            server.should_exit = True
+            await asyncio.wait_for(task, timeout=2)
+    finally:
+        sock.close()
 
 
 async def run_pi(base_url: str, scenario: str) -> dict[str, Any]:

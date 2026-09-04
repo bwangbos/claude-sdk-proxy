@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any
 
 from claude_sdk_proxy.domain import (
-    CanonicalMessage,
     Completed,
     ConversationEvent,
+    InputUsage,
     RequestValidationError,
-    Role,
     TextDelta,
     TextRequest,
-    UnsupportedFeature,
+)
+from claude_sdk_proxy.text_api import (
+    boolean,
+    reject_fields,
+    required_string,
+    text_messages,
+    usage_counter,
 )
 
 _SUPPORTED_FIELDS = {
@@ -37,23 +42,22 @@ _UNSUPPORTED_FIELDS = {
     "audio",
     "reasoning_effort",
 }
-_MESSAGE_FIELDS = {"role", "content"}
 _TOOL_MESSAGE_FIELDS = {"tool_calls", "tool_call_id", "function_call"}
 
 
 def parse_openai_request(
     body: Mapping[str, object], allowed_models: frozenset[str]
 ) -> TextRequest:
-    _reject_fields(body)
-    model = _string(body, "model", required=True)
+    reject_fields(body, _SUPPORTED_FIELDS, _UNSUPPORTED_FIELDS)
+    model = required_string(body, "model")
     if model not in allowed_models:
         raise RequestValidationError("model", "model is not configured")
-    stream = _boolean(body, "stream", default=False)
+    stream = boolean(body, "stream")
     if "store" in body and body["store"] is not False:
         raise RequestValidationError("store", "must be exactly false")
     include_usage = _stream_options(body)
     max_tokens = _openai_max_tokens(body)
-    system, messages = _messages(body)
+    system, messages = text_messages(body, _TOOL_MESSAGE_FIELDS, allow_system=True)
     try:
         return TextRequest(
             model, system, tuple(messages), max_tokens, stream, include_usage
@@ -89,6 +93,8 @@ def encode_openai_start(request_id: str, model: str) -> tuple[bytes, ...]:
 def encode_openai_event(
     request_id: str, model: str, event: ConversationEvent, include_usage: bool
 ) -> tuple[bytes, ...]:
+    if isinstance(event, InputUsage):
+        return ()
     if isinstance(event, TextDelta):
         return (_sse(_chunk(request_id, model, {"content": event.text})),)
     if not isinstance(event, Completed):
@@ -124,34 +130,6 @@ def encode_openai_error(code: str, message: str) -> tuple[bytes, ...]:
     )
 
 
-def _reject_fields(body: Mapping[str, object]) -> None:
-    for field in body:
-        if field in _UNSUPPORTED_FIELDS:
-            raise UnsupportedFeature(field, "not supported by the text gateway")
-        if field not in _SUPPORTED_FIELDS:
-            raise RequestValidationError(field, "field is not supported")
-
-
-def _string(body: Mapping[str, object], field: str, *, required: bool) -> str:
-    value = body.get(field)
-    if value is None and not required:
-        return ""
-    if not isinstance(value, str):
-        raise RequestValidationError(field, "must be a string")
-    if required and not value:
-        raise RequestValidationError(field, "must not be empty")
-    return value
-
-
-def _boolean(body: Mapping[str, object], field: str, *, default: bool) -> bool:
-    if field not in body:
-        return default
-    value = body[field]
-    if type(value) is not bool:
-        raise RequestValidationError(field, "must be a boolean")
-    return value
-
-
 def _openai_max_tokens(body: Mapping[str, object]) -> int | None:
     names = [name for name in ("max_tokens", "max_completion_tokens") if name in body]
     if len(names) > 1:
@@ -176,45 +154,6 @@ def _stream_options(body: Mapping[str, object]) -> bool:
     if type(include_usage) is not bool:
         raise RequestValidationError("stream_options", "include_usage must be boolean")
     return include_usage
-
-
-def _messages(body: Mapping[str, object]) -> tuple[str, list[CanonicalMessage]]:
-    value = body.get("messages")
-    if not isinstance(value, list) or not value:
-        raise RequestValidationError("messages", "must be a non-empty array")
-    system = ""
-    messages: list[CanonicalMessage] = []
-    for index, raw_message in enumerate(value):
-        if not isinstance(raw_message, Mapping):
-            raise RequestValidationError("messages", "entries must be objects")
-        extras = set(raw_message) - _MESSAGE_FIELDS
-        if extras & _TOOL_MESSAGE_FIELDS:
-            raise UnsupportedFeature(
-                "messages", "tool message fields are not supported"
-            )
-        if extras:
-            raise RequestValidationError("messages", "message fields are not supported")
-        role = raw_message.get("role")
-        content = raw_message.get("content")
-        if not isinstance(role, str):
-            raise RequestValidationError("messages", "role must be a string")
-        if not isinstance(content, str):
-            if isinstance(content, list):
-                raise UnsupportedFeature("messages", "content blocks are not supported")
-            raise RequestValidationError("messages", "content must be a string")
-        if role == "system":
-            if index != 0:
-                raise RequestValidationError(
-                    "messages", "system must be the first message"
-                )
-            system = content
-            continue
-        if role in {"tool", "function"}:
-            raise UnsupportedFeature("messages", "tool roles are not supported")
-        if role not in {"user", "assistant"}:
-            raise RequestValidationError("messages", "role must be user or assistant")
-        messages.append(CanonicalMessage(cast(Role, role), content))
-    return system, messages
 
 
 def _chunk(
@@ -245,20 +184,13 @@ def _openai_stop_reason(reason: str | None) -> str:
 
 
 def _openai_usage(usage: dict[str, Any] | None) -> dict[str, int]:
-    input_tokens = _usage_counter(usage, "input_tokens")
-    output_tokens = _usage_counter(usage, "output_tokens")
+    input_tokens = usage_counter(usage, "input_tokens")
+    output_tokens = usage_counter(usage, "output_tokens")
     return {
         "prompt_tokens": input_tokens,
         "completion_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     }
-
-
-def _usage_counter(usage: dict[str, Any] | None, field: str) -> int:
-    value = 0 if usage is None else usage.get(field, 0)
-    return value if type(value) is int and value >= 0 else 0
-
-
 def _sse(value: dict[str, object]) -> bytes:
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return f"data: {encoded}\n\n".encode()
