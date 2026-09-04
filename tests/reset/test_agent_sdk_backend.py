@@ -56,7 +56,9 @@ def test_build_options_disables_ambient_agent_behavior(
     }
     assert options.stderr is not None
     options.stderr("secret-bearing diagnostic")
-    assert capsys.readouterr().err == ""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
     assert options.max_buffer_size == 64 * 1024
 
 
