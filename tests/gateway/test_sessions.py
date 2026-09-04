@@ -226,6 +226,27 @@ async def test_premature_replay_release_preserves_healthy_session(
 
 
 @pytest.mark.anyio
+async def test_replay_close_before_first_iteration_releases_reservation() -> None:
+    factory = FakeSessionFactory(outputs=("answer",))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    original = await registry.open_turn(request, explicit_id=None)
+    await collect(original.stream())
+    replay = await registry.open_turn(request, explicit_id=None)
+    replay_stream = replay.stream()
+
+    await replay_stream.aclose()
+    continuation = await registry.open_turn(
+        continuation_request("hello", "answer", "next"), explicit_id=None
+    )
+
+    assert await collect(continuation.stream()) == completed_events("answer")
+    assert factory.created == 1
+    assert factory.sessions[0].prompts == ["hello", "next"]
+    assert factory.sessions[0].close_count == 0
+
+
+@pytest.mark.anyio
 async def test_replay_identity_ignores_rendering_and_advisory_fields() -> None:
     factory = FakeSessionFactory(outputs=("answer",))
     registry = SessionRegistry(factory)

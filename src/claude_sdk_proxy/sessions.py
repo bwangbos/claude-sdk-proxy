@@ -17,6 +17,7 @@ from claude_sdk_proxy.domain import (
     TextDelta,
     TextRequest,
 )
+from claude_sdk_proxy.replay_stream import ReplayStream
 
 _EXPLICIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
@@ -52,40 +53,37 @@ def _fingerprint(request: TextRequest) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+@dataclass(slots=True)
 class TurnLease:
-    def __init__(
-        self, registry: SessionRegistry, conversation: _Conversation,
-        request: TextRequest, fingerprint: str, deadline: float | None,
-        replay: tuple[ConversationEvent, ...] | None,
-    ) -> None:
-        self._registry = registry
-        self._conversation = conversation
-        self._request = request
-        self._fingerprint = fingerprint
-        self._deadline = deadline
-        self._replay = replay
-        self.response_headers = {"X-Claude-Proxy-Session": conversation.external_id}
-        self._stream_started = False
-        self._committed = False
-        self._aborted = False
-        self._replay_released = False
-        self._abort_lock = asyncio.Lock()
+    _registry: SessionRegistry
+    _conversation: _Conversation
+    _request: TextRequest
+    _fingerprint: str
+    _deadline: float | None
+    _replay: tuple[ConversationEvent, ...] | None
+    response_headers: dict[str, str] = field(init=False)
+    _stream_started: bool = False
+    _committed: bool = False
+    _aborted: bool = False
+    _replay_released: bool = False
+    _abort_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
-    async def stream(self) -> AsyncIterator[ConversationEvent]:
+    def __post_init__(self) -> None:
+        conversation = self._conversation
+        self.response_headers = {"X-Claude-Proxy-Session": conversation.external_id}
+
+    def stream(self) -> AsyncIterator[ConversationEvent]:
         if self._stream_started:
             raise RuntimeError("turn stream can only be consumed once")
         self._stream_started = True
         if self._aborted:
             raise RuntimeError("turn was aborted")
-        if self._replay is not None:
-            try:
-                for event in self._replay:
-                    if self._aborted:
-                        raise RuntimeError("turn was aborted")
-                    yield event
-            finally:
-                await self._release_replay()
-            return
+        replay = self._replay
+        if replay is not None:
+            return ReplayStream(replay, self._release_replay, lambda: self._aborted)
+        return self._active_stream()
+
+    async def _active_stream(self) -> AsyncIterator[ConversationEvent]:
         events: list[ConversationEvent] = []
         assistant_parts: list[str] = []
         try:
