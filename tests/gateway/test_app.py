@@ -75,6 +75,22 @@ class SlowAfterDeltaSession(FakeConversationSession):
         yield Completed("end_turn", None)  # pragma: no cover
 
 
+class FailingCloseSession(BlockingStreamSession):
+    async def close(self) -> None:
+        self.close_count += 1
+        raise BackendFailure("cleanup leaked /Users/alice/.claude credential")
+
+
+class BlockingStartFailingCloseSession(FailingCloseSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_entered = asyncio.Event()
+
+    async def start(self) -> None:
+        self.start_entered.set()
+        await asyncio.Event().wait()
+
+
 class SequentialSession(FakeConversationSession):
     def __init__(self, outputs: tuple[str, ...]) -> None:
         super().__init__("unused")
@@ -342,8 +358,50 @@ async def test_send_failure_aborts_and_closes_active_turn() -> None:
 
 
 @pytest.mark.anyio
+async def test_terminal_send_failure_preserves_committed_replay_and_backend() -> None:
+    factory = FakeSessionFactory(outputs=("answer", "unexpected"))
+    app = create_app(models=("sonnet",), session_factory=factory)
+    async with lifespan_app(app):
+        with pytest.raises(ConnectionError, match="synthetic send failure"):
+            await post_json(
+                app,
+                "/v1/chat/completions",
+                openai_body(stream=True),
+                fail_send_after=3,
+            )
+        replay = await post_json(
+            app, "/v1/chat/completions", openai_body(stream=True)
+        )
+        assert factory.sessions[0].close_count == 0
+
+    assert replay.status == 200
+    assert b'"content":"answer"' in replay.body
+    assert factory.created == 1
+    assert factory.sessions[0].prompts == ["hello"]
+
+
+@pytest.mark.anyio
 async def test_explicit_http_disconnect_aborts_without_waiting_for_backend() -> None:
     session = BlockingStreamSession()
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        response = await asyncio.wait_for(
+            post_json(
+                app,
+                "/v1/chat/completions",
+                openai_body(stream=True),
+                disconnect_after_start=True,
+            ),
+            timeout=0.5,
+        )
+
+    assert response.status == 200
+    assert session.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_disconnect_cancels_sender_even_when_backend_close_fails() -> None:
+    session = FailingCloseSession()
     app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
     async with lifespan_app(app):
         response = await asyncio.wait_for(
@@ -374,6 +432,64 @@ async def test_cancelling_asgi_response_aborts_active_turn_immediately() -> None
             await response_task
         await asyncio.sleep(0)
         assert session.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_external_cancellation_is_not_masked_when_backend_close_fails() -> None:
+    session = FailingCloseSession()
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        response_task = asyncio.create_task(
+            post_json(app, "/v1/chat/completions", openai_body(stream=True))
+        )
+        await session.entered.wait()
+        response_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(response_task, timeout=0.5)
+
+    assert session.close_count == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_preheader_cancellation_survives_failing_backend_close(
+    stream: bool,
+) -> None:
+    session = BlockingStartFailingCloseSession()
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        response_task = asyncio.create_task(
+            post_json(
+                app,
+                "/v1/chat/completions",
+                openai_body(stream=stream),
+            )
+        )
+        await session.start_entered.wait()
+        response_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(response_task, timeout=0.5)
+
+    assert session.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_send_failure_is_not_masked_when_backend_close_fails() -> None:
+    session = FailingCloseSession()
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        with pytest.raises(ConnectionError, match="synthetic send failure"):
+            await asyncio.wait_for(
+                post_json(
+                    app,
+                    "/v1/chat/completions",
+                    openai_body(stream=True),
+                    fail_send_after=1,
+                ),
+                timeout=0.5,
+            )
+
+    assert session.close_count == 1
 
 
 @pytest.mark.anyio

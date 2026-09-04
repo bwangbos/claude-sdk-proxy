@@ -61,9 +61,9 @@ class EventStreamResponse:
     ) -> None:
         while True:
             if (await receive())["type"] == "http.disconnect":
-                await self._lease.abort()
                 disconnected.set()
                 owner.cancel()
+                await self._abort_best_effort()
                 return
 
     async def _send_response(self, send: Send) -> None:
@@ -84,6 +84,7 @@ class EventStreamResponse:
             await self._send_event(send, self._first)
             async for event in self._stream:
                 await self._send_event(send, event)
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
         except asyncio.CancelledError:
             await self._cleanup_failed_send()
             raise
@@ -91,11 +92,13 @@ class EventStreamResponse:
             await self._cleanup_failed_send()
             raise
         except Exception as error:
+            if self._cancellation_pending():
+                await self._cleanup_failed_send()
+                raise asyncio.CancelledError from None
             await self._send_stream_error(send, error)
             return
         finally:
-            await self._stream.aclose()
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+            await self._close_best_effort()
 
     async def _send_event(self, send: Send, event: ConversationEvent) -> None:
         for chunk in self._encode_event(event):
@@ -106,12 +109,28 @@ class EventStreamResponse:
         await send({"type": "http.response.body", "body": chunk, "more_body": True})
 
     async def _cleanup_failed_send(self) -> None:
-        await self._lease.abort()
-        await self._stream.aclose()
+        await self._abort_best_effort()
+        await self._close_best_effort()
 
     async def _send_stream_error(self, send: Send, error: Exception) -> None:
-        await self._lease.abort()
-        await self._stream.aclose()
+        await self._cleanup_failed_send()
         for chunk in self._encode_error(error):
             await self._send_chunk(send, chunk)
         await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def _abort_best_effort(self) -> None:
+        try:
+            await self._lease.abort()
+        except BaseException:
+            pass
+
+    async def _close_best_effort(self) -> None:
+        try:
+            await self._stream.aclose()
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _cancellation_pending() -> bool:
+        task = asyncio.current_task()
+        return task is not None and task.cancelling() > 0

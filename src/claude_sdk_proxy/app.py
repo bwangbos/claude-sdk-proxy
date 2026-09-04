@@ -142,12 +142,12 @@ async def _stream_response(
     try:
         first = await anext(stream)
     except asyncio.CancelledError:
-        await lease.abort()
-        await stream.aclose()
+        await _cleanup_best_effort(lease, stream)
         raise
     except Exception as error:
-        await lease.abort()
-        await stream.aclose()
+        await _cleanup_best_effort(lease, stream)
+        if _cancellation_pending():
+            raise asyncio.CancelledError from None
         return _error_response(dialect, error, lease.response_headers)
     if dialect == "openai":
         return cast(
@@ -193,23 +193,49 @@ async def _nonstream_response(
             elif isinstance(event, Completed):
                 completed = event
     except asyncio.CancelledError:
-        await lease.abort()
-        await stream.aclose()
+        await _cleanup_best_effort(lease, stream)
         raise
     except Exception as error:
-        await lease.abort()
-        await stream.aclose()
+        await _cleanup_best_effort(lease, stream)
+        if _cancellation_pending():
+            raise asyncio.CancelledError from None
         return _error_response(dialect, error, lease.response_headers)
     finally:
-        await stream.aclose()
+        await _close_best_effort(stream)
     if completed is None:
-        await lease.abort()
+        await _abort_best_effort(lease)
         return _error_response(dialect, BackendFailure("missing completion"))
     renderer = (
         render_openai_response if dialect == "openai" else render_anthropic_response
     )
     payload = renderer(request_id, request.model, "".join(text), completed)
     return JSONResponse(payload, headers=lease.response_headers)
+
+
+async def _cleanup_best_effort(
+    lease: TurnLease, stream: ClosableEventStream
+) -> None:
+    await _abort_best_effort(lease)
+    await _close_best_effort(stream)
+
+
+async def _abort_best_effort(lease: TurnLease) -> None:
+    try:
+        await lease.abort()
+    except BaseException:
+        pass
+
+
+async def _close_best_effort(stream: ClosableEventStream) -> None:
+    try:
+        await stream.aclose()
+    except BaseException:
+        pass
+
+
+def _cancellation_pending() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 def _error_detail(error: Exception) -> _Error:
