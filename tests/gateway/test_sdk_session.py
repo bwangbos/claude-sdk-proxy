@@ -5,14 +5,22 @@ from pathlib import Path
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
+    ConversationResetMessage,
     DeferredToolUse,
+    HookEventMessage,
+    MirrorErrorMessage,
+    RateLimitEvent,
+    RateLimitInfo,
     ResultMessage,
     ServerToolResultBlock,
     ServerToolUseBlock,
     StreamEvent,
+    SystemMessage,
+    TaskStartedMessage,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
 from claude_sdk_proxy.domain import BackendFailure, Completed, TextDelta
@@ -481,3 +489,117 @@ async def test_sdk_session_requires_same_identity_across_turns(tmp_path: Path) -
     with pytest.raises(BackendFailure, match="protocol"):
         _ = [event async for event in session.stream_turn("second")]
     await session.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "stop_reason",
+    ("end_turn", "max_tokens", "model_context_window_exceeded", "refusal"),
+)
+async def test_sdk_session_accepts_legitimate_text_stop_reasons(
+    tmp_path: Path, stop_reason: str
+) -> None:
+    events = await collect_sdk_response(
+        tmp_path, (text_event(), result_message(stop_reason=stop_reason))
+    )
+    assert events[-1] == Completed(
+        stop_reason, {"input_tokens": 2, "output_tokens": 1}
+    )
+
+
+def live_system(message_subtype: str, **changes: object) -> SystemMessage:
+    data: dict[str, object] = {
+        "type": "system",
+        "subtype": message_subtype,
+        "session_id": "sdk-1",
+        "uuid": f"{message_subtype}-1",
+    }
+    if message_subtype == "init":
+        data.update(
+            model="claude-sonnet-5",
+            tools=[],
+            mcp_servers=[],
+            skills=[],
+            plugins=[],
+            permissionMode="dontAsk",
+        )
+    else:
+        data["status"] = "requesting"
+    data.update(changes)
+    return SystemMessage(message_subtype, data)  # type: ignore[arg-type]
+
+
+def live_rate_limit(**changes: object) -> RateLimitEvent:
+    fields: dict[str, object] = {
+        "status": "allowed_warning",
+        "resets_at": 1_789_052_400,
+        "rate_limit_type": "seven_day",
+        "utilization": 0.27,
+        "raw": {"status": "allowed_warning"},
+    }
+    fields.update(changes)
+    info = RateLimitInfo(**fields)  # type: ignore[arg-type]
+    return RateLimitEvent(info, "rate-1", "sdk-1")
+
+
+@pytest.mark.anyio
+async def test_sdk_session_allows_live_system_and_rate_messages(tmp_path: Path) -> None:
+    events = await collect_sdk_response(
+        tmp_path,
+        (
+            live_system("init"),
+            live_system("status"),
+            text_event(),
+            live_rate_limit(),
+            result_message(),
+        ),
+    )
+    assert events == [
+        TextDelta("answer"),
+        Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "message",
+    [
+        TaskStartedMessage(
+            "task_started", {}, "task-secret", "work", "task-1", "sdk-1"
+        ),
+        HookEventMessage("hook_started", {}, "PreToolUse", "sdk-1", "hook-1"),
+        ConversationResetMessage("new-secret", "reset-1", "sdk-1"),
+        MirrorErrorMessage("mirror_error", {}, error="mirror-secret"),
+        UserMessage("user-secret"),
+        SystemMessage("future-secret", {"type": "system"}),
+    ],
+)
+async def test_sdk_session_rejects_non_text_sdk_message_variants(
+    tmp_path: Path, message: object
+) -> None:
+    with pytest.raises(BackendFailure, match="protocol") as error:
+        await collect_sdk_response(tmp_path, (message, result_message()))
+    assert "secret" not in str(error.value)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "message",
+    [
+        live_system("init", session_id="sdk-other-secret"),
+        live_system("status", status="idle-secret"),
+        live_system("status", subtype="future-secret"),
+        live_rate_limit(status="future-secret"),
+        live_rate_limit(utilization=1.5),
+        live_rate_limit(resets_at=-1),
+        live_rate_limit(overage_resets_at=True),
+        live_rate_limit(rate_limit_type="future-secret"),
+        live_rate_limit(raw=[]),
+    ],
+)
+async def test_sdk_session_rejects_malformed_benign_sdk_metadata(
+    tmp_path: Path, message: object
+) -> None:
+    with pytest.raises(BackendFailure, match="protocol") as error:
+        await collect_sdk_response(tmp_path, (message, result_message()))
+    assert "secret" not in str(error.value)

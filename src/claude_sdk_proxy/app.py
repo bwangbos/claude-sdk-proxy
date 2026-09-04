@@ -143,7 +143,7 @@ async def _handle(request: Request, *, dialect: str) -> Response:
             parsed, request.headers.get("x-claude-proxy-session")
         )
     except asyncio.CancelledError:
-        if monitor is not None and monitor.disconnected:
+        if monitor is not None and monitor.consume_disconnect_cancellation():
             return cast(Response, monitor.wrap(None))
         if monitor is not None:
             await monitor.close()
@@ -169,7 +169,7 @@ async def _stream_response(
         first = await anext(stream)
     except asyncio.CancelledError:
         await cleanup_best_effort(lease, stream)
-        if monitor.disconnected:
+        if monitor.consume_disconnect_cancellation():
             return cast(Response, monitor.wrap(None))
         await monitor.close()
         raise
@@ -228,7 +228,7 @@ async def _nonstream_response(
                 completed = event
     except asyncio.CancelledError:
         await cleanup_best_effort(lease, stream)
-        if monitor.disconnected:
+        if monitor.consume_disconnect_cancellation():
             return cast(Response, monitor.wrap(None))
         await monitor.close()
         raise

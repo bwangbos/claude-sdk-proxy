@@ -9,13 +9,14 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    RateLimitEvent,
     ResultMessage,
     ServerToolResultBlock,
     ServerToolUseBlock,
     StreamEvent,
+    SystemMessage,
     ToolResultBlock,
     ToolUseBlock,
-    UserMessage,
 )
 
 from claude_sdk_proxy.domain import (
@@ -24,6 +25,10 @@ from claude_sdk_proxy.domain import (
     ConversationEvent,
     InputUsage,
     TextDelta,
+)
+from claude_sdk_proxy.sdk_metadata import (
+    validate_rate_limit_event,
+    validate_system_message,
 )
 
 
@@ -57,7 +62,9 @@ _TOOL_BLOCK_CLASSES = (
     ServerToolResultBlock,
 )
 _PROTOCOL_ERROR = "Agent SDK protocol failure"
-_STOP_REASONS = {"end_turn", "max_tokens"}
+_STOP_REASONS = {
+    "end_turn", "max_tokens", "model_context_window_exceeded", "refusal"
+}
 
 
 class SdkSession:
@@ -181,8 +188,6 @@ class SdkSession:
                         yield TextDelta(text)
                 elif isinstance(message, AssistantMessage):
                     self._validate_assistant(message)
-                elif isinstance(message, UserMessage):
-                    self._validate_user(message)
                 elif isinstance(message, ResultMessage):
                     self._observe_session_id(message.session_id)
                     if type(message.is_error) is not bool:
@@ -191,6 +196,12 @@ class SdkSession:
                         failure = "Agent SDK query failed"
                     else:
                         completed = self._normalize_result(message, start_input)
+                elif type(message) is SystemMessage:
+                    self._observe_session_id(validate_system_message(message))
+                elif isinstance(message, RateLimitEvent):
+                    self._observe_session_id(validate_rate_limit_event(message))
+                else:
+                    self._fail_protocol()
         except BackendFailure:
             raise
         except Exception:
@@ -264,18 +275,6 @@ class SdkSession:
             self._observe_session_id(message.session_id)
         if self._has_tool_block(message.content):
             self._fail_protocol()
-
-    @classmethod
-    def _validate_user(cls, message: UserMessage) -> None:
-        if (
-            message.parent_tool_use_id is not None
-            or message.tool_use_result is not None
-            or cls._has_tool_block(message.content)
-        ):
-            cls._fail_protocol()
-        origin = message.origin
-        if origin is not None and not cls._human_origin(origin):
-            cls._fail_protocol()
 
     @classmethod
     def _reject_tool_event(cls, event: Mapping[str, Any]) -> None:

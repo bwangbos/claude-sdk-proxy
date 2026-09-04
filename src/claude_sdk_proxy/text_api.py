@@ -79,6 +79,6 @@ def text_messages(
     return system, messages
 
 
-def usage_counter(usage: dict[str, Any] | None, field: str) -> int:
+def usage_counter(usage: Mapping[str, Any] | None, field: str) -> int:
     value = 0 if usage is None else usage.get(field, 0)
     return value if type(value) is int and value >= 0 else 0

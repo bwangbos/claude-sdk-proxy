@@ -183,7 +183,7 @@ def _openai_stop_reason(reason: str | None) -> str:
     return "stop" if reason in {None, "end_turn"} else "length"
 
 
-def _openai_usage(usage: dict[str, Any] | None) -> dict[str, int]:
+def _openai_usage(usage: Mapping[str, Any] | None) -> dict[str, int]:
     input_tokens = usage_counter(usage, "input_tokens")
     output_tokens = usage_counter(usage, "output_tokens")
     return {

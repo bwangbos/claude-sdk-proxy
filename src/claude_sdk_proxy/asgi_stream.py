@@ -21,6 +21,8 @@ class DisconnectMonitor:
     def __init__(self, receive: Receive) -> None:
         self._receive = receive
         self._task: asyncio.Task[None] | None = None
+        self._owner: asyncio.Task[object] | None = None
+        self._disconnect_cancels = 0
         self._response: ASGIApp | None = None
         self.disconnected = False
 
@@ -28,6 +30,7 @@ class DisconnectMonitor:
         owner = asyncio.current_task()
         if owner is None:  # pragma: no cover - asyncio always owns an ASGI task
             raise RuntimeError("ASGI request has no owner task")
+        self._owner = owner
         self._task = asyncio.create_task(self._listen(owner))
         await asyncio.sleep(0)
 
@@ -35,7 +38,23 @@ class DisconnectMonitor:
         while (await self._receive())["type"] != "http.disconnect":
             pass
         self.disconnected = True
+        before = owner.cancelling()
         owner.cancel()
+        self._disconnect_cancels += owner.cancelling() - before
+
+    def consume_disconnect_cancellation(self) -> bool:
+        owner = self._owner
+        if owner is None:
+            return False
+        if not self.disconnected or self._disconnect_cancels == 0:
+            return False
+        current = asyncio.current_task()
+        if current is None or owner is not current:
+            return False
+        while self._disconnect_cancels and current.cancelling():
+            current.uncancel()
+            self._disconnect_cancels -= 1
+        return self._disconnect_cancels == 0 and current.cancelling() == 0
 
     def wrap(self, response: ASGIApp | None) -> DisconnectMonitor:
         self._response = response
@@ -46,7 +65,7 @@ class DisconnectMonitor:
             if not self.disconnected and self._response is not None:
                 await self._response(scope, receive, send)
         except asyncio.CancelledError:
-            if not self.disconnected:
+            if not self.consume_disconnect_cancellation():
                 raise
         finally:
             await self.close()

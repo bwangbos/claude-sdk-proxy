@@ -602,6 +602,25 @@ async def test_abort_after_commit_preserves_replay_and_backend() -> None:
 
 
 @pytest.mark.anyio
+async def test_completed_usage_is_immutable_across_replay() -> None:
+    factory = FakeSessionFactory(outputs=("answer",))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    first = await registry.open_turn(request, explicit_id="lineage")
+    first_events = await collect(first.stream())
+    completed = first_events[-1]
+    assert isinstance(completed, Completed)
+    assert completed.usage is not None
+
+    with pytest.raises(TypeError):
+        completed.usage["output_tokens"] = 999
+
+    replay = await registry.open_turn(request, explicit_id="lineage")
+    replay_events = await collect(replay.stream())
+    assert replay_events[-1] == Completed("end_turn", {"output_tokens": 1})
+
+
+@pytest.mark.anyio
 async def test_commit_and_abort_serialize_at_completed_boundary() -> None:
     factory = FakeSessionFactory(outputs=("answer", "unexpected"))
     registry = SessionRegistry(factory)

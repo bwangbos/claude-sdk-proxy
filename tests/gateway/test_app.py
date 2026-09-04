@@ -5,7 +5,12 @@ import json
 from collections.abc import AsyncIterator
 
 import pytest
-from claude_agent_sdk import ResultMessage, StreamEvent
+from claude_agent_sdk import (
+    ConversationResetMessage,
+    ResultMessage,
+    StreamEvent,
+    TaskStartedMessage,
+)
 
 from claude_sdk_proxy.app import create_app
 from claude_sdk_proxy.domain import (
@@ -136,6 +141,42 @@ def one_session_factory(session: FakeConversationSession):
         return session
 
     return factory
+
+
+def text_event_for_app() -> StreamEvent:
+    return StreamEvent(
+        uuid="event-1",
+        session_id="sdk-1",
+        event={
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "answer"},
+        },
+    )
+
+
+def result_message_for_app() -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=0,
+        duration_api_ms=0,
+        is_error=False,
+        num_turns=1,
+        session_id="sdk-1",
+        stop_reason="end_turn",
+        usage={"input_tokens": 2, "output_tokens": 1},
+    )
+
+
+def sdk_app(tmp_path, client: FakeSdkClient):
+    def factory(model: str, system: str) -> SdkSession:
+        return SdkSession(
+            model,
+            system,
+            directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+            client_factory=lambda options: client.capture_options(options),
+        )
+
+    return create_app(models=("sonnet",), session_factory=factory)
 
 
 @pytest.mark.anyio
@@ -395,6 +436,36 @@ async def test_midstream_timeout_survives_failing_backend_close() -> None:
 
 
 @pytest.mark.anyio
+async def test_slow_sse_send_is_not_cancelled_by_backend_deadline() -> None:
+    session = FakeConversationSession("answer")
+    app = create_app(
+        models=("sonnet",),
+        session_factory=one_session_factory(session),
+        turn_timeout_seconds=0.01,
+    )
+    send_entered = asyncio.Event()
+    release_send = asyncio.Event()
+    async with lifespan_app(app):
+        response_task = asyncio.create_task(
+            post_json(
+                app,
+                "/v1/chat/completions",
+                openai_body(stream=True),
+                body_send_entered=send_entered,
+                body_send_release=release_send,
+            )
+        )
+        await send_entered.wait()
+        await asyncio.sleep(0.03)
+        assert not response_task.done()
+        release_send.set()
+        response = await asyncio.wait_for(response_task, timeout=0.5)
+
+    assert response.status == 200
+    assert b'"content":"answer"' in response.body
+
+
+@pytest.mark.anyio
 async def test_anthropic_stream_primes_backend_event_before_protocol_start() -> None:
     factory = FakeSessionFactory(outputs=("answer",))
     app = create_app(models=("sonnet",), session_factory=factory)
@@ -500,6 +571,25 @@ async def test_queued_disconnect_cancels_preheader_backend_work(stream: bool) ->
     assert response is None
     assert session.start_count == 0
     assert session.close_count == 0
+
+
+@pytest.mark.anyio
+async def test_disconnect_does_not_swallow_concurrent_external_cancellation() -> None:
+    session = FakeConversationSession("unused")
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        response_task = asyncio.create_task(
+            post_json_then_disconnect(
+                app,
+                "/v1/chat/completions",
+                openai_body(stream=True),
+                external_cancel=True,
+            )
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await response_task
+
+    assert session.start_count == 0
 
 
 @pytest.mark.anyio
@@ -753,6 +843,40 @@ async def test_backend_tool_protocol_violation_is_http_502(tmp_path) -> None:
 
     assert response.status == 502
     assert response.json["error"]["code"] == "backend_error"
+    assert b"secret" not in response.body
+
+
+@pytest.mark.anyio
+async def test_backend_task_message_is_redacted_http_502(tmp_path) -> None:
+    task = TaskStartedMessage(
+        "task_started", {}, "task-secret", "work", "task-1", "sdk-1"
+    )
+    client = FakeSdkClient(responses=((task, result_message_for_app()),))
+    app = sdk_app(tmp_path, client)
+
+    async with lifespan_app(app):
+        response = await post_json(app, "/v1/chat/completions", openai_body())
+
+    assert response.status == 502
+    assert response.json["error"]["code"] == "backend_error"
+    assert b"secret" not in response.body
+
+
+@pytest.mark.anyio
+async def test_backend_reset_message_is_redacted_sse_error(tmp_path) -> None:
+    reset = ConversationResetMessage("new-secret", "reset-1", "sdk-1")
+    client = FakeSdkClient(
+        responses=((text_event_for_app(), reset, result_message_for_app()),)
+    )
+    app = sdk_app(tmp_path, client)
+
+    async with lifespan_app(app):
+        response = await post_json(
+            app, "/v1/chat/completions", openai_body(stream=True)
+        )
+
+    assert response.status == 200
+    assert b'"type":"backend_error"' in response.body
     assert b"secret" not in response.body
 
 

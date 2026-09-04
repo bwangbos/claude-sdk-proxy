@@ -73,7 +73,11 @@ async def request(
     disconnect_after_request: bool = False,
     allow_no_response: bool = False,
     block_body_after_start: bool = False,
+    body_send_entered: asyncio.Event | None = None,
+    body_send_release: asyncio.Event | None = None,
+    external_cancel_with_disconnect: bool = False,
 ) -> AsgiResponse | None:
+    owner = asyncio.current_task()
     request_sent = False
     response_started = asyncio.Event()
     never = asyncio.Event()
@@ -86,6 +90,8 @@ async def request(
             request_sent = True
             return {"type": "http.request", "body": body, "more_body": False}
         if disconnect_after_request:
+            if external_cancel_with_disconnect and owner is not None:
+                owner.cancel()
             return {"type": "http.disconnect"}
         if disconnect_after_start:
             await response_started.wait()
@@ -99,10 +105,14 @@ async def request(
             response_started.set()
         elif message["type"] == "http.response.body":
             body_sends += 1
+            if body_send_entered is not None:
+                body_send_entered.set()
             if fail_send_after is not None and body_sends >= fail_send_after:
                 raise ConnectionError("synthetic send failure")
             if block_body_after_start:
                 await never.wait()
+            if body_send_release is not None:
+                await body_send_release.wait()
         sent.append(message)
 
     raw_headers = [
@@ -149,6 +159,8 @@ async def post_json(
     fail_send_after: int | None = None,
     disconnect_after_start: bool = False,
     block_body_after_start: bool = False,
+    body_send_entered: asyncio.Event | None = None,
+    body_send_release: asyncio.Event | None = None,
 ) -> AsgiResponse:
     encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
     merged = {"content-type": "application/json", **(headers or {})}
@@ -161,6 +173,8 @@ async def post_json(
         fail_send_after=fail_send_after,
         disconnect_after_start=disconnect_after_start,
         block_body_after_start=block_body_after_start,
+        body_send_entered=body_send_entered,
+        body_send_release=body_send_release,
     )
 
 
@@ -169,6 +183,8 @@ async def post_json_then_disconnect(
     path: str,
     body: object,
     after: asyncio.Event | None = None,
+    *,
+    external_cancel: bool = False,
 ) -> AsgiResponse | None:
     encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
     if after is None:
@@ -180,6 +196,7 @@ async def post_json_then_disconnect(
             {"content-type": "application/json"},
             disconnect_after_request=True,
             allow_no_response=True,
+            external_cancel_with_disconnect=external_cancel,
         )
 
     request_sent = False

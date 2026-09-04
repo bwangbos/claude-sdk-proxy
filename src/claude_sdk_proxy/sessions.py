@@ -22,8 +22,7 @@ from claude_sdk_proxy.replay_stream import ReplayStream
 _EXPLICIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
-class SessionConflict(RuntimeError):
-    pass
+class SessionConflict(RuntimeError): ...
 
 
 class SessionMismatch(ValueError):
@@ -70,8 +69,8 @@ class TurnLease:
     _invalidation: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
-        sid = self._conversation.external_id
-        self.response_headers = {"X-Claude-Proxy-Session": sid}
+        self.response_headers = {
+            "X-Claude-Proxy-Session": self._conversation.external_id}
     def stream(self) -> AsyncIterator[ConversationEvent]:
         if self._stream_started:
             raise RuntimeError("turn stream can only be consumed once")
@@ -88,28 +87,33 @@ class TurnLease:
         try:
             async with asyncio.timeout_at(self._deadline):
                 await self._conversation.backend.start()
-                async for event in self._conversation.backend.stream_turn(
-                    self._request.next_prompt
-                ):
-                    if self._aborted:
-                        raise RuntimeError("turn was aborted")
-                    events.append(event)
-                    if isinstance(event, TextDelta):
-                        assistant_parts.append(event.text)
-                        yield event
-                        continue
-                    if isinstance(event, Completed):
-                        async with self._abort_lock:
-                            if self._aborted:
-                                raise RuntimeError("turn was aborted")
-                            await self._registry._commit(
-                                self._conversation, self._request, self._fingerprint,
-                                tuple(events), "".join(assistant_parts))
-                            self._committed = True
-                        yield event
-                        return
+            backend_stream = self._conversation.backend.stream_turn(
+                self._request.next_prompt)
+            while True:
+                try:
+                    async with asyncio.timeout_at(self._deadline):
+                        event = await anext(backend_stream)
+                except StopAsyncIteration:
+                    break
+                if self._aborted:
+                    raise RuntimeError("turn was aborted")
+                events.append(event)
+                if isinstance(event, TextDelta):
+                    assistant_parts.append(event.text)
                     yield event
-                raise RuntimeError("backend stream ended without completion")
+                    continue
+                if isinstance(event, Completed):
+                    async with self._abort_lock:
+                        if self._aborted:
+                            raise RuntimeError("turn was aborted")
+                        await self._registry._commit(
+                            self._conversation, self._request, self._fingerprint,
+                            tuple(events), "".join(assistant_parts))
+                        self._committed = True
+                    yield event
+                    return
+                yield event
+            raise RuntimeError("backend stream ended without completion")
         except TimeoutError:
             await self._invalidate_best_effort()
             raise SessionTimeout("SDK turn timed out") from None
@@ -166,8 +170,7 @@ class SessionRegistry:
         self._implicit: dict[str, _Conversation] = {}
         self._closed = False
     async def open_turn(
-        self, request: TextRequest, explicit_id: str | None
-    ) -> TurnLease:
+        self, request: TextRequest, explicit_id: str | None) -> TurnLease:
         if explicit_id is not None and _EXPLICIT_ID.fullmatch(explicit_id) is None:
             raise SessionMismatch("invalid explicit session ID")
         fingerprint = _fingerprint(request)
@@ -230,9 +233,7 @@ class SessionRegistry:
         conversation = self._create(request, uuid.uuid4().hex, explicit=False)
         self._implicit[conversation.external_id] = conversation
         return self._new_lease(conversation, request, fingerprint)
-    def _create(
-        self, request: TextRequest, sid: str, explicit: bool
-    ) -> _Conversation:
+    def _create(self, request: TextRequest, sid: str, explicit: bool) -> _Conversation:
         backend = self._session_factory(request.model, request.system)
         return _Conversation(sid, explicit, request.model, request.system, (), backend)
     def _new_lease(

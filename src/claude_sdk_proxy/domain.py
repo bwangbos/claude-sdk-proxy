@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
 type CapabilityStatus = Literal["pass", "fail", "untested"]
@@ -56,7 +57,11 @@ class InputUsage:
 @dataclass(frozen=True, slots=True)
 class Completed:
     stop_reason: str | None
-    usage: dict[str, Any] | None
+    usage: Mapping[str, Any] | None
+
+    def __post_init__(self) -> None:
+        if self.usage is not None:
+            object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
 
 
 type BackendEvent = TextDelta | Completed

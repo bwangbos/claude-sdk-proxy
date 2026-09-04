@@ -148,7 +148,7 @@ def _anthropic_stop_reason(reason: str | None) -> str:
     return "end_turn" if reason in {None, "end_turn"} else "max_tokens"
 
 
-def _anthropic_usage(usage: dict[str, Any] | None) -> dict[str, int]:
+def _anthropic_usage(usage: Mapping[str, Any] | None) -> dict[str, int]:
     return {
         "input_tokens": usage_counter(usage, "input_tokens"),
         "output_tokens": usage_counter(usage, "output_tokens"),
