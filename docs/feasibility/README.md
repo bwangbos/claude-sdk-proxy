@@ -7,6 +7,110 @@ feasibility checks. Release evidence must run with:
 uv run pytest --strict-markers --forbid-skips -W error
 ```
 
+## Current runnable text gateway
+
+The current implementation is a private, single-user compatibility gateway for
+fresh, linear text conversations. It uses the Claude Agent SDK and the Claude
+login already available to the process. Run it from the same normal host login
+context where `claude` is authenticated; a sandboxed process may not be able to
+read the macOS Keychain item even though the CLI works in a terminal.
+
+Install the locked dependencies and launch the default model on loopback:
+
+```bash
+uv sync --dev
+uv run claude-proxy --model sonnet
+```
+
+The server listens at `http://127.0.0.1:8317`. It exposes
+`POST /v1/chat/completions`, `POST /v1/messages`, `GET /v1/models`, and
+`GET /health`. `--host` accepts loopback IP addresses only. Repeat `--model`
+to expose more than one configured Agent SDK model alias.
+
+### Pi configuration
+
+Add this provider to `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "claude-subscription-local": {
+      "baseUrl": "http://127.0.0.1:8317/v1",
+      "api": "openai-completions",
+      "apiKey": "local-placeholder",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsStore": true,
+        "supportsUsageInStreaming": true,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "sonnet",
+          "name": "Claude subscription (local)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 200000,
+          "maxTokens": 16384,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+Start a new text-only Pi session with:
+
+```bash
+pi --provider claude-subscription-local --model sonnet --no-tools
+```
+
+The dummy API key is deliberately non-secret; the gateway ignores it and uses
+the operator's local Claude login. Do not configure sampling parameters,
+reasoning options, or tools. The Pi provider's normal `store: false` and
+streaming-usage fields are accepted.
+
+Most clients can use transcript matching without a custom header. A client that
+can set per-conversation headers may send a unique
+`X-Claude-Proxy-Session: <id>` to distinguish independent conversations that
+begin with identical text. Never configure one static value globally: that
+would collapse all conversations into one lineage.
+
+### Supported boundary
+
+- Supported: text-only streaming and non-streaming calls, exact system/user
+  strings, retries of completed requests, and append-only continuations that
+  originated through this running gateway.
+- Advisory only: `max_tokens` and `max_completion_tokens`; the Agent SDK does
+  not provide exact output-token enforcement through this path.
+- Unsupported: imported assistant histories, edits, branching, tools, exact
+  sampling/stop controls, public or multi-user service, and recovery of live
+  conversations after the gateway restarts.
+- Concurrency: one turn at a time per conversation. An in-flight duplicate or
+  continuation returns HTTP 409. A completed duplicate replays from memory.
+
+The real Pi provider integration suite uses actual Uvicorn and localhost HTTP
+but deterministic fake SDK sessions, so it never invokes a model:
+
+```bash
+.venv/bin/pytest -q --strict-markers --forbid-skips -W error tests/integration
+```
+
+The separately gated live test uses only a synthetic marker and never inspects
+credentials:
+
+```bash
+CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet \
+  .venv/bin/pytest -q --strict-markers -m live tests/live/test_gateway_text.py
+```
+
 Live subscription checks are opt-in and require `RUN_LIVE_CLAUDE_TESTS=1`.
 They must stop if the current policy evidence is absent, ambiguous, or negative.
 
