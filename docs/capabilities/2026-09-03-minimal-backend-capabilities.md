@@ -16,14 +16,15 @@ conversation. OpenAI Chat Completions and Anthropic Messages share the same
 strict transcript registry, while each dialect retains its own response and
 SSE framing.
 
-A black-box fixture imports Pi 0.84.4's real `openai-completions` provider and
-runs it through actual Uvicorn on a kernel-selected loopback port. The model is
-replaced only behind the gateway by deterministic fake SDK sessions. The
-fixture covers a linear continuation, a completed-request replay, an HTTP
-abort, and a mid-stream timeout. It also verifies that Pi sends its ordinary
-`store: false` and `stream_options: {"include_usage": true}` request fields.
-This is provider-wire compatibility evidence, not a claim that the current
-text gateway can run Pi's tools.
+A black-box fixture imports Pi 0.84.4's real `openai-completions` provider,
+calls its ordinary `streamSimple` path, and runs it through actual Uvicorn on a
+kernel-selected loopback port. The model is replaced only behind the gateway
+by deterministic fake SDK sessions. The fixture covers a linear continuation,
+a completed-request replay, an HTTP abort, and a mid-stream timeout. It also
+verifies Pi's `max_tokens`, `store: false`, and
+`stream_options: {"include_usage": true}` request fields and validates the
+final streamed usage mapping. This is provider-wire compatibility evidence,
+not a claim that the current text gateway can run Pi's tools.
 
 The live check is separately gated by both `CLAUDE_PROXY_LIVE=1` and a nonempty
 `CLAUDE_PROXY_LIVE_MODEL`. It sends a synthetic marker through two HTTP turns
@@ -53,6 +54,12 @@ Anthropic API clone:
 | Caller tools | Unsupported in this increment |
 | Restart recovery | Unsupported |
 | Public or multi-user service | Unsupported |
+
+Pi's automatic compaction and manual `/compact` rewrite the active transcript,
+so neither is compatible with the append-only registry. Pi 0.84.4 documents
+`compaction.enabled` (default `true`) in `settings.json`; set it to `false` for
+this provider and avoid `/compact`. Start a new session before the context
+window fills.
 
 Launch and Pi configuration are documented in
 [`docs/feasibility/README.md`](../feasibility/README.md). The original negative

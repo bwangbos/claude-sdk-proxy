@@ -75,7 +75,25 @@ pi --provider claude-subscription-local --model sonnet --no-tools
 The dummy API key is deliberately non-secret; the gateway ignores it and uses
 the operator's local Claude login. Do not configure sampling parameters,
 reasoning options, or tools. The Pi provider's normal `store: false` and
-streaming-usage fields are accepted.
+streaming-usage fields are accepted, as is the advisory `max_tokens` field
+added by Pi's ordinary `streamSimple` path.
+
+Pi 0.84.4 enables automatic context compaction by default, and `/compact`
+performs the same lossy history replacement manually. Both produce a rewritten
+transcript that this append-only gateway must reject. Add the following key to
+the existing `~/.pi/agent/settings.json`, or to `.pi/settings.json` for only the
+current project, and do not invoke `/compact` while using this provider:
+
+```json
+{
+  "compaction": {
+    "enabled": false
+  }
+}
+```
+
+Disabling auto-compaction does not make very long sessions unlimited; start a
+new Pi session before the model context is exhausted.
 
 Most clients can use transcript matching without a custom header. A client that
 can set per-conversation headers may send a unique
@@ -111,8 +129,18 @@ CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet \
   .venv/bin/pytest -q --strict-markers -m live tests/live/test_gateway_text.py
 ```
 
-Live subscription checks are opt-in and require `RUN_LIVE_CLAUDE_TESTS=1`.
-They must stop if the current policy evidence is absent, ambiguous, or negative.
+## Superseded legacy Phase 0 feasibility record
+
+Everything below this heading describes the earlier fail-closed probe design,
+its Agent SDK 0.2.148 pin, and its negative Phase 0 verdict. It is retained for
+audit history and is not the launch or verification contract for the current
+Agent SDK 0.2.152 text gateway above. In particular,
+`RUN_LIVE_CLAUDE_TESTS=1` is the legacy probe opt-in; current gateway live tests
+use `CLAUDE_PROXY_LIVE=1` plus `CLAUDE_PROXY_LIVE_MODEL`.
+
+Legacy live subscription checks are opt-in and require
+`RUN_LIVE_CLAUDE_TESTS=1`. They must stop if the legacy policy evidence is
+absent, ambiguous, or negative.
 
 ## Release policy
 

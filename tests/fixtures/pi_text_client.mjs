@@ -15,7 +15,7 @@ if (!["linear", "retry", "abort", "timeout"].includes(scenario)) {
 const moduleSpecifier = path.isAbsolute(moduleName)
   ? pathToFileURL(moduleName).href
   : moduleName;
-const { stream } = await import(moduleSpecifier);
+const { streamSimple } = await import(moduleSpecifier);
 
 const model = {
   id: "sonnet",
@@ -38,7 +38,7 @@ const model = {
 };
 
 const sessionId = `pi-${scenario}`;
-let requestsUsePiDefaults = true;
+const requestPayloads = [];
 
 function user(text) {
   return { role: "user", content: text, timestamp: Date.now() };
@@ -46,21 +46,21 @@ function user(text) {
 
 async function runTurn(context, { abortAfterText = false } = {}) {
   const controller = new AbortController();
-  const turn = { text: "", finishReason: null, error: null };
+  const turn = { text: "", finishReason: null, error: null, usage: null };
   let assistant = null;
-  const events = stream(model, context, {
+  const events = streamSimple(model, context, {
     apiKey: "local-placeholder",
     headers: { "X-Claude-Proxy-Session": sessionId },
     signal: controller.signal,
     maxRetries: 0,
     onPayload(payload) {
-      const valid =
-        payload?.stream === true &&
-        payload?.store === false &&
-        payload?.stream_options?.include_usage === true &&
-        payload?.temperature === undefined &&
-        payload?.reasoning_effort === undefined;
-      requestsUsePiDefaults &&= valid;
+      requestPayloads.push({
+        maxTokens: payload?.max_tokens,
+        store: payload?.store,
+        includeUsage: payload?.stream_options?.include_usage,
+        hasTemperature: payload?.temperature !== undefined,
+        hasReasoningEffort: payload?.reasoning_effort !== undefined,
+      });
     },
   });
 
@@ -74,6 +74,11 @@ async function runTurn(context, { abortAfterText = false } = {}) {
       } else if (event.type === "done") {
         turn.finishReason = event.reason;
         assistant = event.message;
+        turn.usage = {
+          input: event.message.usage.input,
+          output: event.message.usage.output,
+          totalTokens: event.message.usage.totalTokens,
+        };
       } else if (event.type === "error") {
         turn.finishReason = event.reason;
         turn.error = event.error.errorMessage || "provider stream error";
@@ -108,5 +113,5 @@ if (scenario === "linear") {
 }
 
 process.stdout.write(
-  JSON.stringify({ scenario, turns, requestsUsePiDefaults }) + "\n",
+  JSON.stringify({ scenario, turns, requestPayloads }) + "\n",
 );
