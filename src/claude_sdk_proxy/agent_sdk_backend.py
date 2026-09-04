@@ -6,6 +6,7 @@ from typing import Any, Protocol
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ProcessError,
     ResultMessage,
     StreamEvent,
     ToolUseBlock,
@@ -36,10 +37,7 @@ class QueryFn(Protocol):
 class AgentSdkBackend:
     def __init__(self, query_fn: QueryFn = query) -> None:
         self._query = query_fn
-
-    def build_options(
-        self, request: CanonicalRequest, cwd: Path
-    ) -> ClaudeAgentOptions:
+    def build_options(self, request: CanonicalRequest, cwd: Path) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
             model=request.model,
             system_prompt=request.system,
@@ -63,7 +61,6 @@ class AgentSdkBackend:
                 "no-session-persistence": None,
             },
         )
-
     def prompt_for(self, request: CanonicalRequest) -> str:
         if request.tools:
             raise UnsupportedFeature(
@@ -74,7 +71,6 @@ class AgentSdkBackend:
                 "messages", "public query input cannot replay assistant history"
             )
         return request.messages[0].content
-
     def structural_report(self) -> CapabilityReport:
         return CapabilityReport(
             backend="agent-sdk",
@@ -90,41 +86,48 @@ class AgentSdkBackend:
                 "caller tools would require proxy-executed MCP and are rejected",
             ),
         )
-
     async def stream(self, request: CanonicalRequest) -> AsyncIterator[BackendEvent]:
         prompt = self.prompt_for(request)
-        terminal_seen = False
+        failure: str | None = None
         completed: Completed | None = None
         with TemporaryDirectory(prefix="claude-proxy-") as directory:
             options = self.build_options(request, Path(directory))
-            async for message in self._query(prompt=prompt, options=options):
-                if terminal_seen:
-                    raise BackendFailure("Agent SDK message after result")
-                if isinstance(message, StreamEvent):
-                    event = message.event
-                    if event.get("type") != "content_block_delta":
-                        continue
-                    delta = event.get("delta")
-                    if not isinstance(delta, dict):
-                        raise BackendFailure("invalid Agent SDK delta")
-                    if delta.get("type") == "text_delta":
-                        text = delta.get("text")
-                        if not isinstance(text, str):
-                            raise BackendFailure("invalid Agent SDK text delta")
-                        yield TextDelta(text)
-                    elif delta.get("type") in {"input_json_delta", "tool_use"}:
+            try:
+                async for message in self._query(prompt=prompt, options=options):
+                    if completed is not None or failure is not None:
+                        if failure is not None:
+                            failure = "Agent SDK message after result"
+                            continue
+                        raise BackendFailure("Agent SDK message after result")
+                    if isinstance(message, StreamEvent):
+                        event = message.event
+                        if event.get("type") != "content_block_delta":
+                            continue
+                        delta = event.get("delta")
+                        if not isinstance(delta, dict):
+                            raise BackendFailure("invalid Agent SDK delta")
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text")
+                            if not isinstance(text, str):
+                                raise BackendFailure("invalid Agent SDK text delta")
+                            yield TextDelta(text)
+                        elif delta.get("type") in {"input_json_delta", "tool_use"}:
+                            raise UnsupportedFeature(
+                                "tools", "Claude built-in tool event"
+                            )
+                    elif isinstance(message, AssistantMessage) and any(
+                        isinstance(block, ToolUseBlock) for block in message.content
+                    ):
                         raise UnsupportedFeature("tools", "Claude built-in tool event")
-                elif isinstance(message, AssistantMessage) and any(
-                    isinstance(block, ToolUseBlock) for block in message.content
-                ):
-                    raise UnsupportedFeature("tools", "Claude built-in tool event")
-                elif isinstance(message, ResultMessage):
-                    if message.is_error:
-                        raise BackendFailure("Agent SDK query failed")
-                    terminal_seen = True
-                    completed = Completed(message.stop_reason, message.usage)
-            if not terminal_seen:
+                    elif isinstance(message, ResultMessage):
+                        if message.is_error:
+                            failure = "Agent SDK query failed"
+                        else:
+                            completed = Completed(message.stop_reason, message.usage)
+            except ProcessError:
+                raise BackendFailure(failure or "Agent SDK query failed") from None
+            if failure is not None:
+                raise BackendFailure(failure)
+            if completed is None:
                 raise BackendFailure("Agent SDK stream ended without result")
-        if completed is None:
-            raise BackendFailure("invalid Agent SDK result")
         yield completed

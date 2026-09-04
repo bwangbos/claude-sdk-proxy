@@ -6,6 +6,8 @@ from typing import Any
 import pytest
 from claude_agent_sdk import (
     AssistantMessage,
+    ProcessError,
+    ResultError,
     ResultMessage,
     StreamEvent,
     ToolUseBlock,
@@ -363,6 +365,128 @@ def test_stream_rejects_error_result() -> None:
 
     with pytest.raises(BackendFailure, match="Agent SDK query failed"):
         asyncio.run(consume())
+
+
+def test_stream_drains_error_result_before_raising() -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+    drained = False
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        nonlocal drained
+        del prompt, options
+        yield ResultMessage(
+            subtype="error_during_execution",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=True,
+            num_turns=1,
+            session_id="session-1",
+            stop_reason=None,
+            usage={"output_tokens": 0},
+        )
+        drained = True
+        raise ResultError(
+            "secret-bearing SDK failure",
+            data={"errors": ["secret-bearing SDK failure"]},
+            exit_code=1,
+        )
+
+    async def consume() -> None:
+        async for _ in AgentSdkBackend(fake_query).stream(request):
+            pass
+
+    with pytest.raises(BackendFailure) as error:
+        asyncio.run(consume())
+
+    assert str(error.value) == "Agent SDK query failed"
+    assert "secret-bearing" not in str(error.value)
+    assert drained is True
+
+
+@pytest.mark.parametrize(
+    "sdk_error",
+    [
+        ProcessError(
+            "secret-bearing process failure",
+            exit_code=1,
+            stderr="secret-bearing stderr",
+        ),
+        ResultError(
+            "secret-bearing result failure",
+            data={"errors": ["secret-bearing result failure"]},
+            exit_code=1,
+        ),
+    ],
+)
+def test_stream_redacts_sdk_process_failures(sdk_error: ProcessError) -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        del prompt, options
+        if False:
+            yield
+        raise sdk_error
+
+    async def consume() -> None:
+        async for _ in AgentSdkBackend(fake_query).stream(request):
+            pass
+
+    with pytest.raises(BackendFailure) as error:
+        asyncio.run(consume())
+
+    assert str(error.value) == "Agent SDK query failed"
+    assert "secret-bearing" not in str(error.value)
+
+
+def test_stream_drains_and_rejects_content_after_error_result() -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+    received: list[BackendEvent] = []
+    drained = False
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        nonlocal drained
+        del prompt, options
+        yield ResultMessage(
+            subtype="error_during_execution",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=True,
+            num_turns=1,
+            session_id="session-1",
+            stop_reason=None,
+            usage={"output_tokens": 0},
+        )
+        yield StreamEvent(
+            uuid="event-1",
+            session_id="session-1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "must-not-leak"},
+            },
+        )
+        drained = True
+
+    async def consume() -> None:
+        async for event in AgentSdkBackend(fake_query).stream(request):
+            received.append(event)
+
+    with pytest.raises(BackendFailure, match="after result"):
+        asyncio.run(consume())
+
+    assert received == []
+    assert drained is True
 
 
 def test_stream_rejects_missing_result() -> None:
