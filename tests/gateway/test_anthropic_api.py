@@ -228,6 +228,30 @@ def test_anthropic_response_maps_max_tokens_and_invalid_usage_to_zero() -> None:
     assert response["usage"] == {"input_tokens": 0, "output_tokens": 0}
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ("end_turn", "max_tokens", "refusal", "model_context_window_exceeded"),
+)
+def test_anthropic_preserves_each_terminal_reason_in_both_modes(reason: str) -> None:
+    completed = Completed(reason, {"input_tokens": 2, "output_tokens": 1})
+
+    response = render_anthropic_response("msg_test", "sonnet", "text", completed)
+    chunks = encode_anthropic_event("msg_test", "sonnet", completed)
+
+    assert response["stop_reason"] == reason
+    assert payload(chunks[1])["delta"]["stop_reason"] == reason
+
+
+@pytest.mark.parametrize("reason", [None, "future_reason"])
+def test_anthropic_rejects_unknown_terminal_reason(reason: str | None) -> None:
+    completed = Completed(reason, None)
+
+    with pytest.raises(ValueError, match="stop reason"):
+        render_anthropic_response("msg_test", "sonnet", "text", completed)
+    with pytest.raises(ValueError, match="stop reason"):
+        encode_anthropic_event("msg_test", "sonnet", completed)
+
+
 def test_anthropic_error_has_event_envelope() -> None:
     chunks = encode_anthropic_error("backend_error", "unavailable")
     assert event_name(chunks[0]) == "error"

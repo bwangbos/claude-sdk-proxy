@@ -102,6 +102,7 @@ def test_structural_report_does_not_claim_unverified_capabilities() -> None:
     assert report.structured_tools == "fail"
     assert report.single_turn_text_viable is False
     assert report.evidence == (
+        "Historical one-shot comparator; not the persistent claude-proxy gateway",
         "ClaudeAgentOptions disables built-ins and ambient sources",
         "query accepts string or user-message iterable; "
         "assistant replay is not claimed",

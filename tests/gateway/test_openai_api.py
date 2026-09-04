@@ -278,6 +278,41 @@ def test_openai_response_preserves_unicode_whitespace_and_zeroes_bad_usage() -> 
     }
 
 
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("end_turn", "stop"),
+        ("max_tokens", "length"),
+        ("refusal", "content_filter"),
+        ("model_context_window_exceeded", "length"),
+    ],
+)
+def test_openai_maps_each_terminal_reason_in_both_modes(
+    reason: str, expected: str
+) -> None:
+    completed = Completed(reason, {"input_tokens": 2, "output_tokens": 1})
+
+    response = render_openai_response("chatcmpl_test", "sonnet", "text", completed)
+    chunks = encode_openai_event(
+        "chatcmpl_test", "sonnet", completed, include_usage=False
+    )
+
+    assert response["choices"][0]["finish_reason"] == expected
+    assert payload(chunks[0])["choices"][0]["finish_reason"] == expected
+
+
+@pytest.mark.parametrize("reason", [None, "future_reason"])
+def test_openai_rejects_unknown_terminal_reason(reason: str | None) -> None:
+    completed = Completed(reason, None)
+
+    with pytest.raises(ValueError, match="stop reason"):
+        render_openai_response("chatcmpl_test", "sonnet", "text", completed)
+    with pytest.raises(ValueError, match="stop reason"):
+        encode_openai_event(
+            "chatcmpl_test", "sonnet", completed, include_usage=False
+        )
+
+
 def test_openai_error_ends_the_stream() -> None:
     chunks = encode_openai_error("backend_error", "unavailable")
     assert payload(chunks[0]) == {

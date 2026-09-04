@@ -31,6 +31,7 @@ from tests.gateway.fakes import (
     FakeSdkClient,
     FakeSessionFactory,
     FixedTemporaryDirectory,
+    raw_text_events,
 )
 
 
@@ -112,6 +113,30 @@ class BlockingStartFailingCloseSession(FailingCloseSession):
     async def start(self) -> None:
         self.start_entered.set()
         await asyncio.Event().wait()
+
+
+class WedgedCloseSession(BlockingStreamSession):
+    def __init__(self, *, block_start: bool = False) -> None:
+        super().__init__()
+        self.block_start = block_start
+        self.close_entered = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_cancellations = 0
+
+    async def start(self) -> None:
+        self.start_count += 1
+        if self.block_start:
+            self.entered.set()
+            await asyncio.Event().wait()
+
+    async def close(self) -> None:
+        self.close_count += 1
+        self.close_entered.set()
+        while not self.close_release.is_set():
+            try:
+                await self.close_release.wait()
+            except asyncio.CancelledError:
+                self.close_cancellations += 1
 
 
 class SequentialSession(FakeConversationSession):
@@ -670,6 +695,76 @@ async def test_cancelling_asgi_response_aborts_active_turn_immediately() -> None
 
 
 @pytest.mark.anyio
+async def test_request_cancellation_does_not_wait_for_wedged_close() -> None:
+    session = WedgedCloseSession()
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        response_task = asyncio.create_task(
+            post_json(app, "/v1/chat/completions", openai_body(stream=True))
+        )
+        await session.entered.wait()
+        response_task.cancel()
+        try:
+            done, _ = await asyncio.wait({response_task}, timeout=0.05)
+            assert response_task in done
+        finally:
+            session.close_release.set()
+            await asyncio.gather(response_task, return_exceptions=True)
+
+    assert session.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_request_timeout_does_not_wait_for_wedged_close() -> None:
+    session = WedgedCloseSession(block_start=True)
+    app = create_app(
+        models=("sonnet",),
+        session_factory=one_session_factory(session),
+        turn_timeout_seconds=0.01,
+    )
+    async with lifespan_app(app):
+        response_task = asyncio.create_task(
+            post_json(app, "/v1/chat/completions", openai_body())
+        )
+        await session.close_entered.wait()
+        try:
+            done, _ = await asyncio.wait({response_task}, timeout=0.05)
+            assert response_task in done
+        finally:
+            session.close_release.set()
+        response = await response_task
+
+    assert response.status == 504
+    assert session.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_lifespan_shutdown_bounds_wedged_close_aggregate() -> None:
+    session = WedgedCloseSession()
+    app = create_app(
+        models=("sonnet",),
+        session_factory=one_session_factory(session),
+        teardown_timeout_seconds=0.01,
+    )
+    lifespan = lifespan_app(app)
+    await lifespan.__aenter__()
+    session.release.set()
+    response = await post_json(app, "/v1/chat/completions", openai_body())
+    assert response.status == 200
+
+    shutdown = asyncio.create_task(lifespan.__aexit__(None, None, None))
+    try:
+        await session.close_entered.wait()
+        done, _ = await asyncio.wait({shutdown}, timeout=0.05)
+        assert shutdown in done
+    finally:
+        session.close_release.set()
+        await asyncio.gather(shutdown, return_exceptions=True)
+
+    assert session.close_cancellations == 1
+
+
+@pytest.mark.anyio
 async def test_external_cancellation_is_not_masked_when_backend_close_fails() -> None:
     session = FailingCloseSession()
     app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
@@ -865,8 +960,9 @@ async def test_backend_task_message_is_redacted_http_502(tmp_path) -> None:
 @pytest.mark.anyio
 async def test_backend_reset_message_is_redacted_sse_error(tmp_path) -> None:
     reset = ConversationResetMessage("new-secret", "reset-1", "sdk-1")
+    raw = raw_text_events("answer", "sdk-1")
     client = FakeSdkClient(
-        responses=((text_event_for_app(), reset, result_message_for_app()),)
+        responses=((raw[0], raw[1], raw[2], reset, result_message_for_app()),)
     )
     app = sdk_app(tmp_path, client)
 
@@ -877,6 +973,48 @@ async def test_backend_reset_message_is_redacted_sse_error(tmp_path) -> None:
 
     assert response.status == 200
     assert b'"type":"backend_error"' in response.body
+    assert b"secret" not in response.body
+
+
+@pytest.mark.anyio
+async def test_unknown_raw_event_is_redacted_http_502(tmp_path) -> None:
+    unknown = StreamEvent(
+        uuid="event-secret",
+        session_id="sdk-1",
+        event={"type": "future_secret_event", "payload": "secret-payload"},
+    )
+    client = FakeSdkClient(responses=((unknown, result_message_for_app()),))
+    app = sdk_app(tmp_path, client)
+
+    async with lifespan_app(app):
+        response = await post_json(app, "/v1/chat/completions", openai_body())
+
+    assert response.status == 502
+    assert response.json["error"]["code"] == "backend_error"
+    assert b"secret" not in response.body
+
+
+@pytest.mark.anyio
+async def test_unknown_raw_event_after_text_is_redacted_sse_error(tmp_path) -> None:
+    unknown = StreamEvent(
+        uuid="event-secret",
+        session_id="sdk-1",
+        event={"type": "future_secret_event", "payload": "secret-payload"},
+    )
+    raw = raw_text_events("answer", "sdk-1")
+    client = FakeSdkClient(
+        responses=((raw[0], raw[1], raw[2], unknown, result_message_for_app()),)
+    )
+    app = sdk_app(tmp_path, client)
+
+    async with lifespan_app(app):
+        response = await post_json(
+            app, "/v1/chat/completions", openai_body(stream=True)
+        )
+
+    assert response.status == 200
+    assert b'"type":"backend_error"' in response.body
+    assert response.body.endswith(b"data: [DONE]\n\n")
     assert b"secret" not in response.body
 
 
@@ -905,3 +1043,51 @@ async def test_streaming_completed_response_can_be_replayed_after_send() -> None
     assert first_records[-1] == replay_records[-1] == b"data: [DONE]"
     assert factory.created == 1
     assert factory.sessions[0].prompts == ["hello"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("path", "body", "error_path"),
+    [
+        ("/v1/chat/completions", openai_body("second"), ("error", "code")),
+        ("/v1/messages", anthropic_body("second"), ("error", "type")),
+    ],
+)
+async def test_all_busy_capacity_is_stable_redacted_503(
+    path: str, body: dict[str, object], error_path: tuple[str, str]
+) -> None:
+    session = BlockingStreamSession()
+    app = create_app(
+        models=("sonnet",),
+        session_factory=one_session_factory(session),
+        max_sessions=1,
+    )
+    async with lifespan_app(app):
+        active = asyncio.create_task(
+            post_json(
+                app,
+                "/v1/chat/completions",
+                openai_body("first", stream=True),
+                {"X-Claude-Proxy-Session": "busy"},
+            )
+        )
+        await session.entered.wait()
+        response = await post_json(
+            app, path, body, {"X-Claude-Proxy-Session": "second"}
+        )
+        session.release.set()
+        await active
+
+    assert response.status == 503
+    assert response.json[error_path[0]][error_path[1]] == "session_capacity"
+    assert b"secret" not in response.body
+
+
+@pytest.mark.parametrize("max_sessions", [0, -1])
+def test_app_rejects_nonpositive_session_capacity(max_sessions: int) -> None:
+    with pytest.raises(ValueError, match="max sessions"):
+        create_app(
+            models=("sonnet",),
+            session_factory=FakeSessionFactory(()),
+            max_sessions=max_sessions,
+        )

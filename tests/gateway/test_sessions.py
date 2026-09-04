@@ -13,10 +13,12 @@ from claude_sdk_proxy.domain import (
     TextRequest,
 )
 from claude_sdk_proxy.sessions import (
+    SessionCapacity,
     SessionConflict,
     SessionMismatch,
     SessionRegistry,
     SessionTimeout,
+    TurnLease,
 )
 from tests.gateway.fakes import FakeConversationSession, FakeSessionFactory
 
@@ -663,3 +665,93 @@ async def test_registry_close_disconnects_every_retained_backend() -> None:
     await registry.close()
 
     assert [session.close_count for session in factory.sessions] == [1, 1]
+
+
+@pytest.mark.anyio
+async def test_capacity_evicts_lru_idle_across_explicit_and_implicit() -> None:
+    factory = FakeSessionFactory(outputs=("explicit", "implicit", "fresh"))
+    registry = SessionRegistry(factory, max_sessions=2)
+    explicit_request = first_request("explicit")
+    implicit_request = first_request("implicit")
+    explicit = await registry.open_turn(explicit_request, explicit_id="explicit")
+    implicit = await registry.open_turn(implicit_request, explicit_id=None)
+    await collect(explicit.stream())
+    await collect(implicit.stream())
+
+    replay = await registry.open_turn(explicit_request, explicit_id="explicit")
+    await collect(replay.stream())
+    fresh = await registry.open_turn(first_request("fresh"), explicit_id="fresh")
+    await asyncio.sleep(0)
+
+    assert factory.sessions[0].close_count == 0
+    assert factory.sessions[1].close_count == 1
+    assert factory.created == 3
+    await fresh.abort()
+
+
+@pytest.mark.anyio
+async def test_capacity_never_evicts_active_or_replay_reserved_sessions() -> None:
+    factory = FakeSessionFactory(outputs=("one", "two"))
+    registry = SessionRegistry(factory, max_sessions=2)
+    replay_request = first_request("one")
+    original = await registry.open_turn(replay_request, explicit_id="one")
+    await collect(original.stream())
+    replay = await registry.open_turn(replay_request, explicit_id="one")
+    active = await registry.open_turn(first_request("two"), explicit_id="two")
+
+    with pytest.raises(SessionCapacity, match="capacity"):
+        await registry.open_turn(first_request("three"), explicit_id="three")
+
+    assert factory.created == 2
+    assert [session.close_count for session in factory.sessions] == [0, 0]
+    await replay.abort()
+    await active.abort()
+
+
+@pytest.mark.anyio
+async def test_capacity_serializes_eviction_and_concurrent_fresh_admission() -> None:
+    factory = FakeSessionFactory(outputs=("old", "winner"))
+    registry = SessionRegistry(factory, max_sessions=1)
+    old = await registry.open_turn(first_request("old"), explicit_id="old")
+    await collect(old.stream())
+
+    results = await asyncio.gather(
+        registry.open_turn(first_request("one"), explicit_id="one"),
+        registry.open_turn(first_request("two"), explicit_id="two"),
+        return_exceptions=True,
+    )
+    leases = [result for result in results if isinstance(result, TurnLease)]
+    failures = [result for result in results if isinstance(result, SessionCapacity)]
+    await asyncio.sleep(0)
+
+    assert len(leases) == len(failures) == 1
+    assert factory.created == 2
+    assert factory.sessions[0].close_count == 1
+    await leases[0].abort()
+
+
+@pytest.mark.anyio
+async def test_only_current_completed_head_remains_replayable() -> None:
+    factory = FakeSessionFactory(outputs=("one", "two"))
+    registry = SessionRegistry(factory)
+    first_request_head = first_request("first")
+    first = await registry.open_turn(first_request_head, explicit_id="lineage")
+    await collect(first.stream())
+    current_request_head = continuation_request("first", "one", "second")
+    continuation = await registry.open_turn(
+        current_request_head, explicit_id="lineage"
+    )
+    expected = await collect(continuation.stream())
+
+    with pytest.raises(SessionMismatch, match="transcript"):
+        await registry.open_turn(first_request_head, explicit_id="lineage")
+    replay = await registry.open_turn(current_request_head, explicit_id="lineage")
+
+    assert await collect(replay.stream()) == expected
+    assert factory.sessions[0].prompts == ["first", "second"]
+
+
+@pytest.mark.parametrize("max_sessions", [0, -1])
+def test_session_capacity_must_be_positive(max_sessions: int) -> None:
+    with pytest.raises(ValueError, match="max sessions"):
+        SessionRegistry(FakeSessionFactory(()), max_sessions=max_sessions)

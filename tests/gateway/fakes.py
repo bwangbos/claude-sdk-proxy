@@ -4,7 +4,13 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, StreamEvent
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    StreamEvent,
+    TextBlock,
+)
 
 from claude_sdk_proxy.domain import Completed, ConversationEvent, TextDelta
 
@@ -52,16 +58,78 @@ class FakeSdkClient:
         self.disconnect_count += 1
 
 
-def sdk_response(text: str, session_id: str) -> tuple[StreamEvent | ResultMessage, ...]:
+def raw_text_events(
+    text: str,
+    session_id: str,
+    *,
+    input_tokens: int = 2,
+    output_tokens: int = 1,
+    stop_reason: str = "end_turn",
+) -> tuple[StreamEvent, ...]:
     return (
         StreamEvent(
-            uuid="event-1",
+            uuid="event-start",
+            session_id=session_id,
+            event={
+                "type": "message_start",
+                "message": {
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+                },
+            },
+        ),
+        StreamEvent(
+            uuid="event-block-start",
+            session_id=session_id,
+            event={
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        ),
+        StreamEvent(
+            uuid="event-delta",
             session_id=session_id,
             event={
                 "type": "content_block_delta",
+                "index": 0,
                 "delta": {"type": "text_delta", "text": text},
             },
         ),
+        StreamEvent(
+            uuid="event-block-stop",
+            session_id=session_id,
+            event={"type": "content_block_stop", "index": 0},
+        ),
+        StreamEvent(
+            uuid="event-message-delta",
+            session_id=session_id,
+            event={
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": None,
+                    "stop_details": None,
+                },
+                "usage": {"output_tokens": output_tokens},
+                "context_management": {"applied_edits": []},
+            },
+        ),
+        StreamEvent(
+            uuid="event-message-stop",
+            session_id=session_id,
+            event={"type": "message_stop"},
+        ),
+    )
+
+
+def sdk_response(
+    text: str, session_id: str
+) -> tuple[StreamEvent | AssistantMessage | ResultMessage, ...]:
+    raw = raw_text_events(text, session_id)
+    return (
+        *raw[:3],
+        AssistantMessage([TextBlock(text)], "sonnet", session_id=session_id),
+        *raw[3:],
         ResultMessage(
             subtype="success",
             duration_ms=0,

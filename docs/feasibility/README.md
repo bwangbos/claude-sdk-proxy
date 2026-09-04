@@ -1,11 +1,15 @@
-# Feasibility probes
+# Claude Agent SDK text gateway and historical probes
 
-This package records fail-closed evidence for the trusted-local Claude Agent SDK
-feasibility checks. Release evidence must run with:
+This package ships a private localhost text gateway and retains the earlier
+trusted-local feasibility probes as historical comparator evidence. The
+authoritative offline release gate, including the real Pi provider integration,
+is:
 
 ```console
-uv run pytest --strict-markers --forbid-skips -W error
+make release-offline
 ```
+
+Live subscription checks remain separately opt-in.
 
 ## Current runnable text gateway
 
@@ -25,7 +29,8 @@ uv run claude-proxy --model sonnet
 The server listens at `http://127.0.0.1:8317`. It exposes
 `POST /v1/chat/completions`, `POST /v1/messages`, `GET /v1/models`, and
 `GET /health`. `--host` accepts loopback IP addresses only. Repeat `--model`
-to expose more than one configured Agent SDK model alias. Both POST endpoints
+to expose more than one configured Agent SDK model alias. `--max-sessions`
+sets the positive retained-session limit and defaults to 8. Both POST endpoints
 require `Content-Type: application/json`; normal media-type parameters such as
 `charset=utf-8` are accepted.
 
@@ -113,8 +118,19 @@ would collapse all conversations into one lineage.
 - Unsupported: imported assistant histories, edits, branching, tools, exact
   sampling/stop controls, public or multi-user service, and recovery of live
   conversations after the gateway restarts.
-- Concurrency: one turn at a time per conversation. An in-flight duplicate or
-  continuation returns HTTP 409. A completed duplicate replays from memory.
+- Capacity: at most 8 sessions are retained by default. Fresh admission at the
+  limit evicts the least-recently-used idle session. In-flight and
+  replay-reserved sessions are never evicted; if all retained sessions are busy,
+  both dialects return HTTP 503 with `session_capacity`.
+- Concurrency and replay: one turn at a time per conversation. An in-flight
+  duplicate or continuation returns HTTP 409. Only the current completed
+  transcript head replays from memory; an older head may return
+  `session_mismatch` after a successful continuation.
+- Terminal reasons: Anthropic preserves `end_turn`, `max_tokens`, `refusal`, and
+  `model_context_window_exceeded`. OpenAI maps them to `stop`, `length`,
+  `content_filter`, and `length`, respectively. Chat Completions has no distinct
+  context-window reason, so context exhaustion deliberately uses its truncation
+  signal.
 
 The real Pi provider integration suite uses actual Uvicorn and localhost HTTP
 but deterministic fake SDK sessions, so it never invokes a model:
@@ -122,6 +138,9 @@ but deterministic fake SDK sessions, so it never invokes a model:
 ```bash
 .venv/bin/pytest -q --strict-markers --forbid-skips -W error tests/integration
 ```
+
+It is included in `make release-offline`, which is the authoritative offline
+release gate. `make check` remains the faster development gate.
 
 The separately gated live test uses only a synthetic marker and never inspects
 credentials:

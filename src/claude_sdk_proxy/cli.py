@@ -16,11 +16,19 @@ def _port(value: str) -> int:
     return port
 
 
+def _positive(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return number
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Private localhost Claude gateway")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=_port, default=8317)
     parser.add_argument("--model", action="append")
+    parser.add_argument("--max-sessions", type=_positive, default=8)
     return parser
 
 
@@ -35,7 +43,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--host must be a loopback IP address")
     models = tuple(args.model or ("sonnet",))
     try:
-        app = create_app(models=models)
+        app = create_app(models=models, max_sessions=args.max_sessions)
     except ValueError as error:
         parser.error(str(error))
     uvicorn.run(app, host=str(host), port=args.port)

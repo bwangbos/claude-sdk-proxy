@@ -5,7 +5,7 @@ CLANG := $(shell xcrun --find clang)
 SDKROOT := $(shell xcrun --show-sdk-path)
 C17_FLAGS := -std=c17 -Wall -Wextra -Werror -pedantic
 
-.PHONY: native unit darwin gateway live-core live-tools check
+.PHONY: native unit darwin gateway integration release-offline live-core live-tools check
 
 native: build/bin/darwin-probe build/lib/libclaude_proxy_lifecycle.dylib build/lib/libclaude_proxy_lifecycle_fault.dylib build/bin/claude-proxy-supervisor build/bin/claude-proxy-supervisor-probe build/bin/claude-proxy-anchor build/bin/claude-proxy-probe-child build/bin/claude-proxy-task6-test-cli
 
@@ -47,6 +47,13 @@ darwin: native
 
 gateway:
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/gateway
+
+integration:
+	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/integration
+
+release-offline: unit darwin gateway integration
+	uv run ruff check .
+	uv run mypy src/claude_sdk_proxy
 
 live-core:
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/live -m live

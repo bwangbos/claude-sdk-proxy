@@ -145,7 +145,16 @@ def encode_anthropic_error(code: str, message: str) -> tuple[bytes, ...]:
 
 
 def _anthropic_stop_reason(reason: str | None) -> str:
-    return "end_turn" if reason in {None, "end_turn"} else "max_tokens"
+    allowed = {
+        "end_turn": "end_turn",
+        "max_tokens": "max_tokens",
+        "refusal": "refusal",
+        "model_context_window_exceeded": "model_context_window_exceeded",
+    }
+    try:
+        return allowed[reason]  # type: ignore[index]
+    except KeyError:
+        raise ValueError("unsupported stop reason") from None
 
 
 def _anthropic_usage(usage: Mapping[str, Any] | None) -> dict[str, int]:

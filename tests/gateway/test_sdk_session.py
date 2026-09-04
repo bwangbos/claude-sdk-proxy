@@ -18,14 +18,20 @@ from claude_agent_sdk import (
     SystemMessage,
     TaskStartedMessage,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
 )
 
-from claude_sdk_proxy.domain import BackendFailure, Completed, TextDelta
+from claude_sdk_proxy.domain import BackendFailure, Completed, InputUsage, TextDelta
 from claude_sdk_proxy.sdk_session import SdkSession
-from tests.gateway.fakes import FakeSdkClient, FixedTemporaryDirectory, sdk_response
+from tests.gateway.fakes import (
+    FakeSdkClient,
+    FixedTemporaryDirectory,
+    raw_text_events,
+    sdk_response,
+)
 
 
 @pytest.mark.anyio
@@ -48,8 +54,16 @@ async def test_sdk_session_reuses_one_client_for_two_turns(tmp_path: Path) -> No
     second = [event async for event in session.stream_turn("second")]
     await session.close()
 
-    assert first == [TextDelta("one"), Completed("end_turn", {"output_tokens": 1})]
-    assert second == [TextDelta("two"), Completed("end_turn", {"output_tokens": 1})]
+    assert first == [
+        InputUsage(2),
+        TextDelta("one"),
+        Completed("end_turn", {"output_tokens": 1}),
+    ]
+    assert second == [
+        InputUsage(2),
+        TextDelta("two"),
+        Completed("end_turn", {"output_tokens": 1}),
+    ]
     assert client.connect_count == 1
     assert client.prompts == ["first", "second"]
     assert client.disconnect_count == 1
@@ -269,13 +283,92 @@ async def collect_sdk_response(
 
 
 @pytest.mark.anyio
+async def test_sdk_session_accepts_only_complete_ordered_raw_text_sequence(
+    tmp_path: Path,
+) -> None:
+    messages = (*raw_text_events("answer", "sdk-1"), result_message())
+
+    events = await collect_sdk_response(tmp_path, messages)
+
+    assert events == [
+        InputUsage(2),
+        TextDelta("answer"),
+        Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
+    ]
+
+
+@pytest.mark.anyio
+async def test_sdk_session_accepts_observed_complete_assistant_placement(
+    tmp_path: Path,
+) -> None:
+    raw = raw_text_events("answer", "sdk-1")
+    assistant = AssistantMessage(
+        [TextBlock("answer")], "sonnet", session_id="sdk-1"
+    )
+    messages = (*raw[:3], assistant, *raw[3:], result_message())
+
+    events = await collect_sdk_response(tmp_path, messages)
+
+    assert events == [
+        InputUsage(2),
+        TextDelta("answer"),
+        Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
+    ]
+
+
+@pytest.mark.anyio
+async def test_sdk_session_rejects_unknown_raw_event_without_leaking_it(
+    tmp_path: Path,
+) -> None:
+    unknown = StreamEvent(
+        uuid="event-secret",
+        session_id="sdk-1",
+        event={"type": "future_secret_event", "payload": "secret-payload"},
+    )
+
+    with pytest.raises(BackendFailure, match="protocol") as error:
+        await collect_sdk_response(tmp_path, (unknown, result_message()))
+
+    assert "secret" not in str(error.value)
+
+
+@pytest.mark.anyio
+async def test_sdk_session_rejects_raw_text_delta_before_block_start(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(BackendFailure, match="protocol"):
+        await collect_sdk_response(tmp_path, (text_event(), result_message()))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "content",
+    [
+        [ThinkingBlock("secret-thought", "secret-signature")],
+        "secret-not-a-list",
+        [object()],
+    ],
+)
+async def test_sdk_session_requires_every_assistant_block_to_be_exact_text(
+    tmp_path: Path, content: object
+) -> None:
+    assistant = AssistantMessage(content, "sonnet")  # type: ignore[arg-type]
+
+    with pytest.raises(BackendFailure, match="protocol") as error:
+        await collect_sdk_response(tmp_path, (assistant, result_message()))
+
+    assert "secret" not in str(error.value)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("is_error", [None, 0, ""])
 async def test_sdk_session_requires_exact_false_success_flag(
     tmp_path: Path, is_error: object
 ) -> None:
     with pytest.raises(BackendFailure, match="protocol") as error:
         await collect_sdk_response(
-            tmp_path, (text_event(), result_message(is_error=is_error))
+            tmp_path,
+            (*raw_text_events("answer", "sdk-1"), result_message(is_error=is_error)),
         )
     assert repr(is_error) not in str(error.value)
 
@@ -295,7 +388,8 @@ async def test_sdk_session_rejects_malformed_used_usage_counters(
 ) -> None:
     with pytest.raises(BackendFailure, match="protocol") as error:
         await collect_sdk_response(
-            tmp_path, (text_event(), result_message(usage=usage))
+            tmp_path,
+            (*raw_text_events("answer", "sdk-1"), result_message(usage=usage)),
         )
     assert "secret-usage" not in str(error.value)
 
@@ -307,7 +401,11 @@ async def test_sdk_session_rejects_non_text_stop_reasons(
 ) -> None:
     with pytest.raises(BackendFailure, match="protocol") as error:
         await collect_sdk_response(
-            tmp_path, (text_event(), result_message(stop_reason=stop_reason))
+            tmp_path,
+            (
+                *raw_text_events("answer", "sdk-1"),
+                result_message(stop_reason=stop_reason),
+            ),
         )
     assert "tool_use" not in str(error.value)
 
@@ -318,7 +416,10 @@ async def test_sdk_session_rejects_deferred_tool_result_state(tmp_path: Path) ->
     with pytest.raises(BackendFailure, match="protocol") as error:
         await collect_sdk_response(
             tmp_path,
-            (text_event(), result_message(deferred_tool_use=deferred)),
+            (
+                *raw_text_events("answer", "sdk-1"),
+                result_message(deferred_tool_use=deferred),
+            ),
         )
     assert "tool-secret" not in str(error.value)
 
@@ -328,7 +429,10 @@ async def test_sdk_session_rejects_deferred_tool_result_state(tmp_path: Path) ->
     "messages",
     [
         (text_event(parent_tool_use_id="tool-secret"), result_message()),
-        (text_event(), result_message(session_id="sdk-other-secret")),
+        (
+            *raw_text_events("answer", "sdk-1"),
+            result_message(session_id="sdk-other-secret"),
+        ),
         (text_event(session_id=""), result_message()),
     ],
 )
@@ -361,7 +465,7 @@ async def test_sdk_session_rejects_injected_result_origin(tmp_path: Path) -> Non
         await collect_sdk_response(
             tmp_path,
             (
-                text_event(),
+                *raw_text_events("answer", "sdk-1"),
                 result_message(origin={"kind": "task-notification"}),
             ),
         )
@@ -371,7 +475,11 @@ async def test_sdk_session_rejects_injected_result_origin(tmp_path: Path) -> Non
 async def test_sdk_session_rejects_non_success_result_subtype(tmp_path: Path) -> None:
     with pytest.raises(BackendFailure, match="protocol"):
         await collect_sdk_response(
-            tmp_path, (text_event(), result_message(subtype="secret-subtype"))
+            tmp_path,
+            (
+                *raw_text_events("answer", "sdk-1"),
+                result_message(subtype="secret-subtype"),
+            ),
         )
 
 
@@ -382,7 +490,7 @@ async def test_sdk_session_normalizes_only_gateway_usage_counters(
     events = await collect_sdk_response(
         tmp_path,
         (
-            text_event(),
+            *raw_text_events("answer", "sdk-1"),
             result_message(
                 usage={
                     "input_tokens": 2,
@@ -394,6 +502,7 @@ async def test_sdk_session_normalizes_only_gateway_usage_counters(
         ),
     )
     assert events == [
+        InputUsage(2),
         TextDelta("answer"),
         Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
     ]
@@ -403,21 +512,11 @@ async def test_sdk_session_normalizes_only_gateway_usage_counters(
 async def test_sdk_session_emits_message_start_input_usage_before_text(
     tmp_path: Path,
 ) -> None:
-    from claude_sdk_proxy.domain import InputUsage
-
-    start = StreamEvent(
-        uuid="event-start",
-        session_id="sdk-1",
-        event={
-            "type": "message_start",
-            "message": {"usage": {"input_tokens": 7, "output_tokens": 0}},
-        },
-    )
+    raw = raw_text_events("answer", "sdk-1", input_tokens=7)
     events = await collect_sdk_response(
         tmp_path,
         (
-            start,
-            text_event(),
+            *raw,
             result_message(usage={"input_tokens": 7, "output_tokens": 1}),
         ),
     )
@@ -443,7 +542,7 @@ async def test_sdk_session_rejects_malformed_message_start_usage(
     )
     with pytest.raises(BackendFailure, match="protocol") as error:
         await collect_sdk_response(
-            tmp_path, (start, text_event(), result_message())
+            tmp_path, (start, *raw_text_events("answer", "sdk-1")[1:], result_message())
         )
     assert "secret-usage" not in str(error.value)
 
@@ -463,7 +562,11 @@ async def test_sdk_session_rejects_start_and_result_input_usage_mismatch(
     with pytest.raises(BackendFailure, match="protocol"):
         await collect_sdk_response(
             tmp_path,
-            (start, text_event(), result_message(usage={"input_tokens": 8})),
+            (
+                start,
+                *raw_text_events("answer", "sdk-1")[1:],
+                result_message(usage={"input_tokens": 8, "output_tokens": 1}),
+            ),
         )
 
 
@@ -471,9 +574,9 @@ async def test_sdk_session_rejects_start_and_result_input_usage_mismatch(
 async def test_sdk_session_requires_same_identity_across_turns(tmp_path: Path) -> None:
     client = FakeSdkClient(
         responses=(
-            (text_event(), result_message()),
+            (*raw_text_events("answer", "sdk-1"), result_message()),
             (
-                text_event(session_id="sdk-other"),
+                *raw_text_events("answer", "sdk-other"),
                 result_message(session_id="sdk-other"),
             ),
         )
@@ -500,7 +603,11 @@ async def test_sdk_session_accepts_legitimate_text_stop_reasons(
     tmp_path: Path, stop_reason: str
 ) -> None:
     events = await collect_sdk_response(
-        tmp_path, (text_event(), result_message(stop_reason=stop_reason))
+        tmp_path,
+        (
+            *raw_text_events("answer", "sdk-1", stop_reason=stop_reason),
+            result_message(stop_reason=stop_reason),
+        ),
     )
     assert events[-1] == Completed(
         stop_reason, {"input_tokens": 2, "output_tokens": 1}
@@ -549,12 +656,13 @@ async def test_sdk_session_allows_live_system_and_rate_messages(tmp_path: Path) 
         (
             live_system("init"),
             live_system("status"),
-            text_event(),
+            *raw_text_events("answer", "sdk-1"),
             live_rate_limit(),
             result_message(),
         ),
     )
     assert events == [
+        InputUsage(2),
         TextDelta("answer"),
         Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
     ]

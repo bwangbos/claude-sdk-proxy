@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -37,8 +35,8 @@ from claude_sdk_proxy.domain import (
     SdkSessionFactory,
     TextDelta,
     TextRequest,
-    UnsupportedFeature,
 )
+from claude_sdk_proxy.http_errors import error_detail, error_response
 from claude_sdk_proxy.openai_api import (
     encode_openai_error,
     encode_openai_event,
@@ -47,21 +45,7 @@ from claude_sdk_proxy.openai_api import (
     render_openai_response,
 )
 from claude_sdk_proxy.sdk_session import SdkSession
-from claude_sdk_proxy.sessions import (
-    SessionConflict,
-    SessionMismatch,
-    SessionRegistry,
-    SessionTimeout,
-    TurnLease,
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _Error:
-    status: int
-    code: str
-    message: str
-    param: str | None = None
+from claude_sdk_proxy.sessions import SessionRegistry, TurnLease
 
 
 def create_app(
@@ -69,7 +53,11 @@ def create_app(
     models: tuple[str, ...],
     session_factory: SdkSessionFactory = SdkSession,
     turn_timeout_seconds: float = 300.0,
+    teardown_timeout_seconds: float = 5.0,
+    max_sessions: int = 8,
 ) -> Starlette:
+    if max_sessions <= 0:
+        raise ValueError("max sessions must be positive")
     if (
         not models
         or any(not model.strip() for model in models)
@@ -80,7 +68,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[dict[str, SessionRegistry]]:
-        registry = SessionRegistry(session_factory, turn_timeout_seconds)
+        registry = SessionRegistry(
+            session_factory,
+            turn_timeout_seconds=turn_timeout_seconds,
+            teardown_timeout_seconds=teardown_timeout_seconds,
+            max_sessions=max_sessions,
+        )
         try:
             yield {"registry": registry}
         finally:
@@ -149,7 +142,7 @@ async def _handle(request: Request, *, dialect: str) -> Response:
             await monitor.close()
         raise
     except Exception as error:
-        response = _error_response(dialect, error)
+        response = error_response(dialect, error)
         return response if monitor is None else cast(Response, monitor.wrap(response))
     request_id = ("chatcmpl_" if dialect == "openai" else "msg_") + uuid.uuid4().hex
     if parsed.stream:
@@ -177,7 +170,7 @@ async def _stream_response(
         await cleanup_best_effort(lease, stream)
         if cancellation_pending():
             raise asyncio.CancelledError from None
-        response = _error_response(dialect, error, lease.response_headers)
+        response = error_response(dialect, error, lease.response_headers)
         return cast(Response, monitor.wrap(response))
     if dialect == "openai":
         stream_response = EventStreamResponse(
@@ -189,7 +182,7 @@ async def _stream_response(
                     request_id, request.model, event, request.include_usage
                 ),
                 lambda error: encode_openai_error(
-                    _error_detail(error).code, _error_detail(error).message
+                    error_detail(error).code, error_detail(error).message
                 ),
             )
         return cast(Response, monitor.wrap(stream_response))
@@ -204,7 +197,7 @@ async def _stream_response(
             ),
             lambda event: encode_anthropic_event(request_id, request.model, event),
             lambda error: encode_anthropic_error(
-                _error_detail(error).code, _error_detail(error).message
+                error_detail(error).code, error_detail(error).message
             ),
         )
     return cast(Response, monitor.wrap(stream_response))
@@ -236,13 +229,13 @@ async def _nonstream_response(
         await cleanup_best_effort(lease, stream)
         if cancellation_pending():
             raise asyncio.CancelledError from None
-        response = _error_response(dialect, error, lease.response_headers)
+        response = error_response(dialect, error, lease.response_headers)
         return cast(Response, monitor.wrap(response))
     finally:
         await close_best_effort(stream)
     if completed is None:
         await abort_best_effort(lease)
-        response = _error_response(dialect, BackendFailure("missing completion"))
+        response = error_response(dialect, BackendFailure("missing completion"))
         return cast(Response, monitor.wrap(response))
     renderer = (
         render_openai_response if dialect == "openai" else render_anthropic_response
@@ -250,45 +243,3 @@ async def _nonstream_response(
     payload = renderer(request_id, request.model, "".join(text), completed)
     response = JSONResponse(payload, headers=lease.response_headers)
     return cast(Response, monitor.wrap(response))
-
-def _error_detail(error: Exception) -> _Error:
-    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
-        return _Error(400, "invalid_request", "Invalid request", "body")
-    if isinstance(error, UnsupportedFeature):
-        return _Error(
-            400, "unsupported_feature", "Feature is not supported", error.field
-        )
-    if isinstance(error, RequestValidationError):
-        if error.field == "model" and error.reason == "model is not configured":
-            return _Error(404, "model_not_found", "Model is not configured", "model")
-        return _Error(400, "invalid_request", "Invalid request", error.field)
-    if isinstance(error, SessionConflict):
-        return _Error(409, "request_in_flight", "Request is already in flight")
-    if isinstance(error, SessionMismatch):
-        return _Error(409, "session_mismatch", "Session transcript does not match")
-    if isinstance(error, SessionTimeout):
-        return _Error(504, "backend_timeout", "Backend turn timed out")
-    return _Error(502, "backend_error", "Backend request failed")
-
-
-def _error_response(
-    dialect: str,
-    error: Exception,
-    headers: Mapping[str, str] | None = None,
-) -> JSONResponse:
-    detail = _error_detail(error)
-    if dialect == "openai":
-        payload: dict[str, Any] = {
-            "error": {
-                "message": detail.message,
-                "type": detail.code,
-                "param": detail.param,
-                "code": detail.code,
-            }
-        }
-    else:
-        payload = {
-            "type": "error",
-            "error": {"type": detail.code, "message": detail.message},
-        }
-    return JSONResponse(payload, status_code=detail.status, headers=headers)

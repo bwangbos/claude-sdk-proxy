@@ -180,7 +180,16 @@ def _chunk(
 
 
 def _openai_stop_reason(reason: str | None) -> str:
-    return "stop" if reason in {None, "end_turn"} else "length"
+    mapping = {
+        "end_turn": "stop",
+        "max_tokens": "length",
+        "refusal": "content_filter",
+        "model_context_window_exceeded": "length",
+    }
+    try:
+        return mapping[reason]  # type: ignore[index]
+    except KeyError:
+        raise ValueError("unsupported stop reason") from None
 
 
 def _openai_usage(usage: Mapping[str, Any] | None) -> dict[str, int]:

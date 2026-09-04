@@ -11,12 +11,8 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     RateLimitEvent,
     ResultMessage,
-    ServerToolResultBlock,
-    ServerToolUseBlock,
     StreamEvent,
     SystemMessage,
-    ToolResultBlock,
-    ToolUseBlock,
 )
 
 from claude_sdk_proxy.domain import (
@@ -24,11 +20,15 @@ from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     InputUsage,
-    TextDelta,
 )
 from claude_sdk_proxy.sdk_metadata import (
     validate_rate_limit_event,
     validate_system_message,
+)
+from claude_sdk_proxy.sdk_text_protocol import (
+    RawTextEventValidator,
+    fail_protocol,
+    normalize_usage,
 )
 
 
@@ -51,17 +51,6 @@ class SessionDirectoryProtocol(Protocol):
 type ClientFactory = Callable[[ClaudeAgentOptions], SdkClientProtocol]
 type DirectoryFactory = Callable[[], SessionDirectoryProtocol]
 
-_TOOL_BLOCK_TYPES = {
-    "tool_use", "server_tool_use", "tool_result", "server_tool_result"
-}
-_TOOL_DELTA_TYPES = _TOOL_BLOCK_TYPES | {"input_json_delta"}
-_TOOL_BLOCK_CLASSES = (
-    ToolUseBlock,
-    ServerToolUseBlock,
-    ToolResultBlock,
-    ServerToolResultBlock,
-)
-_PROTOCOL_ERROR = "Agent SDK protocol failure"
 _STOP_REASONS = {
     "end_turn", "max_tokens", "model_context_window_exceeded", "refusal"
 }
@@ -141,7 +130,7 @@ class SdkSession:
         completed: Completed | None = None
         failure: str | None = None
         start_input: int | None = None
-        saw_text = False
+        raw = RawTextEventValidator()
         try:
             await client.query(prompt)
             async for message in client.receive_response():
@@ -160,34 +149,13 @@ class SdkSession:
                     event_type = event.get("type")
                     if not isinstance(event_type, str):
                         self._fail_protocol()
-                    self._reject_tool_event(event)
-                    if event_type == "message_start":
-                        if start_input is not None or saw_text:
-                            self._fail_protocol()
-                        start_input = self._message_start_input(event)
-                        yield InputUsage(start_input)
-                        continue
-                    if event_type == "content_block_start":
-                        block = event.get("content_block")
-                        if (
-                            not isinstance(block, Mapping)
-                            or block.get("type") != "text"
-                        ):
-                            self._fail_protocol()
-                    elif event_type == "content_block_delta":
-                        delta = event.get("delta")
-                        if (
-                            not isinstance(delta, Mapping)
-                            or delta.get("type") != "text_delta"
-                        ):
-                            self._fail_protocol()
-                        text = delta.get("text")
-                        if not isinstance(text, str):
-                            self._fail_protocol()
-                        saw_text = True
-                        yield TextDelta(text)
+                    normalized = raw.observe(event)
+                    if isinstance(normalized, InputUsage):
+                        start_input = normalized.input_tokens
+                    if normalized is not None:
+                        yield normalized
                 elif isinstance(message, AssistantMessage):
-                    self._validate_assistant(message)
+                    self._validate_assistant(message, raw)
                 elif isinstance(message, ResultMessage):
                     self._observe_session_id(message.session_id)
                     if type(message.is_error) is not bool:
@@ -196,6 +164,7 @@ class SdkSession:
                         failure = "Agent SDK query failed"
                     else:
                         completed = self._normalize_result(message, start_input)
+                        raw.validate_result(completed.stop_reason, completed.usage)
                 elif type(message) is SystemMessage:
                     self._observe_session_id(validate_system_message(message))
                 elif isinstance(message, RateLimitEvent):
@@ -236,64 +205,22 @@ class SdkSession:
         origin = message.origin
         if origin is not None and not self._human_origin(origin):
             self._fail_protocol()
-        usage = self._normalize_usage(message.usage, ("input_tokens", "output_tokens"))
+        usage = normalize_usage(message.usage, ("input_tokens", "output_tokens"))
         if start_input is not None and usage is not None:
             final_input = usage.get("input_tokens")
             if final_input is not None and final_input != start_input:
                 self._fail_protocol()
         return Completed(message.stop_reason, usage)
-    @classmethod
-    def _message_start_input(cls, event: Mapping[str, Any]) -> int:
-        message = event.get("message")
-        if not isinstance(message, Mapping):
-            cls._fail_protocol()
-        usage = cls._normalize_usage(message.get("usage"), ("input_tokens",))
-        if usage is None or "input_tokens" not in usage:
-            cls._fail_protocol()
-        return usage["input_tokens"]
-    @classmethod
-    def _normalize_usage(
-        cls, usage: object, fields: tuple[str, ...]
-    ) -> dict[str, int] | None:
-        if usage is None:
-            return None
-        if not isinstance(usage, Mapping):
-            cls._fail_protocol()
-        normalized: dict[str, int] = {}
-        for field in fields:
-            if field not in usage:
-                continue
-            value = usage[field]
-            if type(value) is not int or value < 0:
-                cls._fail_protocol()
-            normalized[field] = value
-        return normalized
-    def _validate_assistant(self, message: AssistantMessage) -> None:
-        if message.parent_tool_use_id is not None or message.error is not None:
-            self._fail_protocol()
+    def _validate_assistant(
+        self, message: AssistantMessage, raw: RawTextEventValidator
+    ) -> None:
         if message.session_id is not None:
             self._observe_session_id(message.session_id)
-        if self._has_tool_block(message.content):
-            self._fail_protocol()
-
-    @classmethod
-    def _reject_tool_event(cls, event: Mapping[str, Any]) -> None:
-        if event.get("type") in _TOOL_DELTA_TYPES:
-            cls._fail_protocol()
-        for field in ("content_block", "delta"):
-            value = event.get(field)
-            if isinstance(value, Mapping) and value.get("type") in _TOOL_DELTA_TYPES:
-                cls._fail_protocol()
-
-    @staticmethod
-    def _has_tool_block(content: object) -> bool:
-        return isinstance(content, list) and any(
-            isinstance(block, _TOOL_BLOCK_CLASSES) for block in content
-        )
+        raw.validate_assistant(message)
 
     @staticmethod
     def _human_origin(origin: object) -> bool:
         return isinstance(origin, Mapping) and origin.get("kind") == "human"
     @staticmethod
     def _fail_protocol() -> Never:
-        raise BackendFailure(_PROTOCOL_ERROR)
+        fail_protocol()

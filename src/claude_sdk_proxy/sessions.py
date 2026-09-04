@@ -5,44 +5,22 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
 
 from claude_sdk_proxy.domain import (
     CanonicalMessage,
-    Completed,
     ConversationEvent,
     SdkSessionFactory,
-    SdkSessionProtocol,
-    TextDelta,
     TextRequest,
 )
-from claude_sdk_proxy.replay_stream import ReplayStream
+from claude_sdk_proxy.session_teardown import SessionTeardown
+from claude_sdk_proxy.session_turn import Conversation
+from claude_sdk_proxy.session_turn import SessionCapacity as SessionCapacity
+from claude_sdk_proxy.session_turn import SessionConflict as SessionConflict
+from claude_sdk_proxy.session_turn import SessionMismatch as SessionMismatch
+from claude_sdk_proxy.session_turn import SessionTimeout as SessionTimeout
+from claude_sdk_proxy.session_turn import TurnLease as TurnLease
 
 _EXPLICIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-
-
-class SessionConflict(RuntimeError): ...
-
-
-class SessionMismatch(ValueError):
-    pass
-
-
-class SessionTimeout(TimeoutError):
-    pass
-
-
-@dataclass(slots=True)
-class _Conversation:
-    external_id: str
-    explicit: bool
-    model: str
-    system: str
-    transcript: tuple[CanonicalMessage, ...]
-    backend: SdkSessionProtocol
-    in_flight_fingerprint: str | None = None
-    replay: dict[str, tuple[ConversationEvent, ...]] = field(default_factory=dict)
 
 
 def _fingerprint(request: TextRequest) -> str:
@@ -52,122 +30,25 @@ def _fingerprint(request: TextRequest) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-@dataclass(slots=True)
-class TurnLease:
-    _registry: SessionRegistry
-    _conversation: _Conversation
-    _request: TextRequest
-    _fingerprint: str
-    _deadline: float | None
-    _replay: tuple[ConversationEvent, ...] | None
-    response_headers: dict[str, str] = field(init=False)
-    _stream_started: bool = False
-    _committed: bool = False
-    _aborted: bool = False
-    _replay_released: bool = False
-    _abort_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
-    _invalidation: asyncio.Task[None] | None = field(default=None, init=False)
-
-    def __post_init__(self) -> None:
-        self.response_headers = {
-            "X-Claude-Proxy-Session": self._conversation.external_id}
-    def stream(self) -> AsyncIterator[ConversationEvent]:
-        if self._stream_started:
-            raise RuntimeError("turn stream can only be consumed once")
-        self._stream_started = True
-        if self._aborted:
-            raise RuntimeError("turn was aborted")
-        replay = self._replay
-        if replay is not None:
-            return ReplayStream(replay, self._release_replay, lambda: self._aborted)
-        return self._active_stream()
-    async def _active_stream(self) -> AsyncIterator[ConversationEvent]:
-        events: list[ConversationEvent] = []
-        assistant_parts: list[str] = []
-        try:
-            async with asyncio.timeout_at(self._deadline):
-                await self._conversation.backend.start()
-            backend_stream = self._conversation.backend.stream_turn(
-                self._request.next_prompt)
-            while True:
-                try:
-                    async with asyncio.timeout_at(self._deadline):
-                        event = await anext(backend_stream)
-                except StopAsyncIteration:
-                    break
-                if self._aborted:
-                    raise RuntimeError("turn was aborted")
-                events.append(event)
-                if isinstance(event, TextDelta):
-                    assistant_parts.append(event.text)
-                    yield event
-                    continue
-                if isinstance(event, Completed):
-                    async with self._abort_lock:
-                        if self._aborted:
-                            raise RuntimeError("turn was aborted")
-                        await self._registry._commit(
-                            self._conversation, self._request, self._fingerprint,
-                            tuple(events), "".join(assistant_parts))
-                        self._committed = True
-                    yield event
-                    return
-                yield event
-            raise RuntimeError("backend stream ended without completion")
-        except TimeoutError:
-            await self._invalidate_best_effort()
-            raise SessionTimeout("SDK turn timed out") from None
-        except BaseException:
-            await self._invalidate_best_effort()
-            raise
-    async def _invalidate_best_effort(self) -> None:
-        if self._committed:
-            return
-        try:
-            await self._registry._invalidate(self._conversation)
-        except BaseException:
-            pass
-    async def abort(self) -> None:
-        async with self._abort_lock:
-            if self._aborted or self._committed:
-                return
-            if self._replay is None:
-                if self._invalidation is None:
-                    self._invalidation = asyncio.create_task(
-                        self._registry._invalidate(self._conversation))
-                try:
-                    await asyncio.shield(self._invalidation)
-                except asyncio.CancelledError:
-                    raise
-                except BaseException:
-                    self._invalidation = None
-                    raise
-                self._aborted = True
-            else:
-                await self._release_replay_locked()
-                self._aborted = True
-    async def _release_replay(self) -> None:
-        async with self._abort_lock:
-            await self._release_replay_locked()
-    async def _release_replay_locked(self) -> None:
-        if self._replay_released:
-            return
-        await self._registry._release(self._conversation, self._fingerprint)
-        self._replay_released = True
-
-
 class SessionRegistry:
     def __init__(
         self, session_factory: SdkSessionFactory,
         turn_timeout_seconds: float = 300.0,
+        teardown_timeout_seconds: float = 5.0,
+        max_sessions: int = 8,
     ) -> None:
         if turn_timeout_seconds <= 0:
             raise ValueError("turn timeout must be positive")
+        if max_sessions <= 0:
+            raise ValueError("max sessions must be positive")
         self._session_factory = session_factory
         self._turn_timeout_seconds = turn_timeout_seconds
+        self._teardown = SessionTeardown(teardown_timeout_seconds)
+        self._max_sessions = max_sessions
+        self._use_counter = 0
         self._lock = asyncio.Lock()
-        self._explicit: dict[str, _Conversation] = {}
-        self._implicit: dict[str, _Conversation] = {}
+        self._explicit: dict[str, Conversation] = {}
+        self._implicit: dict[str, Conversation] = {}
         self._closed = False
     async def open_turn(
         self, request: TextRequest, explicit_id: str | None) -> TurnLease:
@@ -187,6 +68,7 @@ class SessionRegistry:
         if conversation is None:
             if len(request.messages) != 1:
                 raise SessionMismatch("request transcript is not a fresh conversation")
+            self._make_room_for_fresh()
             conversation = self._create(request, explicit_id, explicit=True)
             self._explicit[explicit_id] = conversation
             return self._new_lease(conversation, request, fingerprint)
@@ -230,34 +112,48 @@ class SessionRegistry:
             return self._new_lease(conversation, request, fingerprint)
         if len(request.messages) != 1:
             raise SessionMismatch("request transcript does not match a conversation")
+        self._make_room_for_fresh()
         conversation = self._create(request, uuid.uuid4().hex, explicit=False)
         self._implicit[conversation.external_id] = conversation
         return self._new_lease(conversation, request, fingerprint)
-    def _create(self, request: TextRequest, sid: str, explicit: bool) -> _Conversation:
+    def _create(self, request: TextRequest, sid: str, explicit: bool) -> Conversation:
         backend = self._session_factory(request.model, request.system)
-        return _Conversation(sid, explicit, request.model, request.system, (), backend)
+        return Conversation(sid, explicit, request.model, request.system, (), backend)
     def _new_lease(
-        self, conversation: _Conversation, request: TextRequest, fingerprint: str,
+        self, conversation: Conversation, request: TextRequest, fingerprint: str,
         replay: tuple[ConversationEvent, ...] | None = None,
     ) -> TurnLease:
+        self._use_counter += 1
+        conversation.last_used = self._use_counter
         conversation.in_flight_fingerprint = fingerprint
         now = asyncio.get_running_loop().time()
         deadline = None if replay is not None else now + self._turn_timeout_seconds
         return TurnLease(self, conversation, request, fingerprint, deadline, replay)
+    def _make_room_for_fresh(self) -> None:
+        conversations = [*self._explicit.values(), *self._implicit.values()]
+        if len(conversations) < self._max_sessions:
+            return
+        idle = [item for item in conversations if item.in_flight_fingerprint is None]
+        if not idle:
+            raise SessionCapacity("session capacity is exhausted")
+        victim = min(idle, key=lambda item: item.last_used)
+        retained = self._explicit if victim.explicit else self._implicit
+        del retained[victim.external_id]
+        self._teardown.schedule(victim.backend.close)
     @staticmethod
-    def _is_continuation(conversation: _Conversation, request: TextRequest) -> bool:
+    def _is_continuation(conversation: Conversation, request: TextRequest) -> bool:
         transcript = conversation.transcript
         return bool(transcript) and request.messages == transcript + (
             request.messages[-1],)
     @staticmethod
-    def _reject_busy(conversation: _Conversation, fingerprint: str) -> None:
+    def _reject_busy(conversation: Conversation, fingerprint: str) -> None:
         active = conversation.in_flight_fingerprint
         if active == fingerprint:
             raise SessionConflict("request is already in flight")
         if active is not None:
             raise SessionConflict("conversation is busy")
     async def _commit(
-        self, conversation: _Conversation, request: TextRequest,
+        self, conversation: Conversation, request: TextRequest,
         fingerprint: str, events: tuple[ConversationEvent, ...],
         assistant_text: str,
     ) -> None:
@@ -269,19 +165,21 @@ class SessionRegistry:
                 raise RuntimeError("turn reservation is no longer active")
             assistant = CanonicalMessage("assistant", assistant_text)
             conversation.transcript = request.messages + (assistant,)
+            conversation.replay.clear()
             conversation.replay[fingerprint] = events
             conversation.in_flight_fingerprint = None
-    async def _invalidate(self, conversation: _Conversation) -> None:
-        should_close = False
+    async def _invalidate(self, conversation: Conversation) -> None:
+        scheduled = False
         async with self._lock:
             conversations = self._explicit if conversation.explicit else self._implicit
             if conversations.get(conversation.external_id) is conversation:
                 del conversations[conversation.external_id]
                 conversation.in_flight_fingerprint = None
-                should_close = True
-        if should_close:
-            await conversation.backend.close()
-    async def _release(self, conversation: _Conversation, fingerprint: str) -> None:
+                self._teardown.schedule(conversation.backend.close)
+                scheduled = True
+        if scheduled:
+            await asyncio.sleep(0)
+    async def _release(self, conversation: Conversation, fingerprint: str) -> None:
         async with self._lock:
             if conversation.in_flight_fingerprint == fingerprint:
                 conversation.in_flight_fingerprint = None
@@ -293,8 +191,6 @@ class SessionRegistry:
             conversations = [*self._explicit.values(), *self._implicit.values()]
             self._explicit.clear()
             self._implicit.clear()
-        closes = (conversation.backend.close() for conversation in conversations)
-        results = await asyncio.gather(*closes, return_exceptions=True)
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+        for conversation in conversations:
+            self._teardown.schedule(conversation.backend.close)
+        await self._teardown.close()

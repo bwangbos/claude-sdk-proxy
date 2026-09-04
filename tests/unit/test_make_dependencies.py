@@ -124,3 +124,19 @@ def test_gateway_target_runs_only_gateway_tests(tmp_path: Path) -> None:
     assert _run_make_target(tmp_path, "gateway") == [
         "uv:run pytest --strict-markers --forbid-skips -W error tests/gateway"
     ]
+
+
+def test_offline_release_includes_real_pi_integration_before_static_checks(
+    tmp_path: Path,
+) -> None:
+    trace = _run_make_target(tmp_path, "release-offline")
+    native_entries = [f"native:{path}" for path in _NATIVE_OUTPUTS]
+    assert trace == [
+        *native_entries,
+        "uv:run pytest --strict-markers --forbid-skips -W error tests/unit",
+        "uv:run pytest --strict-markers --forbid-skips -W error tests/darwin",
+        "uv:run pytest --strict-markers --forbid-skips -W error tests/gateway",
+        "uv:run pytest --strict-markers --forbid-skips -W error tests/integration",
+        "uv:run ruff check .",
+        "uv:run mypy src/claude_sdk_proxy",
+    ]

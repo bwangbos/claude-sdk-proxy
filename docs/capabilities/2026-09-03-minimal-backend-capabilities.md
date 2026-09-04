@@ -47,6 +47,8 @@ Anthropic API clone:
 | Anthropic Messages text | Streaming and non-streaming |
 | Fresh append-only continuation | Supported while the process remains alive |
 | Completed-request retry | In-memory replay without another SDK turn |
+| Retained sessions | Default maximum 8; least-recently-used idle eviction |
+| Capacity exhaustion | HTTP 503 `session_capacity` when every retained session is busy |
 | Independent identical starts | Requires a unique `X-Claude-Proxy-Session` per conversation |
 | Imported history, edits, or branching | Unsupported |
 | Exact output-token cap | Unsupported; accepted fields are advisory |
@@ -60,6 +62,18 @@ so neither is compatible with the append-only registry. Pi 0.84.4 documents
 `compaction.enabled` (default `true`) in `settings.json`; set it to `false` for
 this provider and avoid `/compact`. Start a new session before the context
 window fills.
+
+Replay is intentionally bounded to the current completed transcript head. After
+a successful continuation, an older request head may return `session_mismatch`,
+while retrying the current head still replays exactly. Anthropic preserves the
+four accepted terminal reasons. OpenAI maps `end_turn` to `stop`, `max_tokens`
+and `model_context_window_exceeded` to `length`, and `refusal` to
+`content_filter`; Chat Completions has no distinct context-window terminal
+reason, so context exhaustion deliberately collapses to its truncation signal.
+
+The installed `claude-proxy-capabilities` command reports historical one-shot
+comparator evidence. Its negative multi-turn and compatibility fields do not
+describe the persistent `claude-proxy` gateway documented above.
 
 Launch and Pi configuration are documented in
 [`docs/feasibility/README.md`](../feasibility/README.md). The original negative
