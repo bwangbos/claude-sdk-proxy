@@ -82,7 +82,6 @@ class TurnLease:
         if replay is not None:
             return ReplayStream(replay, self._release_replay, lambda: self._aborted)
         return self._active_stream()
-
     async def _active_stream(self) -> AsyncIterator[ConversationEvent]:
         events: list[ConversationEvent] = []
         assistant_parts: list[str] = []
@@ -100,11 +99,14 @@ class TurnLease:
                         yield event
                         continue
                     if isinstance(event, Completed):
-                        await self._registry._commit(
-                            self._conversation, self._request, self._fingerprint,
-                            tuple(events), "".join(assistant_parts),
-                        )
-                        self._committed = True
+                        async with self._abort_lock:
+                            if self._aborted:
+                                raise RuntimeError("turn was aborted")
+                            await self._registry._commit(
+                                self._conversation, self._request, self._fingerprint,
+                                tuple(events), "".join(assistant_parts),
+                            )
+                            self._committed = True
                         yield event
                         return
                 raise RuntimeError("backend stream ended without completion")
@@ -116,7 +118,7 @@ class TurnLease:
 
     async def abort(self) -> None:
         async with self._abort_lock:
-            if self._aborted:
+            if self._aborted or self._committed:
                 return
             if self._replay is None:
                 self._aborted = True
@@ -216,9 +218,8 @@ class SessionRegistry:
         if len(request.messages) != 1:
             raise SessionMismatch("request transcript does not match a conversation")
 
-        external_id = uuid.uuid4().hex
-        conversation = self._create(request, external_id, explicit=False)
-        self._implicit[external_id] = conversation
+        conversation = self._create(request, uuid.uuid4().hex, explicit=False)
+        self._implicit[conversation.external_id] = conversation
         return self._new_lease(conversation, request, fingerprint)
 
     def _create(self, request: TextRequest, sid: str, explicit: bool) -> _Conversation:

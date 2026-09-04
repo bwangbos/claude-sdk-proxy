@@ -560,6 +560,55 @@ async def test_commit_happens_before_terminal_event_is_exposed() -> None:
 
 
 @pytest.mark.anyio
+async def test_abort_after_commit_preserves_replay_and_backend() -> None:
+    factory = FakeSessionFactory(outputs=("answer", "unexpected"))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    lease = await registry.open_turn(request, explicit_id="lineage")
+    stream = lease.stream()
+
+    assert await anext(stream) == TextDelta("answer")
+    assert await anext(stream) == Completed("end_turn", {"output_tokens": 1})
+    await lease.abort()
+    duplicate = await registry.open_turn(request, explicit_id="lineage")
+
+    assert await collect(duplicate.stream()) == completed_events("answer")
+    assert factory.created == 1
+    assert factory.sessions[0].close_count == 0
+    await stream.aclose()
+
+
+@pytest.mark.anyio
+async def test_commit_and_abort_serialize_at_completed_boundary() -> None:
+    factory = FakeSessionFactory(outputs=("answer", "unexpected"))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    lease = await registry.open_turn(request, explicit_id="lineage")
+    stream = lease.stream()
+    assert await anext(stream) == TextDelta("answer")
+
+    await registry._lock.acquire()
+    try:
+        terminal = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        abort = asyncio.create_task(lease.abort())
+        await asyncio.sleep(0)
+        assert not terminal.done()
+        assert not abort.done()
+    finally:
+        registry._lock.release()
+
+    assert await terminal == Completed("end_turn", {"output_tokens": 1})
+    await abort
+    duplicate = await registry.open_turn(request, explicit_id="lineage")
+
+    assert await collect(duplicate.stream()) == completed_events("answer")
+    assert factory.created == 1
+    assert factory.sessions[0].close_count == 0
+    await stream.aclose()
+
+
+@pytest.mark.anyio
 async def test_registry_close_disconnects_every_retained_backend() -> None:
     factory = FakeSessionFactory(outputs=("one", "two"))
     registry = SessionRegistry(factory)
