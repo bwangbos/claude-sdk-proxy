@@ -317,6 +317,31 @@ async def test_sdk_session_accepts_observed_complete_assistant_placement(
 
 
 @pytest.mark.anyio
+async def test_sdk_session_rejects_text_delta_after_complete_assistant_message(
+    tmp_path: Path,
+) -> None:
+    raw = raw_text_events("a", "sdk-1")
+    assistant = AssistantMessage([TextBlock("a")], "sonnet", session_id="sdk-1")
+    late_delta = StreamEvent(
+        uuid="event-late-delta",
+        session_id="sdk-1",
+        event={
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "secret-b"},
+        },
+    )
+
+    with pytest.raises(BackendFailure, match="protocol") as error:
+        await collect_sdk_response(
+            tmp_path,
+            (*raw[:3], assistant, late_delta, *raw[3:], result_message()),
+        )
+
+    assert "secret-b" not in str(error.value)
+
+
+@pytest.mark.anyio
 async def test_sdk_session_rejects_unknown_raw_event_without_leaking_it(
     tmp_path: Path,
 ) -> None:

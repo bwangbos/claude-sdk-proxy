@@ -115,7 +115,7 @@ class RawTextEventValidator:
         self._phase = "block_delta"
 
     def _block_delta(self, event: Mapping[str, Any]) -> TextDelta:
-        if self._phase != "block_delta":
+        if self._phase != "block_delta" or self._assistant_text is not None:
             fail_protocol()
         self._require_keys(event, {"type", "index", "delta"})
         self._require_index(event)
