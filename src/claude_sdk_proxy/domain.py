@@ -109,6 +109,13 @@ class UnsupportedFeature(ValueError):
         self.reason = reason
 
 
+class RequestValidationError(ValueError):
+    def __init__(self, field: str, reason: str) -> None:
+        super().__init__(f"invalid field {field}: {reason}")
+        self.field = field
+        self.reason = reason
+
+
 class BackendFailure(RuntimeError):
     pass
 
