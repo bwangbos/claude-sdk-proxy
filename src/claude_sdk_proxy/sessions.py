@@ -118,11 +118,12 @@ class TurnLease:
         async with self._abort_lock:
             if self._aborted:
                 return
-            self._aborted = True
             if self._replay is None:
+                self._aborted = True
                 await self._registry._invalidate(self._conversation)
             else:
                 await self._release_replay_locked()
+                self._aborted = True
 
     async def _release_replay(self) -> None:
         async with self._abort_lock:

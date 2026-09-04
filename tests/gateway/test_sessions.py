@@ -247,6 +247,33 @@ async def test_replay_close_before_first_iteration_releases_reservation() -> Non
 
 
 @pytest.mark.anyio
+async def test_cancelled_replay_abort_can_be_retried() -> None:
+    factory = FakeSessionFactory(outputs=("answer",))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    original = await registry.open_turn(request, explicit_id=None)
+    await collect(original.stream())
+    replay = await registry.open_turn(request, explicit_id=None)
+
+    await registry._lock.acquire()
+    try:
+        abort = asyncio.create_task(replay.abort())
+        await asyncio.sleep(0)
+        assert not abort.done()
+        abort.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await abort
+    finally:
+        registry._lock.release()
+
+    await replay.abort()
+    later = await registry.open_turn(request, explicit_id=None)
+    assert await collect(later.stream()) == completed_events("answer")
+    assert factory.created == 1
+    assert factory.sessions[0].close_count == 0
+
+
+@pytest.mark.anyio
 async def test_replay_identity_ignores_rendering_and_advisory_fields() -> None:
     factory = FakeSessionFactory(outputs=("answer",))
     registry = SessionRegistry(factory)
