@@ -158,6 +158,22 @@ def test_openai_parser_rejects_tool_calls_even_when_text_content_is_present() ->
     assert error.value.field == "messages"
 
 
+@pytest.mark.parametrize("field,value", [("extra", 1), ("stream", "yes")])
+def test_openai_parser_rejects_unknown_fields_and_nonboolean_stream(
+    field: str, value: object
+) -> None:
+    with pytest.raises(RequestValidationError) as error:
+        parse_openai_request(
+            {
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "hello"}],
+                field: value,
+            },
+            frozenset({"sonnet"}),
+        )
+    assert error.value.field == field
+
+
 def test_openai_start_and_delta_use_literal_chunk_order() -> None:
     start = encode_openai_start("chatcmpl_test", "sonnet")
     delta = encode_openai_event(
@@ -204,6 +220,17 @@ def test_openai_completed_event_emits_requested_usage_then_done() -> None:
     assert chunks[-1] == b"data: [DONE]\n\n"
 
 
+def test_openai_completed_event_without_usage_ends_after_terminal_chunk() -> None:
+    chunks = encode_openai_event(
+        request_id="chatcmpl_test",
+        model="sonnet",
+        event=Completed("max_tokens", None),
+        include_usage=False,
+    )
+    assert payload(chunks[0])["choices"][0]["finish_reason"] == "length"
+    assert chunks == (chunks[0], b"data: [DONE]\n\n")
+
+
 def test_openai_nonstream_response_maps_text_stop_and_usage() -> None:
     response = render_openai_response(
         "chatcmpl_test",
@@ -224,6 +251,22 @@ def test_openai_nonstream_response_maps_text_stop_and_usage() -> None:
         "prompt_tokens": 2,
         "completion_tokens": 1,
         "total_tokens": 3,
+    }
+
+
+def test_openai_response_preserves_unicode_whitespace_and_zeroes_bad_usage() -> None:
+    response = render_openai_response(
+        "chatcmpl_test",
+        "sonnet",
+        "  λ\n",
+        Completed("max_tokens", {"input_tokens": "bad", "output_tokens": -1}),
+    )
+    assert response["choices"][0]["message"]["content"] == "  λ\n"
+    assert response["choices"][0]["finish_reason"] == "length"
+    assert response["usage"] == {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
     }
 
 

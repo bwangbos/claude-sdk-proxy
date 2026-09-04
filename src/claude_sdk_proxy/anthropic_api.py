@@ -179,6 +179,8 @@ def _messages(body: Mapping[str, object]) -> list[CanonicalMessage]:
             raise RequestValidationError("messages", "message fields are not supported")
         role = raw_message.get("role")
         content = raw_message.get("content")
+        if not isinstance(role, str):
+            raise RequestValidationError("messages", "role must be a string")
         if role in {"tool", "function"}:
             raise UnsupportedFeature("messages", "tool roles are not supported")
         if role not in {"user", "assistant"}:

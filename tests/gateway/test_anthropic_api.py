@@ -136,6 +136,37 @@ def test_anthropic_parser_rejects_extra_tool_message_fields() -> None:
     assert error.value.field == "messages"
 
 
+@pytest.mark.parametrize("role", [[], {}])
+def test_anthropic_parser_rejects_unhashable_message_roles(role: object) -> None:
+    with pytest.raises(RequestValidationError) as error:
+        parse_anthropic_request(
+            {
+                "model": "sonnet",
+                "messages": [{"role": role, "content": "hello"}],
+                "max_tokens": 1,
+            },
+            frozenset({"sonnet"}),
+        )
+    assert error.value.field == "messages"
+
+
+@pytest.mark.parametrize("field,value", [("extra", 1), ("stream", 1)])
+def test_anthropic_parser_rejects_unknown_fields_and_nonboolean_stream(
+    field: str, value: object
+) -> None:
+    with pytest.raises(RequestValidationError) as error:
+        parse_anthropic_request(
+            {
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1,
+                field: value,
+            },
+            frozenset({"sonnet"}),
+        )
+    assert error.value.field == field
+
+
 def test_anthropic_stream_uses_message_content_and_stop_order() -> None:
     start = encode_anthropic_start("msg_test", "sonnet")
     delta = encode_anthropic_event("msg_test", "sonnet", TextDelta("hello"))
@@ -179,6 +210,18 @@ def test_anthropic_nonstream_response_maps_text_stop_and_usage() -> None:
         "stop_sequence": None,
         "usage": {"input_tokens": 2, "output_tokens": 1},
     }
+
+
+def test_anthropic_response_maps_max_tokens_and_invalid_usage_to_zero() -> None:
+    response = render_anthropic_response(
+        "msg_test",
+        "sonnet",
+        "  λ\n",
+        Completed("max_tokens", {"input_tokens": "bad", "output_tokens": -1}),
+    )
+    assert response["content"] == [{"type": "text", "text": "  λ\n"}]
+    assert response["stop_reason"] == "max_tokens"
+    assert response["usage"] == {"input_tokens": 0, "output_tokens": 0}
 
 
 def test_anthropic_error_has_event_envelope() -> None:
