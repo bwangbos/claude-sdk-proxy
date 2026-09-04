@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 type CapabilityStatus = Literal["pass", "fail", "untested"]
 type Role = Literal["user", "assistant"]
@@ -54,6 +55,51 @@ class Completed:
 
 
 type BackendEvent = TextDelta | Completed
+
+
+@dataclass(frozen=True, slots=True)
+class TextRequest:
+    model: str
+    system: str
+    messages: tuple[CanonicalMessage, ...]
+    max_tokens: int | None
+    stream: bool
+    include_usage: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.model.strip():
+            raise ValueError("model must not be empty")
+        if self.max_tokens is not None and self.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if not self.messages:
+            raise ValueError("messages must not be empty")
+        if any(not message.content for message in self.messages):
+            raise ValueError("message content must not be empty")
+        expected = "user"
+        for message in self.messages:
+            if message.role != expected:
+                raise ValueError("messages must alternate user and assistant")
+            expected = "assistant" if expected == "user" else "user"
+        if self.messages[-1].role != "user":
+            raise ValueError("conversation must end with a user message")
+
+    @property
+    def next_prompt(self) -> str:
+        if self.messages[-1].role != "user":
+            raise ValueError("conversation must end with a user message")
+        return self.messages[-1].content
+
+
+type ConversationEvent = TextDelta | Completed
+
+
+class SdkSessionProtocol(Protocol):
+    async def start(self) -> None: ...
+    def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]: ...
+    async def close(self) -> None: ...
+
+
+type SdkSessionFactory = Callable[[str, str], SdkSessionProtocol]
 
 
 class UnsupportedFeature(ValueError):

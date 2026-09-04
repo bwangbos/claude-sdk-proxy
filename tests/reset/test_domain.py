@@ -5,6 +5,7 @@ from claude_sdk_proxy.domain import (
     CanonicalRequest,
     CapabilityReport,
     CapabilityStatus,
+    TextRequest,
     ToolDefinition,
 )
 
@@ -85,3 +86,18 @@ def test_canonical_request_rejects_an_invalid_tool_name() -> None:
         )
 
     assert str(error.value) == "tool name is invalid"
+
+
+def test_text_request_requires_alternating_messages_ending_in_user() -> None:
+    with pytest.raises(ValueError, match="alternate"):
+        TextRequest(
+            model="sonnet",
+            system="",
+            messages=(
+                CanonicalMessage("user", "one"),
+                CanonicalMessage("user", "two"),
+            ),
+            max_tokens=1024,
+            stream=False,
+            include_usage=False,
+        )
