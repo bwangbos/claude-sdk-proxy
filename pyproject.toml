@@ -5,14 +5,18 @@ build-backend = "hatchling.build"
 [project]
 name = "claude-sdk-proxy"
 version = "0.0.0"
-description = "Trusted-local Claude Agent SDK feasibility probes"
+description = "Private localhost Claude Agent SDK text gateway and historical probes"
 readme = "docs/feasibility/README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
-    "claude-agent-sdk==0.2.148",
+    "claude-agent-sdk==0.2.152",
+    "starlette>=1.6,<2",
+    "uvicorn>=0.52,<1",
 ]
 
 [project.scripts]
+claude-proxy = "claude_sdk_proxy.cli:main"
+claude-proxy-capabilities = "claude_sdk_proxy.capability_cli:main"
 claude-proxy-probe = "claude_sdk_proxy.probe_cli:main"
 
 [dependency-groups]
