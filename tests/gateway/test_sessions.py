@@ -135,6 +135,97 @@ async def test_completed_duplicate_replays_without_new_sdk_turn() -> None:
 
 
 @pytest.mark.anyio
+async def test_replay_lease_reserves_conversation_before_consumption() -> None:
+    factory = FakeSessionFactory(outputs=("answer",))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    original = await registry.open_turn(request, explicit_id=None)
+    await collect(original.stream())
+
+    replay = await registry.open_turn(request, explicit_id=None)
+
+    with pytest.raises(SessionConflict, match="in flight"):
+        await registry.open_turn(request, explicit_id=None)
+    await replay.abort()
+
+
+@pytest.mark.anyio
+async def test_second_duplicate_is_rejected_while_replay_is_paused() -> None:
+    factory = FakeSessionFactory(outputs=("answer",))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    original = await registry.open_turn(request, explicit_id=None)
+    await collect(original.stream())
+    replay = await registry.open_turn(request, explicit_id=None)
+    replay_stream = replay.stream()
+    assert await anext(replay_stream) == TextDelta("answer")
+
+    with pytest.raises(SessionConflict, match="in flight"):
+        await registry.open_turn(request, explicit_id=None)
+    await replay_stream.aclose()
+
+
+@pytest.mark.anyio
+async def test_continuation_is_rejected_while_replay_is_paused() -> None:
+    factory = FakeSessionFactory(outputs=("answer",))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    original = await registry.open_turn(request, explicit_id=None)
+    await collect(original.stream())
+    replay = await registry.open_turn(request, explicit_id=None)
+    replay_stream = replay.stream()
+    assert await anext(replay_stream) == TextDelta("answer")
+
+    with pytest.raises(SessionConflict, match="conversation is busy"):
+        await registry.open_turn(
+            continuation_request("hello", "answer", "next"), explicit_id=None
+        )
+    await replay_stream.aclose()
+
+
+@pytest.mark.anyio
+async def test_completed_replay_releases_conversation_reservation() -> None:
+    factory = FakeSessionFactory(outputs=("answer",))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    original = await registry.open_turn(request, explicit_id=None)
+    await collect(original.stream())
+    replay = await registry.open_turn(request, explicit_id=None)
+
+    assert await collect(replay.stream()) == completed_events("answer")
+    continuation = await registry.open_turn(
+        continuation_request("hello", "answer", "next"), explicit_id=None
+    )
+    await continuation.abort()
+    assert factory.sessions[0].close_count == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("release", ["close", "abort"])
+async def test_premature_replay_release_preserves_healthy_session(
+    release: str,
+) -> None:
+    factory = FakeSessionFactory(outputs=("answer",))
+    registry = SessionRegistry(factory)
+    request = first_request("hello")
+    original = await registry.open_turn(request, explicit_id=None)
+    await collect(original.stream())
+    replay = await registry.open_turn(request, explicit_id=None)
+    replay_stream = replay.stream()
+
+    if release == "close":
+        assert await anext(replay_stream) == TextDelta("answer")
+        await replay_stream.aclose()
+    else:
+        await replay.abort()
+
+    later = await registry.open_turn(request, explicit_id=None)
+    assert await collect(later.stream()) == completed_events("answer")
+    assert factory.created == 1
+    assert factory.sessions[0].close_count == 0
+
+
+@pytest.mark.anyio
 async def test_replay_identity_ignores_rendering_and_advisory_fields() -> None:
     factory = FakeSessionFactory(outputs=("answer",))
     registry = SessionRegistry(factory)
