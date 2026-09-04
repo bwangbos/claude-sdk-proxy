@@ -277,3 +277,111 @@ def test_stream_rejects_agent_tool_use_from_injected_query() -> None:
         asyncio.run(collect())
 
     assert error.value.field == "tools"
+
+
+def test_stream_rejects_malformed_delta() -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        del prompt, options
+        yield StreamEvent(
+            uuid="event-1",
+            session_id="session-1",
+            event={"type": "content_block_delta", "delta": "not-a-mapping"},
+        )
+
+    async def consume() -> None:
+        async for _ in AgentSdkBackend(fake_query).stream(request):
+            pass
+
+    with pytest.raises(BackendFailure, match="invalid Agent SDK delta"):
+        asyncio.run(consume())
+
+
+def test_stream_rejects_streamed_tool_delta() -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        del prompt, options
+        yield StreamEvent(
+            uuid="event-1",
+            session_id="session-1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "input_json_delta", "partial_json": "{}"},
+            },
+        )
+
+    async def consume() -> None:
+        async for _ in AgentSdkBackend(fake_query).stream(request):
+            pass
+
+    with pytest.raises(UnsupportedFeature, match="tools") as error:
+        asyncio.run(consume())
+
+    assert error.value.field == "tools"
+
+
+def test_stream_rejects_error_result() -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        del prompt, options
+        yield ResultMessage(
+            subtype="error_during_execution",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=True,
+            num_turns=1,
+            session_id="session-1",
+            stop_reason=None,
+            usage={"output_tokens": 0},
+        )
+
+    async def consume() -> None:
+        async for _ in AgentSdkBackend(fake_query).stream(request):
+            pass
+
+    with pytest.raises(BackendFailure, match="Agent SDK query failed"):
+        asyncio.run(consume())
+
+
+def test_stream_rejects_missing_result() -> None:
+    request = CanonicalRequest(
+        model="claude-test",
+        system="",
+        messages=(CanonicalMessage("user", "caller-message"),),
+    )
+    received: list[BackendEvent] = []
+
+    async def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+        del prompt, options
+        yield StreamEvent(
+            uuid="event-1",
+            session_id="session-1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "partial"},
+            },
+        )
+
+    async def consume() -> None:
+        async for event in AgentSdkBackend(fake_query).stream(request):
+            received.append(event)
+
+    with pytest.raises(BackendFailure, match="stream ended without result"):
+        asyncio.run(consume())
+
+    assert received == [TextDelta("partial")]
