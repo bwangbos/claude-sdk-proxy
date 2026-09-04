@@ -6,6 +6,8 @@ from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, StreamEvent
 
+from claude_sdk_proxy.domain import Completed, ConversationEvent, TextDelta
+
 
 class FixedTemporaryDirectory:
     def __init__(self, path: Path) -> None:
@@ -71,3 +73,39 @@ def sdk_response(text: str, session_id: str) -> tuple[StreamEvent | ResultMessag
             usage={"output_tokens": 1},
         ),
     )
+
+
+class FakeConversationSession:
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.start_count = 0
+        self.close_count = 0
+        self.prompts: list[str] = []
+
+    async def start(self) -> None:
+        self.start_count += 1
+
+    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+        self.prompts.append(prompt)
+        yield TextDelta(self._text)
+        yield Completed("end_turn", {"output_tokens": 1})
+
+    async def close(self) -> None:
+        if self.close_count == 0:
+            self.close_count = 1
+
+
+class FakeSessionFactory:
+    def __init__(self, outputs: tuple[str, ...]) -> None:
+        self._outputs = iter(outputs)
+        self.sessions: list[FakeConversationSession] = []
+
+    @property
+    def created(self) -> int:
+        return len(self.sessions)
+
+    def __call__(self, model: str, system: str) -> FakeConversationSession:
+        del model, system
+        session = FakeConversationSession(next(self._outputs))
+        self.sessions.append(session)
+        return session
