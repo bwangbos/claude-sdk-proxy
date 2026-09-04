@@ -23,6 +23,10 @@ from claude_sdk_proxy.domain import (
 )
 
 
+def _discard_stderr(_: str) -> None:
+    pass
+
+
 class QueryFn(Protocol):
     def __call__(
         self, *, prompt: str, options: ClaudeAgentOptions
@@ -50,12 +54,13 @@ class AgentSdkBackend:
             plugins=[],
             cwd=cwd,
             include_partial_messages=True,
+            stderr=_discard_stderr,
+            max_buffer_size=64 * 1024,
             extra_args={
                 "safe-mode": None,
                 "restricted": None,
                 "disable-slash-commands": None,
                 "no-session-persistence": None,
-                "system-prompt-snapshot": "off",
             },
         )
 

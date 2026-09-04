@@ -24,7 +24,9 @@ from claude_sdk_proxy.domain import (
 )
 
 
-def test_build_options_disables_ambient_agent_behavior(tmp_path: Path) -> None:
+def test_build_options_disables_ambient_agent_behavior(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     request = CanonicalRequest(
         model="claude-test",
         system="caller-system",
@@ -51,8 +53,11 @@ def test_build_options_disables_ambient_agent_behavior(tmp_path: Path) -> None:
         "restricted": None,
         "disable-slash-commands": None,
         "no-session-persistence": None,
-        "system-prompt-snapshot": "off",
     }
+    assert options.stderr is not None
+    options.stderr("secret-bearing diagnostic")
+    assert capsys.readouterr().err == ""
+    assert options.max_buffer_size == 64 * 1024
 
 
 def test_sdk_rejects_assistant_history_instead_of_flattening() -> None:
