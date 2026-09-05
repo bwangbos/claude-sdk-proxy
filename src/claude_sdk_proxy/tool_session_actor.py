@@ -74,6 +74,7 @@ class ToolSessionActor:
     _runner: asyncio.Task[None] | None = None
     _watcher: asyncio.Task[None] | None = None
     _submitter: asyncio.Task[None] | None = None
+    _cleanup: asyncio.Task[None] | None = None
     _started: bool = False
     _generation_deadline: float | None = None
     _wait_deadline: float | None = None
@@ -327,37 +328,43 @@ class ToolSessionActor:
     async def _fail(self, error: BaseException) -> None:
         current = asyncio.current_task()
         tasks: tuple[asyncio.Task[None], ...] = ()
-        notify = False
+        cleanup: asyncio.Task[None] | None = None
         async with self._lock:
             if self.state is ToolSessionState.CLOSED:
-                return
-            self.state = ToolSessionState.CLOSED
-            self.in_flight_fingerprint = None
-            self.pending_call_ids = frozenset()
-            self._wait_deadline = None
-            self._wait_token += 1
-            self._resume.set()
-            response, self._current = self._current, None
-            if response is not None and not response.detached:
-                response.queue.put_nowait(StreamFailure(error))
-                response.queue.put_nowait(STREAM_END)
-            tasks = tuple(
-                task
-                for task in (self._runner, self._watcher, self._submitter)
-                if task is not None and task is not current and not task.done()
-            )
-            self._runner = None
-            self._watcher = None
-            self._submitter = None
-            for task in tasks:
-                task.add_done_callback(self._consume_worker)
-                task.cancel()
-            notify = True
-        if notify:
-            await self.on_close(self)
+                cleanup = self._cleanup
+            else:
+                self.state = ToolSessionState.CLOSED
+                self.in_flight_fingerprint = None
+                self.pending_call_ids = frozenset()
+                self._wait_deadline = None
+                self._wait_token += 1
+                self._resume.set()
+                response, self._current = self._current, None
+                if response is not None and not response.detached:
+                    response.queue.put_nowait(StreamFailure(error))
+                    response.queue.put_nowait(STREAM_END)
+                tasks = tuple(
+                    task
+                    for task in (self._runner, self._watcher, self._submitter)
+                    if task is not None and task is not current and not task.done()
+                )
+                self._runner = None
+                self._watcher = None
+                self._submitter = None
+                for task in tasks:
+                    task.add_done_callback(self._consume_worker)
+                    task.cancel()
+                cleanup = asyncio.create_task(self._notify_close())
+                cleanup.add_done_callback(self._consume_worker)
+                self._cleanup = cleanup
+        if cleanup is not None:
+            await asyncio.shield(cleanup)
 
     async def shutdown(self) -> None:
         await self._fail(RuntimeError("session registry is closed"))
+
+    async def _notify_close(self) -> None:
+        await self.on_close(self)
 
     @staticmethod
     def _now() -> float:

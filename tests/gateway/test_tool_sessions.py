@@ -913,3 +913,36 @@ async def test_registry_close_reaches_backend_before_waiting_for_actor_workers(
 
     assert backend.cancelled.is_set()
     assert backend.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_cancelled_shutdown_keeps_one_registry_cleanup_for_retry() -> None:
+    backend = ToolSession((call_boundary("toolu_one"),))
+    registry = SessionRegistry(ToolFactory((backend,)))
+    lease = await registry.open_turn(
+        first_request(tools=(echo_tool(),)), explicit_id="lineage"
+    )
+    actor = registry._explicit["lineage"]
+    assert isinstance(actor, ToolSessionActor)
+    await registry._lock.acquire()
+    shutdown = asyncio.create_task(actor.shutdown())
+
+    try:
+        while actor.state.name != "CLOSED":
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        shutdown.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+        assert registry._explicit["lineage"] is actor
+    finally:
+        registry._lock.release()
+
+    await actor.shutdown()
+    await asyncio.wait_for(backend.closed.wait(), timeout=0.2)
+    assert "lineage" not in registry._explicit
+    assert backend.close_count == 1
+
+    await lease.abort()
+    await registry.close()
+    assert backend.close_count == 1
