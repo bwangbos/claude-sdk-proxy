@@ -17,7 +17,9 @@ from claude_sdk_proxy.domain import (
     BackendFailure,
     Completed,
     ConversationEvent,
+    Dialect,
     TextDelta,
+    ToolDefinition,
 )
 from claude_sdk_proxy.sdk_session import SdkSession
 from tests.gateway.asgi_client import (
@@ -58,7 +60,9 @@ class FailingSession(FakeConversationSession):
         super().__init__("unused")
         self.after_delta = after_delta
 
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         if self.after_delta:
             yield TextDelta("partial")
@@ -77,7 +81,9 @@ class BlockingStreamSession(FakeConversationSession):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta("first")
         self.entered.set()
@@ -86,7 +92,9 @@ class BlockingStreamSession(FakeConversationSession):
 
 
 class SlowAfterDeltaSession(FakeConversationSession):
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta("partial")
         await asyncio.Event().wait()
@@ -144,14 +152,18 @@ class SequentialSession(FakeConversationSession):
         super().__init__("unused")
         self._outputs = iter(outputs)
 
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta(next(self._outputs))
         yield Completed("end_turn", {"output_tokens": 1})
 
 
 class InputUsageSession(FakeConversationSession):
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
         from claude_sdk_proxy.domain import InputUsage
 
         self.prompts.append(prompt)
@@ -161,8 +173,14 @@ class InputUsageSession(FakeConversationSession):
 
 
 def one_session_factory(session: FakeConversationSession):
-    def factory(model: str, system: str) -> FakeConversationSession:
-        del model, system
+    def factory(
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> FakeConversationSession:
+        del model, system, tools, dialect
         return session
 
     return factory
@@ -193,7 +211,14 @@ def result_message_for_app() -> ResultMessage:
 
 
 def sdk_app(tmp_path, client: FakeSdkClient):
-    def factory(model: str, system: str) -> SdkSession:
+    def factory(
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> SdkSession:
+        del tools, dialect
         return SdkSession(
             model,
             system,
@@ -924,7 +949,14 @@ async def test_backend_tool_protocol_violation_is_http_502(tmp_path) -> None:
         )
     )
 
-    def factory(model: str, system: str) -> SdkSession:
+    def factory(
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> SdkSession:
+        del tools, dialect
         return SdkSession(
             model,
             system,

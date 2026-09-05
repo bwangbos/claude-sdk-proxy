@@ -340,6 +340,13 @@ class SdkSession:
         self._awaiting_submit = False
         self._awaiting_echo = True
 
+    async def wait_failure(self) -> None:
+        bridge = self._bridge
+        if bridge is None:
+            await asyncio.Event().wait()
+            return
+        await bridge.wait_failure()
+
     def _observe_session_id(self, value: object) -> None:
         if not isinstance(value, str) or not value:
             self._fail_protocol()

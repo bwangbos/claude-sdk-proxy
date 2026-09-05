@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, cast
@@ -180,7 +180,6 @@ class TextRequest:
 
         normalized_tools = validate_tool_definitions(self.tools)
         object.__setattr__(self, "tools", normalized_tools)
-        tool_names = {item.name for item in normalized_tools}
         normalized_messages: list[CanonicalMessage] = []
         expected: Role = "user"
         prior_call_ids: set[str] | None = None
@@ -229,10 +228,6 @@ class TextRequest:
                         raise RequestValidationError(
                             "messages", "tool call ID is invalid"
                         )
-                    if call.name not in tool_names:
-                        raise RequestValidationError(
-                            "messages", "tool call name is unknown"
-                        )
                     validate_tool_arguments(call.arguments)
                     call_ids.add(call.id)
                 if (
@@ -276,11 +271,23 @@ type ConversationEvent = InputUsage | TextDelta | ToolCall | Completed
 
 class SdkSessionProtocol(Protocol):
     async def start(self) -> None: ...
-    def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]: ...
+    def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]: ...
+    async def submit_tool_results(
+        self, results: Iterable[ToolResultBlock]
+    ) -> None: ...
+    async def wait_failure(self) -> None: ...
     async def close(self) -> None: ...
 
 
-type SdkSessionFactory = Callable[[str, str], SdkSessionProtocol]
+class SdkSessionFactory(Protocol):
+    def __call__(
+        self,
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> SdkSessionProtocol: ...
 
 
 class UnsupportedFeature(ValueError):

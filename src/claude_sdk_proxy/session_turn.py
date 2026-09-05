@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 from claude_sdk_proxy.domain import (
     CanonicalMessage,
@@ -17,6 +17,7 @@ from claude_sdk_proxy.replay_stream import ReplayStream
 
 if TYPE_CHECKING:
     from claude_sdk_proxy.sessions import SessionRegistry
+    from claude_sdk_proxy.tool_session_actor import ToolResponse, ToolSessionActor
 
 
 class SessionConflict(RuntimeError): ...
@@ -34,12 +35,20 @@ class SessionCapacity(RuntimeError):
     pass
 
 
+class TurnLeaseProtocol(Protocol):
+    response_headers: dict[str, str]
+
+    def stream(self) -> AsyncIterator[ConversationEvent]: ...
+    async def abort(self) -> None: ...
+
+
 @dataclass(slots=True)
 class Conversation:
     external_id: str
     explicit: bool
     model: str
     system: str
+    dialect: str
     transcript: tuple[CanonicalMessage, ...]
     backend: SdkSessionProtocol
     in_flight_fingerprint: str | None = None
@@ -85,7 +94,7 @@ class TurnLease:
         try:
             async with asyncio.timeout_at(self._deadline):
                 await self._conversation.backend.start()
-            backend_stream = self._conversation.backend.stream_turn(
+            backend_stream = self._conversation.backend.stream_generation(
                 self._request.next_prompt
             )
             while True:
@@ -162,3 +171,72 @@ class TurnLease:
             return
         await self._registry._release(self._conversation, self._fingerprint)
         self._replay_released = True
+
+
+@dataclass(slots=True)
+class ToolTurnLease:
+    _registry: SessionRegistry
+    _actor: ToolSessionActor
+    _fingerprint: str
+    _response: ToolResponse | None
+    _replay: tuple[ConversationEvent, ...] | None = None
+    response_headers: dict[str, str] = field(init=False)
+    _stream_started: bool = False
+    _aborted: bool = False
+    _released: bool = False
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+
+    def __post_init__(self) -> None:
+        self.response_headers = {"X-Claude-Proxy-Session": self._actor.external_id}
+
+    def stream(self) -> AsyncIterator[ConversationEvent]:
+        if self._stream_started:
+            raise RuntimeError("turn stream can only be consumed once")
+        self._stream_started = True
+        if self._aborted:
+            raise RuntimeError("turn was aborted")
+        if self._replay is not None:
+            return ReplayStream(
+                self._replay, self._release_replay, lambda: self._aborted
+            )
+        return self._active_stream()
+
+    async def _active_stream(self) -> AsyncIterator[ConversationEvent]:
+        from claude_sdk_proxy.tool_session_actor import STREAM_END, StreamFailure
+
+        response = self._response
+        if response is None:
+            raise RuntimeError("tool turn has no response")
+        finished = False
+        try:
+            while True:
+                item = await response.queue.get()
+                if item is STREAM_END:
+                    finished = True
+                    return
+                if isinstance(item, StreamFailure):
+                    raise item.error
+                yield cast(ConversationEvent, item)
+        finally:
+            if not finished:
+                await self._actor.detach(response)
+
+    async def abort(self) -> None:
+        async with self._lock:
+            if self._aborted:
+                return
+            if self._replay is not None:
+                await self._release_replay_locked()
+            elif self._response is not None:
+                await self._actor.detach(self._response)
+            self._aborted = True
+
+    async def _release_replay(self) -> None:
+        async with self._lock:
+            await self._release_replay_locked()
+
+    async def _release_replay_locked(self) -> None:
+        if self._released:
+            return
+        await self._registry._release_tool(self._actor, self._fingerprint)
+        self._released = True

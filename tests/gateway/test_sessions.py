@@ -9,8 +9,10 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
     ConversationEvent,
+    Dialect,
     TextDelta,
     TextRequest,
+    ToolDefinition,
 )
 from claude_sdk_proxy.sessions import (
     SessionCapacity,
@@ -79,7 +81,9 @@ class BlockingConversationSession(FakeConversationSession):
         self._started = started
         self._release = release
 
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         self._started.set()
         await self._release.wait()
@@ -97,8 +101,15 @@ class BlockingSessionFactory:
     def created(self) -> int:
         return len(self.sessions)
 
-    def __call__(self, model: str, system: str) -> BlockingConversationSession:
-        del model, system
+    def __call__(
+        self,
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> BlockingConversationSession:
+        del model, system, tools, dialect
         session = BlockingConversationSession("answer", self.started, self.release)
         self.sessions.append(session)
         return session
@@ -116,7 +127,9 @@ class BlockingStartSession(FakeConversationSession):
 
 
 class IncompleteSession(FakeConversationSession):
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta(self._text)
 
@@ -453,8 +466,14 @@ async def test_exact_continuation_reuses_the_same_backend() -> None:
 async def test_timeout_during_start_invalidates_and_closes_session() -> None:
     sessions: list[BlockingStartSession] = []
 
-    def factory(model: str, system: str) -> BlockingStartSession:
-        del model, system
+    def factory(
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> BlockingStartSession:
+        del model, system, tools, dialect
         session = BlockingStartSession("unused")
         sessions.append(session)
         return session
@@ -549,8 +568,14 @@ async def test_cancelled_active_abort_can_be_retried() -> None:
 async def test_incomplete_backend_stream_invalidates_session() -> None:
     sessions: list[IncompleteSession] = []
 
-    def factory(model: str, system: str) -> IncompleteSession:
-        del model, system
+    def factory(
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> IncompleteSession:
+        del model, system, tools, dialect
         session = IncompleteSession("partial")
         sessions.append(session)
         return session

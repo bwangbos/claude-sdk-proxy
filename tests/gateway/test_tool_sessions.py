@@ -1,0 +1,577 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator, Iterable
+
+import pytest
+
+from claude_sdk_proxy.domain import (
+    BackendFailure,
+    CanonicalMessage,
+    Completed,
+    ConversationEvent,
+    Dialect,
+    TextDelta,
+    TextRequest,
+    ToolCall,
+    ToolCallBlock,
+    ToolDefinition,
+    ToolResultBlock,
+)
+from claude_sdk_proxy.session_identity import request_fingerprint
+from claude_sdk_proxy.sessions import (
+    SessionCapacity,
+    SessionConflict,
+    SessionMismatch,
+    SessionRegistry,
+    SessionTimeout,
+    ToolSessionActor,
+)
+
+
+def echo_tool(*, description: str = "echo") -> ToolDefinition:
+    return ToolDefinition(
+        "echo",
+        description,
+        {"type": "object", "properties": {"value": {"type": "string"}}},
+    )
+
+
+def first_request(
+    *,
+    tools: tuple[ToolDefinition, ...] | None = None,
+    dialect: str = "anthropic",
+) -> TextRequest:
+    return TextRequest(
+        "sonnet",
+        "system",
+        (CanonicalMessage.user_text("go"),),
+        1024,
+        True,
+        dialect=dialect,  # type: ignore[arg-type]
+        tools=tools or (),
+    )
+
+
+def continuation(
+    first: TextRequest,
+    calls: tuple[ToolCall, ...],
+    results: tuple[ToolResultBlock, ...],
+) -> TextRequest:
+    assistant = CanonicalMessage(
+        "assistant",
+        tuple(
+            ToolCallBlock(call.id, call.name, call.arguments) for call in calls
+        ),
+    )
+    return TextRequest(
+        first.model,
+        first.system,
+        (*first.messages, assistant, CanonicalMessage("user", results)),
+        first.max_tokens,
+        first.stream,
+        dialect=first.dialect,
+        tools=first.tools,
+    )
+
+
+async def collect(stream: AsyncIterator[ConversationEvent]) -> list[ConversationEvent]:
+    return [event async for event in stream]
+
+
+class ToolSession:
+    def __init__(
+        self,
+        boundaries: tuple[tuple[ConversationEvent, ...], ...],
+        generation_entered: asyncio.Event | None = None,
+        generation_release: asyncio.Event | None = None,
+    ) -> None:
+        self.boundaries = boundaries
+        self.generation_entered = generation_entered
+        self.generation_release = generation_release
+        self.prompts: list[str] = []
+        self.results: list[tuple[ToolResultBlock, ...]] = []
+        self.close_count = 0
+        self.start_count = 0
+        self._resume = asyncio.Event()
+        self._failure = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def start(self) -> None:
+        self.start_count += 1
+
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
+        self.prompts.append(prompt)
+        for index, boundary in enumerate(self.boundaries):
+            if index:
+                await self._resume.wait()
+                self._resume.clear()
+            if self.generation_entered is not None:
+                self.generation_entered.set()
+            if self.generation_release is not None:
+                await self.generation_release.wait()
+            for event in boundary:
+                yield event
+
+    async def submit_tool_results(
+        self, results: Iterable[ToolResultBlock]
+    ) -> None:
+        self.results.append(tuple(results))
+        self._resume.set()
+
+    async def wait_failure(self) -> None:
+        await self._failure.wait()
+        raise BackendFailure("SDK tool protocol failure")
+
+    async def close(self) -> None:
+        self.close_count += 1
+        self.closed.set()
+
+    def fail_bridge(self) -> None:
+        self._failure.set()
+
+
+class ToolFactory:
+    def __init__(self, sessions: tuple[ToolSession, ...]) -> None:
+        self._sessions = iter(sessions)
+        self.sessions: list[ToolSession] = []
+        self.calls: list[tuple[str, str, tuple[ToolDefinition, ...], str]] = []
+
+    def __call__(
+        self,
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> ToolSession:
+        self.calls.append((model, system, tools, dialect))
+        session = next(self._sessions)
+        self.sessions.append(session)
+        return session
+
+
+def call_boundary(*ids: str) -> tuple[ConversationEvent, ...]:
+    return (
+        *(ToolCall(call_id, "echo", {"value": "same"}) for call_id in ids),
+        Completed("tool_use", {"input_tokens": 3, "output_tokens": 2}),
+    )
+
+
+def final_boundary(text: str) -> tuple[ConversationEvent, ...]:
+    return (TextDelta(text), Completed("end_turn", {"output_tokens": 1}))
+
+
+@pytest.mark.anyio
+async def test_one_tool_round_keeps_the_sdk_generation_alive() -> None:
+    backend = ToolSession((call_boundary("toolu_one"), final_boundary("done")))
+    factory = ToolFactory((backend,))
+    registry = SessionRegistry(factory)
+    first = first_request(tools=(echo_tool(),))
+
+    boundary = await collect((await registry.open_turn(first, None)).stream())
+    calls = tuple(event for event in boundary if isinstance(event, ToolCall))
+    request = continuation(
+        first, calls, (ToolResultBlock(calls[0].id, ("one",), False),)
+    )
+
+    assert await collect((await registry.open_turn(request, None)).stream()) == list(
+        final_boundary("done")
+    )
+    assert backend.prompts == ["go"]
+    assert backend.results == [
+        (ToolResultBlock("toolu_one", ("one",), False),)
+    ]
+    assert factory.calls == [
+        ("sonnet", "system", (echo_tool(),), "anthropic")
+    ]
+
+
+@pytest.mark.anyio
+async def test_reverse_order_results_and_completed_replay_keep_ids() -> None:
+    backend = ToolSession(
+        (call_boundary("toolu_left", "toolu_right"), final_boundary("left/right"))
+    )
+    registry = SessionRegistry(ToolFactory((backend,)))
+    first = first_request(tools=(echo_tool(),))
+    original = await collect((await registry.open_turn(first, None)).stream())
+    calls = tuple(event for event in original if isinstance(event, ToolCall))
+    request = continuation(
+        first,
+        calls,
+        (
+            ToolResultBlock(calls[1].id, ("right",), False),
+            ToolResultBlock(calls[0].id, ("left",), False),
+        ),
+    )
+
+    expected = await collect((await registry.open_turn(request, None)).stream())
+    replay = await collect((await registry.open_turn(request, None)).stream())
+
+    assert expected == replay == list(final_boundary("left/right"))
+    assert backend.results == [request.messages[-1].blocks]
+    actor = next(iter(registry._implicit.values()))
+    assert isinstance(actor, ToolSessionActor)
+    committed_results = actor.transcript[-2].blocks
+    assert [item.tool_call_id for item in committed_results] == [
+        "toolu_left",
+        "toolu_right",
+    ]
+
+
+@pytest.mark.anyio
+async def test_tool_configuration_and_dialect_are_frozen_per_conversation() -> None:
+    backend = ToolSession((call_boundary("toolu_one"), final_boundary("unused")))
+    registry = SessionRegistry(ToolFactory((backend,)))
+    first = first_request(tools=(echo_tool(),))
+    boundary = await collect(
+        (await registry.open_turn(first, explicit_id="lineage")).stream()
+    )
+    calls = tuple(event for event in boundary if isinstance(event, ToolCall))
+    base = continuation(
+        first, calls, (ToolResultBlock(calls[0].id, ("one",), False),)
+    )
+
+    for changed in (
+        TextRequest(
+            base.model,
+            base.system,
+            base.messages,
+            base.max_tokens,
+            base.stream,
+            dialect="openai",
+            tools=base.tools,
+        ),
+        TextRequest(
+            base.model,
+            base.system,
+            base.messages,
+            base.max_tokens,
+            base.stream,
+            dialect=base.dialect,
+            tools=(echo_tool(description="changed"),),
+        ),
+    ):
+        with pytest.raises(SessionMismatch):
+            await registry.open_turn(changed, explicit_id="lineage")
+
+    assert backend.results == []
+
+
+@pytest.mark.anyio
+async def test_omitted_tools_on_continuation_is_mismatch_without_losing_wait() -> None:
+    backend = ToolSession((call_boundary("toolu_one"), final_boundary("done")))
+    registry = SessionRegistry(ToolFactory((backend,)))
+    first = first_request(tools=(echo_tool(),))
+    boundary = await collect(
+        (await registry.open_turn(first, explicit_id="lineage")).stream()
+    )
+    call = next(event for event in boundary if isinstance(event, ToolCall))
+    valid = continuation(
+        first, (call,), (ToolResultBlock(call.id, ("one",), False),)
+    )
+    omitted = TextRequest(
+        valid.model,
+        valid.system,
+        valid.messages,
+        valid.max_tokens,
+        valid.stream,
+        dialect=valid.dialect,
+        tools=(),
+    )
+
+    with pytest.raises(SessionMismatch):
+        await registry.open_turn(omitted, explicit_id="lineage")
+
+    lease = await registry.open_turn(valid, explicit_id="lineage")
+    assert await collect(lease.stream()) == list(final_boundary("done"))
+
+
+@pytest.mark.anyio
+async def test_waiting_tool_session_is_not_capacity_evictable() -> None:
+    backend = ToolSession((call_boundary("toolu_one"), final_boundary("unused")))
+    registry = SessionRegistry(ToolFactory((backend,)), max_sessions=1)
+    first = first_request(tools=(echo_tool(),))
+    await collect((await registry.open_turn(first, explicit_id="tools")).stream())
+
+    with pytest.raises(SessionCapacity):
+        await registry.open_turn(
+            first_request(tools=(echo_tool(description="other"),)),
+            explicit_id="other",
+        )
+
+    assert backend.close_count == 0
+
+
+@pytest.mark.anyio
+async def test_disconnect_after_result_commit_buffers_boundary_for_replay() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    backend = ToolSession(
+        (call_boundary("toolu_one"), final_boundary("done")), entered, release
+    )
+    registry = SessionRegistry(ToolFactory((backend,)))
+    first = first_request(tools=(echo_tool(),))
+    initial = asyncio.create_task(
+        collect((await registry.open_turn(first, explicit_id="lineage")).stream())
+    )
+    await entered.wait()
+    release.set()
+    calls = tuple(
+        event for event in await initial if isinstance(event, ToolCall)
+    )
+    entered.clear()
+    release.clear()
+    request = continuation(
+        first, calls, (ToolResultBlock(calls[0].id, ("one",), False),)
+    )
+    lease = await registry.open_turn(request, explicit_id="lineage")
+    stream = lease.stream()
+    consume = asyncio.create_task(anext(stream))
+    await entered.wait()
+    consume.cancel()
+    await asyncio.gather(consume, return_exceptions=True)
+    await lease.abort()
+    release.set()
+    await asyncio.gather(consume, return_exceptions=True)
+    actor = registry._explicit["lineage"]
+    assert isinstance(actor, ToolSessionActor)
+    assert actor._runner is not None
+    await actor._runner
+
+    replay = await registry.open_turn(request, explicit_id="lineage")
+    assert await collect(replay.stream()) == list(final_boundary("done"))
+    assert backend.close_count == 0
+
+
+def test_fingerprint_binds_every_tool_transcript_field() -> None:
+    tool = echo_tool()
+    base = first_request(tools=(tool,))
+    call = ToolCall("toolu_one", "echo", {"value": "same"})
+    result_request = continuation(
+        base, (call,), (ToolResultBlock(call.id, ("one",), False),)
+    )
+    changed = (
+        first_request(tools=(echo_tool(description="changed"),)),
+        first_request(tools=(tool,), dialect="openai"),
+        continuation(
+            base,
+            (ToolCall("toolu_other", "echo", {"value": "same"}),),
+            (ToolResultBlock("toolu_other", ("one",), False),),
+        ),
+        continuation(
+            base, (call,), (ToolResultBlock(call.id, ("changed",), False),)
+        ),
+        continuation(
+            base, (call,), (ToolResultBlock(call.id, ("one",), True),)
+        ),
+    )
+
+    fingerprints = {
+        request_fingerprint(item) for item in (base, result_request, *changed)
+    }
+    assert len(fingerprints) == 7
+
+
+@pytest.mark.anyio
+async def test_stale_result_transcript_does_not_consume_waiting_session() -> None:
+    backend = ToolSession((call_boundary("toolu_one"), final_boundary("done")))
+    registry = SessionRegistry(ToolFactory((backend,)))
+    first = first_request(tools=(echo_tool(),))
+    boundary = await collect(
+        (await registry.open_turn(first, explicit_id="lineage")).stream()
+    )
+    call = next(event for event in boundary if isinstance(event, ToolCall))
+    stale_call = ToolCall("toolu_stale", call.name, call.arguments)
+    stale = continuation(
+        first,
+        (stale_call,),
+        (ToolResultBlock(stale_call.id, ("wrong",), False),),
+    )
+
+    with pytest.raises(SessionMismatch):
+        await registry.open_turn(stale, explicit_id="lineage")
+
+    corrected = continuation(
+        first, (call,), (ToolResultBlock(call.id, ("right",), False),)
+    )
+    assert await collect(
+        (await registry.open_turn(corrected, explicit_id="lineage")).stream()
+    ) == list(final_boundary("done"))
+
+
+@pytest.mark.anyio
+async def test_repeated_tool_rounds_reuse_one_receive_iterator() -> None:
+    backend = ToolSession(
+        (
+            call_boundary("toolu_first"),
+            call_boundary("toolu_second"),
+            final_boundary("done"),
+        )
+    )
+    registry = SessionRegistry(ToolFactory((backend,)))
+    first = first_request(tools=(echo_tool(),))
+    first_events = await collect((await registry.open_turn(first, None)).stream())
+    first_call = next(event for event in first_events if isinstance(event, ToolCall))
+    second_request = continuation(
+        first,
+        (first_call,),
+        (ToolResultBlock(first_call.id, ("one",), False),),
+    )
+    second_events = await collect(
+        (await registry.open_turn(second_request, None)).stream()
+    )
+    second_call = next(event for event in second_events if isinstance(event, ToolCall))
+    third_request = TextRequest(
+        first.model,
+        first.system,
+        (
+            *second_request.messages,
+            CanonicalMessage(
+                "assistant",
+                (
+                    ToolCallBlock(
+                        second_call.id, second_call.name, second_call.arguments
+                    ),
+                ),
+            ),
+            CanonicalMessage(
+                "user",
+                (ToolResultBlock(second_call.id, ("two",), False),),
+            ),
+        ),
+        1024,
+        True,
+        tools=first.tools,
+    )
+
+    lease = await registry.open_turn(third_request, None)
+    assert await collect(lease.stream()) == list(final_boundary("done"))
+    assert backend.prompts == ["go"]
+    assert len(backend.results) == 2
+
+
+@pytest.mark.anyio
+async def test_in_flight_tool_duplicate_is_rejected() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    backend = ToolSession((call_boundary("toolu_one"),), entered, release)
+    registry = SessionRegistry(ToolFactory((backend,)))
+    request = first_request(tools=(echo_tool(),))
+    lease = await registry.open_turn(request, None)
+    consume = asyncio.create_task(collect(lease.stream()))
+    await entered.wait()
+
+    with pytest.raises(SessionConflict, match="in flight"):
+        await registry.open_turn(request, None)
+
+    release.set()
+    await consume
+
+
+@pytest.mark.anyio
+async def test_disconnect_before_first_commit_closes_session() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    first_backend = ToolSession((final_boundary("late"),), entered, release)
+    retry_backend = ToolSession((final_boundary("retry"),))
+    registry = SessionRegistry(ToolFactory((first_backend, retry_backend)))
+    request = first_request(tools=(echo_tool(),))
+    lease = await registry.open_turn(request, explicit_id="lineage")
+    stream = lease.stream()
+    consume = asyncio.create_task(anext(stream))
+    await entered.wait()
+    consume.cancel()
+    await asyncio.gather(consume, return_exceptions=True)
+    await lease.abort()
+    await first_backend.closed.wait()
+
+    retry = await registry.open_turn(request, explicit_id="lineage")
+    assert await collect(retry.stream()) == list(final_boundary("retry"))
+    assert first_backend.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_late_bridge_failure_closes_parked_session() -> None:
+    first_backend = ToolSession((call_boundary("toolu_one"),))
+    retry_backend = ToolSession((final_boundary("retry"),))
+    registry = SessionRegistry(ToolFactory((first_backend, retry_backend)))
+    request = first_request(tools=(echo_tool(),))
+    await collect(
+        (await registry.open_turn(request, explicit_id="lineage")).stream()
+    )
+
+    first_backend.fail_bridge()
+    await first_backend.closed.wait()
+    retry = await registry.open_turn(request, explicit_id="lineage")
+
+    assert await collect(retry.stream()) == list(final_boundary("retry"))
+    assert first_backend.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_generation_deadline_closes_blocked_actor() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    backend = ToolSession((final_boundary("late"),), entered, release)
+    registry = SessionRegistry(ToolFactory((backend,)), turn_timeout_seconds=0.001)
+    request = first_request(tools=(echo_tool(),))
+    lease = await registry.open_turn(request, explicit_id="lineage")
+    consume = asyncio.create_task(collect(lease.stream()))
+    await entered.wait()
+    with pytest.raises(SessionTimeout):
+        await consume
+    await backend.closed.wait()
+    assert backend.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_expired_tool_result_deadline_wins_before_commit() -> None:
+    backend = ToolSession((call_boundary("toolu_one"), final_boundary("unused")))
+    registry = SessionRegistry(ToolFactory((backend,)))
+    first = first_request(tools=(echo_tool(),))
+    boundary = await collect(
+        (await registry.open_turn(first, explicit_id="lineage")).stream()
+    )
+    call = next(event for event in boundary if isinstance(event, ToolCall))
+    actor = registry._explicit["lineage"]
+    assert isinstance(actor, ToolSessionActor)
+    actor._wait_deadline = asyncio.get_running_loop().time()
+    request = continuation(
+        first, (call,), (ToolResultBlock(call.id, ("too late",), False),)
+    )
+
+    with pytest.raises(SessionTimeout):
+        await registry.open_turn(request, explicit_id="lineage")
+
+    await backend.closed.wait()
+    assert backend.results == []
+
+
+@pytest.mark.anyio
+async def test_shutdown_cancels_waiting_actor_and_closes_once() -> None:
+    backend = ToolSession((call_boundary("toolu_one"),))
+    registry = SessionRegistry(ToolFactory((backend,)))
+    request = first_request(tools=(echo_tool(),))
+    await collect((await registry.open_turn(request, None)).stream())
+
+    await registry.close()
+    await registry.close()
+
+    assert backend.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_parked_tool_result_timeout_closes_session() -> None:
+    backend = ToolSession((call_boundary("toolu_one"),))
+    registry = SessionRegistry(
+        ToolFactory((backend,)), tool_result_timeout_seconds=0.001
+    )
+    request = first_request(tools=(echo_tool(),))
+    await collect(
+        (await registry.open_turn(request, explicit_id="lineage")).stream()
+    )
+
+    await backend.closed.wait()
+
+    assert backend.close_count == 1
+    assert backend.results == []

@@ -7,7 +7,7 @@ from typing import Protocol
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from claude_sdk_proxy.domain import ConversationEvent
-from claude_sdk_proxy.sessions import TurnLease
+from claude_sdk_proxy.session_turn import TurnLeaseProtocol
 
 type EventEncoder = Callable[[ConversationEvent], tuple[bytes, ...]]
 type ErrorEncoder = Callable[[Exception], tuple[bytes, ...]]
@@ -80,7 +80,7 @@ class DisconnectMonitor:
 class EventStreamResponse:
     def __init__(
         self,
-        lease: TurnLease,
+        lease: TurnLeaseProtocol,
         stream: ClosableEventStream,
         first: ConversationEvent,
         start_chunks: tuple[bytes, ...],
@@ -146,7 +146,7 @@ class EventStreamResponse:
             await self._send_chunk(send, chunk)
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
-async def abort_best_effort(lease: TurnLease) -> None:
+async def abort_best_effort(lease: TurnLeaseProtocol) -> None:
     try:
         await lease.abort()
     except BaseException:
@@ -161,7 +161,7 @@ async def close_best_effort(stream: ClosableEventStream) -> None:
 
 
 async def cleanup_best_effort(
-    lease: TurnLease, stream: ClosableEventStream
+    lease: TurnLeaseProtocol, stream: ClosableEventStream
 ) -> None:
     await abort_best_effort(lease)
     await close_best_effort(stream)

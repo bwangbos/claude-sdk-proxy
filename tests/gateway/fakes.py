@@ -17,7 +17,13 @@ from claude_agent_sdk import (
 from mcp.server import Server
 from mcp.types import CallToolRequestParams, CallToolResult
 
-from claude_sdk_proxy.domain import Completed, ConversationEvent, TextDelta
+from claude_sdk_proxy.domain import (
+    Completed,
+    ConversationEvent,
+    Dialect,
+    TextDelta,
+    ToolDefinition,
+)
 
 
 class FixedTemporaryDirectory:
@@ -347,7 +353,9 @@ class FakeConversationSession:
     async def start(self) -> None:
         self.start_count += 1
 
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta(self._text)
         yield Completed("end_turn", {"output_tokens": 1})
@@ -366,8 +374,15 @@ class FakeSessionFactory:
     def created(self) -> int:
         return len(self.sessions)
 
-    def __call__(self, model: str, system: str) -> FakeConversationSession:
-        del model, system
+    def __call__(
+        self,
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> FakeConversationSession:
+        del model, system, tools, dialect
         session = FakeConversationSession(next(self._outputs))
         self.sessions.append(session)
         return session

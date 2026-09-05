@@ -45,7 +45,8 @@ from claude_sdk_proxy.openai_api import (
     render_openai_response,
 )
 from claude_sdk_proxy.sdk_session import SdkSession
-from claude_sdk_proxy.sessions import SessionRegistry, TurnLease
+from claude_sdk_proxy.session_turn import TurnLeaseProtocol
+from claude_sdk_proxy.sessions import SessionRegistry
 
 
 def create_app(
@@ -154,7 +155,7 @@ async def _stream_response(
     dialect: str,
     request_id: str,
     request: TextRequest,
-    lease: TurnLease,
+    lease: TurnLeaseProtocol,
     monitor: DisconnectMonitor,
 ) -> Response:
     stream = cast(ClosableEventStream, lease.stream())
@@ -207,7 +208,7 @@ async def _nonstream_response(
     dialect: str,
     request_id: str,
     request: TextRequest,
-    lease: TurnLease,
+    lease: TurnLeaseProtocol,
     monitor: DisconnectMonitor,
 ) -> Response:
     stream = cast(ClosableEventStream, lease.stream())

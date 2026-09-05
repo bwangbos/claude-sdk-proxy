@@ -14,7 +14,13 @@ from typing import Any
 import pytest
 import uvicorn
 
-from claude_sdk_proxy.domain import Completed, ConversationEvent, TextDelta
+from claude_sdk_proxy.domain import (
+    Completed,
+    ConversationEvent,
+    Dialect,
+    TextDelta,
+    ToolDefinition,
+)
 from tests.gateway.fakes import FakeConversationSession
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_text_client.mjs"
@@ -27,7 +33,9 @@ class IntegrationSession(FakeConversationSession):
         self._outputs = iter(outputs)
         self._stall = stall
 
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta(next(self._outputs))
         if self._stall:
@@ -42,8 +50,15 @@ class SequenceSessionFactory:
         self._specifications = iter(specifications)
         self.sessions: list[IntegrationSession] = []
 
-    def __call__(self, model: str, system: str) -> IntegrationSession:
-        del model, system
+    def __call__(
+        self,
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> IntegrationSession:
+        del model, system, tools, dialect
         outputs, stall = next(self._specifications)
         session = IntegrationSession(outputs, stall=stall)
         self.sessions.append(session)
