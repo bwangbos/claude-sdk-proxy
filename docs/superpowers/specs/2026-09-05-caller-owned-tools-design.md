@@ -94,8 +94,13 @@ The adapters return a stable HTTP 400 unsupported-feature error for:
 - explicit `parallel_tool_calls: false`;
 - non-function OpenAI tools;
 - non-object input schemas;
+- external or relative JSON Schema references (self-contained fragment
+  references such as `#/$defs/item` and local anchors are pre-resolved; the
+  proxy never resolves schemas over the network or filesystem);
 - image, document, resource, or other non-text result blocks;
 - user text mixed into a pending tool-result continuation;
+- Anthropic `is_error: true` results with no non-empty text (the backend rejects
+  empty error content; empty successful results remain valid);
 - partial result sets.
 
 Tool names use Anthropic's portable constraint `[A-Za-z0-9_-]{1,64}`. Names
@@ -232,10 +237,15 @@ ClaudeAgentOptions(
     permission_mode="dontAsk",
     agents={},
     plugins=[],
-    max_buffer_size=2 * 1024 * 1024,
+    max_buffer_size=8 * 1024 * 1024,
     # existing empty cwd, disabled memory/slash commands/persistence
 )
 ```
+
+The 8 MiB internal line buffer is derived from the 1 MiB aggregate UTF-8 result
+limit: JSON escaping can expand a one-byte control character to six wire bytes,
+and the remainder covers the SDK message envelope. This does not increase any
+public schema, argument, or result limit.
 
 The proxy does not enable general MCP discovery or any Claude Code built-in.
 Tool schemas are necessarily visible to Claude, and Anthropic automatically adds
