@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -52,11 +52,15 @@ class FakeSdkClient:
             asyncio.Event, asyncio.Event, asyncio.Event
         ]
         | None = None,
+        message_barriers: Mapping[int, tuple[asyncio.Event, asyncio.Event]]
+        | None = None,
     ) -> None:
         self._responses = iter(responses)
         self._response: tuple[Any, ...] = ()
         self.connect_count = 0
         self.disconnect_count = 0
+        self.disconnected = asyncio.Event()
+        self.tool_handler_count = 0
         self.prompts: list[str] = []
         self.options: ClaudeAgentOptions | None = None
         self.tool_results: list[CallToolResult] = []
@@ -65,6 +69,7 @@ class FakeSdkClient:
         self._start_callbacks = start_tool_callbacks
         self._wait_before_user = wait_for_tool_callbacks_before_user
         self._user_message_barrier = user_message_barrier
+        self._message_barriers = dict(message_barriers or {})
 
     def capture_options(self, options: ClaudeAgentOptions) -> FakeSdkClient:
         self.options = options
@@ -78,7 +83,12 @@ class FakeSdkClient:
         self._response = next(self._responses)
 
     async def receive_response(self) -> AsyncIterator[Any]:
-        for message in self._response:
+        for index, message in enumerate(self._response):
+            barrier = self._message_barriers.get(index)
+            if barrier is not None:
+                entered, release = barrier
+                entered.set()
+                await release.wait()
             if self._start_callbacks and isinstance(message, AssistantMessage):
                 self._start_tool_callbacks(message)
             if (
@@ -99,6 +109,7 @@ class FakeSdkClient:
 
     async def disconnect(self) -> None:
         self.disconnect_count += 1
+        self.disconnected.set()
         tasks = [*self._tool_tasks, *self._parked_tool_tasks]
         for task in tasks:
             task.cancel()
@@ -129,7 +140,11 @@ class FakeSdkClient:
             name=name,
             arguments=cast(dict[str, object], arguments),
         )
-        task = asyncio.create_task(cast(Any, entry.handler)(None, params))
+        async def invoke_handler() -> CallToolResult:
+            self.tool_handler_count += 1
+            return await cast(Any, entry.handler)(None, params)
+
+        task = asyncio.create_task(invoke_handler())
         target = self._tool_tasks if wait_for_echo else self._parked_tool_tasks
         target.append(task)
 

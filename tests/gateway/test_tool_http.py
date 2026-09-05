@@ -3,8 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Iterable
+from pathlib import Path
+from typing import Any
 
 import pytest
+from claude_agent_sdk import ResultMessage, UserMessage
+from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
 
 from claude_sdk_proxy.app import create_app
 from claude_sdk_proxy.domain import (
@@ -17,11 +21,18 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
+from claude_sdk_proxy.sdk_session import SdkSession
 from tests.gateway.asgi_client import (
     _LIFESPAN_STATES,
     lifespan_app,
     post_json,
     post_json_then_disconnect,
+)
+from tests.gateway.fakes import (
+    FakeSdkClient,
+    FixedTemporaryDirectory,
+    raw_text_events,
+    raw_tool_events,
 )
 
 
@@ -113,16 +124,6 @@ class BlockingToolSession(ToolBoundarySession):
             await self.release.wait()
         yield ToolCall("toolu_one", "echo", {"value": "same"})
         yield Completed("tool_use", {"input_tokens": 13, "output_tokens": 6})
-
-
-class SecretFailureToolSession(ToolBoundarySession):
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
-        self.prompts.append(prompt)
-        secret = "model-argument-secret-" + "x" * (256 * 1024)
-        raise RuntimeError(f"{secret} session=sdk-private-id")
-        yield  # pragma: no cover
 
 
 def tool_body(dialect: str, *, stream: bool = False) -> dict[str, object]:
@@ -283,6 +284,495 @@ def _public_boundary(
         if item["choices"]
     )
     return calls, (usage["prompt_tokens"], usage["completion_tokens"]), text
+
+
+def _sdk_tool_body(
+    dialect: str,
+    messages: list[dict[str, object]] | None = None,
+    *,
+    stream: bool,
+) -> dict[str, object]:
+    body: dict[str, object] = {
+        "model": "sonnet",
+        "messages": messages or [{"role": "user", "content": "go"}],
+        "max_tokens": 128,
+        "stream": stream,
+    }
+    schema = {
+        "type": "object",
+        "properties": {"v": {"type": "integer"}},
+        "required": ["v"],
+        "additionalProperties": False,
+    }
+    if dialect == "anthropic":
+        body["tools"] = [
+            {"name": "echo", "description": "echo integer", "input_schema": schema}
+        ]
+    else:
+        body["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "echo integer",
+                    "parameters": schema,
+                },
+            }
+        ]
+        if stream:
+            body["stream_options"] = {"include_usage": True}
+    return body
+
+
+def _sdk_app(tmp_path: Path, client: FakeSdkClient):
+    def factory(
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+    ) -> SdkSession:
+        return SdkSession(
+            model,
+            system,
+            directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+            client_factory=lambda options: client.capture_options(options),
+            tools=tools,
+            dialect=dialect,
+        )
+
+    return create_app(models=("sonnet",), session_factory=factory)
+
+
+def _result_message(usage: dict[str, int]) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=0,
+        duration_api_ms=0,
+        is_error=False,
+        num_turns=3,
+        session_id="sdk-real",
+        stop_reason="end_turn",
+        usage=usage,
+    )
+
+
+def _tool_payloads(dialect: str, response_body: bytes, response_json: object):
+    if response_json:
+        assert isinstance(response_json, dict)
+        if dialect == "anthropic":
+            return tuple(
+                (block["id"], block["input"])
+                for block in response_json["content"]
+                if block["type"] == "tool_use"
+            )
+        return tuple(
+            (call["id"], json.loads(call["function"]["arguments"]))
+            for call in response_json["choices"][0]["message"]["tool_calls"]
+        )
+    records = _sse_records(response_body)
+    if dialect == "anthropic":
+        starts = {
+            item["index"]: item["content_block"]
+            for _, item in records
+            if isinstance(item, dict) and item.get("type") == "content_block_start"
+        }
+        deltas = {
+            item["index"]: item["delta"]["partial_json"]
+            for _, item in records
+            if isinstance(item, dict)
+            and item.get("type") == "content_block_delta"
+            and item["delta"]["type"] == "input_json_delta"
+        }
+        return tuple(
+            (block["id"], json.loads(deltas[index]))
+            for index, block in sorted(starts.items())
+            if block["type"] == "tool_use"
+        )
+    return tuple(
+        (
+            item["choices"][0]["delta"]["tool_calls"][0]["id"],
+            json.loads(
+                item["choices"][0]["delta"]["tool_calls"][0]["function"][
+                    "arguments"
+                ]
+            ),
+        )
+        for _, item in records
+        if isinstance(item, dict)
+        and item.get("choices")
+        and "tool_calls" in item["choices"][0]["delta"]
+    )
+
+
+def _assistant_sdk_message(
+    dialect: str, calls: tuple[tuple[str, dict[str, int]], ...]
+) -> dict[str, object]:
+    if dialect == "anthropic":
+        return {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": identifier,
+                    "name": "echo",
+                    "input": arguments,
+                }
+                for identifier, arguments in calls
+            ],
+        }
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": identifier,
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "arguments": json.dumps(
+                        arguments, sort_keys=True, separators=(",", ":")
+                    ),
+                },
+            }
+            for identifier, arguments in calls
+        ],
+    }
+
+
+def _sdk_result_messages(
+    dialect: str, results: tuple[tuple[str, str], ...]
+) -> list[dict[str, object]]:
+    if dialect == "anthropic":
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": identifier,
+                        "content": value,
+                    }
+                    for identifier, value in results
+                ],
+            }
+        ]
+    return [
+        {"role": "tool", "tool_call_id": identifier, "content": value}
+        for identifier, value in results
+    ]
+
+
+def _sse_records(body: bytes) -> list[tuple[str | None, Any]]:
+    records: list[tuple[str | None, Any]] = []
+    event: str | None = None
+    for line in body.splitlines():
+        if line.startswith(b"event: "):
+            event = line.removeprefix(b"event: ").decode()
+        elif line.startswith(b"data: "):
+            raw = line.removeprefix(b"data: ")
+            records.append((event, "[DONE]" if raw == b"[DONE]" else json.loads(raw)))
+            event = None
+    return records
+
+
+def _normalize_response_id(records: list[tuple[str | None, Any]]):
+    copied = json.loads(json.dumps(records))
+    for _, item in copied:
+        if not isinstance(item, dict):
+            continue
+        if "id" in item:
+            item["id"] = "<response>"
+        message = item.get("message")
+        if isinstance(message, dict) and "id" in message:
+            message["id"] = "<response>"
+    return copied
+
+
+def _normalized_http_payload(response_json: object) -> object:
+    copied = json.loads(json.dumps(response_json))
+    if isinstance(copied, dict) and "id" in copied:
+        copied["id"] = "<response>"
+    return copied
+
+
+def _assert_exact_tool_sse(
+    dialect: str,
+    body: bytes,
+    calls: tuple[tuple[str, dict[str, int]], ...],
+    usage: tuple[int, int],
+) -> None:
+    if dialect == "anthropic":
+        expected: list[list[object]] = [
+            [
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "<response>",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "sonnet",
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": usage[0], "output_tokens": 0},
+                    },
+                },
+            ]
+        ]
+        for index, (identifier, arguments) in enumerate(calls):
+            expected.extend(
+                [
+                    [
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": identifier,
+                                "name": "echo",
+                                "input": {},
+                            },
+                        },
+                    ],
+                    [
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps(
+                                    arguments, sort_keys=True, separators=(",", ":")
+                                ),
+                            },
+                        },
+                    ],
+                    [
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": index},
+                    ],
+                ]
+            )
+        expected.extend(
+            [
+                [
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": "tool_use",
+                            "stop_sequence": None,
+                        },
+                        "usage": {"output_tokens": usage[1]},
+                    },
+                ],
+                ["message_stop", {"type": "message_stop"}],
+            ]
+        )
+        assert _normalize_response_id(_sse_records(body)) == expected
+        return
+    first = {
+        "id": "<response>",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "sonnet",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "logprobs": None,
+                "finish_reason": None,
+            }
+        ],
+    }
+    expected = [[None, first]]
+    for index, (identifier, arguments) in enumerate(calls):
+        expected.append(
+            [
+                None,
+                {
+                    **first,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": identifier,
+                                        "type": "function",
+                                        "function": {
+                                            "name": "echo",
+                                            "arguments": json.dumps(
+                                                arguments,
+                                                sort_keys=True,
+                                                separators=(",", ":"),
+                                            ),
+                                        },
+                                    }
+                                ]
+                            },
+                            "logprobs": None,
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+            ]
+        )
+    expected.extend(
+        [
+            [
+                None,
+                {
+                    **first,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "logprobs": None,
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                },
+            ],
+            [
+                None,
+                {
+                    "id": "<response>",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "sonnet",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": usage[0],
+                        "completion_tokens": usage[1],
+                        "total_tokens": sum(usage),
+                    },
+                },
+            ],
+            [None, "[DONE]"],
+        ]
+    )
+    assert _normalize_response_id(_sse_records(body)) == expected
+
+
+def _assert_exact_final_sse(dialect: str, body: bytes) -> None:
+    records = _normalize_response_id(_sse_records(body))
+    if dialect == "anthropic":
+        assert records == [
+            [
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "<response>",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "sonnet",
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 11, "output_tokens": 0},
+                    },
+                },
+            ],
+            [
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ],
+            [
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "real-sdk-final"},
+                },
+            ],
+            [
+                "content_block_stop",
+                {"type": "content_block_stop", "index": 0},
+            ],
+            [
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 4},
+                },
+            ],
+            ["message_stop", {"type": "message_stop"}],
+        ]
+        return
+    chunk = {
+        "id": "<response>",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "sonnet",
+    }
+    assert records == [
+        [
+            None,
+            {
+                **chunk,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "logprobs": None,
+                        "finish_reason": None,
+                    }
+                ],
+            },
+        ],
+        [
+            None,
+            {
+                **chunk,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "real-sdk-final"},
+                        "logprobs": None,
+                        "finish_reason": None,
+                    }
+                ],
+            },
+        ],
+        [
+            None,
+            {
+                **chunk,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "logprobs": None,
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        ],
+        [
+            None,
+            {
+                **chunk,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 4,
+                    "total_tokens": 15,
+                },
+            },
+        ],
+        [None, "[DONE]"],
+    ]
 
 
 @pytest.mark.anyio
@@ -661,6 +1151,289 @@ async def test_http_repeated_tool_rounds_reverse_parallel_results_and_replay(
     ]
     assert handler_count == session.handler_count == 2
     assert session.prompts == ["go"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("dialect", "path"),
+    [
+        ("anthropic", "/v1/messages"),
+        ("openai", "/v1/chat/completions"),
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+async def test_real_sdk_http_boundaries_usage_bridge_replay_and_wire(
+    tmp_path: Path, dialect: str, path: str, stream: bool
+) -> None:
+    sdk_name = "mcp__caller_tools_v1__echo"
+    messages = (
+        *raw_tool_events(
+            (("sdk-a", sdk_name, '{"v":1}'), ("sdk-b", sdk_name, '{"v":1}')),
+            "sdk-real",
+            input_tokens=5,
+            output_tokens=2,
+        ),
+        UserMessage(
+            [
+                SdkToolResultBlock("sdk-b", "right-result", False),
+                SdkToolResultBlock("sdk-a", "left-result", False),
+            ]
+        ),
+        *raw_tool_events(
+            (("sdk-c", sdk_name, '{"v":2}'),),
+            "sdk-real",
+            input_tokens=7,
+            output_tokens=3,
+        ),
+        UserMessage([SdkToolResultBlock("sdk-c", "round-two", False)]),
+        *raw_text_events(
+            "real-sdk-final", "sdk-real", input_tokens=11, output_tokens=4
+        ),
+        _result_message({"input_tokens": 101, "output_tokens": 47}),
+    )
+    client = FakeSdkClient(responses=(messages,))
+    app = _sdk_app(tmp_path, client)
+    initial_body = _sdk_tool_body(dialect, stream=stream)
+    async with lifespan_app(app):
+        first = await post_json(app, path, initial_body)
+        first_json = {} if stream else first.json
+        first_calls = _tool_payloads(dialect, first.body, first_json)
+        assert first_calls[0][0] != first_calls[1][0]
+        assert first_calls[0][1] == first_calls[1][1] == {"v": 1}
+        assert client.tool_handler_count == 2
+
+        replay = await post_json(app, path, initial_body)
+        assert client.tool_handler_count == 2
+        if stream:
+            assert _normalize_response_id(_sse_records(replay.body)) == (
+                _normalize_response_id(_sse_records(first.body))
+            )
+        else:
+            assert _normalized_http_payload(replay.json) == (
+                _normalized_http_payload(first.json)
+            )
+
+        transcript: list[dict[str, object]] = [
+            {"role": "user", "content": "go"},
+            _assistant_sdk_message(dialect, first_calls),
+            *_sdk_result_messages(
+                dialect,
+                (
+                    (first_calls[1][0], "right-result"),
+                    (first_calls[0][0], "left-result"),
+                ),
+            ),
+        ]
+        second = await post_json(
+            app, path, _sdk_tool_body(dialect, transcript, stream=stream)
+        )
+        second_json = {} if stream else second.json
+        second_calls = _tool_payloads(dialect, second.body, second_json)
+        transcript.extend(
+            [
+                _assistant_sdk_message(dialect, second_calls),
+                *_sdk_result_messages(
+                    dialect, ((second_calls[0][0], "round-two"),)
+                ),
+            ]
+        )
+        final = await post_json(
+            app, path, _sdk_tool_body(dialect, transcript, stream=stream)
+        )
+        final_json = {} if stream else final.json
+
+    assert first.status == replay.status == second.status == final.status == 200
+    assert _public_boundary(dialect, first.body, first_json, stream=stream) == (
+        tuple(item[0] for item in first_calls),
+        (5, 2),
+        "",
+    )
+    assert _public_boundary(dialect, second.body, second_json, stream=stream) == (
+        tuple(item[0] for item in second_calls),
+        (7, 3),
+        "",
+    )
+    assert _public_boundary(dialect, final.body, final_json, stream=stream) == (
+        (),
+        (11, 4),
+        "real-sdk-final",
+    )
+    if stream:
+        _assert_exact_tool_sse(dialect, first.body, first_calls, (5, 2))
+        _assert_exact_tool_sse(dialect, second.body, second_calls, (7, 3))
+        _assert_exact_final_sse(dialect, final.body)
+    assert client.tool_handler_count == 3
+    assert client.prompts == ["go"]
+    assert len(client.tool_results) == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("dialect", "path", "header_chunk"),
+    [
+        ("anthropic", "/v1/messages", b"event: message_start\n"),
+        ("openai", "/v1/chat/completions", b'"role":"assistant"'),
+    ],
+)
+async def test_real_sdk_disconnect_after_usage_before_tool_commit_aborts(
+    tmp_path: Path, dialect: str, path: str, header_chunk: bytes
+) -> None:
+    raw_blocked = asyncio.Event()
+    raw_release = asyncio.Event()
+    sdk_name = "mcp__caller_tools_v1__echo"
+    client = FakeSdkClient(
+        responses=(
+            raw_tool_events(
+                (("sdk-private-call", sdk_name, '{"v":1}'),),
+                "sdk-private-session",
+                input_tokens=5,
+                output_tokens=2,
+            ),
+        ),
+        message_barriers={1: (raw_blocked, raw_release)},
+    )
+    app = _sdk_app(tmp_path, client)
+    async with lifespan_app(app):
+        response = await post_json(
+            app,
+            path,
+            _sdk_tool_body(dialect, stream=True),
+            disconnect_after_body_contains=header_chunk,
+        )
+        await asyncio.wait_for(client.disconnected.wait(), timeout=0.5)
+        registry = _LIFESPAN_STATES[app]["registry"]
+        assert not registry._implicit
+
+    assert response.status == 200
+    assert raw_blocked.is_set()
+    assert client.tool_handler_count == 0
+    assert client.disconnect_count == 1
+    assert b"sdk-private-call" not in response.body
+    assert b"sdk-private-session" not in response.body
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("dialect", "path", "terminal_chunk"),
+    [
+        ("anthropic", "/v1/messages", b"event: message_stop\n"),
+        ("openai", "/v1/chat/completions", b"data: [DONE]\n\n"),
+    ],
+)
+async def test_real_sdk_disconnect_after_complete_tool_wire_keeps_actor(
+    tmp_path: Path, dialect: str, path: str, terminal_chunk: bytes
+) -> None:
+    sdk_name = "mcp__caller_tools_v1__echo"
+    messages = (
+        *raw_tool_events(
+            (("sdk-private-call", sdk_name, '{"v":1}'),),
+            "sdk-private-session",
+            input_tokens=5,
+            output_tokens=2,
+        ),
+        UserMessage([SdkToolResultBlock("sdk-private-call", "result", False)]),
+        *raw_text_events(
+            "continued", "sdk-private-session", input_tokens=8, output_tokens=3
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=0,
+            duration_api_ms=0,
+            is_error=False,
+            num_turns=2,
+            session_id="sdk-private-session",
+            stop_reason="end_turn",
+            usage={"input_tokens": 88, "output_tokens": 33},
+        ),
+    )
+    client = FakeSdkClient(responses=(messages,))
+    app = _sdk_app(tmp_path, client)
+    async with lifespan_app(app):
+        boundary = await post_json(
+            app,
+            path,
+            _sdk_tool_body(dialect, stream=True),
+            disconnect_after_body_contains=terminal_chunk,
+        )
+        calls = _tool_payloads(dialect, boundary.body, {})
+        assert len(calls) == 1
+        assert client.tool_handler_count == 1
+        assert client.disconnect_count == 0
+        transcript = [
+            {"role": "user", "content": "go"},
+            _assistant_sdk_message(dialect, calls),
+            *_sdk_result_messages(dialect, ((calls[0][0], "result"),)),
+        ]
+        continued = await post_json(
+            app, path, _sdk_tool_body(dialect, transcript, stream=False)
+        )
+
+    assert boundary.status == continued.status == 200
+    assert _public_boundary(dialect, continued.body, continued.json, stream=False) == (
+        (),
+        (8, 3),
+        "continued",
+    )
+    assert client.tool_handler_count == 1
+    assert client.disconnect_count == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("dialect", "path"),
+    [
+        ("anthropic", "/v1/messages"),
+        ("openai", "/v1/chat/completions"),
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+async def test_real_sdk_oversized_raw_tool_arguments_are_redacted_http_errors(
+    tmp_path: Path, dialect: str, path: str, stream: bool
+) -> None:
+    secret = "oversized-model-secret-" + "z" * (300 * 1024)
+    encoded = json.dumps({"v": secret}, separators=(",", ":"))
+    client = FakeSdkClient(
+        responses=(
+            raw_tool_events(
+                (
+                    (
+                        "sdk-internal-oversized",
+                        "mcp__caller_tools_v1__echo",
+                        encoded,
+                    ),
+                ),
+                "sdk-session-secret",
+                input_tokens=5,
+                output_tokens=2,
+            ),
+        )
+    )
+    app = _sdk_app(tmp_path, client)
+    body = _sdk_tool_body(dialect, stream=stream)
+    if dialect == "anthropic":
+        body["tools"][0]["input_schema"]["properties"]["v"] = {  # type: ignore[index]
+            "type": "string"
+        }
+    else:
+        body["tools"][0]["function"]["parameters"]["properties"]["v"] = {  # type: ignore[index]
+            "type": "string"
+        }
+    async with lifespan_app(app):
+        response = await post_json(app, path, body)
+
+    if stream:
+        assert response.status == 200
+        assert b"backend_error" in response.body
+    else:
+        assert response.status == 502
+        assert response.json["error"][
+            "type" if dialect == "anthropic" else "code"
+        ] == "backend_error"
+    assert b"oversized-model-secret" not in response.body
+    assert b"sdk-internal-oversized" not in response.body
+    assert b"sdk-session-secret" not in response.body
+    assert client.tool_handler_count == 0
+    assert client.disconnect_count == 1
 
 
 @pytest.mark.anyio
@@ -1126,7 +1899,7 @@ async def test_shutdown_closes_waiting_tool_actor_once() -> None:
 
 
 @pytest.mark.anyio
-async def test_oversized_caller_result_and_model_failure_are_redacted() -> None:
+async def test_oversized_caller_result_is_redacted() -> None:
     caller_session = RepeatedRoundSession(
         (
             (
@@ -1139,9 +1912,6 @@ async def test_oversized_caller_result_and_model_failure_are_redacted() -> None:
             ),
         )
     )
-    model_session = SecretFailureToolSession()
-    sessions = iter((caller_session, model_session))
-
     def factory(
         model: str,
         system: str,
@@ -1150,7 +1920,7 @@ async def test_oversized_caller_result_and_model_failure_are_redacted() -> None:
         dialect: Dialect = "anthropic",
     ) -> ToolBoundarySession:
         del model, system, tools, dialect
-        return next(sessions)
+        return caller_session
 
     app = create_app(models=("sonnet",), session_factory=factory)
     oversized = "caller-result-secret-" + "y" * (256 * 1024)
@@ -1172,20 +1942,9 @@ async def test_oversized_caller_result_and_model_failure_are_redacted() -> None:
             _body_with_messages("anthropic", messages, stream=False),
             {"X-Claude-Proxy-Session": "caller-secret-session"},
         )
-        model = await post_json(
-            app,
-            "/v1/messages",
-            tool_body("anthropic"),
-            {"X-Claude-Proxy-Session": "model-secret-session"},
-        )
 
     assert boundary.status == 200
     assert caller.status == 400
     assert caller.json["error"]["type"] == "invalid_request"
     assert b"caller-result-secret" not in caller.body
     assert b"caller-secret-session" not in caller.body
-    assert model.status == 502
-    assert model.json["error"]["type"] == "backend_error"
-    assert b"model-argument-secret" not in model.body
-    assert b"sdk-private-id" not in model.body
-    assert b"model-secret-session" not in model.body
