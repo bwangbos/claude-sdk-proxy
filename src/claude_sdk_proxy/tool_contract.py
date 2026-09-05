@@ -31,79 +31,122 @@ _MAX_TOTAL_SCHEMA_BYTES = 512 * 1024
 _MAX_ARGUMENT_BYTES = 256 * 1024
 _MAX_RESULT_BYTES = 256 * 1024
 _MAX_TOTAL_RESULT_BYTES = 1024 * 1024
+MAX_JSON_CONTAINER_DEPTH = 64
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _PUBLIC_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _REFERENCE_KEYWORDS = ("$ref", "$dynamicRef", "$recursiveRef")
+_JSON_DEPTH_REASON = "JSON nesting exceeds its depth limit"
 
 
-def freeze_json(value: object) -> JsonValue:
-    return _freeze_json(value, set())
+def freeze_json(value: object, *, field: str = "tools") -> JsonValue:
+    try:
+        return _freeze_json(value, set(), 0, field)
+    except RecursionError:
+        raise RequestValidationError(field, _JSON_DEPTH_REASON) from None
 
 
-def _freeze_json(value: object, ancestors: set[int]) -> JsonValue:
+def _freeze_json(
+    value: object, ancestors: set[int], container_depth: int, field: str
+) -> JsonValue:
     if value is None or type(value) is bool or isinstance(value, str):
         return cast(JsonValue, value)
     if type(value) is int:
         return cast(JsonValue, value)
     if type(value) is float:
         if not math.isfinite(value):
-            raise RequestValidationError("tools", "must contain JSON values")
+            raise RequestValidationError(field, "must contain JSON values")
         return value
     if isinstance(value, Mapping):
-        return _freeze_mapping(value, ancestors)
+        return _freeze_mapping(value, ancestors, container_depth, field)
     if isinstance(value, (list, tuple)):
-        return _freeze_array(value, ancestors)
-    raise RequestValidationError("tools", "must contain JSON values")
+        return _freeze_array(value, ancestors, container_depth, field)
+    raise RequestValidationError(field, "must contain JSON values")
 
 
-def _freeze_mapping(value: Mapping[object, object], ancestors: set[int]) -> JsonValue:
+def _freeze_mapping(
+    value: Mapping[object, object],
+    ancestors: set[int],
+    container_depth: int,
+    field: str,
+) -> JsonValue:
+    container_depth += 1
+    if container_depth > MAX_JSON_CONTAINER_DEPTH:
+        raise RequestValidationError(field, _JSON_DEPTH_REASON)
     marker = id(value)
     if marker in ancestors:
-        raise RequestValidationError("tools", "must contain JSON values")
+        raise RequestValidationError(field, "must contain JSON values")
     ancestors.add(marker)
     try:
         frozen: dict[str, JsonValue] = {}
         for key, item in value.items():
             if not isinstance(key, str):
-                raise RequestValidationError("tools", "must contain JSON values")
-            frozen[key] = _freeze_json(item, ancestors)
+                raise RequestValidationError(field, "must contain JSON values")
+            frozen[key] = _freeze_json(item, ancestors, container_depth, field)
         return MappingProxyType(frozen)
     finally:
         ancestors.remove(marker)
 
 
 def _freeze_array(
-    value: list[object] | tuple[object, ...], ancestors: set[int]
+    value: list[object] | tuple[object, ...],
+    ancestors: set[int],
+    container_depth: int,
+    field: str,
 ) -> JsonValue:
+    container_depth += 1
+    if container_depth > MAX_JSON_CONTAINER_DEPTH:
+        raise RequestValidationError(field, _JSON_DEPTH_REASON)
     marker = id(value)
     if marker in ancestors:
-        raise RequestValidationError("tools", "must contain JSON values")
+        raise RequestValidationError(field, "must contain JSON values")
     ancestors.add(marker)
     try:
-        return tuple(_freeze_json(item, ancestors) for item in value)
+        return tuple(
+            _freeze_json(item, ancestors, container_depth, field) for item in value
+        )
     finally:
         ancestors.remove(marker)
 
 
-def plain_json(value: JsonValue) -> object:
+def plain_json(value: JsonValue, *, field: str = "tools") -> object:
+    try:
+        return _plain_json(value, 0, field)
+    except RecursionError:
+        raise RequestValidationError(field, _JSON_DEPTH_REASON) from None
+
+
+def _plain_json(value: JsonValue, container_depth: int, field: str) -> object:
     if isinstance(value, Mapping):
-        return {key: plain_json(item) for key, item in value.items()}
+        container_depth += 1
+        if container_depth > MAX_JSON_CONTAINER_DEPTH:
+            raise RequestValidationError(field, _JSON_DEPTH_REASON)
+        return {
+            key: _plain_json(item, container_depth, field)
+            for key, item in value.items()
+        }
     if isinstance(value, tuple):
-        return [plain_json(item) for item in value]
+        container_depth += 1
+        if container_depth > MAX_JSON_CONTAINER_DEPTH:
+            raise RequestValidationError(field, _JSON_DEPTH_REASON)
+        return [_plain_json(item, container_depth, field) for item in value]
     return value
 
 
-def canonical_json(value: JsonValue) -> str:
+def canonical_json(value: JsonValue, *, field: str = "tools") -> str:
     try:
         return json.dumps(
-            plain_json(freeze_json(value)),
+            plain_json(freeze_json(value, field=field), field=field),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
         )
+    except RecursionError:
+        raise RequestValidationError(field, _JSON_DEPTH_REASON) from None
+    except RequestValidationError:
+        raise
     except TypeError, ValueError:
-        raise RequestValidationError("tools", "must contain JSON values") from None
+        raise RequestValidationError(field, "must contain JSON values") from None
 
 
 def validate_tool_definitions(
@@ -154,12 +197,14 @@ def validate_tool_definitions(
     return tuple(sorted(validated, key=lambda item: item.name))
 
 
-def validate_tool_arguments(value: object) -> Mapping[str, JsonValue]:
-    frozen = freeze_json(value)
+def validate_tool_arguments(
+    value: object, *, field: str = "tools"
+) -> Mapping[str, JsonValue]:
+    frozen = freeze_json(value, field=field)
     if not isinstance(frozen, Mapping):
-        raise RequestValidationError("tools", "arguments must be an object")
-    if len(canonical_json(frozen).encode()) > _MAX_ARGUMENT_BYTES:
-        raise RequestValidationError("tools", "arguments exceed their size limit")
+        raise RequestValidationError(field, "arguments must be an object")
+    if len(canonical_json(frozen, field=field).encode()) > _MAX_ARGUMENT_BYTES:
+        raise RequestValidationError(field, "arguments exceed their size limit")
     return frozen
 
 
@@ -207,12 +252,14 @@ def validate_tool_results(
 
 
 def _validate_schema(schema: Mapping[str, JsonValue]) -> None:
-    plain = cast(Mapping[str, object], plain_json(schema))
-    validator = validator_for(plain, default=Draft202012Validator)
     try:
+        plain = cast(Mapping[str, object], plain_json(schema))
+        validator = validator_for(plain, default=Draft202012Validator)
         validator.check_schema(plain)
     except SchemaError as error:
         raise RequestValidationError("tools", "input schema is invalid") from error
+    except RecursionError:
+        raise RequestValidationError("tools", _JSON_DEPTH_REASON) from None
     try:
         resource = (
             Resource.from_contents(plain)
@@ -224,7 +271,12 @@ def _validate_schema(schema: Mapping[str, JsonValue]) -> None:
         raise RequestValidationError(
             "tools", "input schema dialect is invalid"
         ) from error
-    _walk_schema_references(resource, registry.resolver(resource.id() or ""))
+    except RecursionError:
+        raise RequestValidationError("tools", _JSON_DEPTH_REASON) from None
+    try:
+        _walk_schema_references(resource, registry.resolver(resource.id() or ""))
+    except RecursionError:
+        raise RequestValidationError("tools", _JSON_DEPTH_REASON) from None
 
 
 def _no_retrieve(uri: str) -> Resource[object]:
@@ -248,6 +300,8 @@ def _walk_schema_references(resource: Resource[object], resolver: Resolver) -> N
             raise RequestValidationError("tools", "schema references must be fragments")
         try:
             resolver.lookup(reference)
+        except RecursionError:
+            raise RequestValidationError("tools", _JSON_DEPTH_REASON) from None
         except Exception:
             raise RequestValidationError(
                 "tools", "schema reference is unresolved"
@@ -257,3 +311,15 @@ def _walk_schema_references(resource: Resource[object], resolver: Resolver) -> N
             child_resource,
             resolver.in_subresource(child_resource),
         )
+
+
+__all__ = [
+    "JsonValue",
+    "MAX_JSON_CONTAINER_DEPTH",
+    "canonical_json",
+    "freeze_json",
+    "plain_json",
+    "validate_tool_arguments",
+    "validate_tool_definitions",
+    "validate_tool_results",
+]

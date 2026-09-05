@@ -15,11 +15,38 @@ from claude_sdk_proxy.domain import (
     ToolResultBlock,
 )
 from claude_sdk_proxy.tool_contract import (
+    MAX_JSON_CONTAINER_DEPTH,
     canonical_json,
+    freeze_json,
+    plain_json,
     validate_tool_arguments,
     validate_tool_definitions,
     validate_tool_results,
 )
+
+JSON_CONTAINER_DEPTH_LIMIT = 64
+
+
+def nested_mapping(depth: int, leaf: object = True) -> dict[str, object]:
+    value = leaf
+    for _ in range(depth):
+        value = {"not": value}
+    assert isinstance(value, dict)
+    return value
+
+
+def nested_arguments(depth: int) -> dict[str, object]:
+    value: object = "leaf"
+    for _ in range(depth - 1):
+        value = [value]
+    return {"value": value}
+
+
+def nested_frozen_arguments(depth: int) -> MappingProxyType[str, object]:
+    value: object = "leaf"
+    for _ in range(depth - 1):
+        value = (value,)
+    return MappingProxyType({"value": value})
 
 
 def echo_definition(schema: dict[str, object] | None = None) -> ToolDefinition:
@@ -189,6 +216,46 @@ def test_canonical_json_rejects_recursive_input() -> None:
         canonical_json(recursive)  # type: ignore[arg-type]
 
     assert error.value.field == "tools"
+
+
+def test_json_container_depth_accepts_exact_limit_and_rejects_first_over() -> None:
+    assert MAX_JSON_CONTAINER_DEPTH == JSON_CONTAINER_DEPTH_LIMIT
+    accepted_schema = nested_mapping(JSON_CONTAINER_DEPTH_LIMIT)
+    accepted_arguments = nested_arguments(JSON_CONTAINER_DEPTH_LIMIT)
+
+    assert validate_tool_definitions((echo_definition(accepted_schema),))
+    assert validate_tool_arguments(accepted_arguments)
+
+    with pytest.raises(RequestValidationError, match="nesting") as schema_error:
+        echo_definition(nested_mapping(JSON_CONTAINER_DEPTH_LIMIT + 1))
+    assert schema_error.value.field == "tools"
+    with pytest.raises(RequestValidationError, match="nesting") as arguments_error:
+        validate_tool_arguments(nested_arguments(JSON_CONTAINER_DEPTH_LIMIT + 1))
+    assert arguments_error.value.field == "tools"
+
+
+def test_all_json_normalizers_enforce_the_same_container_depth() -> None:
+    over_depth = JSON_CONTAINER_DEPTH_LIMIT + 1
+
+    for operation, value in (
+        (freeze_json, nested_arguments(over_depth)),
+        (plain_json, nested_frozen_arguments(over_depth)),
+        (canonical_json, nested_arguments(over_depth)),
+    ):
+        with pytest.raises(RequestValidationError, match="nesting") as error:
+            operation(value)  # type: ignore[arg-type]
+        assert error.value.field == "tools"
+
+
+def test_historical_arguments_map_depth_failure_to_messages() -> None:
+    with pytest.raises(RequestValidationError, match="nesting") as error:
+        ToolCallBlock(
+            "call_a",
+            "echo",
+            nested_arguments(JSON_CONTAINER_DEPTH_LIMIT + 1),
+        )
+
+    assert error.value.field == "messages"
 
 
 def test_tool_definition_validation_sorts_names_and_rejects_duplicates() -> None:

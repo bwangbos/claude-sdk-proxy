@@ -222,7 +222,9 @@ would collapse all conversations into one lineage.
   canonical argument object is at most 256 KiB. Each joined UTF-8 result is at
   most 256 KiB and one result batch is at most 1 MiB. JSON Schemas must be
   self-contained; only resolvable fragment references are accepted and no
-  network or filesystem retrieval occurs.
+  network or filesystem retrieval occurs. Schema and argument JSON is limited
+  to 64 nested mappings/arrays, counting the root container as depth 1; depth
+  64 is accepted and depth 65 is rejected.
 - Capacity: at most 8 sessions are retained by default. Fresh admission at the
   limit evicts the least-recently-used idle session. In-flight and
   replay-reserved sessions are never evicted; if all retained sessions are busy,

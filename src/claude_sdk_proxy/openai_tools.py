@@ -168,7 +168,7 @@ def _tool_call(raw: object) -> ToolCallBlock:
         raise RequestValidationError("messages", "tool call function is invalid")
     try:
         arguments = json.loads(encoded)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError, RecursionError:
         raise RequestValidationError(
             "messages", "tool call arguments must be JSON"
         ) from None

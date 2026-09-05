@@ -411,6 +411,34 @@ def test_openai_parser_rejects_unsupported_or_incomplete_tool_shapes(
     assert error.value.field == field
 
 
+def test_openai_parser_maps_argument_decoder_recursion_to_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_decode(value: str) -> object:
+        del value
+        raise RecursionError
+
+    monkeypatch.setattr("claude_sdk_proxy.openai_tools.json.loads", fail_decode)
+    body = {
+        "model": "sonnet",
+        "tools": [openai_echo_tool()],
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [function_call("call_a", "echo", "{}")],
+            },
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+        ],
+    }
+
+    with pytest.raises(RequestValidationError) as error:
+        parse_openai_request(body, frozenset({"sonnet"}))
+
+    assert error.value.field == "messages"
+
+
 def test_openai_parser_preserves_empty_and_json_string_tool_results() -> None:
     request = parse_openai_request(
         {

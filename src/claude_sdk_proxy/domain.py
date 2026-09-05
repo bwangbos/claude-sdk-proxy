@@ -32,7 +32,7 @@ class ToolCallBlock:
     def __post_init__(self) -> None:
         from claude_sdk_proxy.tool_contract import freeze_json
 
-        frozen = freeze_json(self.arguments)
+        frozen = freeze_json(self.arguments, field="messages")
         object.__setattr__(self, "arguments", cast(Mapping[str, object], frozen))
 
 
@@ -228,7 +228,7 @@ class TextRequest:
                         raise RequestValidationError(
                             "messages", "tool call ID is invalid"
                         )
-                    validate_tool_arguments(call.arguments)
+                    validate_tool_arguments(call.arguments, field="messages")
                     call_ids.add(call.id)
                 if (
                     all(isinstance(item, TextBlock) for item in blocks)

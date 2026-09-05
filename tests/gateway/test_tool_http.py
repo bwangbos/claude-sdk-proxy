@@ -10,17 +10,20 @@ import pytest
 from claude_agent_sdk import ResultMessage, UserMessage
 from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
 
+from claude_sdk_proxy.anthropic_api import parse_anthropic_request
 from claude_sdk_proxy.app import create_app
 from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     Dialect,
     InputUsage,
+    RequestValidationError,
     TextDelta,
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
 )
+from claude_sdk_proxy.openai_api import parse_openai_request
 from claude_sdk_proxy.sdk_session import SdkSession
 from tests.gateway.asgi_client import (
     _LIFESPAN_STATES,
@@ -155,6 +158,71 @@ def tool_body(dialect: str, *, stream: bool = False) -> dict[str, object]:
             }
         ]
     return common
+
+
+def _nested_container(depth: int, *, schema: bool) -> dict[str, object]:
+    value: object = True if schema else "leaf"
+    for _ in range(depth - (0 if schema else 1)):
+        value = {"not": value} if schema else [value]
+    return value if schema else {"value": value}  # type: ignore[return-value]
+
+
+def _deep_public_body(dialect: str, field: str, depth: int) -> dict[str, object]:
+    body = tool_body(dialect)
+    if field == "tools":
+        schema = _nested_container(depth, schema=True)
+        if dialect == "anthropic":
+            body["tools"][0]["input_schema"] = schema  # type: ignore[index]
+        else:
+            body["tools"][0]["function"]["parameters"] = schema  # type: ignore[index]
+        return body
+
+    arguments = _nested_container(depth, schema=False)
+    if dialect == "anthropic":
+        body["messages"] = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_deep",
+                        "name": "echo",
+                        "input": arguments,
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_deep",
+                        "content": "done",
+                    }
+                ],
+            },
+        ]
+    else:
+        body["messages"] = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_deep",
+                        "type": "function",
+                        "function": {
+                            "name": "echo",
+                            "arguments": json.dumps(arguments),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_deep", "content": "done"},
+        ]
+    return body
 
 
 def _body_with_messages(
@@ -487,6 +555,56 @@ def _normalize_response_id(records: list[tuple[str | None, Any]]):
         if isinstance(message, dict) and "id" in message:
             message["id"] = "<response>"
     return copied
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("dialect", ("anthropic", "openai"))
+@pytest.mark.parametrize("field", ("tools", "messages"))
+async def test_http_rejects_json_over_container_depth_limit_as_invalid_request(
+    dialect: str, field: str
+) -> None:
+    body = _deep_public_body(dialect, field, 65)
+    parser = parse_anthropic_request if dialect == "anthropic" else parse_openai_request
+
+    with pytest.raises(RequestValidationError) as parsed_error:
+        parser(body, frozenset({"sonnet"}))
+    assert getattr(parsed_error.value, "field", None) == field
+
+    def unexpected_session(*args: object, **kwargs: object) -> ToolBoundarySession:
+        del args, kwargs
+        raise AssertionError("over-depth request reached session construction")
+
+    app = create_app(models=("sonnet",), session_factory=unexpected_session)
+    path = "/v1/messages" if dialect == "anthropic" else "/v1/chat/completions"
+    async with lifespan_app(app):
+        response = await post_json(app, path, body)
+
+    assert response.status == 400
+    if dialect == "anthropic":
+        assert response.json == {
+            "type": "error",
+            "error": {"type": "invalid_request", "message": "Invalid request"},
+        }
+    else:
+        assert response.json["error"] == {
+            "message": "Invalid request",
+            "type": "invalid_request",
+            "param": field,
+            "code": "invalid_request",
+        }
+
+
+@pytest.mark.parametrize("dialect", ("anthropic", "openai"))
+@pytest.mark.parametrize("field", ("tools", "messages"))
+def test_public_parsers_accept_exact_json_container_depth_limit(
+    dialect: str, field: str
+) -> None:
+    body = _deep_public_body(dialect, field, 64)
+    parser = parse_anthropic_request if dialect == "anthropic" else parse_openai_request
+
+    request = parser(body, frozenset({"sonnet"}))
+
+    assert request.dialect == dialect
 
 
 def _normalized_http_payload(response_json: object) -> object:

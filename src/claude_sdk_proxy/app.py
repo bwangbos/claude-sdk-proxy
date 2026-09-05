@@ -128,7 +128,10 @@ async def _handle(request: Request, *, dialect: str) -> Response:
             raise RequestValidationError(
                 "body", "content type must be application/json"
             )
-        body = await request.json()
+        try:
+            body = await request.json()
+        except RecursionError:
+            raise RequestValidationError("body", "JSON nesting is invalid") from None
         if not isinstance(body, Mapping):
             raise RequestValidationError("body", "must be a JSON object")
         allowed = cast(frozenset[str], request.app.state.allowed_models)

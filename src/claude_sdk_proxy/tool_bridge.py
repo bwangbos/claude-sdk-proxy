@@ -97,9 +97,6 @@ class ToolBridge:
         self._pending: dict[str, _PendingInvocation] = {}
         self._pending_by_internal: dict[str, _PendingInvocation] = {}
         self._parked_failures: set[asyncio.Future[None]] = set()
-        self._publications: asyncio.Queue[ToolInvocation | BridgeProtocolFailure] = (
-            asyncio.Queue()
-        )
         self._entry_changed = asyncio.Event()
         self._failure_changed = asyncio.Event()
         self._failure: BridgeProtocolFailure | None = None
@@ -217,16 +214,8 @@ class ToolBridge:
             return await self._park_protocol_failure(failure)
         self._callbacks_seen.add(internal_id)
         self._epoch_invocations.append(pending.invocation)
-        self._publications.put_nowait(pending.invocation)
         self._entry_changed.set()
         return await self._await_result(pending)
-
-    async def next_invocation(self) -> ToolInvocation:
-        """Return the next handler entry, redacting protocol failures."""
-        publication = await self._publications.get()
-        if isinstance(publication, BridgeProtocolFailure):
-            raise BackendFailure(_PROTOCOL_FAILURE)
-        return publication
 
     async def seal_epoch(
         self, expected_calls: Iterable[ExpectedCall]
@@ -263,7 +252,6 @@ class ToolBridge:
             )
             raise BackendFailure(_PROTOCOL_FAILURE)
 
-        ordered: list[ToolInvocation] = []
         for internal_id, name, arguments_json in expected:
             pending = self._pending_by_internal.get(internal_id)
             if pending is None:
@@ -285,7 +273,7 @@ class ToolBridge:
                 except BridgeProtocolFailure as failure:
                     self._signal_failure(failure)
                     raise BackendFailure(_PROTOCOL_FAILURE) from None
-                self._publications.put_nowait(pending.invocation)
+                self._epoch_invocations.append(pending.invocation)
             elif (
                 pending.invocation.name,
                 canonical_json(pending.invocation.arguments),
@@ -294,12 +282,10 @@ class ToolBridge:
                     BridgeProtocolFailure("SDK tool callback did not match raw call")
                 )
                 raise BackendFailure(_PROTOCOL_FAILURE)
-            ordered.append(pending.invocation)
 
-        self._epoch_invocations = ordered
         self._epoch_sealed = True
         self._epoch_verified = True
-        return tuple(ordered)
+        return tuple(self._epoch_invocations)
 
     async def wait_epoch_complete(self) -> None:
         """Wait until every sealed raw call has returned through its callback."""
@@ -332,6 +318,9 @@ class ToolBridge:
                 BridgeProtocolFailure("sealed raw tool callback was not delivered")
             )
             raise BackendFailure(_PROTOCOL_FAILURE)
+        self._epoch_invocations.clear()
+        self._expected_by_internal.clear()
+        self._callbacks_seen.clear()
 
     async def begin_epoch(self) -> None:
         """Open admission only when a subsequent tool boundary begins."""
@@ -394,7 +383,13 @@ class ToolBridge:
         for parked in tuple(self._parked_failures):
             if not parked.done():
                 parked.set_exception(BackendFailure(_CANCELLED))
-        self._publications.put_nowait(BridgeProtocolFailure("bridge was cancelled"))
+        self._pending.clear()
+        self._pending_by_internal.clear()
+        self._parked_failures.clear()
+        self._epoch_invocations.clear()
+        self._expected_by_internal.clear()
+        self._callbacks_seen.clear()
+        self._issued_ids.clear()
         self._entry_changed.set()
 
     async def wait_failure(self) -> None:
@@ -418,7 +413,6 @@ class ToolBridge:
     def _signal_failure(self, failure: BridgeProtocolFailure) -> None:
         if self._failure is None:
             self._failure = failure
-            self._publications.put_nowait(failure)
             self._failure_changed.set()
         self._entry_changed.set()
 

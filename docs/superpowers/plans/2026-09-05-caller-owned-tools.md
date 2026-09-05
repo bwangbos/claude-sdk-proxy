@@ -4,7 +4,7 @@
 
 **Goal:** Add native caller-owned tool loops to both compatibility endpoints so an ordinary agent harness can define tools, receive uniquely identified calls, execute them, and return results while the authenticated Claude Agent SDK operation remains parked in memory.
 
-**Architecture:** Both dialect adapters normalize tool definitions and transcript blocks into one immutable model. A per-conversation `ToolSessionActor` owns the sole long-running SDK receive iterator; an in-process MCP `ToolBridge` publishes one independently identified invocation per handler coroutine and accepts results by public ID. The existing registry still performs append-only transcript matching, single-flight admission, exact replay, and bounded teardown, extended with a non-evictable waiting-for-results state.
+**Architecture:** Both dialect adapters normalize tool definitions and transcript blocks into one immutable model. A per-conversation `ToolSessionActor` owns the sole long-running SDK receive iterator; an in-process MCP `ToolBridge` records one independently identified invocation per handler coroutine, seals each raw boundary against exact private callback metadata, and accepts caller results by opaque public ID. The existing registry still performs append-only transcript matching, single-flight admission, exact replay, and bounded teardown, extended with a non-evictable waiting-for-results state.
 
 **Tech Stack:** Python 3.14, `claude-agent-sdk==0.2.152`, Starlette 1.x, Uvicorn 0.x, Anthropic and OpenAI Python clients in development tests, pytest, pytest-anyio, Ruff, mypy.
 
@@ -18,14 +18,14 @@
 - Expose only the generated in-process MCP server and generated caller-tool allowlist. Keep built-ins, ambient MCP, settings, skills, agents, plugins, auto-memory, slash commands, and session persistence disabled.
 - Do not add prose, JSON-output instructions, or synthetic tool results to caller system/user text. The only additional model-visible data is the SDK-native MCP schema and Anthropic's provider-owned tool instructions.
 - Freeze dialect, model, system prompt, and the non-empty canonical tool-definition tuple for the lifetime of a tool-enabled conversation.
-- Correlate results only by an opaque public ID minted per handler invocation. Never correlate by tool name, arguments, SDK block ID, ordering of returned results, or `(name, arguments)` lookup.
-- Buffer tool calls until a complete validated SDK `message_stop`. Compare raw SDK calls with MCP handler invocations as a multiset of canonical `(name, arguments)` values before exposing any call.
+- Correlate caller results only by an opaque public ID minted per invocation. The narrow internal exception is the callback's private `_meta["claudecode/toolUseId"]`, which must form a bijection with raw/typed SDK IDs and must match the exact name and canonical arguments. Never expose or accept that SDK ID publicly, and never fall back to name, arguments, order, guessing, or a `(name, arguments)` lookup.
+- Buffer tool calls until a complete validated SDK `message_stop`. Seal the raw IDs against already-entered callbacks and create placeholders for SDK-serialized deferred callbacks. After result echo, require every placeholder callback to enter and return its stored result before accepting a later SDK item; terminal text does not reopen the sealed epoch.
 - Accept all and only the pending result IDs, exactly once and in any order. Invalid or partial result submissions return HTTP 400 without consuming the wait or resetting its deadline.
 - Keep waiting sessions non-evictable and within `--max-sessions`. Normal completed sessions remain LRU-evictable.
 - Commit and cache each public boundary before it can be observed as complete. A duplicate completed request replays the same text, calls, IDs, stop reason, and usage without re-entering the SDK or handler.
 - Use the existing 300-second generation timeout and add a separate 300-second default tool-result timeout that resets only after a newly committed tool boundary.
 - Before a boundary commits, cancellation/disconnect invalidates the session. After a tool boundary commits, disconnect leaves the SDK parked. After continuation results commit, background generation finishes into replay even if that HTTP client disconnects.
-- Keep tool limits exactly as specified: 128 definitions; 8 KiB per description; 64 KiB per canonical schema and 512 KiB aggregate; 256 KiB per generated argument object; 256 KiB per result; 1 MiB aggregate results; 8 MiB SDK buffer. The buffer accounts for worst-case sixfold JSON escaping plus the SDK envelope; it does not enlarge a public limit.
+- Keep tool limits exactly as specified: 128 definitions; 8 KiB per description; 64 KiB per canonical schema and 512 KiB aggregate; 64 nested JSON mapping/array containers for schemas and arguments, counting the root as depth 1; 256 KiB per generated argument object; 256 KiB per result; 1 MiB aggregate results; 8 MiB SDK buffer. The buffer accounts for worst-case sixfold JSON escaping plus the SDK envelope; it does not enlarge a public limit.
 - Keep production modules auditable. If `app.py`, either dialect adapter, `sessions.py`, or `session_turn.py` would exceed 300 lines, extract narrowly named parser, renderer, or actor helpers instead of creating a monolith.
 - Every task follows red-green-refactor, runs the focused checks shown, and commits only its own coherent change. Do not weaken an existing fail-closed test to make tool traffic pass.
 
@@ -45,7 +45,7 @@
 - Produces immutable `TextBlock`, `ToolCallBlock`, `ToolResultBlock`, `ToolDefinition`, and `CanonicalMessage` values and extends the existing `TextRequest` instead of introducing a parallel request type.
 - `TextRequest` retains its existing fields and adds `dialect: Literal["anthropic", "openai"]` plus `tools: tuple[ToolDefinition, ...]`, both with text-compatible defaults until the adapters set them explicitly.
 - `TextRequest.next_input` is either the final user text string or the complete tuple of `ToolResultBlock`; mixed user text/results is invalid. Definition tuples normalize by tool name and result-only turns normalize by public call ID, making definition/result order semantically irrelevant.
-- Produces `canonical_json(value) -> str`, `validate_tool_definitions(...)`, `validate_tool_arguments(...)`, and `validate_tool_results(...)` with the exact spec limits.
+- Produces `canonical_json(value) -> str`, `validate_tool_definitions(...)`, `validate_tool_arguments(...)`, and `validate_tool_results(...)` with the exact spec size and 64-container depth limits.
 - Adds `ToolCall` to `ConversationEvent`; `Completed("tool_use", usage)` is the public tool boundary.
 
 - [ ] **Step 1: Write failing canonical-model tests**
@@ -164,7 +164,7 @@ The compatibility constructor and `content` property above keep existing text-on
 
 - [ ] **Step 5: Implement bounded canonical JSON and tool validation**
 
-In `tool_contract.py`, implement `freeze_json` that recursively copies mappings into `MappingProxyType` and arrays into tuples, plus `plain_json` that recursively thaws those values into dictionaries/lists. Make `canonical_json` call `plain_json` before encoding with `ensure_ascii=False`, sorted keys, compact separators, and `allow_nan=False`; a shallow `dict(...)` conversion is insufficient. Select the validator dialect, call `check_schema`, and create a `referencing.Resource` with Draft 2020-12 as the default only when `$schema` is absent. Put it in a `referencing.Registry` whose retrieval callback always fails, crawl registered subresources/anchors, and recursively walk `Resource.subresources()` with `resolver.in_subresource(...)`. Only at those schema locations, resolve `$ref`, `$dynamicRef`, and `$recursiveRef`; reject any non-fragment URI or failed lookup as caller-controlled HTTP 400. This schema-aware walk must ignore identical keys inside `const`, `enum`, defaults, examples, and property names. Reject non-string keys, NaN/infinity, duplicate names, non-object schemas/arguments, invalid names, non-Boolean error flags, invalid IDs, and every size/count violation with `RequestValidationError` pointing to `tools` or `messages`. Empty successful result strings and empty successful text-block arrays are valid zero-byte results; reject `is_error=True` when the concatenated result text is empty because the backend rejects that shape. Return definitions sorted by name and result-only blocks sorted by public ID after validation; do not reorder assistant calls, whose stable order comes from handler invocation.
+In `tool_contract.py`, implement `freeze_json` that recursively copies mappings into `MappingProxyType` and arrays into tuples, plus `plain_json` that recursively thaws those values into dictionaries/lists. Both operations, `canonical_json`, and schema validation enforce one 64-container nesting limit before recursive library exhaustion; map defensive `RecursionError` only at those public boundaries. Make `canonical_json` call `plain_json` before encoding with `ensure_ascii=False`, sorted keys, compact separators, and `allow_nan=False`; a shallow `dict(...)` conversion is insufficient. Select the validator dialect, call `check_schema`, and create a `referencing.Resource` with Draft 2020-12 as the default only when `$schema` is absent. Put it in a `referencing.Registry` whose retrieval callback always fails, crawl registered subresources/anchors, and recursively walk `Resource.subresources()` with `resolver.in_subresource(...)`. Only at those schema locations, resolve `$ref`, `$dynamicRef`, and `$recursiveRef`; reject any non-fragment URI or failed lookup as caller-controlled HTTP 400. This schema-aware walk must ignore identical keys inside `const`, `enum`, defaults, examples, and property names. Reject non-string keys, NaN/infinity, duplicate names, non-object schemas/arguments, invalid names, non-Boolean error flags, invalid IDs, and every size/count/depth violation with `RequestValidationError` pointing to `tools` or `messages`. Empty successful result strings and empty successful text-block arrays are valid zero-byte results; reject `is_error=True` when the concatenated result text is empty because the backend rejects that shape. Return definitions sorted by name and result-only blocks sorted by public ID after validation; do not reorder assistant calls, whose stable order comes from handler invocation.
 
 ```python
 def canonical_json(value: JsonValue) -> str:
@@ -410,12 +410,12 @@ git commit -m "feat: add OpenAI tool wire protocol"
 
 **Interfaces:**
 - `ToolBridge(definitions, dialect, id_factory=None)` owns one generated `McpSdkServerConfig` and the generated allowed-tool tuple.
-- `ToolBridge.next_invocation() -> ToolInvocation` publishes invocations in handler-entry order; if a handler published `BridgeProtocolFailure` instead, this consumer raises a redacted `BackendFailure` in the owning SDK/actor task and leaves the handler parked for cancellation.
+- `ToolBridge.seal_epoch(expected_calls) -> tuple[ToolInvocation, ...]` returns the current epoch in handler-entry order, with raw-order placeholders appended for callbacks deferred by the SDK. The epoch list is current-only and is cleared after the exact callback-completion barrier; there is no publication queue or lifetime cursor.
 - `ToolBridge.resolve(results)` resolves all and only currently pending public IDs by ID, regardless of result order.
-- `ToolBridge.cancel()` fails every pending handler and prevents new publication.
+- `ToolBridge.cancel()` fails every pending handler, prevents new admission, and clears bridge-owned epoch collections.
 - `ToolBridge.wait_failure()` is a lifetime fatal signal watched by the actor in generating and waiting states, so an invalid or late callback closes the session even after a public boundary has committed.
 - `ToolInvocation` carries `public_id`, original public `name`, immutable arguments, and the generated SDK name only for internal validation.
-- Each assistant message has a bridge epoch. `seal_epoch(expected_calls)` atomically waits for exactly the expected callback entries, rejects an already-extra callback before exposure, and closes admission before returning the immutable invocation tuple. A callback entering after the seal publishes a fatal late-invocation signal and can never join that public tuple.
+- Each assistant message has a bridge epoch. `seal_epoch(expected_calls)` validates the exact private-ID/name/canonical-argument bijection for callbacks already entered, creates pending placeholders for deferred callbacks, rejects extras, and closes ordinary admission before returning the immutable invocation tuple. A sealed callback is accepted only for its exact unused placeholder. `wait_epoch_complete()` requires every callback to return its stored result before any later SDK item is accepted.
 
 - [ ] **Step 1: Write failing bridge tests without an SDK subprocess**
 
@@ -425,10 +425,11 @@ Invoke the low-level MCP call callback directly. Prove advertised schema equalit
 @pytest.mark.anyio
 async def test_identical_handlers_resolve_by_public_id_in_reverse() -> None:
     bridge = ToolBridge((echo_definition(),), dialect="openai", id_factory=id_sequence("call_a", "call_b"))
-    first_task = asyncio.create_task(bridge.call_tool("echo", {"v": 1}))
-    second_task = asyncio.create_task(bridge.call_tool("echo", {"v": 1}))
-    first = await bridge.next_invocation()
-    second = await bridge.next_invocation()
+    first_task = asyncio.create_task(bridge.call_tool("echo", {"v": 1}, internal_id="sdk-a"))
+    second_task = asyncio.create_task(bridge.call_tool("echo", {"v": 1}, internal_id="sdk-b"))
+    first, second = await bridge.seal_epoch(
+        (ToolCall("sdk-a", "echo", {"v": 1}), ToolCall("sdk-b", "echo", {"v": 1}))
+    )
 
     bridge.resolve(
         (
@@ -442,6 +443,7 @@ async def test_identical_handlers_resolve_by_public_id_in_reverse() -> None:
     assert [block.text for block in second_result.content] == ["second"]
     assert first_result.is_error is False
     assert second_result.is_error is False
+    await bridge.wait_epoch_complete()
 ```
 
 - [ ] **Step 2: Run the focused tests and confirm RED**
@@ -497,7 +499,7 @@ config: McpSdkServerConfig = {
 
 - [ ] **Step 5: Implement per-coroutine IDs and atomic result delivery**
 
-Before minting a public call, validate the generated arguments against the exact frozen caller schema with the already-pinned `jsonschema` validator and apply the 256 KiB canonical-argument limit. A schema/shape/size failure publishes `BridgeProtocolFailure` and parks the callback for actor cancellation; it never becomes a caller-visible call or model-visible MCP error. For a valid call, enter the current epoch and register the future atomically before publishing, copy/freeze arguments, and remove futures only after delivery/cancellation. At raw `message_stop`, seal the epoch against the expected raw multiset before exposing it; any callback beyond the sealed count is fatal even if its task starts later. Validate a complete result batch before resolving any future so a bad batch has no partial effect. Return accepted caller results as `CallToolResult` containing only `TextContent` blocks and the exact Anthropic `isError` value.
+Before minting a public call, validate the generated arguments against the exact frozen caller schema with the already-pinned `jsonschema` validator and apply the 256 KiB canonical-argument and 64-container limits. A schema/shape/size/depth failure signals `BridgeProtocolFailure` and parks the callback for actor cancellation; it never becomes a caller-visible call or model-visible MCP error. For a valid call, require the exact private `_meta["claudecode/toolUseId"]`, enter the current epoch, and register the future atomically before awaiting it. At raw `message_stop`, seal the epoch against the exact private-ID/name/canonical-argument bijection, retaining already-entered handler order and appending placeholders for SDK-serialized callbacks. Reject extras and mismatches without a name/argument/order fallback. Validate a complete caller result batch before resolving any future so a bad batch has no partial effect. Return accepted caller results as `CallToolResult` containing only `TextContent` blocks and the exact Anthropic `isError` value. After echo validation, require all placeholder callbacks to enter and return, then clear current epoch invocation/argument collections.
 
 - [ ] **Step 6: Run focused tests and static checks; confirm GREEN**
 
@@ -556,7 +558,7 @@ async def test_tool_session_exposes_only_generated_caller_tools(tmp_path: Path) 
 
 - [ ] **Step 2: Write failing protocol tests**
 
-Cover a single call, text plus calls, two identical calls, call-set count/value mismatch, malformed/oversized arguments, incomplete raw JSON, tool stop without handler publication, a callback released after the expected bridge epoch seals, handler publication without raw SDK call, built-in/non-MCP tool names, parent-attributed blocks, a raw tool block followed by a text block, and a normal final result after one and two tool rounds. For native result echoes, cover single/parallel result-only `UserMessage` values, exact internal ID sets, content/error equality with bridge-delivered values, duplicate/missing/unknown IDs, strings versus text-block lists, unexpected blocks, origin/parent attribution, and user messages in every wrong phase. Preserve all existing raw text protocol failures.
+Cover a single call, text plus calls, two identical calls, exact private-ID/name/argument mismatch, malformed/oversized/over-depth arguments, incomplete raw JSON, tool stop without handler entry, a callback released after the expected bridge epoch seals, handler entry without a raw SDK call, built-in/non-MCP tool names, parent-attributed blocks, a raw tool block followed by a text block, and a normal final result after one and two tool rounds. Cover deferred serial callbacks, both exact callback-completion versus incoming-SDK-item orderings, and bounded bridge state after repeated rounds. For native result echoes, cover single/parallel result-only `UserMessage` values, exact internal ID sets, content/error equality with bridge-delivered values, duplicate/missing/unknown IDs, strings versus text-block lists, unexpected blocks, origin/parent attribution, and user messages in every wrong phase. Preserve all existing raw text protocol failures.
 
 - [ ] **Step 3: Write a failing real SDK transport buffer test**
 
@@ -572,7 +574,7 @@ Expected: tool events remain protocol failures and SDK options have no generated
 
 - [ ] **Step 5: Implement raw tool-use validation**
 
-In `sdk_tool_protocol.py`, track raw block indexes and assemble JSON deltas, then compare them to exact complete `ToolUseBlock` values from `AssistantMessage`. Permit text blocks before the first tool block, but require tool-use blocks to be a suffix: after the first tool block starts, any later text block/delta is a protocol failure rather than a silently reordered public transcript. Accept only names with the exact generated `mcp__caller_tools_v1__` prefix and map them back through the frozen definition table before comparison; reject every built-in, unknown server, or unknown public name. At complete `message_stop`, atomically seal the bridge epoch against the raw call count/multiset, compare `Counter((public_name, canonical_json(arguments)))`, and return bridge invocations in publication order. An already-extra or later callback is fatal and never joins the sealed public set. Never expose the SDK's internal tool-use ID.
+In `sdk_tool_protocol.py`, track raw block indexes and assemble JSON deltas, then compare them to exact complete `ToolUseBlock` values from `AssistantMessage`. Permit text blocks before the first tool block, but require tool-use blocks to be a suffix: after the first tool block starts, any later text block/delta is a protocol failure rather than a silently reordered public transcript. Accept only names with the exact generated `mcp__caller_tools_v1__` prefix and map them back through the frozen definition table before comparison; reject every built-in, unknown server, or unknown public name. At complete `message_stop`, seal the bridge using each raw/typed internal ID and require the callback's private `_meta["claudecode/toolUseId"]`, public name, and canonical arguments to match exactly. Keep opaque public IDs independent and never expose the SDK ID. Already-extra, duplicate, mismatched, or late callbacks are fatal; deferred callbacks may enter only their exact sealed placeholder, with no fallback correlation.
 
 - [ ] **Step 6: Validate configuration-aware SDK metadata**
 
@@ -580,7 +582,7 @@ Change `validate_system_message` to receive the expected generated tool and MCP-
 
 - [ ] **Step 7: Integrate the bridge and multi-boundary receive iterator**
 
-Configure the generated MCP server only when definitions are non-empty. Create/reset a raw validator at every `message_start`; on each validated tool boundary, yield its boundary-local `InputUsage`, calls, and `Completed("tool_use", boundary_usage)`, but keep iterating the same `receive_response()` after `submit_tool_results()` releases handlers. In the exact post-submit phase, accumulate one or more consecutive tool-result-only SDK `UserMessage` values until the next assistant `message_start`; their aggregate internal ID set must equal the preceding raw `ToolUseBlock.id` set, attribution fields must be absent, and the normalized text/error multiset must equal the results just delivered through the bridge. Validate the completed aggregate before accepting the next assistant boundary. Require the final `ResultMessage` only at terminal completion; its status and stop reason must agree with the last raw boundary, while its independently valid aggregate usage may differ and is not emitted as that public boundary's usage.
+Configure the generated MCP server only when definitions are non-empty. Create/reset a raw validator at every `message_start`; on each validated tool boundary, yield its boundary-local `InputUsage`, calls, and `Completed("tool_use", boundary_usage)`, but keep iterating the same `receive_response()` after `submit_tool_results()` releases handlers. In the exact post-submit phase, accumulate one or more consecutive tool-result-only SDK `UserMessage` values until the complete native internal-ID set and exact delivered text/error values have been validated. Then race the bridge's exact callback-completion barrier against the next SDK item: callback completion must win, including when both tasks are done before the waiter resumes. A later tool-use start may open the next epoch; terminal text leaves it sealed. Require the final `ResultMessage` only at terminal completion; its status and stop reason must agree with the last raw boundary, while its independently valid aggregate usage may differ and is not emitted as that public boundary's usage.
 
 - [ ] **Step 8: Run focused tests and static checks; confirm GREEN**
 
@@ -766,7 +768,7 @@ Expose an explicit lease property/method that tells cleanup whether the current 
 
 - [ ] **Step 6: Complete stable error mapping**
 
-Use `RequestValidationError` for malformed/partial results, `UnsupportedFeature` for rejected controls/shapes, `SessionMismatch` for transcript/configuration/dialect changes, `SessionConflict` for busy duplicates, `SessionCapacity` for all-busy admission, `SessionTimeout` for generation or attached result-wait timeout, and `BackendFailure` for SDK protocol faults. Never include SDK exception text, tool arguments, tool results, or session IDs in public errors.
+Use `RequestValidationError` for malformed schemas/references/messages and invalid or partial result sets. Use `UnsupportedFeature` only for well-formed but unsupported controls and shapes such as forced tool choice, disabled parallel calls, non-function OpenAI tools, and non-text result blocks. Use `SessionMismatch` for transcript/configuration/dialect changes, `SessionConflict` for busy duplicates, `SessionCapacity` for all-busy admission, `SessionTimeout` for generation or attached result-wait timeout, and `BackendFailure` for SDK protocol faults. Never include SDK exception text, tool arguments, tool results, or session IDs in public errors.
 
 - [ ] **Step 7: Run focused and full gateway checks; confirm GREEN**
 

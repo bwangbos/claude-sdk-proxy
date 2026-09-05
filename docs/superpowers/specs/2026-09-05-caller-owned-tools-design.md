@@ -88,16 +88,21 @@ string content.
 
 ### Rejected controls and shapes
 
-The adapters return a stable HTTP 400 unsupported-feature error for:
+The adapters return a stable HTTP 400 `unsupported_feature` error for supported
+wire shapes that request behavior outside this subset:
 
 - forced, required, named, or `none` tool choice;
 - explicit `parallel_tool_calls: false`;
 - non-function OpenAI tools;
-- non-object input schemas;
+- image, document, resource, or other non-text result blocks.
+
+Malformed values and invalid completeness constraints return HTTP 400
+`invalid_request`, including:
+
+- non-object or otherwise invalid input schemas and unknown schema dialects;
 - external or relative JSON Schema references (self-contained fragment
   references such as `#/$defs/item` and local anchors are pre-resolved; the
   proxy never resolves schemas over the network or filesystem);
-- image, document, resource, or other non-text result blocks;
 - user text mixed into a pending tool-result continuation;
 - Anthropic `is_error: true` results with no non-empty text (the backend rejects
   empty error content; empty successful results remain valid);
@@ -111,6 +116,11 @@ generated argument object is capped at 256 KiB of canonical JSON. Each tool resu
 is capped at 256 KiB of UTF-8 text and a complete result set at 1 MiB. Exceeding
 a caller-controlled limit returns HTTP 400; an oversized model-generated argument
 object is an SDK protocol failure.
+Every schema and argument JSON value is limited to 64 nested containers. The
+root mapping or array has depth 1, and each nested mapping or array adds 1;
+depth 64 is accepted and depth 65 is rejected. Caller definitions and history
+return HTTP 400, while model-generated over-depth arguments are a redacted SDK
+protocol failure.
 
 ## Canonical model
 
@@ -167,8 +177,8 @@ Every handler invocation is a distinct coroutine. On invocation it:
 
 1. validates the arguments supplied by the SDK;
 2. mints a dialect-appropriate, opaque public call ID;
-3. publishes a `ToolInvocation` containing that ID, original name, and arguments
-   to the owning actor;
+3. records a `ToolInvocation` containing that ID, original name, and arguments
+   in the current bridge epoch;
 4. awaits the future associated with that public ID;
 5. returns the harness-provided text blocks and error flag as an MCP result.
 
@@ -189,6 +199,8 @@ returned through that callback. An arriving assistant or result boundary wins a
 race against an incomplete callback barrier and fails the session without
 committing that boundary. A later tool-generating boundary opens the next epoch;
 terminal text does not reopen callback admission.
+Completed epoch invocation/argument collections are cleared at that barrier;
+the bridge does not keep a lifetime publication history.
 
 ### `ToolSessionActor`
 
@@ -206,9 +218,11 @@ any nonterminal state -> CLOSED
 
 During generation the actor forwards validated text deltas. It observes native
 SDK tool-use blocks but buffers public tool calls until the SDK's complete
-`message_stop`. At that boundary it compares the SDK tool calls with the bridge
-invocations as a multiset of canonical `(name, arguments)` values. Counts and
-values must match. A mismatch is an SDK protocol failure and closes the session.
+`message_stop`. At that boundary the session seals every raw/typed SDK ID against
+the callback's private metadata ID, public name, and canonical arguments, while
+allowing an exact placeholder for an SDK-serialized deferred callback. Any
+missing, duplicate, extra, or mismatched association is an SDK protocol failure
+and closes the session; there is no fallback correlation.
 
 After validation, the actor emits the bridge calls in stable invocation order,
 commits the canonical assistant turn, caches the response for retry, ends the

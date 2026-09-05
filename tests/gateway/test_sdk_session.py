@@ -1407,16 +1407,27 @@ async def test_stream_generation_supports_two_native_tool_rounds(
     )
     session, _ = make_tool_session(tmp_path, messages)
     await session.start()
+    bridge = session._bridge
+    assert bridge is not None
     generation = session.stream_generation("go")
     try:
         first = await next_boundary(generation)
         first_call = next(event for event in first if isinstance(event, ToolCall))
+        first_arguments = first_call.arguments
         await session.submit_tool_results(
             (ToolResultBlock(first_call.id, ("first",), False),)
         )
         second = await next_boundary(generation)
         second_call = next(event for event in second if isinstance(event, ToolCall))
         assert second_call.id != first_call.id
+        assert all(
+            invocation.arguments is not first_arguments
+            for invocation in bridge._epoch_invocations
+        )
+        assert all(
+            pending.invocation.arguments is not first_arguments
+            for pending in bridge._pending.values()
+        )
         await session.submit_tool_results(
             (ToolResultBlock(second_call.id, ("second",), False),)
         )
@@ -1425,8 +1436,24 @@ async def test_stream_generation_supports_two_native_tool_rounds(
             TextDelta("done"),
             Completed("end_turn", {"input_tokens": 9, "output_tokens": 4}),
         ]
+        publication_queue = getattr(bridge, "_publications", None)
+        assert publication_queue is None, (
+            f"bridge retained {publication_queue.qsize()} completed invocations"
+        )
+        assert bridge._pending == {}
+        assert bridge._pending_by_internal == {}
+        assert bridge._epoch_invocations == []
+        assert bridge._expected_by_internal == {}
+        assert bridge._callbacks_seen == set()
     finally:
         await session.close()
+
+    assert bridge._pending == {}
+    assert bridge._pending_by_internal == {}
+    assert bridge._epoch_invocations == []
+    assert bridge._expected_by_internal == {}
+    assert bridge._callbacks_seen == set()
+    assert bridge._issued_ids == set()
 
 
 @pytest.mark.anyio
