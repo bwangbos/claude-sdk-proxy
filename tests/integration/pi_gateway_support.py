@@ -28,7 +28,9 @@ from tests.gateway.fakes import FakeConversationSession
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_text_client.mjs"
 TOOL_FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_tool_client.mjs"
-INSTALL_PI = "install pi with: npm install -g @earendil-works/pi-coding-agent"
+INSTALL_PI = (
+    "install pi with: npm install -g @earendil-works/pi-coding-agent@0.84.4"
+)
 
 
 class IntegrationSession(FakeConversationSession):
@@ -134,6 +136,10 @@ def pi_agent_module() -> Path:
     return _pi_module("pi-agent-core", Path("dist/index.js"))
 
 
+def pi_coding_agent_module() -> Path:
+    return _pi_module("pi-coding-agent", Path("dist/bundle/cli.js"))
+
+
 def _pi_module(package_name: str, relative_module: Path) -> Path:
     executable = shutil.which("pi")
     if executable is None:
@@ -203,6 +209,7 @@ async def run_pi_tool(base_url: str) -> dict[str, Any]:
         **os.environ,
         "PI_AI_MODULE": str(pi_ai_module()),
         "PI_AGENT_MODULE": str(pi_agent_module()),
+        "PI_CODING_AGENT_MODULE": str(pi_coding_agent_module()),
         "PROXY_BASE_URL": f"{base_url}/v1",
     }
     process = await asyncio.create_subprocess_exec(

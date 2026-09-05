@@ -395,6 +395,11 @@ async def test_official_clients_complete_tool_rounds_over_real_http(
     assert sdk_client.tool_handler_count == 2 + (rounds == 2)
     assert sdk_client.prompts == ["go"]
     assert len(sdk_client.tool_results) == 2 + (rounds == 2)
+    assert [result.content[0].text for result in sdk_client.tool_results] == [
+        "left",
+        "right",
+        *(["round-two"] if rounds == 2 else []),
+    ]
 
 
 @pytest.mark.anyio

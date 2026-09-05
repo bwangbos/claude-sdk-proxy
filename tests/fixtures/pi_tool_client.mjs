@@ -1,13 +1,16 @@
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const aiModuleName = process.env.PI_AI_MODULE;
 const agentModuleName = process.env.PI_AGENT_MODULE;
+const codingAgentModuleName = process.env.PI_CODING_AGENT_MODULE;
 const baseUrl = process.env.PROXY_BASE_URL;
 
-if (!aiModuleName || !agentModuleName || !baseUrl) {
+if (!aiModuleName || !agentModuleName || !codingAgentModuleName || !baseUrl) {
   throw new Error(
-    "PI_AI_MODULE, PI_AGENT_MODULE, and PROXY_BASE_URL are required",
+    "PI_AI_MODULE, PI_AGENT_MODULE, PI_CODING_AGENT_MODULE, and " +
+      "PROXY_BASE_URL are required",
   );
 }
 
@@ -16,6 +19,50 @@ function moduleSpecifier(moduleName) {
     ? pathToFileURL(moduleName).href
     : moduleName;
 }
+
+async function installedPackageVersion(moduleName, expectedName) {
+  if (!path.isAbsolute(moduleName)) {
+    throw new Error(`version discovery requires an absolute path: ${moduleName}`);
+  }
+  let directory = path.dirname(moduleName);
+  while (true) {
+    try {
+      const manifest = JSON.parse(
+        await readFile(path.join(directory, "package.json"), "utf8"),
+      );
+      if (manifest.name === expectedName) {
+        if (typeof manifest.version !== "string") {
+          throw new Error(`${expectedName} package version is invalid`);
+        }
+        return manifest.version;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) {
+      throw new Error(`could not find ${expectedName} package.json`);
+    }
+    directory = parent;
+  }
+}
+
+const packageVersions = {
+  "pi-coding-agent": await installedPackageVersion(
+    codingAgentModuleName,
+    "@earendil-works/pi-coding-agent",
+  ),
+  "pi-agent-core": await installedPackageVersion(
+    agentModuleName,
+    "@earendil-works/pi-agent-core",
+  ),
+  "pi-ai": await installedPackageVersion(
+    aiModuleName,
+    "@earendil-works/pi-ai",
+  ),
+};
 
 const { streamSimple } = await import(moduleSpecifier(aiModuleName));
 const { Agent } = await import(moduleSpecifier(agentModuleName));
@@ -171,6 +218,7 @@ const replayText = replayAssistant.content
 process.stdout.write(
   JSON.stringify({
     provider: { api: model.api, baseUrl: model.baseUrl },
+    packageVersions,
     customSessionHeaders,
     requestCount: requests.length,
     requests,
