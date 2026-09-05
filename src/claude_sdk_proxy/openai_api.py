@@ -83,6 +83,8 @@ def parse_openai_request(
             dialect="openai",
             tools=tools,
         )
+    except RequestValidationError:
+        raise
     except ValueError as error:
         raise RequestValidationError("messages", str(error)) from None
 

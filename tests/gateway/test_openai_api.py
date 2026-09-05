@@ -218,6 +218,38 @@ def test_openai_parser_accepts_empty_fresh_tools_and_auto_controls() -> None:
 
 
 @pytest.mark.parametrize(
+    "tools",
+    [
+        [openai_echo_tool(), openai_echo_tool()],
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "Repeat the provided value.",
+                    "parameters": {"type": "not-a-type"},
+                },
+            }
+        ],
+    ],
+)
+def test_openai_parser_preserves_tool_definition_validation_field(
+    tools: list[object],
+) -> None:
+    with pytest.raises(RequestValidationError) as error:
+        parse_openai_request(
+            {
+                "model": "sonnet",
+                "tools": tools,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            frozenset({"sonnet"}),
+        )
+
+    assert error.value.field == "tools"
+
+
+@pytest.mark.parametrize(
     ("tool_choice", "field"),
     [
         ("required", "tool_choice"),
