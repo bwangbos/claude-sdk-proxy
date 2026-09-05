@@ -192,6 +192,10 @@ class TextRequest:
                 raise RequestValidationError("messages", "blocks must not be empty")
             if message.role == "user":
                 if all(isinstance(item, TextBlock) for item in blocks):
+                    if prior_call_ids is not None:
+                        raise RequestValidationError(
+                            "messages", "tool results must match prior calls"
+                        )
                     if not message.require_text():
                         raise ValueError("message content must not be empty")
                     normalized_messages.append(message)

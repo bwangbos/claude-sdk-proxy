@@ -11,7 +11,8 @@ from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from referencing import Registry, Resource
-from referencing.jsonschema import DRAFT202012
+from referencing.exceptions import CannotDetermineSpecification
+from referencing.jsonschema import DRAFT202012, UnknownDialect
 
 from claude_sdk_proxy.domain import (
     RequestValidationError,
@@ -212,12 +213,17 @@ def _validate_schema(schema: Mapping[str, JsonValue]) -> None:
         validator.check_schema(plain)
     except SchemaError as error:
         raise RequestValidationError("tools", "input schema is invalid") from error
-    resource = (
-        Resource.from_contents(plain)
-        if "$schema" in plain
-        else Resource.from_contents(plain, default_specification=DRAFT202012)
-    )
-    registry = Registry(retrieve=_no_retrieve).with_resource("", resource).crawl()  # type: ignore[call-arg]
+    try:
+        resource = (
+            Resource.from_contents(plain)
+            if "$schema" in plain
+            else Resource.from_contents(plain, default_specification=DRAFT202012)
+        )
+        registry = Registry(retrieve=_no_retrieve).with_resource("", resource).crawl()  # type: ignore[call-arg]
+    except (CannotDetermineSpecification, UnknownDialect) as error:
+        raise RequestValidationError(
+            "tools", "input schema dialect is invalid"
+        ) from error
     _walk_schema_references(resource, registry.resolver(resource.id() or ""))
 
 

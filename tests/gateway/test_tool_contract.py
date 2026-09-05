@@ -127,6 +127,19 @@ def test_gateway_request_rejects_duplicate_result_ids() -> None:
     assert error.value.field == "messages"
 
 
+def test_gateway_request_requires_results_before_later_user_text() -> None:
+    with pytest.raises(RequestValidationError) as error:
+        tool_request(
+            (
+                CanonicalMessage.user_text("use echo"),
+                CanonicalMessage("assistant", (ToolCallBlock("call_a", "echo", {}),)),
+                CanonicalMessage.user_text("skip the result"),
+            )
+        )
+
+    assert error.value.field == "messages"
+
+
 def test_blocks_copy_and_recursively_freeze_caller_json() -> None:
     schema: dict[str, object] = {"type": "object", "properties": {"v": [1]}}
     arguments: dict[str, object] = {"nested": {"items": ["before"]}}
@@ -198,6 +211,41 @@ def test_tool_definition_limits_are_measured_after_canonical_json() -> None:
     assert error.value.field == "tools"
 
 
+def test_tool_definition_count_accepts_128_and_rejects_129() -> None:
+    accepted = tuple(ToolDefinition(f"tool{index}", "", {}) for index in range(128))
+    rejected = accepted + (ToolDefinition("tool129", "", {}),)
+
+    assert len(validate_tool_definitions(accepted)) == 128
+    with pytest.raises(RequestValidationError) as error:
+        validate_tool_definitions(rejected)
+    assert error.value.field == "tools"
+
+
+def test_tool_description_byte_limit_accepts_8_kib_and_rejects_one_more_byte() -> None:
+    accepted = ToolDefinition("echo", "d" * (8 * 1024), {})
+    rejected = ToolDefinition("echo", "d" * (8 * 1024 + 1), {})
+
+    assert validate_tool_definitions((accepted,)) == (accepted,)
+    with pytest.raises(RequestValidationError) as error:
+        validate_tool_definitions((rejected,))
+    assert error.value.field == "tools"
+
+
+def test_aggregate_schema_limit_accepts_512_kib_and_rejects_one_more_byte() -> None:
+    schema = {"x": "s" * (64 * 1024 - 8)}
+    accepted = tuple(ToolDefinition(f"tool{index}", "", schema) for index in range(8))
+    rejected = (
+        accepted[:-1]
+        + (ToolDefinition("tool7", "", {"x": "s" * (64 * 1024 - 9)}),)
+        + (ToolDefinition("tool8", "", {}),)
+    )
+
+    assert len(validate_tool_definitions(accepted)) == 8
+    with pytest.raises(RequestValidationError) as error:
+        validate_tool_definitions(rejected)
+    assert error.value.field == "tools"
+
+
 @pytest.mark.parametrize(
     "schema",
     (
@@ -209,6 +257,21 @@ def test_tool_definition_limits_are_measured_after_canonical_json() -> None:
 def test_tool_definition_rejects_malformed_schema(schema: object) -> None:
     with pytest.raises(RequestValidationError) as error:
         validate_tool_definitions((ToolDefinition("echo", "", schema),))  # type: ignore[arg-type]
+
+    assert error.value.field == "tools"
+
+
+def test_tool_definition_maps_unsupported_schema_dialect_to_request_error() -> None:
+    with pytest.raises(RequestValidationError) as error:
+        validate_tool_definitions(
+            (
+                ToolDefinition(
+                    "echo",
+                    "",
+                    {"$schema": "https://example.test/unsupported-schema"},
+                ),
+            )
+        )
 
     assert error.value.field == "tools"
 
@@ -299,6 +362,31 @@ def test_tool_result_validation_normalizes_order_and_rejects_invalid_values() ->
     with pytest.raises(RequestValidationError) as flag_error:
         validate_tool_results((ToolResultBlock("call_a", ("error",), 1),))  # type: ignore[arg-type]
     assert flag_error.value.field == "messages"
+
+
+def test_tool_result_byte_limit_accepts_256_kib_and_rejects_one_more_byte() -> None:
+    accepted = ToolResultBlock("call_a", ("r" * (256 * 1024),), False)
+    rejected = ToolResultBlock("call_a", ("r" * (256 * 1024 + 1),), False)
+
+    assert validate_tool_results((accepted,)) == (accepted,)
+    with pytest.raises(RequestValidationError) as error:
+        validate_tool_results((rejected,))
+    assert error.value.field == "messages"
+
+
+def test_aggregate_tool_result_limit_accepts_one_mib_and_rejects_one_more_byte() -> (
+    None
+):
+    accepted = tuple(
+        ToolResultBlock(f"call_{index}", ("r" * (256 * 1024),), False)
+        for index in range(4)
+    )
+    rejected = accepted + (ToolResultBlock("call_4", ("r",), False),)
+
+    assert len(validate_tool_results(accepted)) == 4
+    with pytest.raises(RequestValidationError) as error:
+        validate_tool_results(rejected)
+    assert error.value.field == "messages"
 
 
 def test_tool_call_event_copies_and_freezes_arguments() -> None:
