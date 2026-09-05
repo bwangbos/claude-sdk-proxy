@@ -456,13 +456,23 @@ class SdkSession:
         bridge = self._bridge
         if bridge is None:
             self._fail_protocol()
+        incoming_was_done = prefetched is not None and prefetched.done()
         completion = asyncio.create_task(bridge.wait_epoch_complete())
         incoming = prefetched or asyncio.create_task(self._receive_message(response))
+        loop = asyncio.get_running_loop()
+        winner: asyncio.Future[Literal["callback", "incoming"]] = loop.create_future()
+
+        def record_winner(label: Literal["callback", "incoming"]) -> None:
+            if not winner.done():
+                winner.set_result(label)
+
+        if incoming_was_done:
+            record_winner("incoming")
+        else:
+            incoming.add_done_callback(lambda _: record_winner("incoming"))
+        completion.add_done_callback(lambda _: record_winner("callback"))
         try:
-            done, _ = await asyncio.wait(
-                (completion, incoming), return_when=asyncio.FIRST_COMPLETED
-            )
-            if completion in done:
+            if await winner == "callback":
                 await completion
                 self._epoch_needs_completion = False
                 return await incoming
@@ -470,7 +480,7 @@ class SdkSession:
             await asyncio.gather(incoming, return_exceptions=True)
             self._fail_protocol()
         finally:
-            tasks = (completion, incoming)
+            tasks = (winner, completion, incoming)
             for task in tasks:
                 if not task.done():
                     task.cancel()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -54,6 +54,7 @@ class FakeSdkClient:
         | None = None,
         message_barriers: Mapping[int, tuple[asyncio.Event, asyncio.Event]]
         | None = None,
+        before_message_actions: Mapping[int, Callable[[], None]] | None = None,
     ) -> None:
         self._responses = iter(responses)
         self._response: tuple[Any, ...] = ()
@@ -70,6 +71,7 @@ class FakeSdkClient:
         self._wait_before_user = wait_for_tool_callbacks_before_user
         self._user_message_barrier = user_message_barrier
         self._message_barriers = dict(message_barriers or {})
+        self._before_message_actions = dict(before_message_actions or {})
 
     def capture_options(self, options: ClaudeAgentOptions) -> FakeSdkClient:
         self.options = options
@@ -89,6 +91,9 @@ class FakeSdkClient:
                 entered, release = barrier
                 entered.set()
                 await release.wait()
+            action = self._before_message_actions.get(index)
+            if action is not None:
+                action()
             if self._start_callbacks and isinstance(message, AssistantMessage):
                 self._start_tool_callbacks(message)
             if (
@@ -138,6 +143,8 @@ class FakeSdkClient:
         *,
         internal_id: str,
         wait_for_echo: bool = True,
+        entry_barrier: asyncio.Event | None = None,
+        completed: asyncio.Event | None = None,
     ) -> None:
         assert self.options is not None
         assert isinstance(self.options.mcp_servers, dict)
@@ -151,8 +158,14 @@ class FakeSdkClient:
             meta={"claudecode/toolUseId": internal_id},
         )
         async def invoke_handler() -> CallToolResult:
+            if entry_barrier is not None:
+                await entry_barrier.wait()
             self.tool_handler_count += 1
-            return await cast(Any, entry.handler)(None, params)
+            try:
+                return await cast(Any, entry.handler)(None, params)
+            finally:
+                if completed is not None:
+                    completed.set()
 
         task = asyncio.create_task(invoke_handler())
         target = self._tool_tasks if wait_for_echo else self._parked_tool_tasks

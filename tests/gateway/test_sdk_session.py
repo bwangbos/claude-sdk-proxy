@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -830,6 +831,8 @@ def make_tool_session(
     wait_for_tool_callbacks_before_user: bool = True,
     user_message_barrier: tuple[asyncio.Event, asyncio.Event, asyncio.Event]
     | None = None,
+    message_barriers: dict[int, tuple[asyncio.Event, asyncio.Event]] | None = None,
+    before_message_actions: dict[int, Callable[[], None]] | None = None,
     system: str = "system",
 ) -> tuple[SdkSession, FakeSdkClient]:
     client = FakeSdkClient(
@@ -837,6 +840,8 @@ def make_tool_session(
         start_tool_callbacks=start_tool_callbacks,
         wait_for_tool_callbacks_before_user=wait_for_tool_callbacks_before_user,
         user_message_barrier=user_message_barrier,
+        message_barriers=message_barriers,
+        before_message_actions=before_message_actions,
     )
     session = SdkSession(
         "sonnet",
@@ -1837,6 +1842,139 @@ async def test_serial_deferred_callback_delivers_stored_result_before_final_text
         ]
         assert len(client.tool_results) == 2
         assert [block.text for block in client.tool_results[1].content] == ["second"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+async def test_same_loop_incoming_first_stays_fatal_after_exact_callback_completes(
+    tmp_path: Path,
+) -> None:
+    raw_tools = raw_tool_events(
+        (
+            ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
+            ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),
+        ),
+        "sdk-1",
+    )
+    release_callback = asyncio.Event()
+    callback_completed = asyncio.Event()
+    messages = (
+        *raw_tools,
+        UserMessage(
+            [
+                SdkToolResultBlock("sdk-a", "first", False),
+                SdkToolResultBlock("sdk-b", "second", False),
+            ]
+        ),
+        *raw_text_events("must-not-commit", "sdk-1"),
+        result_message(),
+    )
+    next_item_index = len(raw_tools) + 1
+    session, client = make_tool_session(
+        tmp_path,
+        messages,
+        start_tool_callbacks=False,
+        wait_for_tool_callbacks_before_user=False,
+        before_message_actions={next_item_index: release_callback.set},
+    )
+    await session.start()
+    client.start_tool_callback("echo", {"v": 1}, internal_id="sdk-a")
+    client.start_tool_callback(
+        "echo",
+        {"v": 2},
+        internal_id="sdk-b",
+        entry_barrier=release_callback,
+        completed=callback_completed,
+    )
+    generation = session.stream_generation("go")
+    emitted: list[object] = []
+    try:
+        first = await next_boundary(generation)
+        calls = [event for event in first if isinstance(event, ToolCall)]
+        await session.submit_tool_results(
+            (
+                ToolResultBlock(calls[0].id, ("first",), False),
+                ToolResultBlock(calls[1].id, ("second",), False),
+            )
+        )
+        with pytest.raises(BackendFailure, match="protocol") as error:
+            async for event in generation:
+                emitted.append(event)
+        assert release_callback.is_set()
+        assert callback_completed.is_set()
+        assert "sdk-b" not in str(error.value)
+        assert "must-not-commit" not in str(error.value)
+        assert TextDelta("must-not-commit") not in emitted
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+async def test_same_loop_callback_first_accepts_immediately_following_item(
+    tmp_path: Path,
+) -> None:
+    raw_tools = raw_tool_events(
+        (
+            ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
+            ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),
+        ),
+        "sdk-1",
+    )
+    next_item_entered = asyncio.Event()
+    release_next_item = asyncio.Event()
+    release_callback = asyncio.Event()
+    callback_completed = asyncio.Event()
+    messages = (
+        *raw_tools,
+        UserMessage(
+            [
+                SdkToolResultBlock("sdk-a", "first", False),
+                SdkToolResultBlock("sdk-b", "second", False),
+            ]
+        ),
+        *raw_text_events("done", "sdk-1"),
+        result_message(),
+    )
+    next_item_index = len(raw_tools) + 1
+    session, client = make_tool_session(
+        tmp_path,
+        messages,
+        start_tool_callbacks=False,
+        wait_for_tool_callbacks_before_user=False,
+        message_barriers={
+            next_item_index: (next_item_entered, release_next_item)
+        },
+    )
+    await session.start()
+    client.start_tool_callback("echo", {"v": 1}, internal_id="sdk-a")
+    client.start_tool_callback(
+        "echo",
+        {"v": 2},
+        internal_id="sdk-b",
+        entry_barrier=release_callback,
+        completed=callback_completed,
+    )
+    generation = session.stream_generation("go")
+    try:
+        first = await next_boundary(generation)
+        calls = [event for event in first if isinstance(event, ToolCall)]
+        await session.submit_tool_results(
+            (
+                ToolResultBlock(calls[0].id, ("first",), False),
+                ToolResultBlock(calls[1].id, ("second",), False),
+            )
+        )
+        final_task = asyncio.create_task(next_boundary(generation))
+        await next_item_entered.wait()
+        release_callback.set()
+        await callback_completed.wait()
+        release_next_item.set()
+        assert await final_task == [
+            InputUsage(2),
+            TextDelta("done"),
+            Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
+        ]
     finally:
         await session.close()
 
