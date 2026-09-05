@@ -54,9 +54,7 @@ class RawSdkMessageValidator:
         self._public_names = {definition.name for definition in normalized}
         self._validators: dict[str, Any] = {}
         for definition in normalized:
-            schema = plain_json(
-                cast(Mapping[str, JsonValue], definition.input_schema)
-            )
+            schema = plain_json(cast(Mapping[str, JsonValue], definition.input_schema))
             assert isinstance(schema, dict)
             validator_class = validator_for(schema)
             self._validators[definition.name] = validator_class(schema)
@@ -65,7 +63,8 @@ class RawSdkMessageValidator:
         self._blocks: list[_RawBlock] = []
         self._current: _RawBlock | None = None
         self._tool_suffix_started = False
-        self._assistant_validated = False
+        self._assistant_mode: str | None = None
+        self._assistant_validated_blocks: set[int] = set()
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
         self.stop_reason: str | None = None
@@ -134,18 +133,36 @@ class RawSdkMessageValidator:
         if (
             message.parent_tool_use_id is not None
             or message.error is not None
-            or self._assistant_validated
             or self._phase not in {"block_delta", "block_start"}
             or not isinstance(message.content, list)
         ):
             fail_protocol()
-        raw_blocks = [*self._blocks]
+        raw_blocks: list[_RawBlock]
+        raw_indices: tuple[int, ...]
         if self._phase == "block_delta":
-            if self._current is None or not self._current.saw_delta:
+            current_index = len(self._blocks)
+            if (
+                self._assistant_mode == "batch"
+                or self._current is None
+                or not self._current.saw_delta
+                or current_index in self._assistant_validated_blocks
+                or len(message.content) != 1
+            ):
                 fail_protocol()
-            raw_blocks.append(self._current)
-        if len(message.content) != len(raw_blocks):
-            fail_protocol()
+            self._assistant_mode = "per_block"
+            raw_blocks = [self._current]
+            raw_indices = (current_index,)
+        else:
+            if (
+                self._assistant_mode == "per_block"
+                or not self._blocks
+                or self._assistant_validated_blocks
+                or len(message.content) != len(self._blocks)
+            ):
+                fail_protocol()
+            self._assistant_mode = "batch"
+            raw_blocks = [*self._blocks]
+            raw_indices = tuple(range(len(raw_blocks)))
         typed_suffix_started = False
         for raw, typed in zip(raw_blocks, message.content, strict=True):
             if type(typed) is TextBlock:
@@ -162,9 +179,7 @@ class RawSdkMessageValidator:
             arguments = self._validated_arguments(typed.input, raw.public_name)
             raw_arguments = raw.arguments
             if raw_arguments is None and raw.json_parts is not None:
-                raw_arguments = self._parse_arguments(
-                    raw.json_parts, raw.public_name
-                )
+                raw_arguments = self._parse_arguments(raw.json_parts, raw.public_name)
             if (
                 typed.id != raw.internal_id
                 or typed.name != raw.sdk_name
@@ -172,7 +187,7 @@ class RawSdkMessageValidator:
                 or canonical_json(arguments) != canonical_json(raw_arguments)
             ):
                 fail_protocol()
-        self._assistant_validated = True
+        self._assistant_validated_blocks.update(raw_indices)
 
     def _message_start(self, event: Mapping[str, Any]) -> InputUsage:
         if self._phase != "message_start":
@@ -207,7 +222,10 @@ class RawSdkMessageValidator:
         return InputUsage(self.input_tokens)
 
     def _block_start(self, event: Mapping[str, Any]) -> None:
-        if self._phase != "block_start" or self._assistant_validated:
+        if self._phase != "block_start" or (
+            self._assistant_mode == "per_block"
+            and len(self._assistant_validated_blocks) != len(self._blocks)
+        ):
             fail_protocol()
         self._require_keys(event, {"type", "index", "content_block"})
         self._require_index(event)
@@ -224,7 +242,10 @@ class RawSdkMessageValidator:
                 fail_protocol()
             self._current = _RawBlock("text", [])
         elif block_type == "tool_use":
-            if set(value) != {"type", "id", "name", "input"}:
+            if set(value) not in (
+                {"type", "id", "name", "input"},
+                {"type", "id", "name", "input", "caller"},
+            ) or value.get("caller", {"type": "direct"}) != {"type": "direct"}:
                 fail_protocol()
             internal_id = value.get("id")
             sdk_name = value.get("name")
@@ -253,7 +274,7 @@ class RawSdkMessageValidator:
     def _block_delta(self, event: Mapping[str, Any]) -> TextDelta | None:
         if (
             self._phase != "block_delta"
-            or self._assistant_validated
+            or len(self._blocks) in self._assistant_validated_blocks
             or self._current is None
         ):
             fail_protocol()
@@ -334,7 +355,8 @@ class RawSdkMessageValidator:
 
     def _message_stop(self, event: Mapping[str, Any]) -> None:
         if self._phase != "message_stop" or (
-            self.has_tools and not self._assistant_validated
+            self.has_tools
+            and len(self._assistant_validated_blocks) != len(self._blocks)
         ):
             fail_protocol()
         self._require_keys(event, {"type"})

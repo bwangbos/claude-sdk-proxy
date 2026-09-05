@@ -125,10 +125,19 @@ class FakeSdkClient:
             prefix = "mcp__caller_tools_v1__"
             if not block.name.startswith(prefix):
                 continue
-            self.start_tool_callback(block.name.removeprefix(prefix), block.input)
+            self.start_tool_callback(
+                block.name.removeprefix(prefix),
+                block.input,
+                internal_id=block.id,
+            )
 
     def start_tool_callback(
-        self, name: str, arguments: object, *, wait_for_echo: bool = True
+        self,
+        name: str,
+        arguments: object,
+        *,
+        internal_id: str,
+        wait_for_echo: bool = True,
     ) -> None:
         assert self.options is not None
         assert isinstance(self.options.mcp_servers, dict)
@@ -139,6 +148,7 @@ class FakeSdkClient:
         params = CallToolRequestParams(
             name=name,
             arguments=cast(dict[str, object], arguments),
+            meta={"claudecode/toolUseId": internal_id},
         )
         async def invoke_handler() -> CallToolResult:
             self.tool_handler_count += 1

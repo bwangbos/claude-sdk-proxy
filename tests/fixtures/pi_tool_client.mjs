@@ -151,9 +151,12 @@ const agent = new Agent({
   streamFn: agentStream,
 });
 
+const toolPrompt =
+  process.env.PI_TOOL_PROMPT ?? "run the echo tool twice";
+
 await agent.prompt({
   role: "user",
-  content: "run the echo tool twice",
+  content: toolPrompt,
   timestamp: Date.now(),
 });
 

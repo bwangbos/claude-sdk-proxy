@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,9 +74,8 @@ class _ReceivedSdkMessage:
     phase: _ProtocolPhase
     tool_epoch: int
 
-_STOP_REASONS = {
-    "end_turn", "max_tokens", "model_context_window_exceeded", "refusal"
-}
+
+_STOP_REASONS = {"end_turn", "max_tokens", "model_context_window_exceeded", "refusal"}
 
 
 class SdkSession:
@@ -112,9 +110,9 @@ class SdkSession:
         self._tool_epoch = 0
         self._epoch_needs_begin = False
         self._expected_internal_ids: set[str] = set()
-        self._expected_echo_values: Counter[tuple[str, bool]] = Counter()
+        self._expected_echo_values: dict[str, tuple[str, bool]] = {}
         self._echo_ids: set[str] = set()
-        self._echo_values: Counter[tuple[str, bool]] = Counter()
+        self._echo_values: dict[str, tuple[str, bool]] = {}
 
     @staticmethod
     def _new_directory() -> TemporaryDirectory[str]:
@@ -145,6 +143,7 @@ class SdkSession:
             plugins=[],
             cwd=Path(directory.__enter__()),
             include_partial_messages=True,
+            thinking={"type": "disabled"},
             stderr=_discard_stderr,
             max_buffer_size=8 * 1024 * 1024,
             env={"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"},
@@ -207,9 +206,21 @@ class SdkSession:
                         prefetched = None
                 except StopAsyncIteration:
                     break
-                if (received.phase, received.tool_epoch) != self._protocol_position():
-                    self._fail_protocol()
                 message = received.message
+                position = self._protocol_position()
+                if (received.phase, received.tool_epoch) != position and not (
+                    (
+                        type(message) is RateLimitEvent
+                        or (
+                            type(message) is SystemMessage
+                            and message.subtype == "status"
+                        )
+                    )
+                    and position == ("awaiting_echo", self._tool_epoch)
+                    and received.phase in {"generation", "awaiting_submit"}
+                    and received.tool_epoch in {self._tool_epoch - 1, self._tool_epoch}
+                ):
+                    self._fail_protocol()
                 if completed is not None or failure is not None:
                     if failure is not None:
                         failure = "Agent SDK message after result"
@@ -256,17 +267,12 @@ class SdkSession:
                         if isinstance(raw, RawSdkMessageValidator):
                             if not raw.complete:
                                 self._fail_protocol()
-                            boundary = Completed(
-                                raw.stop_reason, raw.boundary_usage
-                            )
+                            boundary = Completed(raw.stop_reason, raw.boundary_usage)
                         else:
                             boundary = Completed(
                                 raw.stop_reason, self._text_boundary_usage(raw)
                             )
-                        if (
-                            isinstance(raw, RawSdkMessageValidator)
-                            and raw.has_tools
-                        ):
+                        if isinstance(raw, RawSdkMessageValidator) and raw.has_tools:
                             public_events, prefetched = await self._tool_boundary(
                                 raw, response
                             )
@@ -295,7 +301,9 @@ class SdkSession:
                         self._validate_result(message, terminal_boundary.stop_reason)
                         completed = terminal_boundary
                 elif type(message) is SystemMessage:
-                    if self._awaiting_echo or self._awaiting_submit:
+                    if self._awaiting_submit or (
+                        self._awaiting_echo and message.subtype != "status"
+                    ):
                         self._fail_protocol()
                     self._observe_session_id(
                         validate_system_message(
@@ -305,7 +313,7 @@ class SdkSession:
                         )
                     )
                 elif isinstance(message, RateLimitEvent):
-                    if self._awaiting_echo or self._awaiting_submit:
+                    if self._awaiting_submit:
                         self._fail_protocol()
                     self._observe_session_id(validate_rate_limit_event(message))
                 elif type(message) is UserMessage:
@@ -331,12 +339,11 @@ class SdkSession:
         if self._bridge is None or not self._awaiting_submit or self._awaiting_echo:
             self._fail_protocol()
         normalized = validate_tool_results(results)
-        self._bridge.resolve(normalized)
-        self._expected_echo_values = Counter(
-            ("".join(result.content), result.is_error) for result in normalized
-        )
+        self._expected_echo_values = self._bridge.resolve(normalized)
+        if set(self._expected_echo_values) != self._expected_internal_ids:
+            self._fail_protocol()
         self._echo_ids = set()
-        self._echo_values = Counter()
+        self._echo_values = {}
         self._awaiting_submit = False
         self._awaiting_echo = True
 
@@ -396,7 +403,9 @@ class SdkSession:
         calls = raw.tool_calls
         invocations, prefetched = await self._seal_tool_epoch(
             bridge,
-            tuple((call.public_name, call.arguments) for call in calls),
+            tuple(
+                (call.internal_id, call.public_name, call.arguments) for call in calls
+            ),
             response,
         )
         self._expected_internal_ids = {call.internal_id for call in calls}
@@ -420,32 +429,11 @@ class SdkSession:
     async def _seal_tool_epoch(
         self,
         bridge: ToolBridge,
-        expected_calls: tuple[tuple[str, Mapping[str, object]], ...],
+        expected_calls: tuple[tuple[str, str, Mapping[str, object]], ...],
         response: AsyncIterator[Any],
-    ) -> tuple[
-        tuple[ToolInvocation, ...], asyncio.Future[_ReceivedSdkMessage]
-    ]:
-        seal = asyncio.create_task(bridge.seal_epoch(expected_calls))
+    ) -> tuple[tuple[ToolInvocation, ...], asyncio.Future[_ReceivedSdkMessage]]:
+        invocations = await bridge.seal_epoch(expected_calls)
         incoming = asyncio.create_task(self._receive_message(response))
-        try:
-            done, _ = await asyncio.wait(
-                (seal, incoming), return_when=asyncio.FIRST_COMPLETED
-            )
-        except BaseException:
-            seal.cancel()
-            incoming.cancel()
-            await asyncio.gather(seal, incoming, return_exceptions=True)
-            raise
-        if seal not in done:
-            seal.cancel()
-            await asyncio.gather(seal, incoming, return_exceptions=True)
-            self._fail_protocol()
-        try:
-            invocations = await seal
-        except BaseException:
-            incoming.cancel()
-            await asyncio.gather(incoming, return_exceptions=True)
-            raise
         return invocations, incoming
 
     async def _receive_message(
@@ -476,25 +464,43 @@ class SdkSession:
             not self._awaiting_echo
             or message.parent_tool_use_id is not None
             or message.origin is not None
-            or message.tool_use_result is not None
             or not isinstance(message.content, list)
             or not message.content
         ):
             self._fail_protocol()
+        raw_result = message.tool_use_result
+        if raw_result is not None:
+            if (
+                len(message.content) != 1
+                or type(message.content[0]) is not SdkToolResultBlock
+            ):
+                self._fail_protocol()
+            typed_result = message.content[0]
+            typed_text = self._normalize_echo_content(typed_result.content)
+            if typed_result.is_error is True:
+                if (
+                    not isinstance(raw_result, str)
+                    or raw_result != f"Error: {typed_text}"
+                ):
+                    self._fail_protocol()
+            elif self._normalize_echo_content(raw_result) != typed_text:
+                self._fail_protocol()
         for block in message.content:
             if type(block) is not SdkToolResultBlock:
                 self._fail_protocol()
             tool_use_id = block.tool_use_id
+            is_error = block.is_error
             if (
                 not isinstance(tool_use_id, str)
                 or tool_use_id not in self._expected_internal_ids
                 or tool_use_id in self._echo_ids
-                or type(block.is_error) is not bool
+                or is_error is not None
+                and type(is_error) is not bool
             ):
                 self._fail_protocol()
             text = self._normalize_echo_content(block.content)
             self._echo_ids.add(tool_use_id)
-            self._echo_values[(text, block.is_error)] += 1
+            self._echo_values[tool_use_id] = (text, is_error is True)
 
     def _finish_echo(self) -> None:
         if (
@@ -504,9 +510,9 @@ class SdkSession:
             self._fail_protocol()
         self._awaiting_echo = False
         self._expected_internal_ids = set()
-        self._expected_echo_values = Counter()
+        self._expected_echo_values = {}
         self._echo_ids = set()
-        self._echo_values = Counter()
+        self._echo_values = {}
 
     @staticmethod
     def _normalize_echo_content(value: object) -> str:

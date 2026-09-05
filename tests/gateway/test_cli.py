@@ -23,9 +23,15 @@ def test_cli_uses_loopback_defaults_and_configured_model(
 def test_cli_accepts_repeatable_models(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 
-    def create_app(*, models: tuple[str, ...], max_sessions: int) -> object:
+    def create_app(
+        *,
+        models: tuple[str, ...],
+        max_sessions: int,
+        tool_result_timeout_seconds: float,
+    ) -> object:
         captured["models"] = models
         captured["max_sessions"] = max_sessions
+        captured["tool_result_timeout_seconds"] = tool_result_timeout_seconds
         return object()
 
     monkeypatch.setattr(cli, "create_app", create_app)
@@ -33,20 +39,66 @@ def test_cli_accepts_repeatable_models(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cli.main(["--model", "sonnet", "--model", "opus"]) == 0
     assert captured["models"] == ("sonnet", "opus")
     assert captured["max_sessions"] == 8
+    assert captured["tool_result_timeout_seconds"] == 300.0
 
 
 def test_cli_threads_configured_max_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 
-    def create_app(*, models: tuple[str, ...], max_sessions: int) -> object:
-        captured.update(models=models, max_sessions=max_sessions)
+    def create_app(
+        *,
+        models: tuple[str, ...],
+        max_sessions: int,
+        tool_result_timeout_seconds: float,
+    ) -> object:
+        captured.update(
+            models=models,
+            max_sessions=max_sessions,
+            tool_result_timeout_seconds=tool_result_timeout_seconds,
+        )
         return object()
 
     monkeypatch.setattr(cli, "create_app", create_app)
     monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
 
     assert cli.main(["--max-sessions", "3"]) == 0
-    assert captured == {"models": ("sonnet",), "max_sessions": 3}
+    assert captured == {
+        "models": ("sonnet",),
+        "max_sessions": 3,
+        "tool_result_timeout_seconds": 300.0,
+    }
+
+
+def test_cli_threads_configured_tool_result_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def create_app(
+        *,
+        models: tuple[str, ...],
+        max_sessions: int,
+        tool_result_timeout_seconds: float,
+    ) -> object:
+        captured.update(
+            models=models,
+            max_sessions=max_sessions,
+            tool_result_timeout_seconds=tool_result_timeout_seconds,
+        )
+        return object()
+
+    monkeypatch.setattr(cli, "create_app", create_app)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+
+    assert cli.main(["--tool-result-timeout", "12.5"]) == 0
+    assert captured["tool_result_timeout_seconds"] == 12.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_cli_rejects_nonpositive_or_nonfinite_tool_result_timeout(value: str) -> None:
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--tool-result-timeout", value])
+    assert error.value.code == 2
 
 
 @pytest.mark.parametrize("value", ["0", "-1"])

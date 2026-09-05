@@ -11,7 +11,11 @@ from claude_sdk_proxy.domain import BackendFailure
 _COUNTER_MAX = 2**63 - 1
 _RATE_LIMIT_STATUSES = {"allowed", "allowed_warning", "rejected"}
 _RATE_LIMIT_TYPES = {
-    "five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage"
+    "five_hour",
+    "seven_day",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "overage",
 }
 
 
@@ -21,6 +25,7 @@ def validate_system_message(
     expected_mcp_servers: tuple[str, ...] = (),
 ) -> object:
     data = message.data
+    servers = [{"name": name, "status": "connected"} for name in expected_mcp_servers]
     if (
         not isinstance(data, Mapping)
         or message.subtype not in {"init", "status"}
@@ -36,7 +41,7 @@ def validate_system_message(
         not _identifier(data.get("model"))
         or data.get("permissionMode") != "dontAsk"
         or data.get("tools") != list(expected_tools)
-        or data.get("mcp_servers") != list(expected_mcp_servers)
+        or data.get("mcp_servers") != servers
         or data.get("skills") != []
         or data.get("plugins") != []
     ):

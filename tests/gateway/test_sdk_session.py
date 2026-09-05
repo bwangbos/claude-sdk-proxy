@@ -877,6 +877,7 @@ async def test_tool_session_exposes_only_generated_caller_tools(
         assert client.options.setting_sources == []
         assert client.options.agents == {}
         assert client.options.plugins == []
+        assert client.options.thinking == {"type": "disabled"}
         assert client.options.strict_mcp_config is True
         assert client.options.permission_mode == "dontAsk"
         assert client.options.max_buffer_size == 8 * 1024 * 1024
@@ -926,14 +927,16 @@ async def test_stream_generation_emits_one_native_tool_boundary_then_final_text(
             input_tokens=3,
             output_tokens=2,
         ),
+        live_system("status"),
         UserMessage(
             [
                 SdkToolResultBlock(
                     "sdk-tool-1",
                     [{"type": "text", "text": "one"}],
-                    False,
+                    None,
                 )
-            ]
+            ],
+            tool_use_result=[{"type": "text", "text": "one"}],  # type: ignore[arg-type]
         ),
         *raw_text_events("done", "sdk-1", input_tokens=7, output_tokens=4),
         result_message(usage={"input_tokens": 91, "output_tokens": 37}),
@@ -965,6 +968,40 @@ async def test_stream_generation_emits_one_native_tool_boundary_then_final_text(
         assert client.prompts == ["caller-final-text"]
         assert len(client.tool_results) == 1
         assert [block.text for block in client.tool_results[0].content] == ["one"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+async def test_tool_error_echo_accepts_live_rate_limit_message_before_echo(
+    tmp_path: Path,
+) -> None:
+    messages = (
+        *raw_tool_events(
+            (("sdk-tool-1", "mcp__caller_tools_v1__echo", '{"v":1}'),),
+            "sdk-1",
+        ),
+        live_rate_limit(),
+        UserMessage(
+            [SdkToolResultBlock("sdk-tool-1", "expected", True)],
+            tool_use_result="Error: expected",
+        ),
+        *raw_text_events("done", "sdk-1"),
+        result_message(),
+    )
+    session, _ = make_tool_session(tmp_path, messages)
+    await session.start()
+    generation = session.stream_generation("go")
+    try:
+        boundary = await next_boundary(generation)
+        call = next(event for event in boundary if isinstance(event, ToolCall))
+        await asyncio.sleep(0)
+        await session.submit_tool_results(
+            (ToolResultBlock(call.id, ("expected",), True),)
+        )
+        assert (await next_boundary(generation))[-1] == Completed(
+            "end_turn", {"input_tokens": 2, "output_tokens": 1}
+        )
     finally:
         await session.close()
 
@@ -1009,6 +1046,45 @@ async def test_parallel_native_results_may_arrive_in_separate_user_messages(
 
 
 @pytest.mark.anyio
+async def test_parallel_native_result_echoes_must_match_exact_internal_ids(
+    tmp_path: Path,
+) -> None:
+    messages = (
+        *raw_tool_events(
+            (
+                ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
+                ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":1}'),
+            ),
+            "sdk-1",
+        ),
+        UserMessage(
+            [
+                SdkToolResultBlock("sdk-a", "right", False),
+                SdkToolResultBlock("sdk-b", "left", False),
+            ]
+        ),
+        *raw_text_events("done", "sdk-1"),
+        result_message(),
+    )
+    session, _ = make_tool_session(tmp_path, messages)
+    await session.start()
+    generation = session.stream_generation("go")
+    try:
+        boundary = await next_boundary(generation)
+        calls = [event for event in boundary if isinstance(event, ToolCall)]
+        await session.submit_tool_results(
+            (
+                ToolResultBlock(calls[0].id, ("left",), False),
+                ToolResultBlock(calls[1].id, ("right",), False),
+            )
+        )
+        with pytest.raises(BackendFailure, match="protocol"):
+            _ = [event async for event in generation]
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "echo",
     [
@@ -1030,6 +1106,16 @@ async def test_parallel_native_results_may_arrive_in_separate_user_messages(
         UserMessage(
             [SdkToolResultBlock("sdk-tool-1", "one", False)],
             origin={"kind": "peer"},
+        ),
+        UserMessage(
+            [SdkToolResultBlock("sdk-tool-1", "one", False)],
+            tool_use_result=[  # type: ignore[arg-type]
+                {"type": "text", "text": "changed"}
+            ],
+        ),
+        UserMessage(
+            [SdkToolResultBlock("sdk-tool-1", "one", True)],
+            tool_use_result="Error: changed",
         ),
     ],
 )
@@ -1152,7 +1238,7 @@ async def test_tool_enabled_system_init_requires_exact_generated_metadata(
     expected = live_system(
         "init",
         tools=["mcp__caller_tools_v1__echo"],
-        mcp_servers=["caller_tools_v1"],
+        mcp_servers=[{"name": "caller_tools_v1", "status": "connected"}],
     )
     messages = (expected, *raw_text_events("done", "sdk-1"), result_message())
     session, _ = make_tool_session(tmp_path, messages)
@@ -1169,14 +1255,33 @@ async def test_tool_enabled_system_init_requires_exact_generated_metadata(
 @pytest.mark.parametrize(
     ("tools", "servers"),
     [
-        (["mcp__caller_tools_v1__echo", "Bash"], ["caller_tools_v1"]),
-        (["mcp__caller_tools_v1__echo"] * 2, ["caller_tools_v1"]),
-        (["mcp__caller_tools_v1__echo"], ["caller_tools_v1", "ambient"]),
-        (["mcp__other__echo"], ["caller_tools_v1"]),
+        (
+            ["mcp__caller_tools_v1__echo", "Bash"],
+            [{"name": "caller_tools_v1", "status": "connected"}],
+        ),
+        (
+            ["mcp__caller_tools_v1__echo"] * 2,
+            [{"name": "caller_tools_v1", "status": "connected"}],
+        ),
+        (
+            ["mcp__caller_tools_v1__echo"],
+            [
+                {"name": "caller_tools_v1", "status": "connected"},
+                {"name": "ambient", "status": "connected"},
+            ],
+        ),
+        (
+            ["mcp__caller_tools_v1__echo"],
+            [{"name": "caller_tools_v1", "status": "failed"}],
+        ),
+        (
+            ["mcp__other__echo"],
+            [{"name": "caller_tools_v1", "status": "connected"}],
+        ),
     ],
 )
 async def test_tool_enabled_system_init_rejects_every_metadata_expansion(
-    tmp_path: Path, tools: list[str], servers: list[str]
+    tmp_path: Path, tools: list[str], servers: list[dict[str, str]]
 ) -> None:
     message = live_system("init", tools=tools, mcp_servers=servers)
     session, _ = make_tool_session(tmp_path, (message,))
@@ -1415,11 +1520,9 @@ async def test_sdk_session_rejects_callback_set_that_does_not_match_raw_calls(
     messages = raw_tool_events(
         (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
     )
-    session, client = make_tool_session(
-        tmp_path, messages, start_tool_callbacks=False
-    )
+    session, client = make_tool_session(tmp_path, messages, start_tool_callbacks=False)
     await session.start()
-    client.start_tool_callback(callback_name, callback_arguments)
+    client.start_tool_callback(callback_name, callback_arguments, internal_id="sdk-a")
     try:
         with pytest.raises(BackendFailure, match="protocol"):
             _ = [event async for event in session.stream_generation("go")]
@@ -1446,7 +1549,9 @@ async def test_callback_after_seal_cannot_join_the_next_tool_epoch(
     try:
         first = await next_boundary(generation)
         call = next(event for event in first if isinstance(event, ToolCall))
-        client.start_tool_callback("echo", {"v": 99}, wait_for_echo=False)
+        client.start_tool_callback(
+            "echo", {"v": 99}, internal_id="sdk-late", wait_for_echo=False
+        )
         await session.submit_tool_results(
             (ToolResultBlock(call.id, ("first",), False),)
         )
@@ -1472,20 +1577,102 @@ def test_raw_tool_validator_rejects_arguments_outside_caller_schema() -> None:
     assert "secret" not in str(error.value)
 
 
+def test_raw_tool_validator_accepts_live_direct_caller_attribution() -> None:
+    validator = RawSdkMessageValidator((echo_definition(),))
+    messages = list(
+        raw_tool_events((("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1")
+    )
+    start = messages[1]
+    assert isinstance(start, StreamEvent)
+    start.event["content_block"]["caller"] = {"type": "direct"}
+
+    for message in messages:
+        if isinstance(message, StreamEvent):
+            validator.observe(message.event)
+        else:
+            validator.validate_assistant(message)
+
+    assert validator.complete is True
+    assert len(validator.tool_calls) == 1
+
+
+def test_raw_tool_validator_accepts_live_per_block_parallel_typed_messages() -> None:
+    sdk_name = "mcp__caller_tools_v1__echo"
+    validator = RawSdkMessageValidator((echo_definition(),))
+    messages = list(
+        raw_tool_events(
+            (("sdk-a", sdk_name, '{"v":1}'), ("sdk-b", sdk_name, '{"v":1}')),
+            "sdk-1",
+        )
+    )
+    final_typed = next(
+        message for message in messages if isinstance(message, AssistantMessage)
+    )
+    messages.remove(final_typed)
+    for internal_id, block_index in reversed((("sdk-a", 0), ("sdk-b", 1))):
+        stop = next(
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message, StreamEvent)
+            and message.event.get("type") == "content_block_stop"
+            and message.event.get("index") == block_index
+        )
+        messages.insert(
+            stop,
+            AssistantMessage([ToolUseBlock(internal_id, sdk_name, {"v": 1})], "sonnet"),
+        )
+
+    for message in messages:
+        if isinstance(message, StreamEvent):
+            validator.observe(message.event)
+        else:
+            validator.validate_assistant(message)
+
+    assert validator.complete is True
+    assert len(validator.tool_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "caller",
+    ["direct", {"type": "agent"}, {"type": "direct", "extra": "secret"}],
+)
+def test_raw_tool_validator_rejects_non_direct_caller_attribution(
+    caller: object,
+) -> None:
+    validator = RawSdkMessageValidator((echo_definition(),))
+    messages = list(
+        raw_tool_events((("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1")
+    )
+    start = messages[1]
+    assert isinstance(start, StreamEvent)
+    start.event["content_block"]["caller"] = caller
+
+    with pytest.raises(BackendFailure, match="protocol") as error:
+        for message in messages:
+            if isinstance(message, StreamEvent):
+                validator.observe(message.event)
+            else:
+                validator.validate_assistant(message)
+
+    assert "secret" not in str(error.value)
+
+
 @pytest.mark.anyio
-async def test_completed_tool_boundary_without_handler_publication_fails_closed(
+async def test_deferred_handler_that_never_arrives_fails_closed_after_result(
     tmp_path: Path,
 ) -> None:
     messages = raw_tool_events(
         (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
     )
-    session, _ = make_tool_session(
-        tmp_path, messages, start_tool_callbacks=False
-    )
+    session, _ = make_tool_session(tmp_path, messages, start_tool_callbacks=False)
     await session.start()
+    generation = session.stream_generation("go")
     try:
-        with pytest.raises(BackendFailure, match="protocol") as error:
-            _ = [event async for event in session.stream_generation("go")]
+        boundary = await next_boundary(generation)
+        call = next(event for event in boundary if isinstance(event, ToolCall))
+        await session.submit_tool_results((ToolResultBlock(call.id, ("one",), False),))
+        with pytest.raises(BackendFailure, match="without result") as error:
+            _ = [event async for event in generation]
         assert "sdk-a" not in str(error.value)
     finally:
         await session.close()
@@ -1532,9 +1719,7 @@ async def test_user_message_after_complete_result_echo_fails_closed(
     try:
         boundary = await next_boundary(generation)
         call = next(event for event in boundary if isinstance(event, ToolCall))
-        await session.submit_tool_results(
-            (ToolResultBlock(call.id, ("one",), False),)
-        )
+        await session.submit_tool_results((ToolResultBlock(call.id, ("one",), False),))
         with pytest.raises(BackendFailure, match="protocol") as error:
             _ = [event async for event in generation]
         assert "secret-extra" not in str(error.value)
@@ -1571,9 +1756,7 @@ async def test_prefetched_user_message_keeps_awaiting_submit_phase(
         await reached.wait()
         release.set()
         await delivered.wait()
-        await session.submit_tool_results(
-            (ToolResultBlock(call.id, ("one",), False),)
-        )
+        await session.submit_tool_results((ToolResultBlock(call.id, ("one",), False),))
 
         with pytest.raises(BackendFailure, match="protocol") as error:
             _ = [event async for event in generation]
@@ -1610,9 +1793,7 @@ async def test_prefetched_user_message_received_after_submit_is_accepted(
         boundary = await next_boundary(generation)
         call = next(event for event in boundary if isinstance(event, ToolCall))
         await reached.wait()
-        await session.submit_tool_results(
-            (ToolResultBlock(call.id, ("one",), False),)
-        )
+        await session.submit_tool_results((ToolResultBlock(call.id, ("one",), False),))
         release.set()
         await delivered.wait()
 
