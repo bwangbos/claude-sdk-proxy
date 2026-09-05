@@ -42,6 +42,10 @@ class FakeSdkClient:
         *,
         start_tool_callbacks: bool = True,
         wait_for_tool_callbacks_before_user: bool = True,
+        user_message_barrier: tuple[
+            asyncio.Event, asyncio.Event, asyncio.Event
+        ]
+        | None = None,
     ) -> None:
         self._responses = iter(responses)
         self._response: tuple[Any, ...] = ()
@@ -54,6 +58,7 @@ class FakeSdkClient:
         self._parked_tool_tasks: list[asyncio.Task[CallToolResult]] = []
         self._start_callbacks = start_tool_callbacks
         self._wait_before_user = wait_for_tool_callbacks_before_user
+        self._user_message_barrier = user_message_barrier
 
     def capture_options(self, options: ClaudeAgentOptions) -> FakeSdkClient:
         self.options = options
@@ -77,6 +82,13 @@ class FakeSdkClient:
             ):
                 self.tool_results.extend(await asyncio.gather(*self._tool_tasks))
                 self._tool_tasks.clear()
+            if isinstance(message, UserMessage) and self._user_message_barrier:
+                reached, release, delivered = self._user_message_barrier
+                reached.set()
+                await release.wait()
+                # No await separates this signal from returning the item, so a
+                # waiter resumes only after the pending anext() has completed.
+                delivered.set()
             yield message
 
     async def disconnect(self) -> None:

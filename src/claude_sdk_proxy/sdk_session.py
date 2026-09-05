@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Never, Protocol
+from typing import Any, Literal, Never, Protocol
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -65,6 +66,14 @@ class SessionDirectoryProtocol(Protocol):
 
 type ClientFactory = Callable[[ClaudeAgentOptions], SdkClientProtocol]
 type DirectoryFactory = Callable[[], SessionDirectoryProtocol]
+type _ProtocolPhase = Literal["generation", "awaiting_submit", "awaiting_echo"]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReceivedSdkMessage:
+    message: Any
+    phase: _ProtocolPhase
+    tool_epoch: int
 
 _STOP_REASONS = {
     "end_turn", "max_tokens", "model_context_window_exceeded", "refusal"
@@ -100,6 +109,7 @@ class SdkSession:
         )
         self._awaiting_submit = False
         self._awaiting_echo = False
+        self._tool_epoch = 0
         self._epoch_needs_begin = False
         self._expected_internal_ids: set[str] = set()
         self._expected_echo_values: Counter[tuple[str, bool]] = Counter()
@@ -184,19 +194,22 @@ class SdkSession:
         failure: str | None = None
         raw: RawTextEventValidator | RawSdkMessageValidator | None = None
         terminal_boundary: Completed | None = None
-        prefetched: asyncio.Future[Any] | None = None
+        prefetched: asyncio.Future[_ReceivedSdkMessage] | None = None
         try:
             await client.query(prompt)
             response = client.receive_response()
             while True:
                 try:
                     if prefetched is None:
-                        message = await anext(response)
+                        received = await self._receive_message(response)
                     else:
-                        message = await prefetched
+                        received = await prefetched
                         prefetched = None
                 except StopAsyncIteration:
                     break
+                if (received.phase, received.tool_epoch) != self._protocol_position():
+                    self._fail_protocol()
+                message = received.message
                 if completed is not None or failure is not None:
                     if failure is not None:
                         failure = "Agent SDK message after result"
@@ -369,7 +382,7 @@ class SdkSession:
         self,
         raw: RawSdkMessageValidator,
         response: AsyncIterator[Any],
-    ) -> tuple[tuple[ConversationEvent, ...], asyncio.Future[Any]]:
+    ) -> tuple[tuple[ConversationEvent, ...], asyncio.Future[_ReceivedSdkMessage]]:
         bridge = self._bridge
         if bridge is None or raw.stop_reason != "tool_use":
             self._fail_protocol()
@@ -382,6 +395,7 @@ class SdkSession:
         self._expected_internal_ids = {call.internal_id for call in calls}
         if len(self._expected_internal_ids) != len(calls):
             self._fail_protocol()
+        self._tool_epoch += 1
         self._awaiting_submit = True
         events: tuple[ConversationEvent, ...] = (
             *(
@@ -401,9 +415,11 @@ class SdkSession:
         bridge: ToolBridge,
         expected_calls: tuple[tuple[str, Mapping[str, object]], ...],
         response: AsyncIterator[Any],
-    ) -> tuple[tuple[ToolInvocation, ...], asyncio.Future[Any]]:
+    ) -> tuple[
+        tuple[ToolInvocation, ...], asyncio.Future[_ReceivedSdkMessage]
+    ]:
         seal = asyncio.create_task(bridge.seal_epoch(expected_calls))
-        incoming = asyncio.ensure_future(anext(response))
+        incoming = asyncio.create_task(self._receive_message(response))
         try:
             done, _ = await asyncio.wait(
                 (seal, incoming), return_when=asyncio.FIRST_COMPLETED
@@ -424,6 +440,20 @@ class SdkSession:
             await asyncio.gather(incoming, return_exceptions=True)
             raise
         return invocations, incoming
+
+    async def _receive_message(
+        self, response: AsyncIterator[Any]
+    ) -> _ReceivedSdkMessage:
+        message = await anext(response)
+        phase, tool_epoch = self._protocol_position()
+        return _ReceivedSdkMessage(message, phase, tool_epoch)
+
+    def _protocol_position(self) -> tuple[_ProtocolPhase, int]:
+        if self._awaiting_submit:
+            return "awaiting_submit", self._tool_epoch
+        if self._awaiting_echo:
+            return "awaiting_echo", self._tool_epoch
+        return "generation", self._tool_epoch
 
     @staticmethod
     def _text_boundary_usage(raw: RawTextEventValidator) -> dict[str, int]:

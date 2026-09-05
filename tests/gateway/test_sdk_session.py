@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -827,12 +828,15 @@ def make_tool_session(
     tools: tuple[ToolDefinition, ...] = (echo_definition(),),
     start_tool_callbacks: bool = True,
     wait_for_tool_callbacks_before_user: bool = True,
+    user_message_barrier: tuple[asyncio.Event, asyncio.Event, asyncio.Event]
+    | None = None,
     system: str = "system",
 ) -> tuple[SdkSession, FakeSdkClient]:
     client = FakeSdkClient(
         responses=(messages,),
         start_tool_callbacks=start_tool_callbacks,
         wait_for_tool_callbacks_before_user=wait_for_tool_callbacks_before_user,
+        user_message_barrier=user_message_barrier,
     )
     session = SdkSession(
         "sonnet",
@@ -1534,5 +1538,88 @@ async def test_user_message_after_complete_result_echo_fails_closed(
         with pytest.raises(BackendFailure, match="protocol") as error:
             _ = [event async for event in generation]
         assert "secret-extra" not in str(error.value)
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+async def test_prefetched_user_message_keeps_awaiting_submit_phase(
+    tmp_path: Path,
+) -> None:
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    delivered = asyncio.Event()
+    messages = (
+        *raw_tool_events(
+            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+        ),
+        UserMessage([SdkToolResultBlock("sdk-a", "one", False)]),
+        *raw_text_events("done", "sdk-1"),
+        result_message(),
+    )
+    session, _ = make_tool_session(
+        tmp_path,
+        messages,
+        wait_for_tool_callbacks_before_user=False,
+        user_message_barrier=(reached, release, delivered),
+    )
+    await session.start()
+    generation = session.stream_generation("go")
+    try:
+        boundary = await next_boundary(generation)
+        call = next(event for event in boundary if isinstance(event, ToolCall))
+        await reached.wait()
+        release.set()
+        await delivered.wait()
+        await session.submit_tool_results(
+            (ToolResultBlock(call.id, ("one",), False),)
+        )
+
+        with pytest.raises(BackendFailure, match="protocol") as error:
+            _ = [event async for event in generation]
+        assert "sdk-a" not in str(error.value)
+        assert "one" not in str(error.value)
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+async def test_prefetched_user_message_received_after_submit_is_accepted(
+    tmp_path: Path,
+) -> None:
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    delivered = asyncio.Event()
+    messages = (
+        *raw_tool_events(
+            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+        ),
+        UserMessage([SdkToolResultBlock("sdk-a", "one", False)]),
+        *raw_text_events("done", "sdk-1"),
+        result_message(),
+    )
+    session, _ = make_tool_session(
+        tmp_path,
+        messages,
+        wait_for_tool_callbacks_before_user=False,
+        user_message_barrier=(reached, release, delivered),
+    )
+    await session.start()
+    generation = session.stream_generation("go")
+    try:
+        boundary = await next_boundary(generation)
+        call = next(event for event in boundary if isinstance(event, ToolCall))
+        await reached.wait()
+        await session.submit_tool_results(
+            (ToolResultBlock(call.id, ("one",), False),)
+        )
+        release.set()
+        await delivered.wait()
+
+        assert await next_boundary(generation) == [
+            InputUsage(2),
+            TextDelta("done"),
+            Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
+        ]
     finally:
         await session.close()
