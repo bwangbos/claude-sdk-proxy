@@ -101,3 +101,15 @@ def test_text_request_requires_alternating_messages_ending_in_user() -> None:
             stream=False,
             include_usage=False,
         )
+
+
+def test_text_request_accepts_canonical_text_helpers() -> None:
+    request = TextRequest(
+        model="sonnet",
+        system="",
+        messages=(CanonicalMessage.user_text("hello"),),
+        max_tokens=1024,
+        stream=False,
+    )
+
+    assert request.next_prompt == "hello"

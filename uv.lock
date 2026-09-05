@@ -92,6 +92,8 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
+    { name = "jsonschema" },
+    { name = "referencing" },
     { name = "starlette" },
     { name = "uvicorn" },
 ]
@@ -107,6 +109,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", specifier = "==0.2.152" },
+    { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "referencing", specifier = "==0.37.0" },
     { name = "starlette", specifier = ">=1.6,<2" },
     { name = "uvicorn", specifier = ">=0.52,<1" },
 ]
