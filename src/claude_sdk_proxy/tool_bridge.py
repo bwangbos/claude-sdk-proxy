@@ -102,6 +102,9 @@ class ToolBridge:
         self._failure: BridgeProtocolFailure | None = None
         self._cancelled = False
         self._epoch_sealed = False
+        self._epoch_verified = False
+        self._epoch_resolved = False
+        self._epoch_transition: asyncio.Future[None] | None = None
         self._epoch_invocations: list[ToolInvocation] = []
 
         wire_tools = [
@@ -207,6 +210,7 @@ class ToolBridge:
         finally:
             if self._pending.get(public_id) is pending:
                 del self._pending[public_id]
+                self._finish_epoch_transition()
 
     async def next_invocation(self) -> ToolInvocation:
         """Return the next handler entry, redacting protocol failures."""
@@ -249,8 +253,38 @@ class ToolBridge:
                     )
                     raise BackendFailure(_PROTOCOL_FAILURE)
                 self._epoch_sealed = True
+                self._epoch_verified = True
                 return tuple(self._epoch_invocations)
             await self._entry_changed.wait()
+
+    async def begin_epoch(self) -> None:
+        """Open admission for the next assistant message after handler quiescence."""
+        if self._cancelled:
+            raise BackendFailure(_CANCELLED)
+        if self._failure is not None:
+            raise BackendFailure(_PROTOCOL_FAILURE)
+        if (
+            not self._epoch_sealed
+            or not self._epoch_verified
+            or not self._epoch_resolved
+            or any(not pending.delivered for pending in self._pending.values())
+            or self._epoch_transition is not None
+        ):
+            self._signal_failure(
+                BridgeProtocolFailure("tool callback epoch transition was premature")
+            )
+            raise BackendFailure(_PROTOCOL_FAILURE)
+
+        loop = asyncio.get_running_loop()
+        transition: asyncio.Future[None] = loop.create_future()
+        self._epoch_transition = transition
+        self._finish_epoch_transition()
+        try:
+            await asyncio.shield(transition)
+        except asyncio.CancelledError:
+            if self._epoch_transition is transition:
+                self._epoch_transition = None
+            raise
 
     def resolve(self, results: Iterable[ToolResultBlock]) -> None:
         """Atomically validate and deliver one complete caller result batch."""
@@ -273,8 +307,8 @@ class ToolBridge:
                 "messages", "tool results must match pending calls"
             )
 
-        self._epoch_invocations = []
-        self._epoch_sealed = False
+        self._epoch_sealed = True
+        self._epoch_resolved = True
         for pending in pending_batch:
             pending.delivered = True
             pending.future.set_result(by_id[pending.invocation.public_id])
@@ -291,6 +325,10 @@ class ToolBridge:
         for parked in tuple(self._parked_failures):
             if not parked.done():
                 parked.set_exception(BackendFailure(_CANCELLED))
+        if self._epoch_transition is not None:
+            if not self._epoch_transition.done():
+                self._epoch_transition.set_exception(BackendFailure(_CANCELLED))
+            self._epoch_transition = None
         self._publications.put_nowait(BridgeProtocolFailure("bridge was cancelled"))
         self._entry_changed.set()
 
@@ -318,6 +356,17 @@ class ToolBridge:
             self._publications.put_nowait(failure)
             self._failure_changed.set()
         self._entry_changed.set()
+
+    def _finish_epoch_transition(self) -> None:
+        transition = self._epoch_transition
+        if transition is None or self._pending:
+            return
+        self._epoch_invocations = []
+        self._epoch_sealed = False
+        self._epoch_verified = False
+        self._epoch_resolved = False
+        self._epoch_transition = None
+        transition.set_result(None)
 
     def _new_public_id(self) -> str:
         prefix = "toolu_" if self._dialect == "anthropic" else "call_"

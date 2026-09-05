@@ -416,3 +416,74 @@ async def test_callback_entering_after_expected_epoch_is_sealed_is_fatal() -> No
     assert not task.done()
 
     await cancel_and_collect(bridge, (task,))
+
+
+@pytest.mark.anyio
+async def test_callback_after_resolve_but_before_next_epoch_is_still_late() -> None:
+    bridge = ToolBridge(
+        (echo_definition(),),
+        dialect="openai",
+        id_factory=id_sequence("call_a", "call_late"),
+    )
+    first_task = asyncio.create_task(bridge.call_tool("echo", {"v": 1}))
+    first = await bridge.next_invocation()
+    await bridge.seal_epoch((ToolCall("raw_a", "echo", {"v": 1}),))
+    release_late_callback = asyncio.Event()
+
+    async def late_callback() -> CallToolResult:
+        await release_late_callback.wait()
+        return await bridge.call_tool("echo", {"v": 2})
+
+    late_task = asyncio.create_task(late_callback())
+    bridge.resolve((ToolResultBlock(first.public_id, ("one",), False),))
+
+    release_late_callback.set()
+    with pytest.raises(BackendFailure, match="SDK tool protocol failure"):
+        await bridge.next_invocation()
+    with pytest.raises(BackendFailure, match="SDK tool protocol failure"):
+        await bridge.wait_failure()
+    assert [block.text for block in (await first_task).content] == ["one"]
+
+    bridge.cancel()
+    with pytest.raises(BackendFailure):
+        await late_task
+
+
+@pytest.mark.anyio
+async def test_explicit_transition_reuses_bridge_for_a_second_epoch() -> None:
+    bridge = ToolBridge(
+        (echo_definition(),),
+        dialect="openai",
+        id_factory=id_sequence("call_a", "call_b"),
+    )
+    first_task = asyncio.create_task(bridge.call_tool("echo", {"v": 1}))
+    first = await bridge.next_invocation()
+    await bridge.seal_epoch((ToolCall("raw_a", "echo", {"v": 1}),))
+    bridge.resolve((ToolResultBlock(first.public_id, ("one",), False),))
+
+    await bridge.begin_epoch()
+    assert [block.text for block in (await first_task).content] == ["one"]
+
+    second_task = asyncio.create_task(bridge.call_tool("echo", {"v": 2}))
+    second = await bridge.next_invocation()
+    assert second.public_id == "call_b"
+    await bridge.seal_epoch((ToolCall("raw_b", "echo", {"v": 2}),))
+    bridge.resolve((ToolResultBlock(second.public_id, ("two",), False),))
+    assert [block.text for block in (await second_task).content] == ["two"]
+
+
+@pytest.mark.anyio
+async def test_premature_epoch_transition_rejects_without_consuming_result() -> None:
+    bridge = ToolBridge(
+        (echo_definition(),), dialect="openai", id_factory=id_sequence("call_a")
+    )
+    task = asyncio.create_task(bridge.call_tool("echo", {"v": 1}))
+    invocation = await bridge.next_invocation()
+    await bridge.seal_epoch((ToolCall("raw_a", "echo", {"v": 1}),))
+
+    with pytest.raises(BackendFailure, match="SDK tool protocol failure"):
+        await bridge.begin_epoch()
+    assert not task.done()
+
+    bridge.resolve((ToolResultBlock(invocation.public_id, ("one",), False),))
+    assert [block.text for block in (await task).content] == ["one"]
