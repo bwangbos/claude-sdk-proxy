@@ -120,8 +120,15 @@ def test_fixed_relay_fd_collision_preserves_supervisor_loss_fallback() -> None:
     assert result.internal_control_fd_closed_on_cli_exec
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        "cleanup_fail_after_admission",
+        "controller_loss_with_stubborn_descendant",
+    ),
+)
 def test_anchor_group_exits_when_its_last_controller_is_killed(
-    tmp_path: Path,
+    tmp_path: Path, scenario: str
 ) -> None:
     identity_path = tmp_path / "anchor-identity"
     controller = (
@@ -138,10 +145,10 @@ def test_anchor_group_exits_when_its_last_controller_is_killed(
         "        os.close(fd)\n"
         "        os.kill(os.getpid(), signal.SIGKILL)\n"
         "probe._python_exception_checkpoint = checkpoint\n"
-        "probe.run_lifecycle_scenario('cleanup_fail_after_admission')\n"
+        "probe.run_lifecycle_scenario(sys.argv[2])\n"
     )
     process = subprocess.Popen(
-        [sys.executable, "-c", controller, str(identity_path)],
+        [sys.executable, "-c", controller, str(identity_path), scenario],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )

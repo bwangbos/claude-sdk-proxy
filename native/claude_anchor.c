@@ -345,7 +345,6 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
     bool internal_lost = false;
     bool external_lost = false;
     bool fallback_consumed = false;
-    bool orphan_journal_failed = false;
     uint64_t orphan_deadline = 0U;
     int child_status = 0;
 
@@ -363,18 +362,18 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
                 return ANCHOR_FAIL_DEAD_EXIT;
             }
         }
-        if (external_lost && !child_reaped &&
-            deadline_reached(orphan_deadline)) {
+        if (external_lost && deadline_reached(orphan_deadline)) {
             (void)killpg(getpgrp(), SIGKILL);
             _exit(ANCHOR_FAIL_DEAD_EXIT);
         }
-        if (cleanup && term_seen != 0 && child_reaped) {
-            return orphan_journal_failed ? ANCHOR_FAIL_DEAD_EXIT : 0;
+        if (!external_lost && cleanup && term_seen != 0 && child_reaped) {
+            return 0;
         }
         controls[0].fd = internal_lost ? -1 : CPL_ANCHOR_INTERNAL_CONTROL_FD;
         controls[0].events = POLLIN;
         controls[0].revents = 0;
-        controls[1].fd = internal_lost && running ? arguments->control_fd : -1;
+        controls[1].fd = internal_lost && running && !external_lost ?
+            arguments->control_fd : -1;
         controls[1].events = POLLIN;
         controls[1].revents = 0;
         if (poll(controls, 2U, 10) < 0) {
@@ -457,11 +456,9 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
             cleanup = true;
             orphan_deadline = monotonic_deadline();
             (void)close(arguments->control_fd);
-            if (cpl_journal_mark_unconfirmed(journal,
-                    CPL_UNCONFIRMED_PROOF_UNAVAILABLE,
-                    control_deadline(), &unconfirmed) != CPL_OK) {
-                orphan_journal_failed = true;
-            }
+            (void)cpl_journal_mark_unconfirmed(journal,
+                CPL_UNCONFIRMED_PROOF_UNAVAILABLE,
+                control_deadline(), &unconfirmed);
             if (killpg(getpgrp(), SIGTERM) < 0) {
                 (void)killpg(getpgrp(), SIGKILL);
                 _exit(ANCHOR_FAIL_DEAD_EXIT);
