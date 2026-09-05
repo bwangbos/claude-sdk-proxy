@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import signal
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from claude_sdk_proxy import supervisor_probe
 from claude_sdk_proxy.supervisor_probe import run_lifecycle_scenario
 
 
@@ -114,3 +118,42 @@ def test_fixed_relay_fd_collision_preserves_supervisor_loss_fallback() -> None:
     assert result.self_term_signal_count == 1
     assert result.external_control_fd_closed_on_cli_exec
     assert result.internal_control_fd_closed_on_cli_exec
+
+
+def test_anchor_group_exits_when_its_last_controller_is_killed(
+    tmp_path: Path,
+) -> None:
+    identity_path = tmp_path / "anchor-identity"
+    controller = (
+        "import os, signal, sys\n"
+        "from claude_sdk_proxy import supervisor_probe as probe\n"
+        "def checkpoint(flow, point):\n"
+        "    if flow == 'actor_loss' and point == 'actor_loss_observed':\n"
+        "        key = probe._retained_actor_chain_keys()[0]\n"
+        "        owner = probe._RETAINED_ACTOR_REGISTRY.get(key)\n"
+        "        fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | "
+        "os.O_EXCL, 0o600)\n"
+        "        os.write(fd, f'{owner.anchor[0]} {owner.anchor[3]}'.encode())\n"
+        "        os.fsync(fd)\n"
+        "        os.close(fd)\n"
+        "        os.kill(os.getpid(), signal.SIGKILL)\n"
+        "probe._python_exception_checkpoint = checkpoint\n"
+        "probe.run_lifecycle_scenario('cleanup_fail_after_admission')\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", controller, str(identity_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    _, diagnostics = process.communicate(timeout=15)
+    assert process.returncode == -signal.SIGKILL, diagnostics.decode()
+    anchor_pid, pgid = (int(value) for value in identity_path.read_text().split())
+    group_absent = False
+
+    try:
+        group_absent = supervisor_probe._fresh_group_is_absent(pgid)
+    finally:
+        if not group_absent:
+            assert supervisor_probe._teardown_recorded_fresh_group(pgid)
+
+    assert group_absent, f"orphaned anchor {anchor_pid} in group {pgid}"
