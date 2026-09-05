@@ -24,7 +24,9 @@ claude-proxy-probe = "claude_sdk_proxy.probe_cli:main"
 
 [dependency-groups]
 dev = [
+    "anthropic>=0.75,<1",
     "mypy>=1.18,<2",
+    "openai>=2.14,<3",
     "pytest>=8.4,<10",
     "pytest-anyio>=0.0.0",
     "ruff>=0.12,<1",
