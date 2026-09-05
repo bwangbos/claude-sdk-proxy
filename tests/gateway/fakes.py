@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -10,7 +11,11 @@ from claude_agent_sdk import (
     ResultMessage,
     StreamEvent,
     TextBlock,
+    ToolUseBlock,
+    UserMessage,
 )
+from mcp.server import Server
+from mcp.types import CallToolRequestParams, CallToolResult
 
 from claude_sdk_proxy.domain import Completed, ConversationEvent, TextDelta
 
@@ -31,13 +36,22 @@ class FixedTemporaryDirectory:
 
 
 class FakeSdkClient:
-    def __init__(self, responses: tuple[tuple[Any, ...], ...]) -> None:
+    def __init__(
+        self,
+        responses: tuple[tuple[Any, ...], ...],
+        *,
+        start_tool_callbacks: bool = True,
+    ) -> None:
         self._responses = iter(responses)
         self._response: tuple[Any, ...] = ()
         self.connect_count = 0
         self.disconnect_count = 0
         self.prompts: list[str] = []
         self.options: ClaudeAgentOptions | None = None
+        self.tool_results: list[CallToolResult] = []
+        self._tool_tasks: list[asyncio.Task[CallToolResult]] = []
+        self._parked_tool_tasks: list[asyncio.Task[CallToolResult]] = []
+        self._start_callbacks = start_tool_callbacks
 
     def capture_options(self, options: ClaudeAgentOptions) -> FakeSdkClient:
         self.options = options
@@ -52,10 +66,48 @@ class FakeSdkClient:
 
     async def receive_response(self) -> AsyncIterator[Any]:
         for message in self._response:
+            if self._start_callbacks and isinstance(message, AssistantMessage):
+                self._start_tool_callbacks(message)
+            if isinstance(message, UserMessage) and self._tool_tasks:
+                self.tool_results.extend(await asyncio.gather(*self._tool_tasks))
+                self._tool_tasks.clear()
             yield message
 
     async def disconnect(self) -> None:
         self.disconnect_count += 1
+        tasks = [*self._tool_tasks, *self._parked_tool_tasks]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tool_tasks.clear()
+        self._parked_tool_tasks.clear()
+
+    def _start_tool_callbacks(self, message: AssistantMessage) -> None:
+        for block in message.content:
+            if type(block) is not ToolUseBlock:
+                continue
+            prefix = "mcp__caller_tools_v1__"
+            if not block.name.startswith(prefix):
+                continue
+            self.start_tool_callback(block.name.removeprefix(prefix), block.input)
+
+    def start_tool_callback(
+        self, name: str, arguments: object, *, wait_for_echo: bool = True
+    ) -> None:
+        assert self.options is not None
+        assert isinstance(self.options.mcp_servers, dict)
+        config = self.options.mcp_servers["caller_tools_v1"]
+        server = cast(Server[Any], config["instance"])
+        entry = server.get_request_handler("tools/call")
+        assert entry is not None
+        params = CallToolRequestParams(
+            name=name,
+            arguments=cast(dict[str, object], arguments),
+        )
+        task = asyncio.create_task(cast(Any, entry.handler)(None, params))
+        target = self._tool_tasks if wait_for_echo else self._parked_tool_tasks
+        target.append(task)
 
 
 def raw_text_events(
@@ -120,6 +172,130 @@ def raw_text_events(
             event={"type": "message_stop"},
         ),
     )
+
+
+def raw_tool_events(
+    calls: tuple[tuple[str, str, str], ...],
+    session_id: str,
+    *,
+    text: str | None = None,
+    input_tokens: int = 3,
+    output_tokens: int = 2,
+) -> tuple[StreamEvent | AssistantMessage, ...]:
+    """Build one complete raw/typed native tool-use assistant boundary.
+
+    Each call is ``(internal_id, generated_sdk_name, partial_json)``.
+    """
+    events: list[StreamEvent | AssistantMessage] = [
+        StreamEvent(
+            uuid="event-tool-start",
+            session_id=session_id,
+            event={
+                "type": "message_start",
+                "message": {
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+                },
+            },
+        )
+    ]
+    complete: list[TextBlock | ToolUseBlock] = []
+    import json
+
+    offset = 0
+    if text is not None:
+        events.extend(
+            [
+                StreamEvent(
+                    uuid="event-tool-text-start",
+                    session_id=session_id,
+                    event={
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                ),
+                StreamEvent(
+                    uuid="event-tool-text-delta",
+                    session_id=session_id,
+                    event={
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": text},
+                    },
+                ),
+                StreamEvent(
+                    uuid="event-tool-text-stop",
+                    session_id=session_id,
+                    event={"type": "content_block_stop", "index": 0},
+                ),
+            ]
+        )
+        complete.append(TextBlock(text))
+        offset = 1
+
+    for index, (internal_id, sdk_name, partial_json) in enumerate(calls):
+        block_index = index + offset
+        events.extend(
+            [
+                StreamEvent(
+                    uuid=f"event-tool-{index}-start",
+                    session_id=session_id,
+                    event={
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": internal_id,
+                            "name": sdk_name,
+                            "input": {},
+                        },
+                    },
+                ),
+                StreamEvent(
+                    uuid=f"event-tool-{index}-delta",
+                    session_id=session_id,
+                    event={
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": partial_json,
+                        },
+                    },
+                ),
+                StreamEvent(
+                    uuid=f"event-tool-{index}-stop",
+                    session_id=session_id,
+                    event={"type": "content_block_stop", "index": block_index},
+                ),
+            ]
+        )
+        complete.append(ToolUseBlock(internal_id, sdk_name, json.loads(partial_json)))
+    events.extend(
+        [
+            AssistantMessage(complete, "sonnet", session_id=session_id),
+            StreamEvent(
+                uuid="event-tool-delta",
+                session_id=session_id,
+                event={
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "tool_use",
+                        "stop_sequence": None,
+                        "stop_details": None,
+                    },
+                    "usage": {"output_tokens": output_tokens},
+                    "context_management": {"applied_edits": []},
+                },
+            ),
+            StreamEvent(
+                uuid="event-tool-stop",
+                session_id=session_id,
+                event={"type": "message_stop"},
+            ),
+        ]
+    )
+    return tuple(events)
 
 
 def sdk_response(

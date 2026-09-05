@@ -15,7 +15,11 @@ _RATE_LIMIT_TYPES = {
 }
 
 
-def validate_system_message(message: SystemMessage) -> object:
+def validate_system_message(
+    message: SystemMessage,
+    expected_tools: tuple[str, ...] = (),
+    expected_mcp_servers: tuple[str, ...] = (),
+) -> object:
     data = message.data
     if (
         not isinstance(data, Mapping)
@@ -31,10 +35,10 @@ def validate_system_message(message: SystemMessage) -> object:
     elif (
         not _identifier(data.get("model"))
         or data.get("permissionMode") != "dontAsk"
-        or any(
-            data.get(field) != []
-            for field in ("tools", "mcp_servers", "skills", "plugins")
-        )
+        or data.get("tools") != list(expected_tools)
+        or data.get("mcp_servers") != list(expected_mcp_servers)
+        or data.get("skills") != []
+        or data.get("plugins") != []
     ):
         _fail()
     return data.get("session_id")
