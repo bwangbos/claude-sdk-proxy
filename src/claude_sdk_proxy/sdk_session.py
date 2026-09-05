@@ -528,11 +528,7 @@ class SdkSession:
                     self._fail_protocol()
             elif (
                 not isinstance(raw_result, list)
-                or len(raw_result) != 1
-                or not isinstance(raw_result[0], Mapping)
-                or set(raw_result[0]) != {"type", "text"}
-                or raw_result[0].get("type") != "text"
-                or raw_result[0].get("text") != typed_text
+                or self._normalize_echo_content(raw_result) != typed_text
             ):
                 self._fail_protocol()
         for block in message.content:

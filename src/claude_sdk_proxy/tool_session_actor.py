@@ -346,11 +346,13 @@ class ToolSessionActor:
                 for task in (self._runner, self._watcher, self._submitter)
                 if task is not None and task is not current and not task.done()
             )
+            self._runner = None
+            self._watcher = None
+            self._submitter = None
             for task in tasks:
+                task.add_done_callback(self._consume_worker)
                 task.cancel()
             notify = True
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
         if notify:
             await self.on_close(self)
 
@@ -360,6 +362,13 @@ class ToolSessionActor:
     @staticmethod
     def _now() -> float:
         return asyncio.get_running_loop().time()
+
+    @staticmethod
+    def _consume_worker(task: asyncio.Task[None]) -> None:
+        try:
+            task.exception()
+        except BaseException:
+            pass
 
 
 def _assistant_message(events: tuple[ConversationEvent, ...]) -> CanonicalMessage:

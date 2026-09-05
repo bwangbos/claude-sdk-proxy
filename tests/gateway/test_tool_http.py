@@ -1386,6 +1386,79 @@ async def test_real_sdk_http_boundaries_usage_bridge_replay_and_wire(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "result_content",
+    [
+        [],
+        [
+            {"type": "text", "text": "left"},
+            {"type": "text", "text": "right"},
+        ],
+    ],
+)
+async def test_real_sdk_anthropic_accepts_empty_and_multiblock_tool_results(
+    tmp_path: Path,
+    stream: bool,
+    result_content: list[dict[str, str]],
+) -> None:
+    sdk_name = "mcp__caller_tools_v1__echo"
+    messages = (
+        *raw_tool_events(
+            (("sdk-result-shape", sdk_name, '{"v":1}'),),
+            "sdk-real",
+            input_tokens=5,
+            output_tokens=2,
+        ),
+        UserMessage(
+            [SdkToolResultBlock("sdk-result-shape", result_content, False)],
+            tool_use_result=result_content,  # type: ignore[arg-type]
+        ),
+        *raw_text_events(
+            "real-sdk-final", "sdk-real", input_tokens=11, output_tokens=4
+        ),
+        _result_message({"input_tokens": 101, "output_tokens": 47}),
+    )
+    client = FakeSdkClient(responses=(messages,))
+    app = _sdk_app(tmp_path, client)
+    path = "/v1/messages"
+    initial = _sdk_tool_body("anthropic", stream=stream)
+
+    async with lifespan_app(app):
+        first = await post_json(app, path, initial)
+        first_json = {} if stream else first.json
+        calls = _tool_payloads("anthropic", first.body, first_json)
+        transcript: list[dict[str, object]] = [
+            {"role": "user", "content": "go"},
+            _assistant_sdk_message("anthropic", calls),
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": calls[0][0],
+                        "content": result_content,
+                    }
+                ],
+            },
+        ]
+        final = await post_json(
+            app,
+            path,
+            _sdk_tool_body("anthropic", transcript, stream=stream),
+        )
+        final_json = {} if stream else final.json
+
+    assert first.status == final.status == 200
+    assert _public_boundary(
+        "anthropic", final.body, final_json, stream=stream
+    ) == ((), (11, 4), "real-sdk-final")
+    assert tuple(block.text for block in client.tool_results[0].content) == tuple(
+        block["text"] for block in result_content
+    )
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("dialect", "path", "header_chunk"),
     [

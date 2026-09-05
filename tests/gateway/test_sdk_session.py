@@ -1051,6 +1051,53 @@ async def test_parallel_native_results_may_arrive_in_separate_user_messages(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("content", "raw_result"),
+    [
+        ((), []),
+        (
+            ("left", "right"),
+            [
+                {"type": "text", "text": "left"},
+                {"type": "text", "text": "right"},
+            ],
+        ),
+    ],
+)
+async def test_success_result_echo_accepts_empty_and_multiple_text_blocks(
+    tmp_path: Path,
+    content: tuple[str, ...],
+    raw_result: list[dict[str, str]],
+) -> None:
+    messages = (
+        *raw_tool_events(
+            (("sdk-tool-1", "mcp__caller_tools_v1__echo", '{"v":1}'),),
+            "sdk-1",
+        ),
+        UserMessage(
+            [SdkToolResultBlock("sdk-tool-1", raw_result, False)],
+            tool_use_result=raw_result,  # type: ignore[arg-type]
+        ),
+        *raw_text_events("done", "sdk-1"),
+        result_message(),
+    )
+    session, _ = make_tool_session(tmp_path, messages)
+    await session.start()
+    generation = session.stream_generation("go")
+    try:
+        boundary = await next_boundary(generation)
+        call = next(event for event in boundary if isinstance(event, ToolCall))
+        await session.submit_tool_results(
+            (ToolResultBlock(call.id, content, False),)
+        )
+        assert (await next_boundary(generation))[-1] == Completed(
+            "end_turn", {"input_tokens": 2, "output_tokens": 1}
+        )
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
 async def test_parallel_native_result_echoes_must_match_exact_internal_ids(
     tmp_path: Path,
 ) -> None:
@@ -1094,11 +1141,6 @@ async def test_parallel_native_result_echoes_must_match_exact_internal_ids(
     "raw_result",
     [
         "one",
-        [],
-        [
-            {"type": "text", "text": "one"},
-            {"type": "text", "text": ""},
-        ],
         [{"type": "text"}],
         [{"text": "one"}],
         [{"type": "image", "text": "one"}],

@@ -206,6 +206,30 @@ class SecretFailureSession(ToolSession):
         raise BackendFailure("cleanup=/Users/alice/.claude/private-token")
 
 
+class CancellationResistantSession(ToolSession):
+    def __init__(self) -> None:
+        super().__init__(())
+        self.cancelled = asyncio.Event()
+
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
+        self.prompts.append(prompt)
+        if self.generation_entered is not None:
+            self.generation_entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            while not self.closed.is_set():
+                try:
+                    await self.closed.wait()
+                except asyncio.CancelledError:
+                    continue
+        if False:
+            yield TextDelta("unreachable")
+
+
 def call_boundary(*ids: str) -> tuple[ConversationEvent, ...]:
     return (
         *(ToolCall(call_id, "echo", {"value": "same"}) for call_id in ids),
@@ -862,3 +886,30 @@ async def test_actor_and_teardown_failures_are_redacted_and_close_once() -> None
     assert "alice" not in str(captured.value)
     assert backend.close_count == 1
     assert backend.wait_failure_count == 1
+
+
+@pytest.mark.anyio
+async def test_registry_close_reaches_backend_before_waiting_for_actor_workers(
+) -> None:
+    entered = asyncio.Event()
+    backend = CancellationResistantSession()
+    backend.generation_entered = entered
+    registry = SessionRegistry(
+        ToolFactory((backend,)), teardown_timeout_seconds=0.05
+    )
+    lease = await registry.open_turn(
+        first_request(tools=(echo_tool(),)), explicit_id="lineage"
+    )
+    consume = asyncio.create_task(collect(lease.stream()))
+    await entered.wait()
+    close = asyncio.create_task(registry.close())
+
+    try:
+        await asyncio.wait_for(asyncio.shield(close), timeout=0.2)
+    finally:
+        backend.closed.set()
+        await asyncio.gather(close, return_exceptions=True)
+        await asyncio.gather(consume, return_exceptions=True)
+
+    assert backend.cancelled.is_set()
+    assert backend.close_count == 1
