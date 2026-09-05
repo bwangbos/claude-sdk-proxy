@@ -30,7 +30,7 @@ def main() -> None:
             continue
         if incoming.get("type") != "user":
             continue
-        text = "\x00" * (1024 * 1024)
+        text = "\x00" * (256 * 1024)
         write(
             {
                 "type": "user",
@@ -39,10 +39,11 @@ def main() -> None:
                     "content": [
                         {
                             "type": "tool_result",
-                            "tool_use_id": "sdk-tool-1",
+                            "tool_use_id": f"sdk-tool-{index}",
                             "content": text,
                             "is_error": False,
                         }
+                        for index in range(4)
                     ],
                 },
             }

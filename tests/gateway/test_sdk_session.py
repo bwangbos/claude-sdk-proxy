@@ -328,6 +328,66 @@ async def test_sdk_session_accepts_observed_complete_assistant_placement(
 
 
 @pytest.mark.anyio
+async def test_text_session_accepts_typed_text_split_across_blocks(
+    tmp_path: Path,
+) -> None:
+    raw = raw_text_events("answer", "sdk-1")
+    assistant = AssistantMessage(
+        [TextBlock("ans"), TextBlock("wer")], "sonnet", session_id="sdk-1"
+    )
+
+    events = await collect_sdk_response(
+        tmp_path, (*raw[:3], assistant, *raw[3:], result_message())
+    )
+
+    assert events == [
+        InputUsage(2),
+        TextDelta("answer"),
+        Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
+    ]
+
+
+@pytest.mark.anyio
+async def test_text_session_rejects_a_second_raw_text_block(tmp_path: Path) -> None:
+    raw = raw_text_events("one", "sdk-1")
+    second = (
+        StreamEvent(
+            "event-second-start",
+            "sdk-1",
+            {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": ""},
+            },
+        ),
+        StreamEvent(
+            "event-second-delta",
+            "sdk-1",
+            {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "two"},
+            },
+        ),
+        StreamEvent(
+            "event-second-stop",
+            "sdk-1",
+            {"type": "content_block_stop", "index": 1},
+        ),
+        AssistantMessage(
+            [TextBlock("one"), TextBlock("two")],
+            "sonnet",
+            session_id="sdk-1",
+        ),
+    )
+
+    with pytest.raises(BackendFailure, match="protocol"):
+        await collect_sdk_response(
+            tmp_path, (*raw[:4], *second, *raw[4:], result_message())
+        )
+
+
+@pytest.mark.anyio
 async def test_sdk_session_rejects_text_delta_after_complete_assistant_message(
     tmp_path: Path,
 ) -> None:
@@ -766,10 +826,13 @@ def make_tool_session(
     *,
     tools: tuple[ToolDefinition, ...] = (echo_definition(),),
     start_tool_callbacks: bool = True,
+    wait_for_tool_callbacks_before_user: bool = True,
     system: str = "system",
 ) -> tuple[SdkSession, FakeSdkClient]:
     client = FakeSdkClient(
-        responses=(messages,), start_tool_callbacks=start_tool_callbacks
+        responses=(messages,),
+        start_tool_callbacks=start_tool_callbacks,
+        wait_for_tool_callbacks_before_user=wait_for_tool_callbacks_before_user,
     )
     session = SdkSession(
         "sonnet",
@@ -1403,3 +1466,73 @@ def test_raw_tool_validator_rejects_arguments_outside_caller_schema() -> None:
                 validator.validate_assistant(message)
 
     assert "secret" not in str(error.value)
+
+
+@pytest.mark.anyio
+async def test_completed_tool_boundary_without_handler_publication_fails_closed(
+    tmp_path: Path,
+) -> None:
+    messages = raw_tool_events(
+        (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+    )
+    session, _ = make_tool_session(
+        tmp_path, messages, start_tool_callbacks=False
+    )
+    await session.start()
+    try:
+        with pytest.raises(BackendFailure, match="protocol") as error:
+            _ = [event async for event in session.stream_generation("go")]
+        assert "sdk-a" not in str(error.value)
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+async def test_user_message_while_awaiting_submit_fails_closed(
+    tmp_path: Path,
+) -> None:
+    messages = (
+        *raw_tool_events(
+            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+        ),
+        UserMessage([SdkToolResultBlock("sdk-a", "secret", False)]),
+    )
+    session, _ = make_tool_session(
+        tmp_path,
+        messages,
+        wait_for_tool_callbacks_before_user=False,
+    )
+    await session.start()
+    try:
+        with pytest.raises(BackendFailure, match="protocol") as error:
+            _ = [event async for event in session.stream_generation("go")]
+        assert "secret" not in str(error.value)
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+async def test_user_message_after_complete_result_echo_fails_closed(
+    tmp_path: Path,
+) -> None:
+    messages = (
+        *raw_tool_events(
+            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+        ),
+        UserMessage([SdkToolResultBlock("sdk-a", "one", False)]),
+        UserMessage([SdkToolResultBlock("sdk-a", "secret-extra", False)]),
+    )
+    session, _ = make_tool_session(tmp_path, messages)
+    await session.start()
+    generation = session.stream_generation("go")
+    try:
+        boundary = await next_boundary(generation)
+        call = next(event for event in boundary if isinstance(event, ToolCall))
+        await session.submit_tool_results(
+            (ToolResultBlock(call.id, ("one",), False),)
+        )
+        with pytest.raises(BackendFailure, match="protocol") as error:
+            _ = [event async for event in generation]
+        assert "secret-extra" not in str(error.value)
+    finally:
+        await session.close()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from pathlib import Path
@@ -33,9 +34,13 @@ from claude_sdk_proxy.sdk_metadata import (
     validate_rate_limit_event,
     validate_system_message,
 )
-from claude_sdk_proxy.sdk_text_protocol import fail_protocol, normalize_usage
+from claude_sdk_proxy.sdk_text_protocol import (
+    RawTextEventValidator,
+    fail_protocol,
+    normalize_usage,
+)
 from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
-from claude_sdk_proxy.tool_bridge import ToolBridge
+from claude_sdk_proxy.tool_bridge import ToolBridge, ToolInvocation
 from claude_sdk_proxy.tool_contract import (
     validate_tool_definitions,
     validate_tool_results,
@@ -177,11 +182,21 @@ class SdkSession:
             raise BackendFailure("Agent SDK query failed")
         completed: Completed | None = None
         failure: str | None = None
-        raw: RawSdkMessageValidator | None = None
+        raw: RawTextEventValidator | RawSdkMessageValidator | None = None
         terminal_boundary: Completed | None = None
+        prefetched: asyncio.Future[Any] | None = None
         try:
             await client.query(prompt)
-            async for message in client.receive_response():
+            response = client.receive_response()
+            while True:
+                try:
+                    if prefetched is None:
+                        message = await anext(response)
+                    else:
+                        message = await prefetched
+                        prefetched = None
+                except StopAsyncIteration:
+                    break
                 if completed is not None or failure is not None:
                     if failure is not None:
                         failure = "Agent SDK message after result"
@@ -203,7 +218,11 @@ class SdkSession:
                         if self._awaiting_echo:
                             self._finish_echo()
                             self._epoch_needs_begin = True
-                        raw = RawSdkMessageValidator(self._tools)
+                        raw = (
+                            RawSdkMessageValidator(self._tools)
+                            if self._bridge is not None
+                            else RawTextEventValidator()
+                        )
                     if raw is None:
                         self._fail_protocol()
                     if event_type == "content_block_start":
@@ -221,11 +240,24 @@ class SdkSession:
                     if normalized is not None:
                         yield normalized
                     if event_type == "message_stop":
-                        if not raw.complete:
-                            self._fail_protocol()
-                        boundary = Completed(raw.stop_reason, raw.boundary_usage)
-                        if raw.has_tools:
-                            async for public_event in self._tool_boundary(raw):
+                        if isinstance(raw, RawSdkMessageValidator):
+                            if not raw.complete:
+                                self._fail_protocol()
+                            boundary = Completed(
+                                raw.stop_reason, raw.boundary_usage
+                            )
+                        else:
+                            boundary = Completed(
+                                raw.stop_reason, self._text_boundary_usage(raw)
+                            )
+                        if (
+                            isinstance(raw, RawSdkMessageValidator)
+                            and raw.has_tools
+                        ):
+                            public_events, prefetched = await self._tool_boundary(
+                                raw, response
+                            )
+                            for public_event in public_events:
                                 yield public_event
                         else:
                             terminal_boundary = boundary
@@ -271,6 +303,11 @@ class SdkSession:
             raise
         except Exception:
             raise BackendFailure("Agent SDK query failed") from None
+        finally:
+            if prefetched is not None:
+                if not prefetched.done():
+                    prefetched.cancel()
+                await asyncio.gather(prefetched, return_exceptions=True)
         if failure is not None:
             raise BackendFailure(failure)
         if completed is None:
@@ -320,29 +357,82 @@ class SdkSession:
             self._fail_protocol()
 
     def _validate_assistant(
-        self, message: AssistantMessage, raw: RawSdkMessageValidator
+        self,
+        message: AssistantMessage,
+        raw: RawTextEventValidator | RawSdkMessageValidator,
     ) -> None:
         if message.session_id is not None:
             self._observe_session_id(message.session_id)
         raw.validate_assistant(message)
 
     async def _tool_boundary(
-        self, raw: RawSdkMessageValidator
-    ) -> AsyncIterator[ConversationEvent]:
+        self,
+        raw: RawSdkMessageValidator,
+        response: AsyncIterator[Any],
+    ) -> tuple[tuple[ConversationEvent, ...], asyncio.Future[Any]]:
         bridge = self._bridge
         if bridge is None or raw.stop_reason != "tool_use":
             self._fail_protocol()
         calls = raw.tool_calls
-        invocations = await bridge.seal_epoch(
-            (call.public_name, call.arguments) for call in calls
+        invocations, prefetched = await self._seal_tool_epoch(
+            bridge,
+            tuple((call.public_name, call.arguments) for call in calls),
+            response,
         )
         self._expected_internal_ids = {call.internal_id for call in calls}
         if len(self._expected_internal_ids) != len(calls):
             self._fail_protocol()
         self._awaiting_submit = True
-        for invocation in invocations:
-            yield ToolCall(invocation.public_id, invocation.name, invocation.arguments)
-        yield Completed("tool_use", raw.boundary_usage)
+        events: tuple[ConversationEvent, ...] = (
+            *(
+                ToolCall(
+                    invocation.public_id,
+                    invocation.name,
+                    invocation.arguments,
+                )
+                for invocation in invocations
+            ),
+            Completed("tool_use", raw.boundary_usage),
+        )
+        return events, prefetched
+
+    async def _seal_tool_epoch(
+        self,
+        bridge: ToolBridge,
+        expected_calls: tuple[tuple[str, Mapping[str, object]], ...],
+        response: AsyncIterator[Any],
+    ) -> tuple[tuple[ToolInvocation, ...], asyncio.Future[Any]]:
+        seal = asyncio.create_task(bridge.seal_epoch(expected_calls))
+        incoming = asyncio.ensure_future(anext(response))
+        try:
+            done, _ = await asyncio.wait(
+                (seal, incoming), return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            seal.cancel()
+            incoming.cancel()
+            await asyncio.gather(seal, incoming, return_exceptions=True)
+            raise
+        if seal not in done:
+            seal.cancel()
+            await asyncio.gather(seal, incoming, return_exceptions=True)
+            self._fail_protocol()
+        try:
+            invocations = await seal
+        except BaseException:
+            incoming.cancel()
+            await asyncio.gather(incoming, return_exceptions=True)
+            raise
+        return invocations, incoming
+
+    @staticmethod
+    def _text_boundary_usage(raw: RawTextEventValidator) -> dict[str, int]:
+        if raw.input_tokens is None or raw.output_tokens is None:
+            fail_protocol()
+        return {
+            "input_tokens": raw.input_tokens,
+            "output_tokens": raw.output_tokens,
+        }
 
     def _observe_result_echo(self, message: UserMessage) -> None:
         if (

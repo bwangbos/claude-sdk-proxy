@@ -15,7 +15,24 @@ from claude_agent_sdk import (
 @pytest.mark.anyio
 async def test_real_sdk_transport_accepts_escape_expanded_one_mib_result() -> None:
     cli_path = Path(__file__).parents[1] / "fixtures" / "fake_sdk_cli.py"
-    wire = json.dumps("\x00" * (1024 * 1024))
+    result_text = "\x00" * (256 * 1024)
+    wire = json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"sdk-tool-{index}",
+                        "content": result_text,
+                        "is_error": False,
+                    }
+                    for index in range(4)
+                ],
+            },
+        }
+    )
     assert len(wire.encode()) > 6 * 1024 * 1024
     client = ClaudeSDKClient(
         ClaudeAgentOptions(
@@ -34,6 +51,8 @@ async def test_real_sdk_transport_accepts_escape_expanded_one_mib_result() -> No
 
     user = next(message for message in messages if isinstance(message, UserMessage))
     assert isinstance(user.content, list)
-    result = user.content[0]
-    assert isinstance(result, ToolResultBlock)
-    assert result.content == "\x00" * (1024 * 1024)
+    assert len(user.content) == 4
+    for index, result in enumerate(user.content):
+        assert isinstance(result, ToolResultBlock)
+        assert result.tool_use_id == f"sdk-tool-{index}"
+        assert result.content == result_text

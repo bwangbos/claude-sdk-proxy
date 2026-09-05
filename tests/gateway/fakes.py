@@ -41,6 +41,7 @@ class FakeSdkClient:
         responses: tuple[tuple[Any, ...], ...],
         *,
         start_tool_callbacks: bool = True,
+        wait_for_tool_callbacks_before_user: bool = True,
     ) -> None:
         self._responses = iter(responses)
         self._response: tuple[Any, ...] = ()
@@ -52,6 +53,7 @@ class FakeSdkClient:
         self._tool_tasks: list[asyncio.Task[CallToolResult]] = []
         self._parked_tool_tasks: list[asyncio.Task[CallToolResult]] = []
         self._start_callbacks = start_tool_callbacks
+        self._wait_before_user = wait_for_tool_callbacks_before_user
 
     def capture_options(self, options: ClaudeAgentOptions) -> FakeSdkClient:
         self.options = options
@@ -68,7 +70,11 @@ class FakeSdkClient:
         for message in self._response:
             if self._start_callbacks and isinstance(message, AssistantMessage):
                 self._start_tool_callbacks(message)
-            if isinstance(message, UserMessage) and self._tool_tasks:
+            if (
+                self._wait_before_user
+                and isinstance(message, UserMessage)
+                and self._tool_tasks
+            ):
                 self.tool_results.extend(await asyncio.gather(*self._tool_tasks))
                 self._tool_tasks.clear()
             yield message
