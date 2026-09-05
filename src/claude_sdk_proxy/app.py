@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from claude_sdk_proxy.anthropic_api import (
+    AnthropicStreamState,
     encode_anthropic_error,
     encode_anthropic_event,
     encode_anthropic_start,
@@ -33,11 +34,14 @@ from claude_sdk_proxy.domain import (
     InputUsage,
     RequestValidationError,
     SdkSessionFactory,
+    TextBlock,
     TextDelta,
     TextRequest,
+    ToolCall,
 )
 from claude_sdk_proxy.http_errors import error_detail, error_response
 from claude_sdk_proxy.openai_api import (
+    OpenAIStreamState,
     encode_openai_error,
     encode_openai_event,
     encode_openai_start,
@@ -54,6 +58,7 @@ def create_app(
     models: tuple[str, ...],
     session_factory: SdkSessionFactory = SdkSession,
     turn_timeout_seconds: float = 300.0,
+    tool_result_timeout_seconds: float = 300.0,
     teardown_timeout_seconds: float = 5.0,
     max_sessions: int = 8,
 ) -> Starlette:
@@ -72,6 +77,7 @@ def create_app(
         registry = SessionRegistry(
             session_factory,
             turn_timeout_seconds=turn_timeout_seconds,
+            tool_result_timeout_seconds=tool_result_timeout_seconds,
             teardown_timeout_seconds=teardown_timeout_seconds,
             max_sessions=max_sessions,
         )
@@ -174,19 +180,25 @@ async def _stream_response(
         response = error_response(dialect, error, lease.response_headers)
         return cast(Response, monitor.wrap(response))
     if dialect == "openai":
+        openai_state = OpenAIStreamState()
         stream_response = EventStreamResponse(
                 lease,
                 stream,
                 first,
                 encode_openai_start(request_id, request.model),
                 lambda event: encode_openai_event(
-                    request_id, request.model, event, request.include_usage
+                    request_id,
+                    request.model,
+                    event,
+                    request.include_usage,
+                    openai_state,
                 ),
                 lambda error: encode_openai_error(
                     error_detail(error).code, error_detail(error).message
                 ),
             )
         return cast(Response, monitor.wrap(stream_response))
+    anthropic_state = AnthropicStreamState()
     stream_response = EventStreamResponse(
             lease,
             stream,
@@ -195,8 +207,12 @@ async def _stream_response(
                 request_id,
                 request.model,
                 first.input_tokens if isinstance(first, InputUsage) else 0,
+                request.tools,
+                anthropic_state,
             ),
-            lambda event: encode_anthropic_event(request_id, request.model, event),
+            lambda event: encode_anthropic_event(
+                request_id, request.model, event, state=anthropic_state
+            ),
             lambda error: encode_anthropic_error(
                 error_detail(error).code, error_detail(error).message
             ),
@@ -212,12 +228,17 @@ async def _nonstream_response(
     monitor: DisconnectMonitor,
 ) -> Response:
     stream = cast(ClosableEventStream, lease.stream())
-    text: list[str] = []
+    blocks: list[TextBlock | ToolCall] = []
     completed: Completed | None = None
     try:
         async for event in stream:
             if isinstance(event, TextDelta):
-                text.append(event.text)
+                if blocks and isinstance(blocks[-1], TextBlock):
+                    blocks[-1] = TextBlock(blocks[-1].text + event.text)
+                else:
+                    blocks.append(TextBlock(event.text))
+            elif isinstance(event, ToolCall):
+                blocks.append(event)
             elif isinstance(event, Completed):
                 completed = event
     except asyncio.CancelledError:
@@ -241,6 +262,11 @@ async def _nonstream_response(
     renderer = (
         render_openai_response if dialect == "openai" else render_anthropic_response
     )
-    payload = renderer(request_id, request.model, "".join(text), completed)
+    rendered = (
+        tuple(blocks)
+        if request.tools
+        else "".join(block.text for block in blocks if isinstance(block, TextBlock))
+    )
+    payload = renderer(request_id, request.model, rendered, completed)
     response = JSONResponse(payload, headers=lease.response_headers)
     return cast(Response, monitor.wrap(response))

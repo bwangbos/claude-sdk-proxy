@@ -172,6 +172,14 @@ class InputUsageSession(FakeConversationSession):
         yield Completed("end_turn", {"input_tokens": 7, "output_tokens": 1})
 
 
+class EmptyTextSession(FakeConversationSession):
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
+        self.prompts.append(prompt)
+        yield Completed("end_turn", {"input_tokens": 1, "output_tokens": 0})
+
+
 def one_session_factory(session: FakeConversationSession):
     def factory(
         model: str,
@@ -280,6 +288,29 @@ async def test_anthropic_nonstream_uses_anthropic_envelope_and_echoes_explicit_i
     assert response.headers["x-claude-proxy-session"] == "client-one"
     assert response.json["type"] == "message"
     assert response.json["content"] == [{"type": "text", "text": "answer"}]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/v1/messages", anthropic_body()),
+        ("/v1/chat/completions", openai_body()),
+    ],
+)
+async def test_empty_text_completion_preserves_legacy_empty_content(
+    path: str, body: dict[str, object]
+) -> None:
+    session = EmptyTextSession("unused")
+    app = create_app(models=("sonnet",), session_factory=one_session_factory(session))
+    async with lifespan_app(app):
+        response = await post_json(app, path, body)
+
+    assert response.status == 200
+    if path == "/v1/messages":
+        assert response.json["content"] == [{"type": "text", "text": ""}]
+    else:
+        assert response.json["choices"][0]["message"]["content"] == ""
 
 
 @pytest.mark.anyio
