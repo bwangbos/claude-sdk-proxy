@@ -615,6 +615,93 @@ def test_anthropic_stream_uses_message_content_and_stop_order() -> None:
     }
 
 
+def test_anthropic_text_only_stream_state_closes_its_eager_text_block() -> None:
+    state = AnthropicStreamState()
+    start = encode_anthropic_start("msg_test", "sonnet", state=state)
+    delta = encode_anthropic_event(
+        "msg_test", "sonnet", TextDelta("hello"), state=state
+    )
+    completed = encode_anthropic_event(
+        "msg_test", "sonnet", Completed("end_turn", {"output_tokens": 1}), state=state
+    )
+
+    assert [event_name(chunk) for chunk in (*start, *delta, *completed)] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert payload(completed[0]) == {"type": "content_block_stop", "index": 0}
+
+
+def test_anthropic_tool_stream_state_assigns_monotonic_indexes() -> None:
+    state = AnthropicStreamState()
+    start = encode_anthropic_start(
+        "msg_test", "sonnet", tools=(ToolDefinition("echo", "", {}),), state=state
+    )
+    text = encode_anthropic_event(
+        "msg_test", "sonnet", TextDelta("before"), state=state
+    )
+    first_call = encode_anthropic_event(
+        "msg_test",
+        "sonnet",
+        ToolCall("toolu_a", "echo", {}),
+        block_index=99,
+        state=state,
+    )
+    second_call = encode_anthropic_event(
+        "msg_test",
+        "sonnet",
+        ToolCall("toolu_b", "echo", {}),
+        block_index=7,
+        state=state,
+    )
+
+    assert [event_name(chunk) for chunk in start] == ["message_start"]
+    assert payload(text[0])["index"] == 0
+    assert payload(first_call[0])["index"] == 0
+    assert payload(first_call[1])["index"] == 1
+    assert payload(second_call[0])["index"] == 2
+
+
+def test_anthropic_call_only_stream_has_complete_native_block_sequence() -> None:
+    state = AnthropicStreamState()
+    start = encode_anthropic_start(
+        "msg_test", "sonnet", tools=(ToolDefinition("echo", "", {}),), state=state
+    )
+    call = encode_anthropic_event(
+        "msg_test", "sonnet", ToolCall("toolu_a", "echo", {"value": "one"}), state=state
+    )
+    completed = encode_anthropic_event(
+        "msg_test", "sonnet", Completed("tool_use", {"output_tokens": 1}), state=state
+    )
+
+    assert [event_name(chunk) for chunk in (*start, *call, *completed)] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert payload(call[0]) == {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_use",
+            "id": "toolu_a",
+            "name": "echo",
+            "input": {},
+        },
+    }
+    assert payload(call[1])["delta"] == {
+        "type": "input_json_delta",
+        "partial_json": '{"value":"one"}',
+    }
+
+
 def test_anthropic_stream_renders_complete_tool_argument_delta() -> None:
     chunks = encode_anthropic_event(
         "msg_1",
@@ -751,6 +838,20 @@ def test_anthropic_nonstream_response_preserves_text_and_tool_call_block_order()
         "stop_sequence": None,
         "usage": {"input_tokens": 2, "output_tokens": 1},
     }
+
+
+def test_anthropic_nonstream_response_renders_call_only_content() -> None:
+    response = render_anthropic_response(
+        "msg_test",
+        "sonnet",
+        (ToolCall("toolu_a", "echo", {"value": "one"}),),
+        Completed("tool_use", {"input_tokens": 2, "output_tokens": 1}),
+    )
+
+    assert response["content"] == [
+        {"type": "tool_use", "id": "toolu_a", "name": "echo", "input": {"value": "one"}}
+    ]
+    assert response["stop_reason"] == "tool_use"
 
 
 def test_anthropic_response_maps_max_tokens_and_invalid_usage_to_zero() -> None:

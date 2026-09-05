@@ -51,6 +51,7 @@ _UNSUPPORTED_FIELDS = {
 class AnthropicStreamState:
     tools_enabled: bool = False
     open_text_index: int | None = None
+    next_block_index: int = 0
 
 
 def parse_anthropic_request(
@@ -115,7 +116,8 @@ def encode_anthropic_start(
     tools_enabled = bool(tools)
     if state is not None:
         state.tools_enabled = tools_enabled
-        state.open_text_index = None
+        state.open_text_index = None if tools_enabled else 0
+        state.next_block_index = 0 if tools_enabled else 1
     start = _sse(
         "message_start",
         {
@@ -142,34 +144,33 @@ def encode_anthropic_event(
     model: str,
     event: ConversationEvent,
     block_index: int = 0,
-    tools_enabled: bool = False,
     state: AnthropicStreamState | None = None,
 ) -> tuple[bytes, ...]:
     del request_id, model
-    enabled = tools_enabled or (state is not None and state.tools_enabled)
+    enabled = state is not None and state.tools_enabled
     if isinstance(event, InputUsage):
         return ()
     if isinstance(event, TextDelta):
         if enabled:
             chunks: list[bytes] = []
-            if state is not None and state.open_text_index not in {None, block_index}:
-                open_index = state.open_text_index
-                assert open_index is not None
-                chunks.append(_content_block_stop(open_index))
-                state.open_text_index = None
-            if state is None or state.open_text_index is None:
-                chunks.append(_text_block_start(block_index))
-                if state is not None:
-                    state.open_text_index = block_index
-            chunks.append(_text_delta(block_index, event.text))
+            assert state is not None
+            if state.open_text_index is None:
+                state.open_text_index = state.next_block_index
+                state.next_block_index += 1
+                chunks.append(_text_block_start(state.open_text_index))
+            chunks.append(_text_delta(state.open_text_index, event.text))
             return tuple(chunks)
         return (_text_delta(0, event.text),)
     if isinstance(event, ToolCall):
         chunks = []
+        index = block_index
         if state is not None and state.open_text_index is not None:
             chunks.append(_content_block_stop(state.open_text_index))
             state.open_text_index = None
-        chunks.extend(_tool_call_events(event, block_index))
+        if state is not None:
+            index = state.next_block_index
+            state.next_block_index += 1
+        chunks.extend(_tool_call_events(event, index))
         return tuple(chunks)
     if not isinstance(event, Completed):
         raise TypeError("unsupported conversation event")
