@@ -109,6 +109,7 @@ class SdkSession:
         self._awaiting_echo = False
         self._tool_epoch = 0
         self._epoch_needs_begin = False
+        self._epoch_needs_completion = False
         self._expected_internal_ids: set[str] = set()
         self._expected_echo_values: dict[str, tuple[str, bool]] = {}
         self._echo_ids: set[str] = set()
@@ -199,7 +200,12 @@ class SdkSession:
             response = client.receive_response()
             while True:
                 try:
-                    if prefetched is None:
+                    if self._epoch_needs_completion:
+                        received = await self._receive_after_epoch_completion(
+                            response, prefetched
+                        )
+                        prefetched = None
+                    elif prefetched is None:
                         received = await self._receive_message(response)
                     else:
                         received = await prefetched
@@ -241,7 +247,6 @@ class SdkSession:
                             self._fail_protocol()
                         if self._awaiting_echo:
                             self._finish_echo()
-                            self._epoch_needs_begin = True
                         raw = (
                             RawSdkMessageValidator(self._tools)
                             if self._bridge is not None
@@ -443,6 +448,34 @@ class SdkSession:
         phase, tool_epoch = self._protocol_position()
         return _ReceivedSdkMessage(message, phase, tool_epoch)
 
+    async def _receive_after_epoch_completion(
+        self,
+        response: AsyncIterator[Any],
+        prefetched: asyncio.Future[_ReceivedSdkMessage] | None,
+    ) -> _ReceivedSdkMessage:
+        bridge = self._bridge
+        if bridge is None:
+            self._fail_protocol()
+        completion = asyncio.create_task(bridge.wait_epoch_complete())
+        incoming = prefetched or asyncio.create_task(self._receive_message(response))
+        try:
+            done, _ = await asyncio.wait(
+                (completion, incoming), return_when=asyncio.FIRST_COMPLETED
+            )
+            if completion in done:
+                await completion
+                self._epoch_needs_completion = False
+                return await incoming
+
+            await asyncio.gather(incoming, return_exceptions=True)
+            self._fail_protocol()
+        finally:
+            tasks = (completion, incoming)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def _protocol_position(self) -> tuple[_ProtocolPhase, int]:
         if self._awaiting_submit:
             return "awaiting_submit", self._tool_epoch
@@ -483,7 +516,14 @@ class SdkSession:
                     or raw_result != f"Error: {typed_text}"
                 ):
                     self._fail_protocol()
-            elif self._normalize_echo_content(raw_result) != typed_text:
+            elif (
+                not isinstance(raw_result, list)
+                or len(raw_result) != 1
+                or not isinstance(raw_result[0], Mapping)
+                or set(raw_result[0]) != {"type", "text"}
+                or raw_result[0].get("type") != "text"
+                or raw_result[0].get("text") != typed_text
+            ):
                 self._fail_protocol()
         for block in message.content:
             if type(block) is not SdkToolResultBlock:
@@ -501,6 +541,8 @@ class SdkSession:
             text = self._normalize_echo_content(block.content)
             self._echo_ids.add(tool_use_id)
             self._echo_values[tool_use_id] = (text, is_error is True)
+        if self._echo_ids == self._expected_internal_ids:
+            self._finish_echo()
 
     def _finish_echo(self) -> None:
         if (
@@ -509,6 +551,8 @@ class SdkSession:
         ):
             self._fail_protocol()
         self._awaiting_echo = False
+        self._epoch_needs_completion = True
+        self._epoch_needs_begin = True
         self._expected_internal_ids = set()
         self._expected_echo_values = {}
         self._echo_ids = set()

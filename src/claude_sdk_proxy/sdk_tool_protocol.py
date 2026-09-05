@@ -242,10 +242,13 @@ class RawSdkMessageValidator:
                 fail_protocol()
             self._current = _RawBlock("text", [])
         elif block_type == "tool_use":
-            if set(value) not in (
-                {"type", "id", "name", "input"},
-                {"type", "id", "name", "input", "caller"},
-            ) or value.get("caller", {"type": "direct"}) != {"type": "direct"}:
+            if set(value) != {
+                "type",
+                "id",
+                "name",
+                "input",
+                "caller",
+            } or value.get("caller") != {"type": "direct"}:
                 fail_protocol()
             internal_id = value.get("id")
             sdk_name = value.get("name")

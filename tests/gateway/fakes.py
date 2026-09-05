@@ -297,6 +297,7 @@ def raw_tool_events(
                             "id": internal_id,
                             "name": sdk_name,
                             "input": {},
+                            "caller": {"type": "direct"},
                         },
                     },
                 ),

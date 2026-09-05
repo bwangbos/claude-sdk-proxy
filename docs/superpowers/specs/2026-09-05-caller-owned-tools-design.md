@@ -174,8 +174,21 @@ Every handler invocation is a distinct coroutine. On invocation it:
 
 The public ID belongs to the handler invocation, not to a `(name, arguments)`
 lookup. Two identical calls therefore have independent futures, and reverse-order
-results cannot be confused. Internal Claude/MCP IDs remain private implementation
-details.
+results cannot be confused. The internal-only exception is the SDK callback's
+private `_meta["claudecode/toolUseId"]`: the bridge requires it to equal the
+unique raw and typed assistant tool-use ID and requires the callback name and
+canonical arguments to match that raw call. This establishes the exact
+bijection needed when the SDK serializes callbacks for parallel blocks. The ID
+is never exposed as a public call ID, accepted from a caller, or included in an
+error or log, and caller results still correlate only by independently minted
+public IDs. There is no name, argument, order, or guessing fallback.
+
+After result echo validation, an epoch remains sealed until every raw call has
+entered exactly one metadata-validated callback and its stored caller result has
+returned through that callback. An arriving assistant or result boundary wins a
+race against an incomplete callback barrier and fails the session without
+committing that boundary. A later tool-generating boundary opens the next epoch;
+terminal text does not reopen callback admission.
 
 ### `ToolSessionActor`
 

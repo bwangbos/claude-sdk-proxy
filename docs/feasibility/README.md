@@ -112,6 +112,13 @@ call ID or in errors. Public IDs are minted independently, and caller results
 still correlate only by those opaque public IDs; there is no name, argument, or
 position fallback.
 
+After the SDK echoes submitted results, the gateway accepts no later assistant
+or final boundary until every raw call has entered exactly one validated
+callback and the stored result has returned through it. The epoch stays sealed
+through terminal text and reopens only if a later boundary generates tools. A
+missing deferred callback therefore loses the session rather than allowing a
+terminal answer to commit.
+
 ### Pi configuration
 
 Add this provider to `~/.pi/agent/models.json`:
