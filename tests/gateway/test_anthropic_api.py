@@ -5,6 +5,7 @@ import json
 import pytest
 
 from claude_sdk_proxy.anthropic_api import (
+    AnthropicStreamState,
     encode_anthropic_error,
     encode_anthropic_event,
     encode_anthropic_start,
@@ -15,7 +16,12 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
     RequestValidationError,
+    TextBlock,
     TextDelta,
+    ToolCall,
+    ToolCallBlock,
+    ToolDefinition,
+    ToolResultBlock,
     UnsupportedFeature,
 )
 
@@ -26,6 +32,17 @@ def event_name(chunk: bytes) -> str:
 
 def payload(chunk: bytes) -> object:
     return json.loads(chunk.split(b"data: ", maxsplit=1)[1])
+
+
+def anthropic_echo_tool() -> dict[str, object]:
+    return {
+        "name": "echo",
+        "description": "Repeat the provided value.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+    }
 
 
 def test_anthropic_parser_preserves_text_messages_and_required_token_limit() -> None:
@@ -51,6 +68,21 @@ def test_anthropic_parser_preserves_text_messages_and_required_token_limit() -> 
     )
     assert request.max_tokens == 321
     assert request.stream is True
+
+
+def test_anthropic_parser_keeps_empty_fresh_tools_on_the_text_only_path() -> None:
+    request = parse_anthropic_request(
+        {
+            "model": "sonnet",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "tools": [],
+        },
+        frozenset({"sonnet"}),
+    )
+
+    assert request.tools == ()
+    assert request.next_input == "hello"
 
 
 @pytest.mark.parametrize(
@@ -80,15 +112,6 @@ def test_anthropic_parser_preserves_text_messages_and_required_token_limit() -> 
         (
             {
                 "model": "sonnet",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 1,
-                "tools": [],
-            },
-            "tools",
-        ),
-        (
-            {
-                "model": "sonnet",
                 "messages": [{"role": "user", "content": [{"type": "image"}]}],
                 "max_tokens": 1,
             },
@@ -102,6 +125,401 @@ def test_anthropic_parser_fails_closed_for_nontext_features(
     with pytest.raises((RequestValidationError, UnsupportedFeature)) as error:
         parse_anthropic_request(body, frozenset({"sonnet"}))
     assert error.value.field == field
+
+
+def test_anthropic_parser_normalizes_parallel_calls_and_reverse_results() -> None:
+    request = parse_anthropic_request(
+        {
+            "model": "sonnet",
+            "max_tokens": 1024,
+            "tools": [anthropic_echo_tool()],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": False},
+            "messages": [
+                {"role": "user", "content": "twice"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_a",
+                            "name": "echo",
+                            "input": {"value": "one"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_b",
+                            "name": "echo",
+                            "input": {"value": "two"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_b",
+                            "content": "B",
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_a",
+                            "content": [{"type": "text", "text": "A"}],
+                        },
+                    ],
+                },
+            ],
+        },
+        frozenset({"sonnet"}),
+    )
+
+    assert request.tools == (
+        ToolDefinition(
+            "echo",
+            "Repeat the provided value.",
+            {"type": "object", "properties": {"value": {"type": "string"}}},
+        ),
+    )
+    assert request.messages[1].blocks == (
+        ToolCallBlock("toolu_a", "echo", {"value": "one"}),
+        ToolCallBlock("toolu_b", "echo", {"value": "two"}),
+    )
+    assert request.next_input == (
+        ToolResultBlock("toolu_a", ("A",), False),
+        ToolResultBlock("toolu_b", ("B",), False),
+    )
+
+
+@pytest.mark.parametrize(
+    "content,want",
+    [
+        ("", ("",)),
+        ([], ()),
+        ([{"type": "text", "text": ""}], ("",)),
+        (
+            [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}],
+            ("first", "second"),
+        ),
+    ],
+)
+def test_anthropic_parser_preserves_successful_tool_result_text(
+    content: object, want: tuple[str, ...]
+) -> None:
+    request = parse_anthropic_request(
+        {
+            "model": "sonnet",
+            "max_tokens": 1,
+            "tools": [anthropic_echo_tool()],
+            "messages": [
+                {"role": "user", "content": "call"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_call",
+                            "name": "echo",
+                            "input": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_call",
+                            "content": content,
+                        }
+                    ],
+                },
+            ],
+        },
+        frozenset({"sonnet"}),
+    )
+
+    assert request.next_input == (ToolResultBlock("toolu_call", want, False),)
+
+
+def test_anthropic_parser_accepts_nonempty_error_result() -> None:
+    request = parse_anthropic_request(
+        {
+            "model": "sonnet",
+            "max_tokens": 1,
+            "tools": [anthropic_echo_tool()],
+            "messages": [
+                {"role": "user", "content": "call"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_call",
+                            "name": "echo",
+                            "input": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_call",
+                            "content": "failed",
+                            "is_error": True,
+                        }
+                    ],
+                },
+            ],
+        },
+        frozenset({"sonnet"}),
+    )
+
+    assert request.next_input == (ToolResultBlock("toolu_call", ("failed",), True),)
+
+
+@pytest.mark.parametrize(
+    "body,field,error_type",
+    [
+        (
+            {
+                "model": "sonnet",
+                "max_tokens": 1,
+                "tools": [anthropic_echo_tool(), anthropic_echo_tool()],
+                "messages": [{"role": "user", "content": "call"}],
+            },
+            "tools",
+            RequestValidationError,
+        ),
+        (
+            {
+                "model": "sonnet",
+                "max_tokens": 1,
+                "tools": [anthropic_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "call"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_same",
+                                "name": "echo",
+                                "input": {},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_same",
+                                "name": "echo",
+                                "input": {},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_same",
+                                "content": "ok",
+                            }
+                        ],
+                    },
+                ],
+            },
+            "messages",
+            RequestValidationError,
+        ),
+        (
+            {
+                "model": "sonnet",
+                "max_tokens": 1,
+                "tools": [anthropic_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "call"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_a",
+                                "name": "echo",
+                                "input": {},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_b",
+                                "name": "echo",
+                                "input": {},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_a",
+                                "content": "only one",
+                            }
+                        ],
+                    },
+                ],
+            },
+            "messages",
+            RequestValidationError,
+        ),
+        (
+            {
+                "model": "sonnet",
+                "max_tokens": 1,
+                "tools": [anthropic_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "call"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_call",
+                                "name": "echo",
+                                "input": {},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "mixed"},
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_call",
+                                "content": "ok",
+                            },
+                        ],
+                    },
+                ],
+            },
+            "messages",
+            RequestValidationError,
+        ),
+        (
+            {
+                "model": "sonnet",
+                "max_tokens": 1,
+                "tools": [anthropic_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "call"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_call",
+                                "name": "echo",
+                                "input": {},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_call",
+                                "content": "",
+                                "is_error": True,
+                            }
+                        ],
+                    },
+                ],
+            },
+            "messages",
+            RequestValidationError,
+        ),
+        (
+            {
+                "model": "sonnet",
+                "max_tokens": 1,
+                "tools": [
+                    {
+                        "name": "echo",
+                        "description": "Repeat the provided value.",
+                        "input_schema": {"type": "definitely-not-a-json-schema-type"},
+                    }
+                ],
+                "messages": [{"role": "user", "content": "call"}],
+            },
+            "tools",
+            RequestValidationError,
+        ),
+        (
+            {
+                "model": "sonnet",
+                "max_tokens": 1,
+                "tools": [anthropic_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "call"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_call",
+                                "name": "echo",
+                                "input": {},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_call",
+                                "content": [{"type": "image", "source": {}}],
+                            }
+                        ],
+                    },
+                ],
+            },
+            "messages",
+            UnsupportedFeature,
+        ),
+    ],
+)
+def test_anthropic_parser_rejects_invalid_tool_subset(
+    body: dict[str, object], field: str, error_type: type[Exception]
+) -> None:
+    with pytest.raises(error_type) as error:
+        parse_anthropic_request(body, frozenset({"sonnet"}))
+    assert error.value.field == field  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        {"type": "tool", "name": "echo"},
+        {"type": "none"},
+        {"type": "auto", "disable_parallel_tool_use": True},
+    ],
+)
+def test_anthropic_parser_rejects_semantically_unsupported_tool_choices(
+    tool_choice: object,
+) -> None:
+    with pytest.raises(UnsupportedFeature) as error:
+        parse_anthropic_request(
+            {
+                "model": "sonnet",
+                "max_tokens": 1,
+                "tools": [anthropic_echo_tool()],
+                "tool_choice": tool_choice,
+                "messages": [{"role": "user", "content": "call"}],
+            },
+            frozenset({"sonnet"}),
+        )
+    assert error.value.field == "tool_choice"
 
 
 def test_anthropic_parser_rejects_unknown_model() -> None:
@@ -197,6 +615,85 @@ def test_anthropic_stream_uses_message_content_and_stop_order() -> None:
     }
 
 
+def test_anthropic_stream_renders_complete_tool_argument_delta() -> None:
+    chunks = encode_anthropic_event(
+        "msg_1",
+        "sonnet",
+        ToolCall("toolu_1", "echo", {"snowman": "☃"}),
+        block_index=1,
+    )
+
+    assert [event_name(chunk) for chunk in chunks] == [
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+    ]
+    assert payload(chunks[0]) == {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "echo",
+            "input": {},
+        },
+    }
+    assert payload(chunks[1])["delta"]["partial_json"] == '{"snowman":"☃"}'
+
+
+def test_anthropic_tool_enabled_stream_starts_blocks_lazily_and_in_order() -> None:
+    state = AnthropicStreamState()
+    start = encode_anthropic_start(
+        "msg_test", "sonnet", tools=(ToolDefinition("echo", "", {}),), state=state
+    )
+    text = encode_anthropic_event(
+        "msg_test", "sonnet", TextDelta("first"), block_index=0, state=state
+    )
+    first_call = encode_anthropic_event(
+        "msg_test",
+        "sonnet",
+        ToolCall("toolu_a", "echo", {"n": 1}),
+        block_index=1,
+        state=state,
+    )
+    second_call = encode_anthropic_event(
+        "msg_test",
+        "sonnet",
+        ToolCall("toolu_b", "echo", {"n": 2}),
+        block_index=2,
+        state=state,
+    )
+    completed = encode_anthropic_event(
+        "msg_test",
+        "sonnet",
+        Completed("tool_use", {"output_tokens": 2}),
+        block_index=2,
+        state=state,
+    )
+
+    assert [
+        event_name(chunk)
+        for chunk in (*start, *text, *first_call, *second_call, *completed)
+    ] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert payload(text[0])["index"] == 0
+    assert payload(first_call[1])["index"] == 1
+    assert payload(second_call[0])["index"] == 2
+    assert payload(completed[0])["delta"]["stop_reason"] == "tool_use"
+
+
 def test_anthropic_nonstream_response_maps_text_stop_and_usage() -> None:
     response = render_anthropic_response(
         "msg_test",
@@ -211,6 +708,46 @@ def test_anthropic_nonstream_response_maps_text_stop_and_usage() -> None:
         "model": "sonnet",
         "content": [{"type": "text", "text": "hello"}],
         "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 2, "output_tokens": 1},
+    }
+
+
+def test_anthropic_nonstream_response_preserves_text_and_tool_call_block_order() -> (
+    None
+):
+    response = render_anthropic_response(
+        "msg_test",
+        "sonnet",
+        (
+            TextBlock("before"),
+            ToolCall("toolu_a", "echo", {"value": "one"}),
+            ToolCall("toolu_b", "echo", {"value": "two"}),
+        ),
+        Completed("tool_use", {"input_tokens": 2, "output_tokens": 1}),
+    )
+
+    assert response == {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "sonnet",
+        "content": [
+            {"type": "text", "text": "before"},
+            {
+                "type": "tool_use",
+                "id": "toolu_a",
+                "name": "echo",
+                "input": {"value": "one"},
+            },
+            {
+                "type": "tool_use",
+                "id": "toolu_b",
+                "name": "echo",
+                "input": {"value": "two"},
+            },
+        ],
+        "stop_reason": "tool_use",
         "stop_sequence": None,
         "usage": {"input_tokens": 2, "output_tokens": 1},
     }
