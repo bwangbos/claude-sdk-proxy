@@ -11,6 +11,7 @@ from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     Dialect,
+    TextBlock,
     TextDelta,
     TextRequest,
     ToolCall,
@@ -85,10 +86,19 @@ class ToolSession:
         boundaries: tuple[tuple[ConversationEvent, ...], ...],
         generation_entered: asyncio.Event | None = None,
         generation_release: asyncio.Event | None = None,
+        *,
+        start_entered: asyncio.Event | None = None,
+        start_release: asyncio.Event | None = None,
+        submit_entered: asyncio.Event | None = None,
+        submit_release: asyncio.Event | None = None,
     ) -> None:
         self.boundaries = boundaries
         self.generation_entered = generation_entered
         self.generation_release = generation_release
+        self.start_entered = start_entered
+        self.start_release = start_release
+        self.submit_entered = submit_entered
+        self.submit_release = submit_release
         self.prompts: list[str] = []
         self.results: list[tuple[ToolResultBlock, ...]] = []
         self.close_count = 0
@@ -96,9 +106,16 @@ class ToolSession:
         self._resume = asyncio.Event()
         self._failure = asyncio.Event()
         self.closed = asyncio.Event()
+        self.watching = asyncio.Event()
+        self.submitted = asyncio.Event()
+        self.wait_failure_count = 0
 
     async def start(self) -> None:
         self.start_count += 1
+        if self.start_entered is not None:
+            self.start_entered.set()
+        if self.start_release is not None:
+            await self.start_release.wait()
 
     async def stream_generation(
         self, prompt: str
@@ -118,10 +135,17 @@ class ToolSession:
     async def submit_tool_results(
         self, results: Iterable[ToolResultBlock]
     ) -> None:
+        if self.submit_entered is not None:
+            self.submit_entered.set()
+        if self.submit_release is not None:
+            await self.submit_release.wait()
         self.results.append(tuple(results))
+        self.submitted.set()
         self._resume.set()
 
     async def wait_failure(self) -> None:
+        self.wait_failure_count += 1
+        self.watching.set()
         await self._failure.wait()
         raise BackendFailure("SDK tool protocol failure")
 
@@ -151,6 +175,35 @@ class ToolFactory:
         session = next(self._sessions)
         self.sessions.append(session)
         return session
+
+
+class BoundaryBarrierSession(ToolSession):
+    def __init__(self) -> None:
+        super().__init__(())
+        self.boundary_entered = asyncio.Event()
+        self.boundary_release = asyncio.Event()
+
+    async def stream_generation(
+        self, prompt: str
+    ) -> AsyncIterator[ConversationEvent]:
+        self.prompts.append(prompt)
+        yield ToolCall("toolu_one", "echo", {"value": "same"})
+        self.boundary_entered.set()
+        await self.boundary_release.wait()
+        yield Completed("tool_use", {"input_tokens": 3, "output_tokens": 2})
+
+
+class SecretFailureSession(ToolSession):
+    async def wait_failure(self) -> None:
+        self.wait_failure_count += 1
+        self.watching.set()
+        await self._failure.wait()
+        raise BackendFailure("credential=/Users/alice/private-token")
+
+    async def close(self) -> None:
+        self.close_count += 1
+        self.closed.set()
+        raise BackendFailure("cleanup=/Users/alice/.claude/private-token")
 
 
 def call_boundary(*ids: str) -> tuple[ConversationEvent, ...]:
@@ -575,3 +628,237 @@ async def test_parked_tool_result_timeout_closes_session() -> None:
 
     assert backend.close_count == 1
     assert backend.results == []
+
+
+@pytest.mark.anyio
+async def test_result_commit_invalidates_old_wait_timeout_while_submit_blocks() -> None:
+    submit_entered, submit_release = asyncio.Event(), asyncio.Event()
+    backend = ToolSession(
+        (call_boundary("toolu_one"), final_boundary("done")),
+        submit_entered=submit_entered,
+        submit_release=submit_release,
+    )
+    registry = SessionRegistry(
+        ToolFactory((backend,)), tool_result_timeout_seconds=0.02
+    )
+    first = first_request(tools=(echo_tool(),))
+    boundary = await collect(
+        (await registry.open_turn(first, explicit_id="lineage")).stream()
+    )
+    call = next(event for event in boundary if isinstance(event, ToolCall))
+    actor = registry._explicit["lineage"]
+    assert isinstance(actor, ToolSessionActor)
+    old_deadline = actor._wait_deadline
+    assert old_deadline is not None
+    request = continuation(
+        first, (call,), (ToolResultBlock(call.id, ("one",), False),)
+    )
+    lease = await registry.open_turn(request, explicit_id="lineage")
+    consume = asyncio.create_task(collect(lease.stream()))
+    await submit_entered.wait()
+
+    old_timeout_processed = asyncio.Event()
+    asyncio.get_running_loop().call_at(
+        old_deadline + 0.01, old_timeout_processed.set
+    )
+    await old_timeout_processed.wait()
+
+    assert actor._runner is not None
+    assert not actor._runner.done()
+    submit_release.set()
+    assert await consume == list(final_boundary("done"))
+
+
+@pytest.mark.anyio
+async def test_bridge_watcher_is_active_while_sdk_start_is_blocked() -> None:
+    start_entered, start_release = asyncio.Event(), asyncio.Event()
+    backend = ToolSession(
+        (final_boundary("unused"),),
+        start_entered=start_entered,
+        start_release=start_release,
+    )
+    registry = SessionRegistry(ToolFactory((backend,)))
+    request = first_request(tools=(echo_tool(),))
+    lease = await registry.open_turn(request, explicit_id="lineage")
+    consume = asyncio.create_task(collect(lease.stream()))
+    try:
+        await start_entered.wait()
+        assert backend.watching.is_set()
+        backend.fail_bridge()
+        await backend.closed.wait()
+        with pytest.raises(BackendFailure, match="Agent SDK query failed"):
+            await consume
+        assert backend.close_count == 1
+        assert backend.wait_failure_count == 1
+    finally:
+        start_release.set()
+        await registry.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("winner", ("close", "boundary"))
+async def test_close_and_tool_boundary_have_one_linear_winner(winner: str) -> None:
+    backend = BoundaryBarrierSession()
+    registry = SessionRegistry(ToolFactory((backend,)))
+    request = first_request(tools=(echo_tool(),))
+    lease = await registry.open_turn(request, explicit_id="lineage")
+    actor = registry._explicit["lineage"]
+    assert isinstance(actor, ToolSessionActor)
+    consume = asyncio.create_task(collect(lease.stream()))
+    await backend.boundary_entered.wait()
+
+    if winner == "close":
+        await registry.close()
+        backend.boundary_release.set()
+        with pytest.raises(RuntimeError, match="registry is closed"):
+            await consume
+        assert actor.replay == {}
+        assert actor.transcript == ()
+    else:
+        backend.boundary_release.set()
+        assert await consume == list(call_boundary("toolu_one"))
+        assert len(actor.replay) == 1
+        assert len(actor.transcript) == 2
+        await registry.close()
+
+    assert backend.close_count == 1
+    assert actor.state.name == "CLOSED"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("winner", ("shutdown", "result"))
+async def test_shutdown_and_tool_result_have_one_linear_winner(winner: str) -> None:
+    generation_entered, generation_release = asyncio.Event(), asyncio.Event()
+    submit_entered, submit_release = asyncio.Event(), asyncio.Event()
+    backend = ToolSession(
+        (call_boundary("toolu_one"), final_boundary("unused")),
+        generation_entered,
+        generation_release,
+        submit_entered=submit_entered,
+        submit_release=submit_release,
+    )
+    registry = SessionRegistry(ToolFactory((backend,)))
+    first = first_request(tools=(echo_tool(),))
+    initial = asyncio.create_task(
+        collect((await registry.open_turn(first, explicit_id="lineage")).stream())
+    )
+    await generation_entered.wait()
+    generation_release.set()
+    boundary = await initial
+    generation_entered.clear()
+    generation_release.clear()
+    call = next(event for event in boundary if isinstance(event, ToolCall))
+    result_request = continuation(
+        first, (call,), (ToolResultBlock(call.id, ("one",), False),)
+    )
+    actor = registry._explicit["lineage"]
+    assert isinstance(actor, ToolSessionActor)
+
+    if winner == "shutdown":
+        await registry.close()
+        with pytest.raises(RuntimeError, match="registry is closed"):
+            await registry.open_turn(result_request, explicit_id="lineage")
+        assert actor.transcript == first.messages + (
+            CanonicalMessage(
+                "assistant",
+                (ToolCallBlock(call.id, call.name, call.arguments),),
+            ),
+        )
+        assert backend.results == []
+    else:
+        lease = await registry.open_turn(result_request, explicit_id="lineage")
+        consume = asyncio.create_task(collect(lease.stream()))
+        await submit_entered.wait()
+        submit_release.set()
+        await backend.submitted.wait()
+        await generation_entered.wait()
+        assert actor.transcript == result_request.messages
+        await registry.close()
+        with pytest.raises(RuntimeError, match="registry is closed"):
+            await consume
+        assert backend.results == [result_request.messages[-1].blocks]
+
+    assert backend.close_count == 1
+    assert len(actor.transcript) in {2, 3}
+
+
+@pytest.mark.anyio
+async def test_mixed_text_and_calls_commit_ordered_assistant_blocks() -> None:
+    boundary = (
+        TextDelta("thinking"),
+        ToolCall("toolu_one", "echo", {"value": "same"}),
+        Completed("tool_use", {"input_tokens": 3, "output_tokens": 2}),
+    )
+    backend = ToolSession((boundary,))
+    registry = SessionRegistry(ToolFactory((backend,)))
+    request = first_request(tools=(echo_tool(),))
+
+    assert await collect((await registry.open_turn(request, None)).stream()) == list(
+        boundary
+    )
+    actor = next(iter(registry._implicit.values()))
+    assert isinstance(actor, ToolSessionActor)
+    assert actor.transcript[-1].blocks == (
+        TextBlock("thinking"),
+        ToolCallBlock("toolu_one", "echo", {"value": "same"}),
+    )
+    await registry.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("busy_state", ("generating", "waiting", "replay"))
+async def test_every_busy_tool_state_exhausts_capacity(busy_state: str) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    if busy_state == "generating":
+        backend = ToolSession((final_boundary("done"),), entered, release)
+    elif busy_state == "waiting":
+        backend = ToolSession((call_boundary("toolu_one"),))
+    else:
+        backend = ToolSession((final_boundary("done"),))
+    registry = SessionRegistry(ToolFactory((backend,)), max_sessions=1)
+    request = first_request(tools=(echo_tool(),))
+    lease = await registry.open_turn(request, explicit_id="busy")
+    consume: asyncio.Task[list[ConversationEvent]] | None = None
+    if busy_state == "generating":
+        consume = asyncio.create_task(collect(lease.stream()))
+        await entered.wait()
+    else:
+        await collect(lease.stream())
+        if busy_state == "replay":
+            lease = await registry.open_turn(request, explicit_id="busy")
+
+    with pytest.raises(SessionCapacity):
+        await registry.open_turn(
+            first_request(tools=(echo_tool(description="other"),)),
+            explicit_id="other",
+        )
+
+    if consume is not None:
+        consume.cancel()
+        await asyncio.gather(consume, return_exceptions=True)
+    await lease.abort()
+    await registry.close()
+    assert backend.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_actor_and_teardown_failures_are_redacted_and_close_once() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    backend = SecretFailureSession((final_boundary("unused"),), entered, release)
+    registry = SessionRegistry(ToolFactory((backend,)))
+    request = first_request(tools=(echo_tool(),))
+    lease = await registry.open_turn(request, explicit_id="lineage")
+    consume = asyncio.create_task(collect(lease.stream()))
+    await entered.wait()
+    await backend.watching.wait()
+
+    backend.fail_bridge()
+    with pytest.raises(BackendFailure) as captured:
+        await consume
+    await backend.closed.wait()
+    await registry.close()
+
+    assert str(captured.value) == "Agent SDK query failed"
+    assert "alice" not in str(captured.value)
+    assert backend.close_count == 1
+    assert backend.wait_failure_count == 1

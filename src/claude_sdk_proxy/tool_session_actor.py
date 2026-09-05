@@ -129,6 +129,8 @@ class ToolSessionActor:
         self.state = ToolSessionState.GENERATING
         self._current = response
         self._generation_deadline = self._now() + self.generation_timeout
+        if self._watcher is None:
+            self._watcher = asyncio.create_task(self._watch_failures())
         self._runner = asyncio.create_task(self._run(request.next_prompt))
 
     def _admit_results_locked(self, response: ToolResponse) -> bool:
@@ -171,7 +173,6 @@ class ToolSessionActor:
             if not self._started:
                 await self._with_generation_deadline(self.backend.start())
                 self._started = True
-                self._watcher = asyncio.create_task(self._watch_failures())
             stream = self.backend.stream_generation(prompt)
             events: list[ConversationEvent] = []
             while True:
@@ -265,21 +266,43 @@ class ToolSessionActor:
     async def _wait_for_results(self) -> bool:
         token = self._wait_token
         deadline = self._wait_deadline
-        try:
-            async with asyncio.timeout_at(deadline):
-                await self._resume.wait()
-        except TimeoutError:
-            async with self._lock:
-                expired = (
-                    self.state is ToolSessionState.WAITING_FOR_TOOLS
-                    and token == self._wait_token
+        while True:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._resume.wait()
+            except TimeoutError:
+                retry, error = await self._classify_wait_timeout(token)
+                if retry:
+                    token = self._wait_token
+                    deadline = self._generation_deadline
+                    continue
+                if error is not None:
+                    await self._fail(error)
+                return False
+            return self.state is ToolSessionState.GENERATING
+
+    async def _classify_wait_timeout(
+        self, token: int
+    ) -> tuple[bool, SessionTimeout | None]:
+        async with self._lock:
+            now = self._now()
+            if self.state is ToolSessionState.WAITING_FOR_TOOLS:
+                if (
+                    token == self._wait_token
                     and self._wait_deadline is not None
-                    and self._now() >= self._wait_deadline
-                )
-            if expired:
-                await self._fail(SessionTimeout("tool result wait timed out"))
-            return False
-        return self.state is ToolSessionState.GENERATING
+                    and now >= self._wait_deadline
+                ):
+                    return False, SessionTimeout("tool result wait timed out")
+                return False, None
+            if self.state is ToolSessionState.GENERATING:
+                if token != self._wait_token:
+                    return True, None
+                if (
+                    self._generation_deadline is not None
+                    and now >= self._generation_deadline
+                ):
+                    return False, SessionTimeout("SDK turn timed out")
+            return False, None
 
     async def _watch_failures(self) -> None:
         try:
