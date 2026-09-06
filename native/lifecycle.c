@@ -233,7 +233,7 @@ static void unregister_handle(cpl_journal *journal) {
 static uint64_t monotonic_ns(void) {
     struct timespec now;
 
-    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+    if (clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0) {
         return 0U;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;

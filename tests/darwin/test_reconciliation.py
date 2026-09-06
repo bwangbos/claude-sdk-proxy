@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -329,12 +330,22 @@ def test_recovery_uses_canonical_request_and_process_not_delivery_boolean(
         "_python_exception_checkpoint",
         lambda flow, checkpoint: None,
     )
-    supervisor_probe._reconcile_retained_actor_chain(key)
-    inspection = supervisor_probe._inspect_retained_actor_chain(key)
-    assert inspection.canonical_state == "UNCONFIRMED"
-    assert inspection.journal_reopened_and_certified
-    assert inspection.actor_live_or_task4_reaped
-    teardown = supervisor_probe._test_release_retained_actor_chain(key)
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            supervisor_probe._reconcile_retained_actor_chain(key)
+            inspection = supervisor_probe._inspect_retained_actor_chain(key)
+            if inspection.canonical_state == "UNCONFIRMED":
+                break
+            # A full socket write does not mean the native actor has exited.
+            # Reconciliation must retain a live executor's admitted batch;
+            # retry until its injected exit permits terminal certification.
+            assert time.monotonic() < deadline, inspection
+            time.sleep(0.001)
+        assert inspection.journal_reopened_and_certified
+        assert inspection.actor_live_or_task4_reaped
+    finally:
+        teardown = supervisor_probe._test_release_retained_actor_chain(key)
     assert teardown.group_absent and teardown.supervisor_child_reaped
 
 

@@ -3,6 +3,13 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
+
+/* Absolute deadlines cross the Python/native/process boundaries in uptime
+ * nanoseconds, matching Python time.monotonic_ns() / mach_absolute_time().
+ * CLOCK_MONOTONIC_RAW includes system sleep on macOS and is a different epoch.
+ */
+#define CPL_DEADLINE_CLOCK CLOCK_UPTIME_RAW
 
 #ifdef __cplusplus
 extern "C" {

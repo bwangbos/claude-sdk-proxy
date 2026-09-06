@@ -138,7 +138,7 @@ static _Noreturn void inject_actor_death(cpl_journal *journal,
 static uint64_t monotonic_deadline(void) {
     struct timespec now;
 
-    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+    if (clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0) {
         return 0U;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL +
@@ -148,7 +148,7 @@ static uint64_t monotonic_deadline(void) {
 static uint64_t control_deadline(void) {
     struct timespec now;
 
-    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+    if (clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0) {
         return 0U;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL +
@@ -158,7 +158,7 @@ static uint64_t control_deadline(void) {
 static uint64_t lease_deadline(void) {
     struct timespec now;
 
-    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+    if (clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0) {
         return 0U;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL +
@@ -171,7 +171,7 @@ static uint64_t selected_lease_deadline(uint32_t injection) {
     if (!actor_loss_injection(injection)) {
         return lease_deadline();
     }
-    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+    if (clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0) {
         return 0U;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL +
@@ -893,7 +893,7 @@ static int launch_anchor(const struct bootstrap_values *values,
     } else if (status == CPL_OK) {
         status = CPL_ERR_CONTROL_PAYLOAD;
     }
-    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+    if (clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0) {
         status = CPL_ERR_SYSTEM;
         deadline = 0U;
     } else {
@@ -920,7 +920,7 @@ static int launch_anchor(const struct bootstrap_values *values,
                 break;
             }
         }
-        if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0 ||
+        if (clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0 ||
             (uint64_t)now.tv_sec * 1000000000ULL +
                 (uint64_t)now.tv_nsec >= deadline) {
             status = CPL_ERR_CERTIFY_TIMEOUT;

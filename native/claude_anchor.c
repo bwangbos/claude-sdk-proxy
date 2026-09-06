@@ -39,7 +39,7 @@ struct anchor_arguments {
 static uint64_t monotonic_deadline(void) {
     struct timespec now;
 
-    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+    if (clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0) {
         return 0U;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL +
@@ -49,7 +49,7 @@ static uint64_t monotonic_deadline(void) {
 static uint64_t control_deadline(void) {
     struct timespec now;
 
-    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+    if (clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0) {
         return 0U;
     }
     return (uint64_t)now.tv_sec * 1000000000ULL +
@@ -60,7 +60,7 @@ static bool deadline_reached(uint64_t deadline) {
     struct timespec now;
     uint64_t current;
 
-    if (deadline == 0U || clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+    if (deadline == 0U || clock_gettime(CPL_DEADLINE_CLOCK, &now) < 0) {
         return true;
     }
     current = (uint64_t)now.tv_sec * 1000000000ULL +

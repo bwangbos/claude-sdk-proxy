@@ -50,8 +50,32 @@ The Python journal constructs absolute deadlines with `time.monotonic_ns()`
 (`mach_absolute_time()` on this host), while `native/lifecycle.c` compares them
 against `CLOCK_MONOTONIC_RAW`. At inspection, the latter was approximately
 510 seconds ahead; the normal one-second deadlines therefore expired immediately.
-Neither clock implementation was changed by this work. This remains a separate
-legacy lifecycle issue, so the full release gate is **not green**.
+Neither clock implementation was changed by the compatibility commit. At that
+checkpoint this separate legacy lifecycle issue left the full release gate red.
 
 No push, PR, merge, running-server restart, or local Pi configuration change was
 performed as part of this implementation.
+
+## Clock-fix follow-up
+
+The native lifecycle library, supervisor, and anchor now share
+`CPL_DEADLINE_CLOCK = CLOCK_UPTIME_RAW`, matching Python's macOS monotonic clock.
+[Apple documents that uptime clock as equivalent to `mach_absolute_time()`](https://developer.apple.com/documentation/kernel/1462446-mach_absolute_time).
+Timeout durations and expiry guards are unchanged; only the clock domain is
+corrected. Rebuild the complete native set with `make native`; do not replace
+individual binaries/libraries inside a running legacy lifecycle allocation.
+
+Three regressions compile the actual native components against test-only clocks
+with a simulated ten-minute sleep offset. They failed before the fix and pass
+afterward, checking future deadline admission, deadline generation, and expiry.
+The formerly failing real journal operation also passes. A timing-sensitive
+reconciliation test now waits for its terminal condition and always performs
+exact-key teardown; production reconciliation safeguards were not changed.
+An independent reviewer approved both changes.
+
+Final `make release-offline` passed on a clean snapshot of the staged project:
+676 unit + 222 macOS lifecycle + 570 gateway + 20 integration tests = **1,488
+passed**, followed by Ruff and mypy. The ordinary working checkout passes the
+same tests but its whole-directory lint step also includes the unrelated,
+untracked `meridian-head-to-head/benchmark.py` (48 existing lint findings). Those
+research files were neither modified nor included in the snapshot or commit.
