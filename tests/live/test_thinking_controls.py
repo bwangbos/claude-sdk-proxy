@@ -224,3 +224,64 @@ async def test_live_pi_anthropic_tool_replay_and_bidirectional_switch() -> None:
         "15",
     ]
     assert factory.notices == []
+
+
+async def test_live_pi_anthropic_bidirectional_switch_roundtrip() -> None:
+    """Isolate both settings switches from the unchanged Opus refusal probe."""
+    _require_live()
+    factory = LiveSdkFactory()
+    app = create_app(
+        models=("sonnet", "opus"),
+        session_factory=factory,
+        turn_timeout_seconds=120,
+        tool_result_timeout_seconds=120,
+    )
+
+    async with serve(app) as base_url:
+        result = await run_pi_thinking(
+            base_url,
+            "anthropic",
+            scenario="roundtrip",
+            first_model="sonnet",
+            first_reasoning="high",
+            second_model="opus",
+            second_reasoning="low",
+            timeout_seconds=240,
+        )
+
+    assert result["customSessionHeaders"] == []
+    assert [options.model for options in factory.options] == [
+        "sonnet",
+        "opus",
+        "sonnet",
+    ]
+    assert factory.resolved_models == [
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+    ]
+    assert [options.effort for options in factory.options] == [
+        "high",
+        "low",
+        "high",
+    ]
+    assert [turn["finishReason"] for turn in result["turns"]] == [
+        "toolUse",
+        "stop",
+        "stop",
+        "stop",
+    ]
+    assert result["toolResults"] == [
+        {"name": "echo", "content": "first"},
+        {"name": "echo", "content": "second"},
+    ]
+    texts = [
+        "".join(
+            block["text"]
+            for block in turn["content"]
+            if block["type"] == "text"
+        )
+        for turn in result["turns"]
+    ]
+    assert texts[1:] == ["4", "7", "15"]
+    assert factory.notices == []

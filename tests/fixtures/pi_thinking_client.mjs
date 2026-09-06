@@ -13,7 +13,7 @@ const secondReasoning = process.env.PI_SECOND_REASONING ?? "low";
 if (!moduleName || !baseUrl) {
   throw new Error("PI_AI_COMPAT_MODULE and PROXY_BASE_URL are required");
 }
-if (!['flow', 'probe'].includes(scenario)) {
+if (!["flow", "probe", "roundtrip"].includes(scenario)) {
   throw new Error(`unknown scenario: ${scenario}`);
 }
 if (!['openai', 'anthropic'].includes(dialect)) {
@@ -269,14 +269,20 @@ const switched = await runTurn(model(secondModelId), context, secondReasoning);
 turns.push(switched.record);
 context.messages.push(
   switched.assistant,
-  user("Return only the integer equal to five plus six."),
+  user(
+    scenario === "roundtrip"
+      ? "Return only the integer equal to seven plus eight."
+      : "Return only the integer equal to five plus six.",
+  ),
 );
-const unchanged = await runTurn(model(secondModelId), context, secondReasoning);
-turns.push(unchanged.record);
-context.messages.push(
-  unchanged.assistant,
-  user("Return only the integer equal to seven plus eight."),
-);
+if (scenario === "flow") {
+  const unchanged = await runTurn(model(secondModelId), context, secondReasoning);
+  turns.push(unchanged.record);
+  context.messages.push(
+    unchanged.assistant,
+    user("Return only the integer equal to seven plus eight."),
+  );
+}
 const switchedBack = await runTurn(firstModel, context, firstReasoning);
 turns.push(switchedBack.record);
 

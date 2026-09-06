@@ -67,6 +67,44 @@ def validate_system_message(
     return data.get("session_id")
 
 
+def validate_refusal_notice(message: SystemMessage) -> tuple[str, str]:
+    """Validate the observed no-fallback refusal discriminator and identity."""
+    data = message.data
+    keys = {
+        "type",
+        "subtype",
+        "session_id",
+        "uuid",
+        "request_id",
+        "refused_user_message_uuid",
+        "original_model",
+        "content",
+        "api_refusal_category",
+        "api_refusal_explanation",
+    }
+    if (
+        message.subtype != "model_refusal_no_fallback"
+        or not isinstance(data, Mapping)
+        or set(data) != keys
+        or data.get("type") != "system"
+        or data.get("subtype") != message.subtype
+        or data.get("api_refusal_category") != "reasoning_extraction"
+        or not isinstance(data.get("api_refusal_explanation"), str)
+        or not data["api_refusal_explanation"]
+        or any(
+            not _identifier(data.get(field))
+            for field in (
+                "session_id",
+                "uuid",
+                "request_id",
+                "refused_user_message_uuid",
+            )
+        )
+    ):
+        _fail()
+    return data["session_id"], data["api_refusal_category"]
+
+
 def validate_rate_limit_event(message: RateLimitEvent) -> object:
     info = message.rate_limit_info
     utilization = info.utilization

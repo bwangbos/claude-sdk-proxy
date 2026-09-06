@@ -44,6 +44,7 @@ from claude_sdk_proxy.images import (
 from claude_sdk_proxy.sdk_history import seed_history
 from claude_sdk_proxy.sdk_metadata import (
     validate_rate_limit_event,
+    validate_refusal_notice,
     validate_system_message,
 )
 from claude_sdk_proxy.sdk_text_protocol import (
@@ -267,6 +268,7 @@ class SdkSession:
         failure: str | None = None
         raw: RawSdkMessageValidator | None = None
         terminal_boundary: Completed | None = None
+        refusal_category: str | None = None
         prefetched: asyncio.Future[_ReceivedSdkMessage] | None = None
         try:
             if isinstance(prompt, ToolResultPrompt):
@@ -341,7 +343,11 @@ class SdkSession:
                     if not isinstance(event_type, str):
                         self._fail_protocol()
                     if event_type == "message_start":
-                        if terminal_boundary is not None or self._awaiting_submit:
+                        if (
+                            terminal_boundary is not None
+                            or self._awaiting_submit
+                            or refusal_category is not None
+                        ):
                             self._fail_protocol()
                         if self._awaiting_echo:
                             self._finish_echo()
@@ -351,18 +357,21 @@ class SdkSession:
                         )
                     if raw is None:
                         self._fail_protocol()
-                    if event_type == "content_block_start":
-                        block = event.get("content_block")
-                        if (
-                            isinstance(block, Mapping)
-                            and block.get("type") == "tool_use"
-                            and self._epoch_needs_begin
-                        ):
-                            if self._bridge is None:
-                                self._fail_protocol()
-                            await self._bridge.begin_epoch()
-                            self._epoch_needs_begin = False
-                    normalized = raw.observe(event)
+                    if refusal_category is not None:
+                        normalized = raw.observe_refusal(event, refusal_category)
+                    else:
+                        if event_type == "content_block_start":
+                            block = event.get("content_block")
+                            if (
+                                isinstance(block, Mapping)
+                                and block.get("type") == "tool_use"
+                                and self._epoch_needs_begin
+                            ):
+                                if self._bridge is None:
+                                    self._fail_protocol()
+                                await self._bridge.begin_epoch()
+                                self._epoch_needs_begin = False
+                        normalized = raw.observe(event)
                     if normalized is not None:
                         yield normalized
                     if event_type == "message_stop":
@@ -380,7 +389,11 @@ class SdkSession:
                 elif isinstance(message, AssistantMessage):
                     if raw is None or self._awaiting_echo or self._awaiting_submit:
                         self._fail_protocol()
-                    self._validate_assistant(message, raw)
+                    if refusal_category is None:
+                        self._validate_assistant(message, raw)
+                    else:
+                        self._observe_session_id(message.session_id)
+                        raw.validate_refusal_assistant(message)
                 elif isinstance(message, ResultMessage):
                     if (
                         raw is None
@@ -392,7 +405,12 @@ class SdkSession:
                     self._observe_session_id(message.session_id)
                     if type(message.is_error) is not bool:
                         self._fail_protocol()
-                    if message.is_error is True:
+                    if refusal_category is not None:
+                        self._validate_refusal_result(
+                            message, terminal_boundary.stop_reason
+                        )
+                        completed = terminal_boundary
+                    elif message.is_error is True:
                         failure = "Agent SDK query failed"
                     else:
                         self._validate_result(message, terminal_boundary.stop_reason)
@@ -401,6 +419,20 @@ class SdkSession:
                     if self._awaiting_submit or (
                         self._awaiting_echo and message.subtype != "status"
                     ):
+                        self._fail_protocol()
+                    if message.subtype == "model_refusal_no_fallback":
+                        if (
+                            raw is None
+                            or terminal_boundary is not None
+                            or refusal_category is not None
+                            or not raw.can_begin_refusal
+                            or self._awaiting_echo
+                        ):
+                            self._fail_protocol()
+                        session_id, refusal_category = validate_refusal_notice(message)
+                        self._observe_session_id(session_id)
+                        continue
+                    if refusal_category is not None:
                         self._fail_protocol()
                     if message.subtype == "thinking_tokens" and (
                         raw is None or not raw.thinking_active
@@ -414,7 +446,7 @@ class SdkSession:
                         )
                     )
                 elif isinstance(message, RateLimitEvent):
-                    if self._awaiting_submit:
+                    if self._awaiting_submit or refusal_category is not None:
                         self._fail_protocol()
                     self._observe_session_id(validate_rate_limit_event(message))
                 elif type(message) is UserMessage:
@@ -482,6 +514,28 @@ class SdkSession:
         usage = normalize_usage(message.usage, USAGE_FIELDS)
         del usage
         if message.stop_reason != boundary_stop_reason:
+            self._fail_protocol()
+
+    def _validate_refusal_result(
+        self, message: ResultMessage, boundary_stop_reason: object
+    ) -> None:
+        if (
+            message.subtype != "success"
+            or message.is_error is not True
+            or message.stop_reason != "refusal"
+            or boundary_stop_reason != "refusal"
+            or message.deferred_tool_use is not None
+            or message.permission_denials not in (None, [])
+            or message.errors not in (None, [])
+            or message.api_error_status is not None
+            or message.terminal_reason != "api_error"
+        ):
+            self._fail_protocol()
+        origin = message.origin
+        if origin is not None and not self._human_origin(origin):
+            self._fail_protocol()
+        usage = normalize_usage(message.usage, USAGE_FIELDS)
+        if usage is None or "output_tokens" not in usage:
             self._fail_protocol()
 
     def _validate_assistant(

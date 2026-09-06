@@ -96,6 +96,7 @@ class RawSdkMessageValidator:
         self._latest_output_tokens: int | None = None
         self.stop_reason: str | None = None
         self._allow_seeded_history = allow_seeded_history
+        self._refusal_diagnostic = False
 
     def observe(
         self, event: Mapping[str, Any]
@@ -273,6 +274,52 @@ class RawSdkMessageValidator:
             self._reconcile_usage(usage)
             if "output_tokens" in usage:
                 self._latest_output_tokens = usage["output_tokens"]
+
+    @property
+    def can_begin_refusal(self) -> bool:
+        return (
+            self._phase == "block_start"
+            and not self._blocks
+            and self._current is None
+            and self._assistant_mode is None
+            and not self._refusal_diagnostic
+        )
+
+    def validate_refusal_assistant(self, message: AssistantMessage) -> None:
+        content = message.content
+        usage = normalize_usage(message.usage, USAGE_FIELDS)
+        if (
+            not self.can_begin_refusal
+            or message.parent_tool_use_id is not None
+            or message.model != "<synthetic>"
+            or message.error != "invalid_request"
+            or message.stop_reason != "refusal"
+            or not isinstance(content, list)
+            or len(content) != 1
+            or type(content[0]) is not TextBlock
+            or not isinstance(content[0].text, str)
+            or not content[0].text
+            or usage is None
+            or "input_tokens" not in usage
+            or "output_tokens" not in usage
+            or any(value != 0 for value in usage.values())
+        ):
+            fail_protocol()
+        self._refusal_diagnostic = True
+
+    def observe_refusal(
+        self, event: Mapping[str, Any], category: str
+    ) -> InputUsage | TextDelta | ThinkingDelta | ThinkingCompleted | None:
+        event_type = event.get("type")
+        if not self._refusal_diagnostic:
+            fail_protocol()
+        if event_type == "message_delta":
+            self._refusal_message_delta(event, category)
+            return None
+        if event_type == "message_stop":
+            self._message_stop(event)
+            return None
+        fail_protocol()
 
     def _message_start(self, event: Mapping[str, Any]) -> InputUsage:
         if self._phase != "message_start":
@@ -518,6 +565,43 @@ class RawSdkMessageValidator:
             fail_protocol()
         self._reconcile_usage(usage)
         self.stop_reason = cast(str, delta["stop_reason"])
+        self.output_tokens = usage["output_tokens"]
+        self._phase = "message_stop"
+
+    def _refusal_message_delta(
+        self, event: Mapping[str, Any], category: str
+    ) -> None:
+        if self._phase != "block_start" or self._blocks or self._current is not None:
+            fail_protocol()
+        self._require_keys(event, {"type", "delta", "usage", "context_management"})
+        delta = event.get("delta")
+        if (
+            not isinstance(delta, Mapping)
+            or set(delta) != {"stop_reason", "stop_sequence", "stop_details"}
+            or delta.get("stop_reason") != "refusal"
+            or delta.get("stop_sequence") is not None
+        ):
+            fail_protocol()
+        details = delta.get("stop_details")
+        if (
+            not isinstance(details, Mapping)
+            or set(details)
+            != {"type", "category", "explanation", "fallback_has_prefill_claim"}
+            or details.get("type") != "refusal"
+            or details.get("category") != category
+            or not isinstance(details.get("explanation"), str)
+            or not details["explanation"]
+            or details.get("fallback_has_prefill_claim") is not False
+        ):
+            fail_protocol()
+        context = event.get("context_management")
+        if not isinstance(context, Mapping) or dict(context) != {"applied_edits": []}:
+            fail_protocol()
+        usage = normalize_usage(event.get("usage"), USAGE_FIELDS)
+        if usage is None or usage.get("output_tokens") != 0:
+            fail_protocol()
+        self._reconcile_usage(usage)
+        self.stop_reason = "refusal"
         self.output_tokens = usage["output_tokens"]
         self._phase = "message_stop"
 

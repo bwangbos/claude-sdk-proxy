@@ -220,3 +220,44 @@ async def test_real_pi_preserves_thinking_through_tool_replay_and_switches_setti
             "thinking": "reason-0",
             "signature": "sig-0",
         }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("dialect", ["openai", "anthropic"])
+async def test_real_pi_roundtrips_model_and_thinking_settings_without_header(
+    tmp_path: Path, dialect: str
+) -> None:
+    """Isolate the bidirectional switch from a second unchanged Opus turn."""
+    factory = PiThinkingSessionFactory(tmp_path)
+    app = create_app(models=("sonnet", "opus"), session_factory=factory)
+
+    async with serve(app) as base_url:
+        result = await run_pi_thinking(base_url, dialect, scenario="roundtrip")
+
+    assert result["customSessionHeaders"] == []
+    assert [turn["finishReason"] for turn in result["turns"]] == [
+        "toolUse",
+        "stop",
+        "stop",
+        "stop",
+    ]
+    assert result["turns"][3]["content"] == [
+        {"type": "text", "text": "PI_SWITCH_BACK_DONE"}
+    ]
+    assert result["toolResults"] == [
+        {"name": "echo", "content": "first"},
+        {"name": "echo", "content": "second"},
+    ]
+    assert factory.models == ["sonnet", "opus", "sonnet"]
+    assert [client.options.effort for client in factory.clients] == [
+        "high",
+        "low",
+        "high",
+    ]
+    assert [client.disconnect_count for client in factory.clients] == [1, 1, 1]
+    assert [payload["model"] for payload in result["requestPayloads"]] == [
+        "sonnet",
+        "sonnet",
+        "opus",
+        "sonnet",
+    ]
