@@ -48,11 +48,10 @@ from claude_sdk_proxy.sdk_metadata import (
 )
 from claude_sdk_proxy.sdk_text_protocol import (
     USAGE_FIELDS,
-    RawTextEventValidator,
     fail_protocol,
     normalize_usage,
 )
-from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator, RawToolCall
 from claude_sdk_proxy.thinking import ThinkingOptions
 from claude_sdk_proxy.tool_bridge import ToolBridge, ToolInvocation
 from claude_sdk_proxy.tool_contract import (
@@ -266,7 +265,7 @@ class SdkSession:
             raise BackendFailure("Agent SDK query failed")
         completed: Completed | None = None
         failure: str | None = None
-        raw: RawTextEventValidator | RawSdkMessageValidator | None = None
+        raw: RawSdkMessageValidator | None = None
         terminal_boundary: Completed | None = None
         prefetched: asyncio.Future[_ReceivedSdkMessage] | None = None
         try:
@@ -346,15 +345,9 @@ class SdkSession:
                             self._fail_protocol()
                         if self._awaiting_echo:
                             self._finish_echo()
-                        raw = (
-                            RawSdkMessageValidator(
-                                self._tools,
-                                allow_seeded_history=bool(self._history),
-                            )
-                            if self._bridge is not None
-                            else RawTextEventValidator(
-                                allow_seeded_history=bool(self._history)
-                            )
+                        raw = RawSdkMessageValidator(
+                            self._tools,
+                            allow_seeded_history=bool(self._history),
                         )
                     if raw is None:
                         self._fail_protocol()
@@ -373,15 +366,10 @@ class SdkSession:
                     if normalized is not None:
                         yield normalized
                     if event_type == "message_stop":
-                        if isinstance(raw, RawSdkMessageValidator):
-                            if not raw.complete:
-                                self._fail_protocol()
-                            boundary = Completed(raw.stop_reason, raw.boundary_usage)
-                        else:
-                            boundary = Completed(
-                                raw.stop_reason, self._text_boundary_usage(raw)
-                            )
-                        if isinstance(raw, RawSdkMessageValidator) and raw.has_tools:
+                        if not raw.complete:
+                            self._fail_protocol()
+                        boundary = Completed(raw.stop_reason, raw.boundary_usage)
+                        if raw.has_tools:
                             public_events, prefetched = await self._tool_boundary(
                                 raw, response
                             )
@@ -495,7 +483,7 @@ class SdkSession:
     def _validate_assistant(
         self,
         message: AssistantMessage,
-        raw: RawTextEventValidator | RawSdkMessageValidator,
+        raw: RawSdkMessageValidator,
     ) -> None:
         if message.session_id is not None:
             self._observe_session_id(message.session_id)
@@ -522,14 +510,18 @@ class SdkSession:
             self._fail_protocol()
         self._tool_epoch += 1
         self._awaiting_submit = True
+        public_calls = {
+            call.internal_id: ToolCall(
+                invocation.public_id, invocation.name, invocation.arguments
+            )
+            for call, invocation in zip(calls, invocations, strict=True)
+        }
         events: tuple[ConversationEvent, ...] = (
             *(
-                ToolCall(
-                    invocation.public_id,
-                    invocation.name,
-                    invocation.arguments,
-                )
-                for invocation in invocations
+                public_calls[event.internal_id]
+                if isinstance(event, RawToolCall)
+                else event
+                for event in raw.tool_suffix
             ),
             Completed("tool_use", raw.boundary_usage),
         )
@@ -596,10 +588,6 @@ class SdkSession:
         if self._awaiting_echo:
             return "awaiting_echo", self._tool_epoch
         return "generation", self._tool_epoch
-
-    @staticmethod
-    def _text_boundary_usage(raw: RawTextEventValidator) -> dict[str, int]:
-        return raw.boundary_usage
 
     def _observe_result_echo(self, message: UserMessage) -> None:
         if (

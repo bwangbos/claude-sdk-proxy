@@ -34,11 +34,14 @@ from claude_sdk_proxy.domain import (
     BackendFailure,
     Completed,
     InputUsage,
+    RedactedThinkingBlock,
     RequestValidationError,
     SdkSessionFactory,
     TextBlock,
     TextDelta,
     TextRequest,
+    ThinkingBlock,
+    ThinkingCompleted,
     ToolCall,
 )
 from claude_sdk_proxy.http_errors import error_detail, error_response
@@ -198,42 +201,42 @@ async def _stream_response(
     if dialect == "openai":
         openai_state = OpenAIStreamState()
         stream_response = EventStreamResponse(
-                lease,
-                stream,
-                first,
-                encode_openai_start(request_id, request.model, created=created),
-                lambda event: encode_openai_event(
-                    request_id,
-                    request.model,
-                    event,
-                    request.include_usage,
-                    openai_state,
-                    created=created,
-                ),
-                lambda error: encode_openai_error(
-                    error_detail(error).code, error_detail(error).message
-                ),
-            )
-        return cast(Response, monitor.wrap(stream_response))
-    anthropic_state = AnthropicStreamState()
-    stream_response = EventStreamResponse(
             lease,
             stream,
             first,
-            encode_anthropic_start(
+            encode_openai_start(request_id, request.model, created=created),
+            lambda event: encode_openai_event(
                 request_id,
                 request.model,
-                first if isinstance(first, InputUsage) else 0,
-                request.tools,
-                anthropic_state,
+                event,
+                request.include_usage,
+                openai_state,
+                created=created,
             ),
-            lambda event: encode_anthropic_event(
-                request_id, request.model, event, state=anthropic_state
-            ),
-            lambda error: encode_anthropic_error(
+            lambda error: encode_openai_error(
                 error_detail(error).code, error_detail(error).message
             ),
         )
+        return cast(Response, monitor.wrap(stream_response))
+    anthropic_state = AnthropicStreamState(lazy_blocks=True)
+    stream_response = EventStreamResponse(
+        lease,
+        stream,
+        first,
+        encode_anthropic_start(
+            request_id,
+            request.model,
+            first if isinstance(first, InputUsage) else 0,
+            request.tools,
+            anthropic_state,
+        ),
+        lambda event: encode_anthropic_event(
+            request_id, request.model, event, state=anthropic_state
+        ),
+        lambda error: encode_anthropic_error(
+            error_detail(error).code, error_detail(error).message
+        ),
+    )
     return cast(Response, monitor.wrap(stream_response))
 
 
@@ -246,7 +249,7 @@ async def _nonstream_response(
     created: int,
 ) -> Response:
     stream = cast(ClosableEventStream, lease.stream())
-    blocks: list[TextBlock | ToolCall] = []
+    blocks: list[TextBlock | ToolCall | ThinkingBlock | RedactedThinkingBlock] = []
     completed: Completed | None = None
     try:
         async for event in stream:
@@ -257,6 +260,8 @@ async def _nonstream_response(
                     blocks.append(TextBlock(event.text))
             elif isinstance(event, ToolCall):
                 blocks.append(event)
+            elif isinstance(event, ThinkingCompleted):
+                blocks.append(event.block)
             elif isinstance(event, Completed):
                 completed = event
     except asyncio.CancelledError:
@@ -277,11 +282,7 @@ async def _nonstream_response(
         await abort_best_effort(lease)
         response = error_response(dialect, BackendFailure("missing completion"))
         return cast(Response, monitor.wrap(response))
-    rendered = (
-        tuple(blocks)
-        if request.tools
-        else "".join(block.text for block in blocks if isinstance(block, TextBlock))
-    )
+    rendered = tuple(blocks) if blocks or request.tools else (TextBlock(""),)
     payload = (
         render_openai_response(
             request_id,

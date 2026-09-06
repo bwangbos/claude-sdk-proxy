@@ -26,6 +26,33 @@ class TextBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class ThinkingBlock:
+    thinking: str
+    signature: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.thinking, str)
+            or not isinstance(self.signature, str)
+            or not self.signature
+        ):
+            raise RequestValidationError(
+                "messages", "thinking requires text and a nonempty signature"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class RedactedThinkingBlock:
+    data: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, str) or not self.data:
+            raise RequestValidationError(
+                "messages", "redacted thinking requires nonempty data"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ImageBlock:
     media_type: str
     data: str
@@ -74,7 +101,14 @@ class ToolResultPrompt:
     results: tuple[ToolResultBlock, ...]
 
 
-type CanonicalBlock = TextBlock | ImageBlock | ToolCallBlock | ToolResultBlock
+type CanonicalBlock = (
+    TextBlock
+    | ImageBlock
+    | ToolCallBlock
+    | ToolResultBlock
+    | ThinkingBlock
+    | RedactedThinkingBlock
+)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -146,6 +180,18 @@ class CanonicalRequest:
 @dataclass(frozen=True, slots=True)
 class TextDelta:
     text: str
+
+
+@dataclass(frozen=True, slots=True)
+class ThinkingDelta:
+    index: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class ThinkingCompleted:
+    index: int
+    block: ThinkingBlock | RedactedThinkingBlock
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,7 +307,16 @@ class TextRequest:
                     )
             else:
                 if any(isinstance(item, ToolResultBlock) for item in blocks) or any(
-                    not isinstance(item, (TextBlock, ToolCallBlock)) for item in blocks
+                    not isinstance(
+                        item,
+                        (
+                            TextBlock,
+                            ToolCallBlock,
+                            ThinkingBlock,
+                            RedactedThinkingBlock,
+                        ),
+                    )
+                    for item in blocks
                 ):
                     raise RequestValidationError(
                         "messages", "assistant blocks are invalid"
@@ -278,6 +333,9 @@ class TextRequest:
                 if (
                     all(isinstance(item, TextBlock) for item in blocks)
                     and not message.require_text()
+                    # A reasoning-only completion has no OpenAI answer text;
+                    # its public replay remains valid even without metadata.
+                    and self.dialect != "openai"
                 ):
                     raise ValueError("message content must not be empty")
                 normalized_messages.append(message)
@@ -319,15 +377,15 @@ def _valid_public_id(value: object) -> bool:
     )
 
 
-type ConversationEvent = InputUsage | TextDelta | ToolCall | Completed
+type ConversationEvent = (
+    InputUsage | TextDelta | ThinkingDelta | ThinkingCompleted | ToolCall | Completed
+)
 
 
 class SdkSessionProtocol(Protocol):
     async def start(self) -> None: ...
     def stream_generation(self, prompt: Prompt) -> AsyncIterator[ConversationEvent]: ...
-    async def submit_tool_results(
-        self, results: Iterable[ToolResultBlock]
-    ) -> None: ...
+    async def submit_tool_results(self, results: Iterable[ToolResultBlock]) -> None: ...
     async def wait_failure(self) -> None: ...
     async def close(self) -> None: ...
 

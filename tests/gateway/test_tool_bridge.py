@@ -492,7 +492,7 @@ async def test_over_depth_generated_arguments_are_redacted_protocol_failure() ->
 
 
 @pytest.mark.anyio
-async def test_seal_epoch_returns_exact_entries_in_handler_order() -> None:
+async def test_seal_epoch_returns_exact_entries_in_raw_order() -> None:
     bridge = ToolBridge(
         (echo_definition(),),
         dialect="openai",
@@ -508,9 +508,9 @@ async def test_seal_epoch_returns_exact_entries_in_handler_order() -> None:
     sealed = await bridge.seal_epoch(
         (ToolCall("raw_2", "echo", {"v": 2}), ToolCall("raw_1", "echo", {"v": 1}))
     )
-    first, second = sealed
+    second, first = sealed
 
-    assert [item.arguments for item in sealed] == [{"v": 1}, {"v": 2}]
+    assert [item.arguments for item in sealed] == [{"v": 2}, {"v": 1}]
     bridge.resolve(
         (
             ToolResultBlock(first.public_id, ("one",), False),

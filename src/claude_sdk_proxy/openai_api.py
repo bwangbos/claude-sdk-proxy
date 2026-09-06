@@ -9,10 +9,14 @@ from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     InputUsage,
+    RedactedThinkingBlock,
     RequestValidationError,
     TextBlock,
     TextDelta,
     TextRequest,
+    ThinkingBlock,
+    ThinkingCompleted,
+    ThinkingDelta,
     ToolCall,
 )
 from claude_sdk_proxy.openai_tools import (
@@ -109,7 +113,8 @@ def parse_openai_request(
 def render_openai_response(
     request_id: str,
     model: str,
-    blocks: str | tuple[TextBlock | ToolCall, ...],
+    blocks: str
+    | tuple[TextBlock | ToolCall | ThinkingBlock | RedactedThinkingBlock, ...],
     completed: Completed,
     *,
     created: int = 0,
@@ -158,6 +163,19 @@ def encode_openai_event(
 ) -> tuple[bytes, ...]:
     if isinstance(event, InputUsage):
         return ()
+    if isinstance(event, ThinkingCompleted):
+        return ()
+    if isinstance(event, ThinkingDelta):
+        return (
+            _sse(
+                _chunk(
+                    request_id,
+                    model,
+                    {"reasoning_content": event.text},
+                    created=created,
+                )
+            ),
+        )
     if isinstance(event, TextDelta):
         return (
             _sse(_chunk(request_id, model, {"content": event.text}, created=created)),
@@ -310,13 +328,18 @@ def _openai_usage(usage: Mapping[str, Any] | None) -> dict[str, object]:
 
 
 def _response_message(
-    blocks: tuple[TextBlock | ToolCall, ...],
+    blocks: tuple[TextBlock | ToolCall | ThinkingBlock | RedactedThinkingBlock, ...],
 ) -> dict[str, object]:
     text: list[str] = []
+    thinking: list[str] = []
     calls: list[dict[str, object]] = []
     for block in blocks:
         if isinstance(block, TextBlock):
             text.append(block.text)
+        elif isinstance(block, ThinkingBlock):
+            thinking.append(block.thinking)
+        elif isinstance(block, RedactedThinkingBlock):
+            continue
         elif isinstance(block, ToolCall):
             calls.append(
                 {
@@ -335,6 +358,8 @@ def _response_message(
         message["content"] = None
     if calls:
         message["tool_calls"] = calls
+    if thinking:
+        message["reasoning_content"] = "".join(thinking)
     return message
 
 

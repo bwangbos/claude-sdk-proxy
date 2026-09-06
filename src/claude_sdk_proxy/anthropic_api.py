@@ -15,10 +15,14 @@ from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     InputUsage,
+    RedactedThinkingBlock,
     RequestValidationError,
     TextBlock,
     TextDelta,
     TextRequest,
+    ThinkingBlock,
+    ThinkingCompleted,
+    ThinkingDelta,
     ToolCall,
     ToolDefinition,
 )
@@ -55,6 +59,8 @@ class AnthropicStreamState:
     tools_enabled: bool = False
     open_text_index: int | None = None
     next_block_index: int = 0
+    lazy_blocks: bool = False
+    open_thinking_index: int | None = None
 
 
 def parse_anthropic_request(
@@ -76,10 +82,7 @@ def parse_anthropic_request(
     max_tokens = body.get("max_tokens")
     if type(max_tokens) is not int or max_tokens <= 0:
         raise RequestValidationError("max_tokens", "must be a positive integer")
-    if (
-        thinking.budget_tokens is not None
-        and thinking.budget_tokens >= max_tokens
-    ):
+    if thinking.budget_tokens is not None and thinking.budget_tokens >= max_tokens:
         raise RequestValidationError(
             "thinking", "budget_tokens must be less than max_tokens"
         )
@@ -107,7 +110,8 @@ def parse_anthropic_request(
 def render_anthropic_response(
     request_id: str,
     model: str,
-    blocks: str | tuple[TextBlock | ToolCall, ...],
+    blocks: str
+    | tuple[TextBlock | ToolCall | ThinkingBlock | RedactedThinkingBlock, ...],
     completed: Completed,
 ) -> dict[str, object]:
     normalized = (TextBlock(blocks),) if isinstance(blocks, str) else blocks
@@ -130,7 +134,7 @@ def encode_anthropic_start(
     tools: tuple[ToolDefinition, ...] = (),
     state: AnthropicStreamState | None = None,
 ) -> tuple[bytes, ...]:
-    tools_enabled = bool(tools)
+    tools_enabled = bool(tools) or (state is not None and state.lazy_blocks)
     if state is not None:
         state.tools_enabled = tools_enabled
         state.open_text_index = None if tools_enabled else 0
@@ -172,9 +176,65 @@ def encode_anthropic_event(
     enabled = state is not None and state.tools_enabled
     if isinstance(event, InputUsage):
         return ()
+    if isinstance(event, (ThinkingDelta, ThinkingCompleted)):
+        if state is None:
+            raise ValueError("thinking streaming requires block state")
+        chunks: list[bytes] = []
+        if state.open_text_index is not None:
+            chunks.append(_content_block_stop(state.open_text_index))
+            state.open_text_index = None
+        if state.open_thinking_index is None:
+            state.open_thinking_index = state.next_block_index
+            state.next_block_index += 1
+            block = event.block if isinstance(event, ThinkingCompleted) else None
+            content = (
+                _response_block(block)
+                if isinstance(block, RedactedThinkingBlock)
+                else {"type": "thinking", "thinking": "", "signature": ""}
+            )
+            chunks.append(
+                _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": state.open_thinking_index,
+                        "content_block": content,
+                    },
+                )
+            )
+        index = state.open_thinking_index
+        if isinstance(event, ThinkingDelta):
+            chunks.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "thinking_delta", "thinking": event.text},
+                    },
+                )
+            )
+        else:
+            if isinstance(event.block, ThinkingBlock):
+                chunks.append(
+                    _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": event.block.signature,
+                            },
+                        },
+                    )
+                )
+            chunks.append(_content_block_stop(index))
+            state.open_thinking_index = None
+        return tuple(chunks)
     if isinstance(event, TextDelta):
         if enabled:
-            chunks: list[bytes] = []
+            chunks = []
             assert state is not None
             if state.open_text_index is None:
                 state.open_text_index = state.next_block_index
@@ -261,9 +321,19 @@ def _input_usage(usage: InputUsage) -> dict[str, int]:
     return normalized
 
 
-def _response_block(block: TextBlock | ToolCall) -> dict[str, object]:
+def _response_block(
+    block: TextBlock | ToolCall | ThinkingBlock | RedactedThinkingBlock,
+) -> dict[str, object]:
     if isinstance(block, TextBlock):
         return {"type": "text", "text": block.text}
+    if isinstance(block, ThinkingBlock):
+        return {
+            "type": "thinking",
+            "thinking": block.thinking,
+            "signature": block.signature,
+        }
+    if isinstance(block, RedactedThinkingBlock):
+        return {"type": "redacted_thinking", "data": block.data}
     if isinstance(block, ToolCall):
         return {
             "type": "tool_use",

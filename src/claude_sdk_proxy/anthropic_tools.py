@@ -8,9 +8,11 @@ from claude_sdk_proxy.domain import (
     CanonicalBlock,
     CanonicalMessage,
     ImageBlock,
+    RedactedThinkingBlock,
     RequestValidationError,
     Role,
     TextBlock,
+    ThinkingBlock,
     ToolCallBlock,
     ToolDefinition,
     ToolResultBlock,
@@ -148,6 +150,24 @@ def _parse_block(raw: object, role: Role) -> CanonicalBlock:
         raise RequestValidationError("messages", "content blocks must be objects")
     raw = without_cache_hint(raw)
     kind = raw.get("type")
+    if kind in {"thinking", "redacted_thinking"}:
+        if role != "assistant":
+            raise RequestValidationError(
+                "messages", "thinking blocks require assistant"
+            )
+        if kind == "thinking":
+            if set(raw) != {"type", "thinking", "signature"}:
+                raise RequestValidationError(
+                    "messages", "thinking block fields are invalid"
+                )
+            return ThinkingBlock(
+                cast(str, raw["thinking"]), cast(str, raw["signature"])
+            )
+        if set(raw) != {"type", "data"}:
+            raise RequestValidationError(
+                "messages", "redacted thinking block fields are invalid"
+            )
+        return RedactedThinkingBlock(cast(str, raw["data"]))
     if kind == "image" and role == "user":
         return anthropic_image(raw)
     if kind == "text":

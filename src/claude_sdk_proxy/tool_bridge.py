@@ -288,7 +288,13 @@ class ToolBridge:
 
         self._epoch_sealed = True
         self._epoch_verified = True
-        return tuple(self._epoch_invocations)
+        # Callback arrival order need not match native content-block order.
+        # Publish the validated bijection in raw order so reasoning can remain
+        # interleaved with the corresponding public tool calls.
+        return tuple(
+            self._pending_by_internal[internal_id].invocation
+            for internal_id in expected_ids
+        )
 
     async def wait_epoch_complete(self) -> None:
         """Wait until every sealed raw call has returned through its callback."""

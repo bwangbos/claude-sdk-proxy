@@ -21,7 +21,8 @@ from claude_sdk_proxy.images import openai_image
 _FUNCTION_TOOL_FIELDS = {"type", "function"}
 _FUNCTION_FIELDS = {"name", "description", "parameters"}
 _MESSAGE_FIELDS = {"role", "content"}
-_ASSISTANT_FIELDS = _MESSAGE_FIELDS | {"tool_calls"}
+_REASONING_FIELDS = {"reasoning_content", "reasoning", "reasoning_text"}
+_ASSISTANT_FIELDS = _MESSAGE_FIELDS | {"tool_calls"} | _REASONING_FIELDS
 _TOOL_MESSAGE_FIELDS = {"role", "tool_call_id", "content"}
 _TOOL_CALL_FIELDS = {"id", "type", "function"}
 _TOOL_CALL_FUNCTION_FIELDS = {"name", "arguments"}
@@ -181,6 +182,13 @@ def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
     }
     if set(raw) - _ASSISTANT_FIELDS:
         raise _message_field_error(raw)
+    for field in _REASONING_FIELDS:
+        if raw.get(field) is not None and not isinstance(raw[field], str):
+            raise RequestValidationError(
+                "messages", "reasoning metadata must be a string or null"
+            )
+    # Pi replays these unsigned fields. They are display metadata, not native
+    # signed thinking and not answer text; leave them out of canonical history.
     calls = raw.get("tool_calls")
     if calls is None:
         return CanonicalMessage("assistant", _assistant_text(raw))
@@ -203,6 +211,8 @@ def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
 
 def _assistant_text(raw: Mapping[str, object]) -> str:
     content = raw.get("content")
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):

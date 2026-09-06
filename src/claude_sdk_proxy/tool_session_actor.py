@@ -7,6 +7,7 @@ from enum import Enum, auto
 
 from claude_sdk_proxy.domain import (
     BackendFailure,
+    CanonicalBlock,
     CanonicalMessage,
     Completed,
     ConversationEvent,
@@ -15,6 +16,7 @@ from claude_sdk_proxy.domain import (
     TextBlock,
     TextDelta,
     TextRequest,
+    ThinkingCompleted,
     ToolCall,
     ToolCallBlock,
     ToolDefinition,
@@ -106,8 +108,7 @@ class ToolSessionActor:
     @property
     def evictable(self) -> bool:
         return (
-            self.in_flight_fingerprint is None
-            and self.state is ToolSessionState.READY
+            self.in_flight_fingerprint is None and self.state is ToolSessionState.READY
         )
 
     def mark_started(self) -> None:
@@ -152,7 +153,7 @@ class ToolSessionActor:
         if ids != self.pending_call_ids:
             raise SessionMismatch("tool results do not match pending calls")
         response.durable = True
-        self.transcript = request.messages
+        self.transcript += request.messages[-1:]
         self.replay.clear()
         self._current = response
         self.state = ToolSessionState.GENERATING
@@ -183,6 +184,7 @@ class ToolSessionActor:
                 self._started = True
             stream = self.backend.stream_generation(prompt)
             events: list[ConversationEvent] = []
+            tool_suffix_started = False
             while True:
                 event = await self._next_event(stream)
                 events.append(event)
@@ -190,14 +192,16 @@ class ToolSessionActor:
                 if response is None:
                     raise RuntimeError("tool generation has no response sink")
                 if not isinstance(event, (ToolCall, Completed)):
-                    if not response.detached:
+                    if not response.detached and not tool_suffix_started:
                         response.queue.put_nowait(event)
                     continue
                 if isinstance(event, ToolCall):
+                    tool_suffix_started = True
                     continue
                 if event.stop_reason == "tool_use":
                     await self._commit_tool_boundary(response, tuple(events))
                     events = []
+                    tool_suffix_started = False
                     if not await self._wait_for_results():
                         return
                     continue
@@ -234,7 +238,9 @@ class ToolSessionActor:
         async with self._lock:
             if self.state is not ToolSessionState.GENERATING:
                 raise RuntimeError("tool session is not generating")
-            self.transcript = response.request.messages + (assistant,)
+            self.transcript += response.request.messages[len(self.transcript) :] + (
+                assistant,
+            )
             self.replay.clear()
             self.replay[response.fingerprint] = events
             self.in_flight_fingerprint = None
@@ -246,8 +252,11 @@ class ToolSessionActor:
             self._resume.clear()
             response.durable = True
             if not response.detached:
+                suffix_started = False
                 for event in events:
-                    if isinstance(event, (ToolCall, Completed)):
+                    if isinstance(event, ToolCall):
+                        suffix_started = True
+                    if suffix_started:
                         response.queue.put_nowait(event)
                 response.queue.put_nowait(STREAM_END)
 
@@ -258,7 +267,9 @@ class ToolSessionActor:
         async with self._lock:
             if self.state is not ToolSessionState.GENERATING:
                 raise RuntimeError("tool session is not generating")
-            self.transcript = response.request.messages + (assistant,)
+            self.transcript += response.request.messages[len(self.transcript) :] + (
+                assistant,
+            )
             self.replay.clear()
             self.replay[response.fingerprint] = events
             self.in_flight_fingerprint = None
@@ -386,15 +397,17 @@ class ToolSessionActor:
 
 
 def _assistant_message(events: tuple[ConversationEvent, ...]) -> CanonicalMessage:
-    blocks: list[TextBlock | ToolCallBlock] = []
-    text = "".join(event.text for event in events if isinstance(event, TextDelta))
-    if text:
-        blocks.append(TextBlock(text))
-    blocks.extend(
-        ToolCallBlock(event.id, event.name, event.arguments)
-        for event in events
-        if isinstance(event, ToolCall)
-    )
+    blocks: list[CanonicalBlock] = []
+    for event in events:
+        if isinstance(event, TextDelta):
+            if blocks and isinstance(blocks[-1], TextBlock):
+                blocks[-1] = TextBlock(blocks[-1].text + event.text)
+            else:
+                blocks.append(TextBlock(event.text))
+        elif isinstance(event, ThinkingCompleted):
+            blocks.append(event.block)
+        elif isinstance(event, ToolCall):
+            blocks.append(ToolCallBlock(event.id, event.name, event.arguments))
     if not blocks:
         raise BackendFailure("Agent SDK query failed")
     return CanonicalMessage("assistant", tuple(blocks))

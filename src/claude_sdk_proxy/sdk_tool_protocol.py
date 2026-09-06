@@ -3,12 +3,22 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Any, cast
 
 from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
+from claude_agent_sdk import ThinkingBlock as SdkThinkingBlock
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
-from claude_sdk_proxy.domain import InputUsage, TextDelta, ToolDefinition
+from claude_sdk_proxy.domain import (
+    InputUsage,
+    RedactedThinkingBlock,
+    TextDelta,
+    ThinkingBlock,
+    ThinkingCompleted,
+    ThinkingDelta,
+    ToolDefinition,
+)
 from claude_sdk_proxy.sdk_text_protocol import (
     USAGE_FIELDS,
     fail_protocol,
@@ -49,6 +59,11 @@ class _RawBlock:
     json_chars: int = 0
     arguments: Mapping[str, JsonValue] | None = None
     saw_delta: bool = False
+    signature: str = ""
+    data: str = ""
+    reasoning_events: list[ThinkingDelta | ThinkingCompleted] = dataclass_field(
+        default_factory=list
+    )
 
 
 class RawSdkMessageValidator:
@@ -82,7 +97,9 @@ class RawSdkMessageValidator:
         self.stop_reason: str | None = None
         self._allow_seeded_history = allow_seeded_history
 
-    def observe(self, event: Mapping[str, Any]) -> InputUsage | TextDelta | None:
+    def observe(
+        self, event: Mapping[str, Any]
+    ) -> InputUsage | TextDelta | ThinkingDelta | ThinkingCompleted | None:
         event_type = event.get("type")
         if event_type == "message_start":
             return self._message_start(event)
@@ -92,8 +109,7 @@ class RawSdkMessageValidator:
         if event_type == "content_block_delta":
             return self._block_delta(event)
         if event_type == "content_block_stop":
-            self._block_stop(event)
-            return None
+            return self._block_stop(event)
         if event_type == "message_delta":
             self._message_delta(event)
             return None
@@ -139,6 +155,22 @@ class RawSdkMessageValidator:
             )
         return tuple(calls)
 
+    @property
+    def tool_suffix(
+        self,
+    ) -> tuple[RawToolCall | ThinkingDelta | ThinkingCompleted, ...]:
+        """Raw-order suffix, published only after all tool callbacks are sealed."""
+        calls = iter(self.tool_calls)
+        events: list[RawToolCall | ThinkingDelta | ThinkingCompleted] = []
+        started = False
+        for block in self._blocks:
+            if block.kind == "tool_use":
+                started = True
+                events.append(next(calls))
+            elif started:
+                events.extend(block.reasoning_events)
+        return tuple(events)
+
     def validate_assistant(self, message: AssistantMessage) -> None:
         if (
             message.parent_tool_use_id is not None
@@ -147,6 +179,20 @@ class RawSdkMessageValidator:
             or not isinstance(message.content, list)
         ):
             fail_protocol()
+        content = message.content
+        # Preserve the legacy text-only SDK projection: multiple typed text
+        # pieces can describe a single raw text block when no tools are enabled.
+        if (
+            not self._public_names
+            and self._current is not None
+            and self._current.kind == "text"
+            and content
+            and all(type(block) is TextBlock for block in content)
+        ):
+            text_blocks = cast(list[TextBlock], content)
+            if any(not isinstance(block.text, str) for block in text_blocks):
+                fail_protocol()
+            content = [TextBlock("".join(block.text for block in text_blocks))]
         raw_blocks: list[_RawBlock]
         raw_indices: tuple[int, ...]
         if self._phase == "block_delta":
@@ -156,7 +202,8 @@ class RawSdkMessageValidator:
                 or self._current is None
                 or not self._current.saw_delta
                 or current_index in self._assistant_validated_blocks
-                or len(message.content) != 1
+                or len(content)
+                != (0 if self._current.kind == "redacted_thinking" else 1)
             ):
                 fail_protocol()
             self._assistant_mode = "per_block"
@@ -167,14 +214,29 @@ class RawSdkMessageValidator:
                 self._assistant_mode == "per_block"
                 or not self._blocks
                 or self._assistant_validated_blocks
-                or len(message.content) != len(self._blocks)
+                or len(content)
+                != sum(block.kind != "redacted_thinking" for block in self._blocks)
             ):
                 fail_protocol()
             self._assistant_mode = "batch"
             raw_blocks = [*self._blocks]
             raw_indices = tuple(range(len(raw_blocks)))
+        # The installed SDK parser drops redacted_thinking only. Compare its
+        # precise projection, preserving the raw opaque block separately.
+        raw_blocks = [
+            block for block in raw_blocks if block.kind != "redacted_thinking"
+        ]
         typed_suffix_started = False
-        for raw, typed in zip(raw_blocks, message.content, strict=True):
+        for raw, typed in zip(raw_blocks, content, strict=True):
+            if type(typed) is SdkThinkingBlock:
+                if (
+                    raw.kind != "thinking"
+                    or not raw.signature
+                    or typed.thinking != "".join(raw.text)
+                    or typed.signature != raw.signature
+                ):
+                    fail_protocol()
+                continue
             if type(typed) is TextBlock:
                 if typed_suffix_started or raw.kind != "text":
                     fail_protocol()
@@ -272,6 +334,21 @@ class RawSdkMessageValidator:
             ):
                 fail_protocol()
             self._current = _RawBlock("text", [])
+        elif block_type == "thinking":
+            if (
+                set(value) != {"type", "thinking", "signature"}
+                or value.get("thinking") != ""
+                or value.get("signature") != ""
+            ):
+                fail_protocol()
+            self._current = _RawBlock("thinking", [])
+        elif block_type == "redacted_thinking":
+            data = value.get("data")
+            if set(value) != {"type", "data"} or not isinstance(data, str) or not data:
+                fail_protocol()
+            self._current = _RawBlock(
+                "redacted_thinking", [], data=data, saw_delta=True
+            )
         elif block_type == "tool_use":
             if set(value) != {
                 "type",
@@ -305,7 +382,9 @@ class RawSdkMessageValidator:
             fail_protocol()
         self._phase = "block_delta"
 
-    def _block_delta(self, event: Mapping[str, Any]) -> TextDelta | None:
+    def _block_delta(
+        self, event: Mapping[str, Any]
+    ) -> TextDelta | ThinkingDelta | None:
         if (
             self._phase != "block_delta"
             or len(self._blocks) in self._assistant_validated_blocks
@@ -316,6 +395,39 @@ class RawSdkMessageValidator:
         self._require_index(event)
         delta = event.get("delta")
         if not isinstance(delta, Mapping):
+            fail_protocol()
+        if self._current.kind == "thinking":
+            if delta.get("type") == "thinking_delta":
+                estimate = delta.get("estimated_tokens")
+                text = delta.get("thinking")
+                if (
+                    set(delta) - {"type", "thinking", "estimated_tokens"}
+                    or not isinstance(text, str)
+                    or self._current.signature
+                    or (
+                        estimate is not None
+                        and (type(estimate) is not int or estimate < 0)
+                    )
+                ):
+                    fail_protocol()
+                self._current.text.append(text)
+                self._current.saw_delta = True
+                thinking_delta = ThinkingDelta(self._block_index, text)
+                self._current.reasoning_events.append(thinking_delta)
+                return None if self._tool_suffix_started else thinking_delta
+            if delta.get("type") == "signature_delta":
+                signature = delta.get("signature")
+                if (
+                    set(delta) != {"type", "signature"}
+                    or not isinstance(signature, str)
+                    or not signature
+                ):
+                    fail_protocol()
+                self._current.signature += signature
+                self._current.saw_delta = True
+                return None
+            fail_protocol()
+        if self._current.kind == "redacted_thinking":
             fail_protocol()
         if self._current.kind == "text":
             if set(delta) != {"type", "text"} or delta.get("type") != "text_delta":
@@ -341,7 +453,7 @@ class RawSdkMessageValidator:
             fail_protocol()
         return None
 
-    def _block_stop(self, event: Mapping[str, Any]) -> None:
+    def _block_stop(self, event: Mapping[str, Any]) -> ThinkingCompleted | None:
         if (
             self._phase != "block_delta"
             or self._current is None
@@ -350,6 +462,20 @@ class RawSdkMessageValidator:
             fail_protocol()
         self._require_keys(event, {"type", "index"})
         self._require_index(event)
+        completed = None
+        if self._current.kind == "thinking":
+            if not self._current.signature:
+                fail_protocol()
+            completed = ThinkingCompleted(
+                self._block_index,
+                ThinkingBlock("".join(self._current.text), self._current.signature),
+            )
+        elif self._current.kind == "redacted_thinking":
+            completed = ThinkingCompleted(
+                self._block_index, RedactedThinkingBlock(self._current.data)
+            )
+        if completed is not None:
+            self._current.reasoning_events.append(completed)
         if self._current.kind == "tool_use":
             assert self._current.json_parts is not None
             assert self._current.public_name is not None
@@ -360,6 +486,7 @@ class RawSdkMessageValidator:
         self._current = None
         self._block_index += 1
         self._phase = "block_start"
+        return None if self._tool_suffix_started else completed
 
     def _message_delta(self, event: Mapping[str, Any]) -> None:
         if self._phase != "block_start" or not self._blocks:
@@ -403,7 +530,13 @@ class RawSdkMessageValidator:
 
     def _message_stop(self, event: Mapping[str, Any]) -> None:
         if self._phase != "message_stop" or (
-            self.has_tools
+            (
+                self.has_tools
+                or any(
+                    block.kind in {"thinking", "redacted_thinking"}
+                    for block in self._blocks
+                )
+            )
             and len(self._assistant_validated_blocks) != len(self._blocks)
         ):
             fail_protocol()

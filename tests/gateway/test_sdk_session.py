@@ -404,7 +404,7 @@ async def test_text_session_accepts_typed_text_split_across_blocks(
 
 
 @pytest.mark.anyio
-async def test_text_session_rejects_a_second_raw_text_block(tmp_path: Path) -> None:
+async def test_text_session_accepts_sequential_raw_text_blocks(tmp_path: Path) -> None:
     raw = raw_text_events("one", "sdk-1")
     second = (
         StreamEvent(
@@ -437,10 +437,13 @@ async def test_text_session_rejects_a_second_raw_text_block(tmp_path: Path) -> N
         ),
     )
 
-    with pytest.raises(BackendFailure, match="protocol"):
-        await collect_sdk_response(
-            tmp_path, (*raw[:4], *second, *raw[4:], result_message())
-        )
+    events = await collect_sdk_response(
+        tmp_path, (*raw[:4], *second, *raw[4:], result_message())
+    )
+    assert [event.text for event in events if isinstance(event, TextDelta)] == [
+        "one",
+        "two",
+    ]
 
 
 @pytest.mark.anyio
@@ -1141,9 +1144,7 @@ async def test_success_result_echo_accepts_empty_and_multiple_text_blocks(
     try:
         boundary = await next_boundary(generation)
         call = next(event for event in boundary if isinstance(event, ToolCall))
-        await session.submit_tool_results(
-            (ToolResultBlock(call.id, content, False),)
-        )
+        await session.submit_tool_results((ToolResultBlock(call.id, content, False),))
         assert (await next_boundary(generation))[-1] == Completed(
             "end_turn", {"input_tokens": 2, "output_tokens": 1}
         )
@@ -1695,9 +1696,7 @@ async def test_sdk_session_rejects_callback_set_that_does_not_match_raw_calls(
     messages = raw_tool_events(
         (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
     )
-    session, client = make_tool_session(
-        tmp_path, messages, start_tool_callbacks=False
-    )
+    session, client = make_tool_session(tmp_path, messages, start_tool_callbacks=False)
     await session.start()
     client.start_tool_callback(callback_name, callback_arguments, internal_id="sdk-a")
     try:
@@ -1930,9 +1929,7 @@ async def test_missing_deferred_callback_rejects_arriving_terminal_boundary(
         *raw_text_events("must-not-commit", "sdk-1"),
         result_message(),
     )
-    session, client = make_tool_session(
-        tmp_path, messages, start_tool_callbacks=False
-    )
+    session, client = make_tool_session(tmp_path, messages, start_tool_callbacks=False)
     await session.start()
     client.start_tool_callback("echo", {"v": 1}, internal_id="sdk-a")
     generation = session.stream_generation("go")
@@ -2102,9 +2099,7 @@ async def test_same_loop_callback_first_accepts_immediately_following_item(
         messages,
         start_tool_callbacks=False,
         wait_for_tool_callbacks_before_user=False,
-        message_barriers={
-            next_item_index: (next_item_entered, release_next_item)
-        },
+        message_barriers={next_item_index: (next_item_entered, release_next_item)},
     )
     await session.start()
     client.start_tool_callback("echo", {"v": 1}, internal_id="sdk-a")

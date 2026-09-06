@@ -16,7 +16,9 @@ from claude_agent_sdk._cli_version import __cli_version__
 from claude_sdk_proxy.domain import (
     CanonicalMessage,
     ImageBlock,
+    RedactedThinkingBlock,
     TextBlock,
+    ThinkingBlock,
     ToolCallBlock,
     ToolResultBlock,
 )
@@ -233,6 +235,14 @@ def _assistant_entries(
         content: dict[str, Any]
         if isinstance(block, TextBlock):
             content = {"type": "text", "text": block.text}
+        elif isinstance(block, ThinkingBlock):
+            content = {
+                "type": "thinking",
+                "thinking": block.thinking,
+                "signature": block.signature,
+            }
+        elif isinstance(block, RedactedThinkingBlock):
+            content = {"type": "redacted_thinking", "data": block.data}
         elif isinstance(block, ToolCallBlock):
             internal_id = "toolu_rebase_" + uuid.uuid4().hex
             internal_tools[block.id] = (internal_id, entry_uuid)

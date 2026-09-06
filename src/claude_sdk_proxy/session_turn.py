@@ -6,12 +6,15 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, cast
 
 from claude_sdk_proxy.domain import (
+    CanonicalBlock,
     CanonicalMessage,
     Completed,
     ConversationEvent,
     SdkSessionProtocol,
+    TextBlock,
     TextDelta,
     TextRequest,
+    ThinkingCompleted,
 )
 from claude_sdk_proxy.replay_stream import ReplayStream
 from claude_sdk_proxy.thinking import ThinkingOptions
@@ -92,7 +95,7 @@ class TurnLease:
 
     async def _active_stream(self) -> AsyncIterator[ConversationEvent]:
         events: list[ConversationEvent] = []
-        assistant_parts: list[str] = []
+        assistant_blocks: list[CanonicalBlock] = []
         try:
             async with asyncio.timeout_at(self._deadline):
                 await self._conversation.backend.start()
@@ -109,9 +112,16 @@ class TurnLease:
                     raise RuntimeError("turn was aborted")
                 events.append(event)
                 if isinstance(event, TextDelta):
-                    assistant_parts.append(event.text)
+                    if assistant_blocks and isinstance(assistant_blocks[-1], TextBlock):
+                        assistant_blocks[-1] = TextBlock(
+                            assistant_blocks[-1].text + event.text
+                        )
+                    else:
+                        assistant_blocks.append(TextBlock(event.text))
                     yield event
                     continue
+                if isinstance(event, ThinkingCompleted):
+                    assistant_blocks.append(event.block)
                 if isinstance(event, Completed):
                     async with self._abort_lock:
                         if self._aborted:
@@ -121,7 +131,9 @@ class TurnLease:
                             self._request,
                             self._fingerprint,
                             tuple(events),
-                            "".join(assistant_parts),
+                            CanonicalMessage(
+                                "assistant", tuple(assistant_blocks) or (TextBlock(""),)
+                            ),
                         )
                         self._committed = True
                     yield event

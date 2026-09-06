@@ -177,7 +177,9 @@ class SessionRegistry:
             and isinstance(request.next_input, tuple)
         ):
             entry.validate_continuation(request)
-            if not messages_equal(request.messages[-2:-1], entry.transcript[-1:]):
+            if not messages_equal(
+                request.messages[-2:-1], entry.transcript[-1:], dialect=request.dialect
+            ):
                 raise SessionMismatch("pending tool calls changed")
             return True
         return False
@@ -421,14 +423,14 @@ class SessionRegistry:
     @staticmethod
     def _is_continuation(entry: SessionEntry, request: TextRequest) -> bool:
         return bool(entry.transcript) and messages_equal(
-            request.messages[:-1], entry.transcript
+            request.messages[:-1], entry.transcript, dialect=request.dialect
         )
 
     @staticmethod
     def _is_stale_request(entry: SessionEntry, request: TextRequest) -> bool:
         count = len(request.messages)
         return count <= len(entry.transcript) and messages_equal(
-            request.messages, entry.transcript[:count]
+            request.messages, entry.transcript[:count], dialect=request.dialect
         )
 
     @staticmethod
@@ -459,7 +461,7 @@ class SessionRegistry:
         request: TextRequest,
         fingerprint: str,
         events: tuple[ConversationEvent, ...],
-        assistant_text: str,
+        assistant: CanonicalMessage,
     ) -> None:
         async with self._lock:
             target = self._explicit if conversation.explicit else self._implicit
@@ -467,9 +469,7 @@ class SessionRegistry:
                 raise RuntimeError("conversation is no longer active")
             if conversation.in_flight_fingerprint != fingerprint:
                 raise RuntimeError("turn reservation is no longer active")
-            conversation.transcript = request.messages + (
-                CanonicalMessage.assistant_text(assistant_text),
-            )
+            conversation.transcript += request.messages[-1:] + (assistant,)
             conversation.replay.clear()
             conversation.replay[fingerprint] = events
             conversation.in_flight_fingerprint = None
