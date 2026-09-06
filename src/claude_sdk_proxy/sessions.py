@@ -26,6 +26,8 @@ from claude_sdk_proxy.tool_session_actor import ToolSessionActor
 
 _EXPLICIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 type SessionEntry = Conversation | ToolSessionActor
+
+
 class SessionRegistry:
     def __init__(
         self,
@@ -58,16 +60,26 @@ class SessionRegistry:
         if explicit_id is not None and _EXPLICIT_ID.fullmatch(explicit_id) is None:
             raise SessionMismatch("invalid explicit session ID")
         fingerprint = request_fingerprint(request)
+        replaced: SessionEntry | None = None
         async with self._lock:
             if self._closed:
                 raise RuntimeError("session registry is closed")
-            entry, replay = self._select(request, explicit_id, fingerprint)
-            self._reserve(entry, fingerprint)
-            if isinstance(entry, Conversation):
+            entry, replay, replaced = self._select(
+                request, explicit_id, fingerprint
+            )
+            self._reserve(replaced or entry, fingerprint)
+            if replaced is not None:
+                entry.in_flight_fingerprint = fingerprint
+            elif isinstance(entry, Conversation):
                 return self._text_lease(entry, request, fingerprint, replay)
-            actor = entry
-            if replay is not None:
-                return ToolTurnLease(self, actor, fingerprint, None, replay)
+            elif replay is not None:
+                return ToolTurnLease(self, entry, fingerprint, None, replay)
+        if replaced is not None:
+            await self._install_rebase(entry, replaced, fingerprint)
+            if isinstance(entry, Conversation):
+                return self._text_lease(entry, request, fingerprint, None)
+        actor = entry
+        assert isinstance(actor, ToolSessionActor)
         try:
             response = await actor.admit(request, fingerprint)
         except BaseException:
@@ -77,13 +89,29 @@ class SessionRegistry:
 
     def _select(
         self, request: TextRequest, explicit_id: str | None, fingerprint: str
-    ) -> tuple[SessionEntry, tuple[ConversationEvent, ...] | None]:
+    ) -> tuple[
+        SessionEntry,
+        tuple[ConversationEvent, ...] | None,
+        SessionEntry | None,
+    ]:
         if explicit_id is not None:
             entry = self._explicit.get(explicit_id)
             if entry is None:
-                return self._fresh(request, explicit_id, True), None
+                return self._fresh(request, explicit_id, True), None, None
             self._validate_config(entry, request)
-            return entry, self._existing(entry, request, fingerprint)
+            try:
+                replay = self._existing(entry, request, fingerprint)
+            except SessionMismatch:
+                if self._is_stale_request(entry, request):
+                    raise
+                if not self._evictable(entry):
+                    raise SessionMismatch(
+                        "request transcript does not match conversation"
+                    ) from None
+                if not isinstance(request.next_input, str):
+                    raise
+                return self._new_entry(request, explicit_id, True), None, entry
+            return entry, replay, None
         entries = tuple(self._implicit.values())
         exact = [
             item
@@ -94,7 +122,7 @@ class SessionRegistry:
             raise SessionMismatch("request transcript matches multiple conversations")
         if exact:
             entry = exact[0]
-            return entry, self._existing(entry, request, fingerprint)
+            return entry, self._existing(entry, request, fingerprint), None
         continuations = [
             item
             for item in entries
@@ -105,8 +133,8 @@ class SessionRegistry:
             raise SessionMismatch("request transcript matches multiple conversations")
         if continuations:
             entry = continuations[0]
-            return entry, self._existing(entry, request, fingerprint)
-        return self._fresh(request, uuid.uuid4().hex, False), None
+            return entry, self._existing(entry, request, fingerprint), None
+        return self._fresh(request, uuid.uuid4().hex, False), None, None
 
     def _existing(
         self, entry: SessionEntry, request: TextRequest, fingerprint: str
@@ -122,21 +150,25 @@ class SessionRegistry:
         return None
 
     def _fresh(self, request: TextRequest, sid: str, explicit: bool) -> SessionEntry:
-        if len(request.messages) != 1 or not isinstance(request.next_input, str):
+        if not isinstance(request.next_input, str):
             raise SessionMismatch("request transcript is not a fresh conversation")
         self._make_room_for_fresh()
-        if not request.tools:
+        entry = self._new_entry(request, sid, explicit)
+        target = self._explicit if explicit else self._implicit
+        target[sid] = entry
+        return entry
+
+    def _new_entry(
+        self, request: TextRequest, sid: str, explicit: bool
+    ) -> SessionEntry:
+        history = request.messages[:-1]
+        if history:
             backend = self._session_factory(
-                request.model, request.system, tools=(), dialect=request.dialect
-            )
-            entry: SessionEntry = Conversation(
-                sid,
-                explicit,
                 request.model,
                 request.system,
-                request.dialect,
-                (),
-                backend,
+                tools=request.tools,
+                dialect=request.dialect,
+                history=history,
             )
         else:
             backend = self._session_factory(
@@ -145,6 +177,17 @@ class SessionRegistry:
                 tools=request.tools,
                 dialect=request.dialect,
             )
+        if not request.tools:
+            entry: SessionEntry = Conversation(
+                sid,
+                explicit,
+                request.model,
+                request.system,
+                request.dialect,
+                history,
+                backend,
+            )
+        else:
             entry = ToolSessionActor(
                 sid,
                 explicit,
@@ -156,10 +199,76 @@ class SessionRegistry:
                 self._turn_timeout_seconds,
                 self._tool_result_timeout_seconds,
                 self._remove_tool,
+                transcript=history,
             )
-        target = self._explicit if explicit else self._implicit
-        target[sid] = entry
         return entry
+
+    async def _install_rebase(
+        self,
+        candidate: SessionEntry,
+        replaced: SessionEntry,
+        fingerprint: str,
+    ) -> None:
+        installed = False
+        try:
+            await candidate.backend.start()
+            async with self._lock:
+                target = self._explicit if replaced.explicit else self._implicit
+                if (
+                    not self._closed
+                    and target.get(replaced.external_id) is replaced
+                    and replaced.in_flight_fingerprint == fingerprint
+                ):
+                    target[replaced.external_id] = candidate
+                    replaced.in_flight_fingerprint = None
+                    self._use_counter += 1
+                    candidate.last_used = self._use_counter
+                    candidate.in_flight_fingerprint = fingerprint
+                    if isinstance(candidate, ToolSessionActor):
+                        candidate.mark_started()
+                    installed = True
+        except BaseException:
+            cleanup = asyncio.create_task(
+                self._cancel_rebase(candidate, replaced, fingerprint)
+            )
+            await asyncio.shield(cleanup)
+            raise
+        if not installed:
+            await self._discard_entry(candidate)
+            raise RuntimeError("conversation changed during rebase")
+        cleanup = asyncio.create_task(self._discard_entry(replaced))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cleanup.add_done_callback(self._consume_task)
+            async with self._lock:
+                if candidate.in_flight_fingerprint == fingerprint:
+                    candidate.in_flight_fingerprint = None
+            raise
+
+    async def _cancel_rebase(
+        self,
+        candidate: SessionEntry,
+        replaced: SessionEntry,
+        fingerprint: str,
+    ) -> None:
+        async with self._lock:
+            if replaced.in_flight_fingerprint == fingerprint:
+                replaced.in_flight_fingerprint = None
+        await self._discard_entry(candidate)
+
+    async def _discard_entry(self, entry: SessionEntry) -> None:
+        if isinstance(entry, ToolSessionActor):
+            await entry.shutdown()
+        self._teardown.schedule(entry.backend.close)
+        await asyncio.sleep(0)
+
+    @staticmethod
+    def _consume_task(task: asyncio.Task[None]) -> None:
+        try:
+            task.exception()
+        except BaseException:
+            pass
 
     def _reserve(self, entry: SessionEntry, fingerprint: str) -> None:
         self._use_counter += 1
@@ -212,6 +321,13 @@ class SessionRegistry:
     def _is_continuation(entry: SessionEntry, request: TextRequest) -> bool:
         return bool(entry.transcript) and messages_equal(
             request.messages[:-1], entry.transcript
+        )
+
+    @staticmethod
+    def _is_stale_request(entry: SessionEntry, request: TextRequest) -> bool:
+        count = len(request.messages)
+        return count <= len(entry.transcript) and messages_equal(
+            request.messages, entry.transcript[:count]
         )
 
     @staticmethod

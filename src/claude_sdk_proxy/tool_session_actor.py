@@ -106,6 +106,11 @@ class ToolSessionActor:
             and self.state is ToolSessionState.READY
         )
 
+    def mark_started(self) -> None:
+        if self.state is not ToolSessionState.READY or self._started:
+            raise RuntimeError("tool session cannot adopt a started backend")
+        self._started = True
+
     async def admit(self, request: TextRequest, fingerprint: str) -> ToolResponse:
         response = ToolResponse(request, fingerprint)
         expired = False

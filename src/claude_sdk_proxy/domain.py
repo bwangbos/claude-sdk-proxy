@@ -181,11 +181,22 @@ class TextRequest:
         normalized_tools = validate_tool_definitions(self.tools)
         object.__setattr__(self, "tools", normalized_tools)
         normalized_messages: list[CanonicalMessage] = []
-        expected: Role = "user"
+        previous_role: Role | None = None
+        previous_user_had_tool_results = False
         prior_call_ids: set[str] | None = None
         for message in self.messages:
-            if message.role != expected:
-                raise ValueError("messages must alternate user and assistant")
+            if previous_role is None and message.role != "user":
+                raise ValueError("conversation must start with a user message")
+            if message.role == "assistant" and previous_role != "user":
+                raise ValueError("assistant messages must follow a user message")
+            if (
+                message.role == "user"
+                and previous_role == "user"
+                and previous_user_had_tool_results
+            ):
+                raise RequestValidationError(
+                    "messages", "tool result turns must be followed by assistant"
+                )
             blocks = message.blocks
             if not blocks:
                 raise RequestValidationError("messages", "blocks must not be empty")
@@ -237,7 +248,10 @@ class TextRequest:
                     raise ValueError("message content must not be empty")
                 normalized_messages.append(message)
                 prior_call_ids = call_ids if call_ids else None
-            expected = "assistant" if expected == "user" else "user"
+            previous_role = message.role
+            previous_user_had_tool_results = message.role == "user" and all(
+                isinstance(item, ToolResultBlock) for item in message.blocks
+            )
         if normalized_messages[-1].role != "user":
             raise ValueError("conversation must end with a user message")
         object.__setattr__(self, "messages", tuple(normalized_messages))
@@ -287,6 +301,7 @@ class SdkSessionFactory(Protocol):
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        history: tuple[CanonicalMessage, ...] = (),
     ) -> SdkSessionProtocol: ...
 
 

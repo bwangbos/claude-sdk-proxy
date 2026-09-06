@@ -15,6 +15,7 @@ from claude_agent_sdk import (
 from claude_sdk_proxy.app import create_app
 from claude_sdk_proxy.domain import (
     BackendFailure,
+    CanonicalMessage,
     Completed,
     ConversationEvent,
     Dialect,
@@ -380,6 +381,7 @@ async def test_anthropic_session_mismatch_uses_anthropic_error_envelope() -> Non
             "/v1/messages",
             {
                 "model": "sonnet",
+                "system": "different",
                 "messages": [
                     {"role": "user", "content": "edited"},
                     {"role": "assistant", "content": "answer"},
@@ -399,6 +401,53 @@ async def test_anthropic_session_mismatch_uses_anthropic_error_envelope() -> Non
             "message": "Session transcript does not match",
         },
     }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("path", "dialect"),
+    [
+        ("/v1/messages", "anthropic"),
+        ("/v1/chat/completions", "openai"),
+    ],
+)
+async def test_explicit_session_rebases_rewritten_text_history(
+    path: str, dialect: str
+) -> None:
+    factory = FakeSessionFactory(outputs=("old answer", "new answer"))
+    app = create_app(models=("sonnet",), session_factory=factory)
+    first_body = (
+        anthropic_body("old question")
+        if dialect == "anthropic"
+        else openai_body("old question")
+    )
+    rewritten = {
+        "model": "sonnet",
+        "messages": [
+            {"role": "user", "content": "compacted summary"},
+            {"role": "assistant", "content": "kept answer"},
+            {"role": "user", "content": "continue"},
+        ],
+        "max_tokens": 128,
+    }
+
+    async with lifespan_app(app):
+        first = await post_json(
+            app, path, first_body, {"X-Claude-Proxy-Session": "lineage"}
+        )
+        rebased = await post_json(
+            app, path, rewritten, {"X-Claude-Proxy-Session": "lineage"}
+        )
+
+    assert first.status == 200
+    assert rebased.status == 200
+    assert factory.created == 2
+    assert factory.histories[1] == (
+        CanonicalMessage.user_text("compacted summary"),
+        CanonicalMessage.assistant_text("kept answer"),
+    )
+    assert factory.sessions[0].close_count == 1
+    assert factory.sessions[1].prompts == ["continue"]
 
 
 @pytest.mark.anyio

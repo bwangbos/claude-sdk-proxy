@@ -243,3 +243,31 @@ async def test_real_pi_agent_executes_repeated_tools_with_provider_config_only(
         (("call_second", "echo:second"),),
     ]
     assert session.prompts == ["run the echo tool twice"]
+
+
+@pytest.mark.anyio
+async def test_real_pi_provider_accepts_a_compacted_transcript_without_adapter() -> (
+    None
+):
+    factory = SequenceSessionFactory(
+        ((("first answer",), False), (("rebased answer",), False))
+    )
+    app = create_app(models=("sonnet",), session_factory=factory)
+
+    async with serve(app) as base_url:
+        result = await run_pi(base_url, "rebase")
+
+    assert result["scenario"] == "rebase"
+    assert [turn["text"] for turn in result["turns"]] == [
+        "first answer",
+        "rebased answer",
+    ]
+    assert factory.created == 2
+    assert factory.sessions[0].prompts == ["first"]
+    assert factory.sessions[1].prompts == ["Return only the exact retained marker."]
+    assert len(factory.histories[1]) == 1
+    assert (
+        factory.histories[1][0]
+        .require_text()
+        .startswith("The conversation history before this point was compacted")
+    )

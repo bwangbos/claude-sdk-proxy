@@ -36,7 +36,7 @@ def normalize_usage(
 
 
 class RawTextEventValidator:
-    def __init__(self) -> None:
+    def __init__(self, *, allow_seeded_history: bool = False) -> None:
         self._phase = "message_start"
         self._block_index = 0
         self._saw_delta = False
@@ -45,6 +45,7 @@ class RawTextEventValidator:
         self.output_tokens: int | None = None
         self.stop_reason: str | None = None
         self._assistant_text: str | None = None
+        self._allow_seeded_history = allow_seeded_history
 
     def observe(self, event: Mapping[str, Any]) -> InputUsage | TextDelta | None:
         event_type = event.get("type")
@@ -85,7 +86,9 @@ class RawTextEventValidator:
             fail_protocol()
         if message.get("stop_details") is not None:
             fail_protocol()
-        if message.get("diagnostics") is not None:
+        if not valid_message_diagnostics(
+            message.get("diagnostics"), self._allow_seeded_history
+        ):
             fail_protocol()
         for field in ("model", "id"):
             value = message.get(field)
@@ -208,3 +211,11 @@ class RawTextEventValidator:
     def _require_keys(event: Mapping[str, Any], keys: set[str]) -> None:
         if set(event) != keys:
             fail_protocol()
+
+
+def valid_message_diagnostics(value: object, allow_seeded_history: bool) -> bool:
+    if value is None:
+        return True
+    return allow_seeded_history and value == {
+        "cache_miss_reason": {"type": "previous_message_not_found"}
+    }

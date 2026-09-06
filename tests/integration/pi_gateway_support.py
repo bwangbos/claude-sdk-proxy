@@ -15,6 +15,7 @@ import pytest
 import uvicorn
 
 from claude_sdk_proxy.domain import (
+    CanonicalMessage,
     Completed,
     ConversationEvent,
     Dialect,
@@ -55,6 +56,7 @@ class SequenceSessionFactory:
     ) -> None:
         self._specifications = iter(specifications)
         self.sessions: list[IntegrationSession] = []
+        self.histories: list[tuple[CanonicalMessage, ...]] = []
 
     def __call__(
         self,
@@ -63,8 +65,10 @@ class SequenceSessionFactory:
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        history: tuple[CanonicalMessage, ...] = (),
     ) -> IntegrationSession:
         del model, system, tools, dialect
+        self.histories.append(history)
         outputs, stall = next(self._specifications)
         session = IntegrationSession(outputs, stall=stall)
         self.sessions.append(session)

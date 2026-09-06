@@ -23,6 +23,7 @@ from claude_agent_sdk import (
 
 from claude_sdk_proxy.domain import (
     BackendFailure,
+    CanonicalMessage,
     Completed,
     ConversationEvent,
     Dialect,
@@ -30,6 +31,7 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
+from claude_sdk_proxy.sdk_history import seed_history
 from claude_sdk_proxy.sdk_metadata import (
     validate_rate_limit_event,
     validate_system_message,
@@ -88,6 +90,7 @@ class SdkSession:
         *,
         tools: Iterable[ToolDefinition] = (),
         dialect: Dialect = "anthropic",
+        history: Iterable[CanonicalMessage] = (),
     ) -> None:
         self._model = model
         self._system = system
@@ -98,6 +101,7 @@ class SdkSession:
         self._closed = False
         self._sdk_session_id: str | None = None
         self._tools = validate_tool_definitions(tools)
+        self._history = tuple(history)
         self._bridge = ToolBridge(self._tools, dialect) if self._tools else None
         self._expected_sdk_tools = (
             self._bridge.allowed_tools if self._bridge is not None else ()
@@ -126,7 +130,42 @@ class SdkSession:
             return
         directory = self._directory_factory()
         self._directory = directory
-        options = ClaudeAgentOptions(
+        try:
+            options = await self._client_options(directory)
+            client = self._client_factory(options)
+            self._client = client
+            await client.connect()
+        except BaseException as error:
+            try:
+                await self.close()
+            except BaseException:
+                pass
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            raise BackendFailure("Agent SDK query failed") from None
+
+    async def _client_options(
+        self, directory: SessionDirectoryProtocol
+    ) -> ClaudeAgentOptions:
+        cwd = Path(directory.__enter__())
+        sdk_tool_names = dict(
+            zip(
+                (definition.name for definition in self._tools),
+                self._expected_sdk_tools,
+                strict=True,
+            )
+        )
+        seeded = (
+            await seed_history(
+                self._history,
+                cwd=cwd,
+                model=self._model,
+                sdk_tool_names=sdk_tool_names,
+            )
+            if self._history
+            else None
+        )
+        return ClaudeAgentOptions(
             model=self._model,
             system_prompt=self._system,
             tools=[],
@@ -142,7 +181,7 @@ class SdkSession:
             permission_mode="dontAsk",
             agents={},
             plugins=[],
-            cwd=Path(directory.__enter__()),
+            cwd=cwd,
             include_partial_messages=True,
             thinking={"type": "disabled"},
             stderr=_discard_stderr,
@@ -151,16 +190,11 @@ class SdkSession:
             extra_args={
                 "restricted": None,
                 "disable-slash-commands": None,
-                "no-session-persistence": None,
+                **({} if seeded is not None else {"no-session-persistence": None}),
             },
+            session_store=seeded.store if seeded is not None else None,
+            resume=seeded.session_id if seeded is not None else None,
         )
-        client = self._client_factory(options)
-        self._client = client
-        try:
-            await client.connect()
-        except Exception:
-            await self.close()
-            raise BackendFailure("Agent SDK query failed") from None
 
     async def close(self) -> None:
         client, directory = self._client, self._directory
@@ -248,9 +282,14 @@ class SdkSession:
                         if self._awaiting_echo:
                             self._finish_echo()
                         raw = (
-                            RawSdkMessageValidator(self._tools)
+                            RawSdkMessageValidator(
+                                self._tools,
+                                allow_seeded_history=bool(self._history),
+                            )
                             if self._bridge is not None
-                            else RawTextEventValidator()
+                            else RawTextEventValidator(
+                                allow_seeded_history=bool(self._history)
+                            )
                         )
                     if raw is None:
                         self._fail_protocol()

@@ -8,7 +8,7 @@ const baseUrl = process.env.PROXY_BASE_URL;
 if (!moduleName || !baseUrl) {
   throw new Error("PI_AI_MODULE and PROXY_BASE_URL are required");
 }
-if (!["linear", "retry", "abort", "timeout"].includes(scenario)) {
+if (!["linear", "retry", "abort", "timeout", "rebase"].includes(scenario)) {
   throw new Error(`unknown scenario: ${scenario}`);
 }
 
@@ -50,7 +50,10 @@ async function runTurn(context, { abortAfterText = false } = {}) {
   let assistant = null;
   const events = streamSimple(model, context, {
     apiKey: "local-placeholder",
-    headers: { "X-Claude-Proxy-Session": sessionId },
+    headers:
+      scenario === "rebase"
+        ? undefined
+        : { "X-Claude-Proxy-Session": sessionId },
     signal: controller.signal,
     maxRetries: 0,
     onPayload(payload) {
@@ -92,14 +95,25 @@ async function runTurn(context, { abortAfterText = false } = {}) {
 }
 
 const turns = [];
-if (scenario === "linear") {
+if (scenario === "linear" || scenario === "rebase") {
   const context = { systemPrompt: "", messages: [user("first")] };
   const first = await runTurn(context);
   turns.push(first.turn);
   if (!first.assistant) {
-    throw new Error("linear first turn did not complete");
+    throw new Error(`${scenario} first turn did not complete`);
   }
-  context.messages.push(first.assistant, user("second"));
+  if (scenario === "rebase") {
+    context.messages = [
+      user(
+        "The conversation history before this point was compacted into " +
+          "the following summary:\n\n<summary>\nThe first answer was " +
+          "recorded. The retained marker is PI_COMPACTION_CYAN_913.\n</summary>",
+      ),
+      user("Return only the exact retained marker."),
+    ];
+  } else {
+    context.messages.push(first.assistant, user("second"));
+  }
   turns.push((await runTurn(context)).turn);
 } else if (scenario === "retry") {
   const context = { systemPrompt: "", messages: [user("retry")] };
