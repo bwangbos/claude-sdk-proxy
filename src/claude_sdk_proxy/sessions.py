@@ -221,6 +221,16 @@ class SessionRegistry:
             raise SessionMismatch("request transcript does not match conversation")
         if isinstance(entry, ToolSessionActor):
             entry.validate_continuation(request)
+            if (
+                entry.state is ToolSessionState.WAITING_FOR_TOOLS
+                and isinstance(request.next_input, tuple)
+                and not messages_equal(
+                    request.messages[-2:-1],
+                    entry.transcript[-1:],
+                    dialect=request.dialect,
+                )
+            ):
+                raise SessionMismatch("pending tool calls changed")
         return None
 
     def _fresh(self, request: TextRequest, sid: str, explicit: bool) -> SessionEntry:

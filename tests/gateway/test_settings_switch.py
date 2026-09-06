@@ -17,6 +17,7 @@ from claude_sdk_proxy.domain import (
     ThinkingBlock,
     ThinkingCompleted,
     ToolCall,
+    ToolCallBlock,
     ToolDefinition,
     ToolResultBlock,
 )
@@ -556,6 +557,147 @@ async def test_pending_tool_results_cannot_change_generation_settings() -> None:
             final_boundary("finished answer")
         )
         assert backend.close_count == 0
+    finally:
+        await registry.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("dialect", ["openai", "anthropic"])
+@pytest.mark.parametrize(
+    "explicit_id", [pytest.param(None, id="implicit"), "lineage"]
+)
+async def test_pending_tool_results_reject_projected_current_assistant(
+    dialect: str, explicit_id: str | None
+) -> None:
+    """Projection tolerance must not weaken the active tool-call boundary."""
+    boundary = (
+        ThinkingCompleted(0, ThinkingBlock("pending reasoning", "pending-sig")),
+        ToolCall("toolu_one", "echo", {"value": "same"}),
+        Completed("tool_use", {"input_tokens": 3, "output_tokens": 2}),
+    )
+    backend = ToolSession((boundary, final_boundary("done")))
+    registry = SessionRegistry(ToolFactory((backend,)))
+    first = first_tool_request(tools=(echo_tool(),), dialect=dialect)
+    try:
+        events = await collect_tool(
+            (await registry.open_turn(first, explicit_id)).stream()
+        )
+        call = next(event for event in events if isinstance(event, ToolCall))
+        projected = CanonicalMessage(
+            "assistant",
+            (
+                TextBlock("pending reasoning"),
+                ToolCallBlock(call.id, call.name, call.arguments),
+            ),
+        )
+        result = ToolResultBlock(call.id, ("result",), False)
+        altered = replace(
+            first,
+            messages=(*first.messages, projected, CanonicalMessage("user", (result,))),
+        )
+
+        with pytest.raises(SessionMismatch, match="pending tool calls changed"):
+            await registry.open_turn(altered, explicit_id)
+
+        assert backend.results == []
+        native = CanonicalMessage(
+            "assistant",
+            (
+                ThinkingBlock("pending reasoning", "pending-sig"),
+                ToolCallBlock(call.id, call.name, call.arguments),
+            )
+            if dialect == "anthropic"
+            else (ToolCallBlock(call.id, call.name, call.arguments),),
+        )
+        valid = replace(
+            first,
+            messages=(*first.messages, native, CanonicalMessage("user", (result,))),
+        )
+        assert await collect_tool(
+            (await registry.open_turn(valid, explicit_id)).stream()
+        ) == list(final_boundary("done"))
+        assert backend.results == [(result,)]
+    finally:
+        await registry.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("dialect", ["openai", "anthropic"])
+async def test_pi_post_switch_tool_results_keep_only_older_projection_tolerance(
+    dialect: str,
+) -> None:
+    """Older projected thinking may replay while the pending suffix stays native."""
+    sonnet_boundary = (
+        ThinkingCompleted(0, ThinkingBlock("sonnet reasoning", "sonnet-sig")),
+        TextDelta("sonnet answer"),
+        Completed("end_turn", {"input_tokens": 3, "output_tokens": 2}),
+    )
+    opus_boundary = (
+        ThinkingCompleted(0, ThinkingBlock("opus reasoning", "opus-sig")),
+        ToolCall("toolu_one", "echo", {"value": "same"}),
+        Completed("tool_use", {"input_tokens": 3, "output_tokens": 2}),
+    )
+    sonnet = ToolSession((sonnet_boundary,))
+    opus = ToolSession((opus_boundary, final_boundary("done")))
+    factory = ToolFactory((sonnet, opus))
+    registry = SessionRegistry(factory)
+    first = replace(
+        first_tool_request(tools=(echo_tool(),), dialect=dialect),
+        thinking=ThinkingOptions(mode="adaptive", effort="high"),
+    )
+    try:
+        await collect_tool((await registry.open_turn(first, None)).stream())
+        old_assistant = (
+            CanonicalMessage(
+                "assistant",
+                (TextBlock("sonnet reasoning"), TextBlock("sonnet answer")),
+            )
+            if dialect == "anthropic"
+            else CanonicalMessage.assistant_text("sonnet reasoningsonnet answer")
+        )
+        switched = replace(
+            first,
+            model="opus",
+            thinking=ThinkingOptions(mode="adaptive", effort="low"),
+            messages=(
+                first.messages[0],
+                old_assistant,
+                CanonicalMessage.user_text("use the tool"),
+            ),
+        )
+        events = await collect_tool(
+            (await registry.open_turn(switched, None)).stream()
+        )
+        call = next(event for event in events if isinstance(event, ToolCall))
+        current_assistant = CanonicalMessage(
+            "assistant",
+            (
+                ThinkingBlock("opus reasoning", "opus-sig"),
+                ToolCallBlock(call.id, call.name, call.arguments),
+            )
+            if dialect == "anthropic"
+            else (ToolCallBlock(call.id, call.name, call.arguments),),
+        )
+        result = ToolResultBlock(call.id, ("result",), False)
+        continued = replace(
+            switched,
+            messages=(
+                *switched.messages,
+                current_assistant,
+                CanonicalMessage("user", (result,)),
+            ),
+        )
+
+        assert await collect_tool(
+            (await registry.open_turn(continued, None)).stream()
+        ) == list(final_boundary("done"))
+        assert [call[0] for call in factory.calls] == ["sonnet", "opus"]
+        assert opus.results == [(result,)]
+        assert any(
+            isinstance(block, ThinkingBlock) and block.signature == "sonnet-sig"
+            for message in factory.histories[-1]
+            for block in message.blocks
+        )
     finally:
         await registry.close()
 
