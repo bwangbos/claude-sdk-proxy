@@ -8,7 +8,11 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
     RequestValidationError,
+    TextBlock,
     TextDelta,
+    ToolCall,
+    ToolCallBlock,
+    ToolResultBlock,
     UnsupportedFeature,
 )
 from claude_sdk_proxy.openai_api import (
@@ -18,6 +22,28 @@ from claude_sdk_proxy.openai_api import (
     parse_openai_request,
     render_openai_response,
 )
+
+
+def openai_echo_tool() -> dict[str, object]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "echo",
+            "description": "Repeat the provided value.",
+            "parameters": {
+                "type": "object",
+                "properties": {"v": {"type": "integer"}},
+            },
+        },
+    }
+
+
+def function_call(identifier: str, name: str, arguments: str) -> dict[str, object]:
+    return {
+        "id": identifier,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
 
 
 def payload(chunk: bytes) -> object:
@@ -140,22 +166,309 @@ def test_openai_parser_rejects_unknown_model() -> None:
     assert error.value.field == "model"
 
 
-def test_openai_parser_rejects_tool_calls_even_when_text_content_is_present() -> None:
+def test_openai_parser_coalesces_reverse_order_tool_messages() -> None:
+    request = parse_openai_request(
+        {
+            "model": "sonnet",
+            "tools": [openai_echo_tool()],
+            "parallel_tool_calls": True,
+            "messages": [
+                {"role": "user", "content": "twice"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        function_call("call_a", "echo", '{"v":1}'),
+                        function_call("call_b", "echo", '{"v":1}'),
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+                {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            ],
+        },
+        frozenset({"sonnet"}),
+    )
+
+    assert request.dialect == "openai"
+    assert tuple(item.name for item in request.tools) == ("echo",)
+    assert request.messages[1].blocks == (
+        ToolCallBlock("call_a", "echo", {"v": 1}),
+        ToolCallBlock("call_b", "echo", {"v": 1}),
+    )
+    assert {item.tool_call_id: item.content for item in request.next_input} == {
+        "call_a": ("A",),
+        "call_b": ("B",),
+    }
+
+
+def test_openai_parser_accepts_empty_fresh_tools_and_auto_controls() -> None:
+    request = parse_openai_request(
+        {
+            "model": "sonnet",
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        frozenset({"sonnet"}),
+    )
+
+    assert request.tools == ()
+    assert request.next_prompt == "hello"
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        [openai_echo_tool(), openai_echo_tool()],
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "Repeat the provided value.",
+                    "parameters": {"type": "not-a-type"},
+                },
+            }
+        ],
+    ],
+)
+def test_openai_parser_preserves_tool_definition_validation_field(
+    tools: list[object],
+) -> None:
+    with pytest.raises(RequestValidationError) as error:
+        parse_openai_request(
+            {
+                "model": "sonnet",
+                "tools": tools,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            frozenset({"sonnet"}),
+        )
+
+    assert error.value.field == "tools"
+
+
+@pytest.mark.parametrize(
+    ("tool_choice", "field"),
+    [
+        ("required", "tool_choice"),
+        ("none", "tool_choice"),
+        ({"type": "function", "function": {"name": "echo"}}, "tool_choice"),
+    ],
+)
+def test_openai_parser_rejects_semantically_unsupported_tool_choices(
+    tool_choice: object, field: str
+) -> None:
     with pytest.raises(UnsupportedFeature) as error:
         parse_openai_request(
             {
                 "model": "sonnet",
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": "answer",
-                        "tool_calls": [{"id": "call_1"}],
-                    }
-                ],
+                "tools": [openai_echo_tool()],
+                "tool_choice": tool_choice,
+                "messages": [{"role": "user", "content": "hello"}],
             },
             frozenset({"sonnet"}),
         )
+    assert error.value.field == field
+
+
+@pytest.mark.parametrize(
+    ("body", "field"),
+    [
+        (
+            {
+                "model": "sonnet",
+                "tools": [{"type": "code_interpreter"}],
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "tools",
+        ),
+        (
+            {
+                "model": "sonnet",
+                "tools": [openai_echo_tool()],
+                "parallel_tool_calls": False,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "parallel_tool_calls",
+        ),
+        (
+            {
+                "model": "sonnet",
+                "tools": [openai_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            function_call("call_a", "echo", "{}"),
+                            function_call("call_a", "echo", "{}"),
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+                ],
+            },
+            "messages",
+        ),
+        (
+            {
+                "model": "sonnet",
+                "tools": [openai_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            function_call("call_a", "echo", "{}"),
+                            function_call("call_b", "echo", "{}"),
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_a",
+                        "content": "again",
+                    },
+                ],
+            },
+            "messages",
+        ),
+        (
+            {
+                "model": "sonnet",
+                "tools": [openai_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [function_call("call_a", "echo", "not json")],
+                    },
+                    {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+                ],
+            },
+            "messages",
+        ),
+        (
+            {
+                "model": "sonnet",
+                "tools": [openai_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [function_call("call_a", "echo", "[]")],
+                    },
+                    {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+                ],
+            },
+            "messages",
+        ),
+        (
+            {
+                "model": "sonnet",
+                "tools": [openai_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [function_call("call_a", "echo", "{}")],
+                    },
+                    {"role": "tool", "content": "A"},
+                ],
+            },
+            "messages",
+        ),
+        (
+            {
+                "model": "sonnet",
+                "tools": [openai_echo_tool()],
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [function_call("call_a", "echo", "{}")],
+                    },
+                    {"role": "user", "content": "interleaved"},
+                    {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+                ],
+            },
+            "messages",
+        ),
+    ],
+)
+def test_openai_parser_rejects_unsupported_or_incomplete_tool_shapes(
+    body: dict[str, object], field: str
+) -> None:
+    with pytest.raises((RequestValidationError, UnsupportedFeature)) as error:
+        parse_openai_request(body, frozenset({"sonnet"}))
+    assert error.value.field == field
+
+
+def test_openai_parser_maps_argument_decoder_recursion_to_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_decode(value: str) -> object:
+        del value
+        raise RecursionError
+
+    monkeypatch.setattr("claude_sdk_proxy.openai_tools.json.loads", fail_decode)
+    body = {
+        "model": "sonnet",
+        "tools": [openai_echo_tool()],
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [function_call("call_a", "echo", "{}")],
+            },
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+        ],
+    }
+
+    with pytest.raises(RequestValidationError) as error:
+        parse_openai_request(body, frozenset({"sonnet"}))
+
     assert error.value.field == "messages"
+
+
+def test_openai_parser_preserves_empty_and_json_string_tool_results() -> None:
+    request = parse_openai_request(
+        {
+            "model": "sonnet",
+            "tools": [openai_echo_tool()],
+            "messages": [
+                {"role": "user", "content": "twice"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        function_call("call_a", "echo", "{}"),
+                        function_call("call_b", "echo", "{}"),
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_b", "content": ""},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_a",
+                    "content": '{"value":1}',
+                },
+            ],
+        },
+        frozenset({"sonnet"}),
+    )
+
+    assert request.next_input == (
+        ToolResultBlock("call_a", ('{"value":1}',), False),
+        ToolResultBlock("call_b", ("",), False),
+    )
 
 
 @pytest.mark.parametrize("field,value", [("extra", 1), ("stream", "yes")])
@@ -262,6 +575,107 @@ def test_openai_nonstream_response_maps_text_stop_and_usage() -> None:
     }
 
 
+def test_openai_nonstream_response_renders_ordered_tool_calls() -> None:
+    response = render_openai_response(
+        "chatcmpl_test",
+        "sonnet",
+        (
+            TextBlock("before"),
+            ToolCall("call_a", "echo", {"v": 1}),
+            TextBlock("after"),
+            ToolCall("call_b", "echo", {"v": 1}),
+        ),
+        Completed("tool_use", {"input_tokens": 2, "output_tokens": 1}),
+    )
+
+    assert response["choices"] == [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "beforeafter",
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": '{"v":1}'},
+                    },
+                    {
+                        "id": "call_b",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": '{"v":1}'},
+                    },
+                ],
+            },
+            "logprobs": None,
+            "finish_reason": "tool_calls",
+        }
+    ]
+
+
+def test_openai_nonstream_call_only_response_uses_null_content() -> None:
+    response = render_openai_response(
+        "chatcmpl_test",
+        "sonnet",
+        (ToolCall("call_a", "echo", {"snowman": "☃"}),),
+        Completed("tool_use", None),
+    )
+
+    assert response["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_a",
+                "type": "function",
+                "function": {"name": "echo", "arguments": '{"snowman":"☃"}'},
+            }
+        ],
+    }
+
+
+def test_openai_stream_renders_two_identical_calls_with_distinct_ids() -> None:
+    from claude_sdk_proxy.openai_api import OpenAIStreamState
+
+    state = OpenAIStreamState()
+    first = payload(
+        encode_openai_event(
+            "chatcmpl_1", "sonnet", ToolCall("call_a", "echo", {"v": 1}), False, state
+        )[0]
+    )
+    second = payload(
+        encode_openai_event(
+            "chatcmpl_1", "sonnet", ToolCall("call_b", "echo", {"v": 1}), False, state
+        )[0]
+    )
+
+    assert first["choices"][0]["delta"]["tool_calls"][0] == {
+        "index": 0,
+        "id": "call_a",
+        "type": "function",
+        "function": {"name": "echo", "arguments": '{"v":1}'},
+    }
+    assert second["choices"][0]["delta"]["tool_calls"][0] == {
+        "index": 1,
+        "id": "call_b",
+        "type": "function",
+        "function": {"name": "echo", "arguments": '{"v":1}'},
+    }
+
+
+def test_openai_stream_tool_completion_has_tool_calls_finish_reason() -> None:
+    chunks = encode_openai_event(
+        "chatcmpl_test",
+        "sonnet",
+        Completed("tool_use", {"input_tokens": 2, "output_tokens": 1}),
+        include_usage=True,
+    )
+
+    assert payload(chunks[0])["choices"][0]["finish_reason"] == "tool_calls"
+    assert payload(chunks[1])["choices"] == []
+    assert chunks[2] == b"data: [DONE]\n\n"
+
+
 def test_openai_response_preserves_unicode_whitespace_and_zeroes_bad_usage() -> None:
     response = render_openai_response(
         "chatcmpl_test",
@@ -308,9 +722,7 @@ def test_openai_rejects_unknown_terminal_reason(reason: str | None) -> None:
     with pytest.raises(ValueError, match="stop reason"):
         render_openai_response("chatcmpl_test", "sonnet", "text", completed)
     with pytest.raises(ValueError, match="stop reason"):
-        encode_openai_event(
-            "chatcmpl_test", "sonnet", completed, include_usage=False
-        )
+        encode_openai_event("chatcmpl_test", "sonnet", completed, include_usage=False)
 
 
 def test_openai_error_ends_the_stream() -> None:

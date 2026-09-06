@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import math
 from collections.abc import Sequence
 
 import uvicorn
@@ -23,12 +24,25 @@ def _positive(value: str) -> int:
     return number
 
 
+def _positive_finite_float(value: str) -> float:
+    number = float(value)
+    if number <= 0 or not math.isfinite(number):
+        raise argparse.ArgumentTypeError("value must be a positive finite number")
+    return number
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Private localhost Claude gateway")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=_port, default=8317)
     parser.add_argument("--model", action="append")
     parser.add_argument("--max-sessions", type=_positive, default=8)
+    parser.add_argument(
+        "--tool-result-timeout",
+        type=_positive_finite_float,
+        default=300.0,
+        metavar="SECONDS",
+    )
     return parser
 
 
@@ -43,7 +57,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--host must be a loopback IP address")
     models = tuple(args.model or ("sonnet",))
     try:
-        app = create_app(models=models, max_sessions=args.max_sessions)
+        app = create_app(
+            models=models,
+            max_sessions=args.max_sessions,
+            tool_result_timeout_seconds=args.tool_result_timeout,
+        )
     except ValueError as error:
         parser.error(str(error))
     uvicorn.run(app, host=str(host), port=args.port)

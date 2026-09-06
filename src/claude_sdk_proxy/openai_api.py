@@ -2,23 +2,31 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, cast
 
 from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     InputUsage,
     RequestValidationError,
+    TextBlock,
     TextDelta,
     TextRequest,
+    ToolCall,
+)
+from claude_sdk_proxy.openai_tools import (
+    parse_openai_messages,
+    parse_openai_tools,
+    validate_openai_tool_controls,
 )
 from claude_sdk_proxy.text_api import (
     boolean,
     reject_fields,
     required_string,
-    text_messages,
     usage_counter,
 )
+from claude_sdk_proxy.tool_contract import JsonValue, canonical_json
 
 _SUPPORTED_FIELDS = {
     "model",
@@ -28,21 +36,25 @@ _SUPPORTED_FIELDS = {
     "stream",
     "store",
     "stream_options",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
 }
 _UNSUPPORTED_FIELDS = {
     "temperature",
     "top_p",
     "top_k",
     "stop",
-    "tools",
-    "tool_choice",
-    "parallel_tool_calls",
     "response_format",
     "modalities",
     "audio",
     "reasoning_effort",
 }
-_TOOL_MESSAGE_FIELDS = {"tool_calls", "tool_call_id", "function_call"}
+
+
+@dataclass(slots=True)
+class OpenAIStreamState:
+    next_tool_index: int = 0
 
 
 def parse_openai_request(
@@ -57,18 +69,33 @@ def parse_openai_request(
         raise RequestValidationError("store", "must be exactly false")
     include_usage = _stream_options(body)
     max_tokens = _openai_max_tokens(body)
-    system, messages = text_messages(body, _TOOL_MESSAGE_FIELDS, allow_system=True)
+    tools = parse_openai_tools(body)
+    validate_openai_tool_controls(body)
+    system, messages = parse_openai_messages(body)
     try:
         return TextRequest(
-            model, system, tuple(messages), max_tokens, stream, include_usage
+            model,
+            system,
+            messages,
+            max_tokens,
+            stream,
+            include_usage,
+            dialect="openai",
+            tools=tools,
         )
+    except RequestValidationError:
+        raise
     except ValueError as error:
         raise RequestValidationError("messages", str(error)) from None
 
 
 def render_openai_response(
-    request_id: str, model: str, text: str, completed: Completed
+    request_id: str,
+    model: str,
+    blocks: str | tuple[TextBlock | ToolCall, ...],
+    completed: Completed,
 ) -> dict[str, object]:
+    normalized = (TextBlock(blocks),) if isinstance(blocks, str) else blocks
     return {
         "id": request_id,
         "object": "chat.completion",
@@ -77,7 +104,7 @@ def render_openai_response(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
+                "message": _response_message(normalized),
                 "logprobs": None,
                 "finish_reason": _openai_stop_reason(completed.stop_reason),
             }
@@ -91,12 +118,43 @@ def encode_openai_start(request_id: str, model: str) -> tuple[bytes, ...]:
 
 
 def encode_openai_event(
-    request_id: str, model: str, event: ConversationEvent, include_usage: bool
+    request_id: str,
+    model: str,
+    event: ConversationEvent,
+    include_usage: bool,
+    state: OpenAIStreamState | None = None,
 ) -> tuple[bytes, ...]:
     if isinstance(event, InputUsage):
         return ()
     if isinstance(event, TextDelta):
         return (_sse(_chunk(request_id, model, {"content": event.text})),)
+    if isinstance(event, ToolCall):
+        index = 0 if state is None else state.next_tool_index
+        if state is not None:
+            state.next_tool_index += 1
+        return (
+            _sse(
+                _chunk(
+                    request_id,
+                    model,
+                    {
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                "id": event.id,
+                                "type": "function",
+                                "function": {
+                                    "name": event.name,
+                                    "arguments": canonical_json(
+                                        cast(JsonValue, event.arguments)
+                                    ),
+                                },
+                            }
+                        ]
+                    },
+                )
+            ),
+        )
     if not isinstance(event, Completed):
         raise TypeError("unsupported conversation event")
     terminal = _chunk(
@@ -159,7 +217,7 @@ def _stream_options(body: Mapping[str, object]) -> bool:
 def _chunk(
     request_id: str,
     model: str,
-    delta: dict[str, str],
+    delta: dict[str, object],
     *,
     finish_reason: str | None = None,
 ) -> dict[str, object]:
@@ -185,6 +243,7 @@ def _openai_stop_reason(reason: str | None) -> str:
         "max_tokens": "length",
         "refusal": "content_filter",
         "model_context_window_exceeded": "length",
+        "tool_use": "tool_calls",
     }
     try:
         return mapping[reason]  # type: ignore[index]
@@ -200,6 +259,37 @@ def _openai_usage(usage: Mapping[str, Any] | None) -> dict[str, int]:
         "completion_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     }
+
+
+def _response_message(
+    blocks: tuple[TextBlock | ToolCall, ...],
+) -> dict[str, object]:
+    text: list[str] = []
+    calls: list[dict[str, object]] = []
+    for block in blocks:
+        if isinstance(block, TextBlock):
+            text.append(block.text)
+        elif isinstance(block, ToolCall):
+            calls.append(
+                {
+                    "id": block.id,
+                    "type": "function",
+                    "function": {
+                        "name": block.name,
+                        "arguments": canonical_json(cast(JsonValue, block.arguments)),
+                    },
+                }
+            )
+        else:
+            raise TypeError("response blocks must be text or tool calls")
+    message: dict[str, object] = {"role": "assistant", "content": "".join(text)}
+    if not text:
+        message["content"] = None
+    if calls:
+        message["tool_calls"] = calls
+    return message
+
+
 def _sse(value: dict[str, object]) -> bytes:
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return f"data: {encoded}\n\n".encode()

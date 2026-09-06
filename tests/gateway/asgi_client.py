@@ -75,11 +75,13 @@ async def request(
     block_body_after_start: bool = False,
     body_send_entered: asyncio.Event | None = None,
     body_send_release: asyncio.Event | None = None,
+    disconnect_after_body_contains: bytes | None = None,
     external_cancel_with_disconnect: bool = False,
 ) -> AsgiResponse | None:
     owner = asyncio.current_task()
     request_sent = False
     response_started = asyncio.Event()
+    body_match = asyncio.Event()
     never = asyncio.Event()
     sent: list[Message] = []
     body_sends = 0
@@ -95,6 +97,9 @@ async def request(
             return {"type": "http.disconnect"}
         if disconnect_after_start:
             await response_started.wait()
+            return {"type": "http.disconnect"}
+        if disconnect_after_body_contains is not None:
+            await body_match.wait()
             return {"type": "http.disconnect"}
         await never.wait()
         raise AssertionError("unreachable")
@@ -113,6 +118,13 @@ async def request(
                 await never.wait()
             if body_send_release is not None:
                 await body_send_release.wait()
+            if disconnect_after_body_contains is not None and (
+                disconnect_after_body_contains in message.get("body", b"")
+            ):
+                sent.append(message)
+                body_match.set()
+                await never.wait()
+                return
         sent.append(message)
 
     raw_headers = [
@@ -161,6 +173,7 @@ async def post_json(
     block_body_after_start: bool = False,
     body_send_entered: asyncio.Event | None = None,
     body_send_release: asyncio.Event | None = None,
+    disconnect_after_body_contains: bytes | None = None,
 ) -> AsgiResponse:
     encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
     merged = {"content-type": "application/json", **(headers or {})}
@@ -175,6 +188,7 @@ async def post_json(
         block_body_after_start=block_body_after_start,
         body_send_entered=body_send_entered,
         body_send_release=body_send_release,
+        disconnect_after_body_contains=disconnect_after_body_contains,
     )
 
 

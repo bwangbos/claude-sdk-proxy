@@ -393,6 +393,7 @@ _SCENARIOS = frozenset(
         "cleanup_fail_after_cont",
         "cleanup_fail_after_term",
         "cleanup_fail_after_kill",
+        "controller_loss_with_stubborn_descendant",
         "anchor_only_cleanup",
         "fallback_while_supervisor_healthy",
         "fallback_early_before_running",
@@ -425,6 +426,7 @@ _REAL_ACTOR_LOSS = frozenset(
         "cleanup_fail_after_cont",
         "cleanup_fail_after_term",
         "cleanup_fail_after_kill",
+        "controller_loss_with_stubborn_descendant",
     }
 )
 _REAL_RETAINING_CLEANUP = frozenset(
@@ -1506,6 +1508,7 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
         "stale_executor": ("after_admission", 1),
         "retirement_replacement": ("after_admission", 1),
         "interrupted_batch_replay": ("after_admission", 1),
+        "controller_loss_with_stubborn_descendant": ("after_admission", 1),
     }
     injection, injection_code = injection_by_name[name]
     handoff = name in _HANDOFF
@@ -1562,7 +1565,9 @@ def _run_real_actor_loss(name: str) -> LifecycleEvidence:
             "--output-path",
             str(instance / "actor-loss-output"),
         ]
-        if injection_code == 6:
+        if name == "controller_loss_with_stubborn_descendant":
+            arguments.append("--spawn-stubborn-descendant")
+        elif injection_code == 6:
             arguments.append("--stubborn")
         process = subprocess.Popen(
             arguments,

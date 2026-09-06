@@ -7,11 +7,13 @@ import pytest
 
 from claude_sdk_proxy.app import create_app
 from tests.integration.pi_gateway_support import (
+    PiToolSession,
     SequenceSessionFactory,
     communicate_or_reap,
     eventually_closed,
     recover_failed_session,
     run_pi,
+    run_pi_tool,
     serve,
 )
 
@@ -162,3 +164,82 @@ async def test_real_pi_openai_provider_against_gateway(
         assert factory.created == 2
         assert factory.sessions[0].close_count == 1
         assert factory.sessions[1].prompts == [scenario]
+
+
+@pytest.mark.anyio
+async def test_real_pi_agent_executes_repeated_tools_with_provider_config_only(
+) -> None:
+    session = PiToolSession()
+
+    def factory(*args, **kwargs):
+        del args, kwargs
+        return session
+
+    app = create_app(models=("sonnet",), session_factory=factory)
+    async with serve(app) as base_url:
+        result = await run_pi_tool(base_url)
+
+    assert result["provider"] == {
+        "api": "openai-completions",
+        "baseUrl": f"{base_url}/v1",
+    }
+    assert result["packageVersions"] == {
+        "pi-coding-agent": "0.84.4",
+        "pi-agent-core": "0.84.4",
+        "pi-ai": "0.84.4",
+    }
+    assert result["customSessionHeaders"] == []
+    assert result["requestCount"] == 4
+    assert result["requests"][2] == result["requests"][3]
+    assert [
+        {
+            "maxTokens": request["maxTokens"],
+            "store": request["store"],
+            "includeUsage": request["includeUsage"],
+        }
+        for request in result["requests"]
+    ] == [
+        {"maxTokens": 4096, "store": False, "includeUsage": True}
+    ] * 4
+    assert [request["messageRoles"] for request in result["requests"]] == [
+        ["user"],
+        ["user", "assistant", "tool"],
+        ["user", "assistant", "tool", "assistant", "tool"],
+        ["user", "assistant", "tool", "assistant", "tool"],
+    ]
+    assert result["requests"][0]["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "description": "Echo a value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    assert result["nativeCalls"] == [
+        {"name": "echo", "arguments": {"value": "first"}},
+        {"name": "echo", "arguments": {"value": "second"}},
+    ]
+    assert result["nativeResults"] == [
+        {"name": "echo", "content": "echo:first"},
+        {"name": "echo", "content": "echo:second"},
+    ]
+    assert result["executions"] == [
+        {"value": "first"},
+        {"value": "second"},
+    ]
+    assert result["finalText"] == "pi tool loop complete"
+    assert result["replayText"] == "pi tool loop complete"
+    assert result["executionCountAfterReplay"] == 2
+    assert session.handler_count == 2
+    assert session.results == [
+        (("call_first", "echo:first"),),
+        (("call_second", "echo:second"),),
+    ]
+    assert session.prompts == ["run the echo tool twice"]

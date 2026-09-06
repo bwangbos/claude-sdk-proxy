@@ -2,35 +2,56 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, cast
 
+from claude_sdk_proxy.anthropic_tools import (
+    parse_anthropic_messages,
+    parse_anthropic_tools,
+    validate_anthropic_tool_choice,
+)
 from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     InputUsage,
     RequestValidationError,
+    TextBlock,
     TextDelta,
     TextRequest,
+    ToolCall,
+    ToolDefinition,
 )
 from claude_sdk_proxy.text_api import (
     boolean,
     reject_fields,
     required_string,
-    text_messages,
     usage_counter,
 )
+from claude_sdk_proxy.tool_contract import JsonValue, canonical_json, plain_json
 
-_SUPPORTED_FIELDS = {"model", "system", "messages", "max_tokens", "stream"}
+_SUPPORTED_FIELDS = {
+    "model",
+    "system",
+    "messages",
+    "max_tokens",
+    "stream",
+    "tools",
+    "tool_choice",
+}
 _UNSUPPORTED_FIELDS = {
     "temperature",
     "top_p",
     "top_k",
     "stop_sequences",
-    "tools",
-    "tool_choice",
     "thinking",
 }
-_TOOL_MESSAGE_FIELDS = {"tool_use_id", "tool_call_id", "tool_calls"}
+
+
+@dataclass(slots=True)
+class AnthropicStreamState:
+    tools_enabled: bool = False
+    open_text_index: int | None = None
+    next_block_index: int = 0
 
 
 def parse_anthropic_request(
@@ -47,22 +68,38 @@ def parse_anthropic_request(
     if type(max_tokens) is not int or max_tokens <= 0:
         raise RequestValidationError("max_tokens", "must be a positive integer")
     stream = boolean(body, "stream")
-    _, messages = text_messages(body, _TOOL_MESSAGE_FIELDS, allow_system=False)
+    tools = parse_anthropic_tools(body)
+    validate_anthropic_tool_choice(body)
+    messages = parse_anthropic_messages(body)
     try:
-        return TextRequest(model, system, tuple(messages), max_tokens, stream)
+        return TextRequest(
+            model,
+            system,
+            messages,
+            max_tokens,
+            stream,
+            dialect="anthropic",
+            tools=tools,
+        )
+    except RequestValidationError:
+        raise
     except ValueError as error:
         raise RequestValidationError("messages", str(error)) from None
 
 
 def render_anthropic_response(
-    request_id: str, model: str, text: str, completed: Completed
+    request_id: str,
+    model: str,
+    blocks: str | tuple[TextBlock | ToolCall, ...],
+    completed: Completed,
 ) -> dict[str, object]:
+    normalized = (TextBlock(blocks),) if isinstance(blocks, str) else blocks
     return {
         "id": request_id,
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": text}],
+        "content": [_response_block(block) for block in normalized],
         "stop_reason": _anthropic_stop_reason(completed.stop_reason),
         "stop_sequence": None,
         "usage": _anthropic_usage(completed.usage),
@@ -70,57 +107,80 @@ def render_anthropic_response(
 
 
 def encode_anthropic_start(
-    request_id: str, model: str, input_tokens: int = 0
+    request_id: str,
+    model: str,
+    input_tokens: int = 0,
+    tools: tuple[ToolDefinition, ...] = (),
+    state: AnthropicStreamState | None = None,
 ) -> tuple[bytes, ...]:
-    return (
-        _sse(
-            "message_start",
-            {
-                "type": "message_start",
-                "message": {
-                    "id": request_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": model,
-                    "content": [],
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-                },
+    tools_enabled = bool(tools)
+    if state is not None:
+        state.tools_enabled = tools_enabled
+        state.open_text_index = None if tools_enabled else 0
+        state.next_block_index = 0 if tools_enabled else 1
+    start = _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": request_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
             },
-        ),
-        _sse(
-            "content_block_start",
-            {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            },
-        ),
+        },
     )
+    if tools_enabled:
+        return (start,)
+    return (start, _text_block_start(0))
 
 
 def encode_anthropic_event(
-    request_id: str, model: str, event: ConversationEvent
+    request_id: str,
+    model: str,
+    event: ConversationEvent,
+    block_index: int = 0,
+    state: AnthropicStreamState | None = None,
 ) -> tuple[bytes, ...]:
     del request_id, model
+    enabled = state is not None and state.tools_enabled
     if isinstance(event, InputUsage):
         return ()
     if isinstance(event, TextDelta):
-        return (
-            _sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": event.text},
-                },
-            ),
-        )
+        if enabled:
+            chunks: list[bytes] = []
+            assert state is not None
+            if state.open_text_index is None:
+                state.open_text_index = state.next_block_index
+                state.next_block_index += 1
+                chunks.append(_text_block_start(state.open_text_index))
+            chunks.append(_text_delta(state.open_text_index, event.text))
+            return tuple(chunks)
+        return (_text_delta(0, event.text),)
+    if isinstance(event, ToolCall):
+        chunks = []
+        index = block_index
+        if state is not None and state.open_text_index is not None:
+            chunks.append(_content_block_stop(state.open_text_index))
+            state.open_text_index = None
+        if state is not None:
+            index = state.next_block_index
+            state.next_block_index += 1
+        chunks.extend(_tool_call_events(event, index))
+        return tuple(chunks)
     if not isinstance(event, Completed):
         raise TypeError("unsupported conversation event")
-    return (
-        _sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+    close_index = None
+    if state is not None:
+        close_index = state.open_text_index
+        state.open_text_index = None
+    elif not enabled:
+        close_index = 0
+    terminal = (
         _sse(
             "message_delta",
             {
@@ -129,13 +189,14 @@ def encode_anthropic_event(
                     "stop_reason": _anthropic_stop_reason(event.stop_reason),
                     "stop_sequence": None,
                 },
-                "usage": {
-                    "output_tokens": usage_counter(event.usage, "output_tokens")
-                },
+                "usage": {"output_tokens": usage_counter(event.usage, "output_tokens")},
             },
         ),
         _sse("message_stop", {"type": "message_stop"}),
     )
+    return (
+        () if close_index is None else (_content_block_stop(close_index),)
+    ) + terminal
 
 
 def encode_anthropic_error(code: str, message: str) -> tuple[bytes, ...]:
@@ -150,6 +211,7 @@ def _anthropic_stop_reason(reason: str | None) -> str:
         "max_tokens": "max_tokens",
         "refusal": "refusal",
         "model_context_window_exceeded": "model_context_window_exceeded",
+        "tool_use": "tool_use",
     }
     try:
         return allowed[reason]  # type: ignore[index]
@@ -162,6 +224,75 @@ def _anthropic_usage(usage: Mapping[str, Any] | None) -> dict[str, int]:
         "input_tokens": usage_counter(usage, "input_tokens"),
         "output_tokens": usage_counter(usage, "output_tokens"),
     }
+
+
+def _response_block(block: TextBlock | ToolCall) -> dict[str, object]:
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    if isinstance(block, ToolCall):
+        return {
+            "type": "tool_use",
+            "id": block.id,
+            "name": block.name,
+            "input": plain_json(cast(JsonValue, block.arguments)),
+        }
+    raise TypeError("response blocks must be text or tool calls")
+
+
+def _text_block_start(index: int) -> bytes:
+    return _sse(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+
+
+def _text_delta(index: int, text: str) -> bytes:
+    return _sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "text_delta", "text": text},
+        },
+    )
+
+
+def _content_block_stop(index: int) -> bytes:
+    return _sse("content_block_stop", {"type": "content_block_stop", "index": index})
+
+
+def _tool_call_events(event: ToolCall, index: int) -> tuple[bytes, ...]:
+    return (
+        _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": event.id,
+                    "name": event.name,
+                    "input": {},
+                },
+            },
+        ),
+        _sse(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": canonical_json(cast(JsonValue, event.arguments)),
+                },
+            },
+        ),
+        _content_block_stop(index),
+    )
 
 
 def _sse(event: str, value: dict[str, object]) -> bytes:

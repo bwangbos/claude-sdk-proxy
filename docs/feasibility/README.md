@@ -1,6 +1,6 @@
-# Claude Agent SDK text gateway and historical probes
+# Claude Agent SDK gateway and historical probes
 
-This package ships a private localhost text gateway and retains the earlier
+This package ships a private localhost text-and-caller-tool gateway and retains the earlier
 trusted-local feasibility probes as historical comparator evidence. The
 authoritative offline release gate, including the real Pi provider integration,
 is:
@@ -11,13 +11,14 @@ make release-offline
 
 Live subscription checks remain separately opt-in.
 
-## Current runnable text gateway
+## Current runnable gateway
 
 The current implementation is a private, single-user compatibility gateway for
-fresh, linear text conversations. It uses the Claude Agent SDK and the Claude
-login already available to the process. Run it from the same normal host login
-context where `claude` is authenticated; a sandboxed process may not be able to
-read the macOS Keychain item even though the CLI works in a terminal.
+fresh, linear text and caller-owned tool conversations. It uses the Claude Agent
+SDK and the Claude login already available to the process. Run it from the same
+normal host login context where `claude` is authenticated; a sandboxed process
+may not be able to read the macOS Keychain item even though the CLI works in a
+terminal.
 
 Install the locked dependencies and launch the default model on loopback:
 
@@ -30,9 +31,93 @@ The server listens at `http://127.0.0.1:8317`. It exposes
 `POST /v1/chat/completions`, `POST /v1/messages`, `GET /v1/models`, and
 `GET /health`. `--host` accepts loopback IP addresses only. Repeat `--model`
 to expose more than one configured Agent SDK model alias. `--max-sessions`
-sets the positive retained-session limit and defaults to 8. Both POST endpoints
-require `Content-Type: application/json`; normal media-type parameters such as
-`charset=utf-8` are accepted.
+sets the positive retained-session limit and defaults to 8.
+`--tool-result-timeout` sets the positive finite number of seconds a suspended
+tool operation can wait for caller results and defaults to `300.0`. Both POST
+endpoints require `Content-Type: application/json`; normal media-type parameters
+such as `charset=utf-8` are accepted.
+
+### Caller-owned tool examples
+
+The gateway publishes calls and remains suspended; the HTTP caller executes the
+tool and continues with the exact public call ID. For Anthropic Messages, start a
+turn with:
+
+```bash
+curl http://127.0.0.1:8317/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claude-Proxy-Session: example-anthropic' \
+  -d '{
+    "model":"sonnet",
+    "max_tokens":256,
+    "messages":[{"role":"user","content":"Use lookup once for Boston."}],
+    "tools":[{"name":"lookup","description":"Look up a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}]
+  }'
+```
+
+Append the returned assistant `content` unchanged, execute every `tool_use`, then
+append one user message containing exactly one `tool_result` per returned ID:
+
+```json
+{
+  "model": "sonnet",
+  "max_tokens": 256,
+  "messages": [
+    {"role": "user", "content": "Use lookup once for Boston."},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_RETURNED_ID", "name": "lookup", "input": {"city": "Boston"}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_RETURNED_ID", "content": "sunny"}]}
+  ],
+  "tools": [{"name": "lookup", "description": "Look up a city", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": false}}
+}
+```
+
+For OpenAI Chat Completions, the equivalent first request is:
+
+```bash
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claude-Proxy-Session: example-openai' \
+  -d '{
+    "model":"sonnet",
+    "messages":[{"role":"user","content":"Use lookup once for Boston."}],
+    "tools":[{"type":"function","function":{"name":"lookup","description":"Look up a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}]
+  }'
+```
+
+Append its assistant message unchanged and then a contiguous tool result for
+each returned `tool_call_id`:
+
+```json
+{
+  "model": "sonnet",
+  "messages": [
+    {"role": "user", "content": "Use lookup once for Boston."},
+    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_RETURNED_ID", "type": "function", "function": {"name": "lookup", "arguments": "{\"city\":\"Boston\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_RETURNED_ID", "content": "sunny"}
+  ],
+  "tools": [{"type": "function", "function": {"name": "lookup", "description": "Look up a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": false}}}]
+}
+```
+
+Send each continuation to the same endpoint and with the same model, system
+string, dialect, and canonical tool definitions as the first request. Parallel
+results may be returned in any order, but correlation is strictly by the public
+ID. Never infer correlation from tool name, arguments, or position.
+
+The SDK's private MCP callback metadata carries its native tool-use ID. The
+gateway validates that ID against the raw and typed assistant blocks and uses it
+only to establish an exact internal bijection, including when the SDK dispatches
+parallel tool blocks through serial callbacks. It is never exposed as the public
+call ID or in errors. Public IDs are minted independently, and caller results
+still correlate only by those opaque public IDs; there is no name, argument, or
+position fallback.
+
+After the SDK echoes submitted results, the gateway accepts no later assistant
+or final boundary until every raw call has entered exactly one validated
+callback and the stored result has returned through it. The epoch stays sealed
+through terminal text and reopens only if a later boundary generates tools. A
+missing deferred callback therefore loses the session rather than allowing a
+terminal answer to commit.
 
 ### Pi configuration
 
@@ -73,17 +158,17 @@ Add this provider to `~/.pi/agent/models.json`:
 }
 ```
 
-Start a new text-only Pi session with:
+Start a new Pi session with its ordinary tool set enabled:
 
 ```bash
-pi --provider claude-subscription-local --model sonnet --no-tools
+pi --provider claude-subscription-local --model sonnet
 ```
 
 The dummy API key is deliberately non-secret; the gateway ignores it and uses
-the operator's local Claude login. Do not configure sampling parameters,
-reasoning options, or tools. The Pi provider's normal `store: false` and
-streaming-usage fields are accepted, as is the advisory `max_tokens` field
-added by Pi's ordinary `streamSimple` path.
+the operator's local Claude login. Pi's ordinary native tool definitions and
+loop are supported; do not configure sampling or reasoning options. The Pi
+provider's normal `store: false` and streaming-usage fields are accepted, as is
+the advisory `max_tokens` field added by Pi's ordinary `streamSimple` path.
 
 Pi 0.84.4 enables automatic context compaction by default, and `/compact`
 performs the same lossy history replacement manually. Both produce a rewritten
@@ -110,18 +195,43 @@ would collapse all conversations into one lineage.
 
 ### Supported boundary
 
-- Supported: text-only streaming and non-streaming calls, exact system/user
-  strings, retries of completed requests, and append-only continuations that
-  originated through this running gateway.
+- Supported: text and caller-owned function tools in streaming and non-streaming
+  calls, including mixed text/calls, parallel calls, repeated tool rounds,
+  reverse-order result submission by public ID, exact system/user strings,
+  retries of completed requests, and append-only continuations that originated
+  through this running gateway. Successful tool results may be empty; Anthropic
+  non-empty results may set `is_error: true`. OpenAI results are text-only and
+  have no supported structured error flag.
+- Anthropic controls: omit `tool_choice`, or use `{"type":"auto"}` with
+  `disable_parallel_tool_use` omitted or `false`. `any`, `tool`, `none`, named
+  choice, and `disable_parallel_tool_use: true` are rejected.
+- OpenAI controls: function tools only; omit `tool_choice`, or use `"auto"`;
+  omit `parallel_tool_calls`, or set it to `true`. Required/none/named choices,
+  `parallel_tool_calls: false`, legacy functions, and non-function tools are
+  rejected.
 - Advisory only: `max_tokens` and `max_completion_tokens`; the Agent SDK does
   not provide exact output-token enforcement through this path.
-- Unsupported: imported assistant histories, edits, branching, tools, exact
-  sampling/stop controls, public or multi-user service, and recovery of live
-  conversations after the gateway restarts.
+- Unsupported: imported assistant histories, edits, branching, mixed text and
+  tool-result blocks in one user turn, non-text tool results, exact
+  sampling/stop controls, reasoning controls, public or multi-user service, and
+  recovery of live conversations after the gateway restarts. A restart loses
+  every suspended tool call, retained transcript, and replay entry.
+- Limits: at most 128 tool definitions; each name is 1–64 ASCII letters,
+  digits, `_`, or `-`; each UTF-8 description is at most 8 KiB; each canonical
+  JSON Schema is at most 64 KiB and all schemas together at most 512 KiB; each
+  canonical argument object is at most 256 KiB. Each joined UTF-8 result is at
+  most 256 KiB and one result batch is at most 1 MiB. JSON Schemas must be
+  self-contained; only resolvable fragment references are accepted and no
+  network or filesystem retrieval occurs. Schema and argument JSON is limited
+  to 64 nested mappings/arrays, counting the root container as depth 1; depth
+  64 is accepted and depth 65 is rejected.
 - Capacity: at most 8 sessions are retained by default. Fresh admission at the
   limit evicts the least-recently-used idle session. In-flight and
   replay-reserved sessions are never evicted; if all retained sessions are busy,
   both dialects return HTTP 503 with `session_capacity`.
+- Timeouts: generation waits up to 300 seconds. A published tool boundary waits
+  up to `--tool-result-timeout` seconds (default `300.0`); expiry closes and
+  removes that session. Backend teardown is bounded to 5 seconds.
 - Concurrency and replay: one turn at a time per conversation. An in-flight
   duplicate or continuation returns HTTP 409. Only the current completed
   transcript head replays from memory; an older head may return
@@ -131,6 +241,13 @@ would collapse all conversations into one lineage.
   `content_filter`, and `length`, respectively. Chat Completions has no distinct
   context-window reason, so context exhaustion deliberately uses its truncation
   signal.
+
+For a tool session, the proxy creates one in-process MCP server named
+`caller_tools_v1`, exposes only the tools from the request, and lets the Agent
+SDK/provider inject its native schema and standard tool-use instructions. The
+proxy does not append tool prose to the caller's system string or final user
+text. Built-ins, ambient settings, MCP servers, skills, plugins, subagents,
+auto-memory, slash commands, and session persistence remain disabled.
 
 The real Pi provider integration suite uses actual Uvicorn and localhost HTTP
 but deterministic fake SDK sessions, so it never invokes a model:
@@ -142,20 +259,34 @@ but deterministic fake SDK sessions, so it never invokes a model:
 It is included in `make release-offline`, which is the authoritative offline
 release gate. `make check` remains the faster development gate.
 
-The separately gated live test uses only a synthetic marker and never inspects
-credentials:
+The separately gated live release matrix uses synthetic markers, the production
+app, the installed Agent SDK, and a stock Pi agent. It never inspects
+credentials. Run it from the normal authenticated host context:
 
 ```bash
 CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet \
-  .venv/bin/pytest -q --strict-markers -m live tests/live/test_gateway_text.py
+  .venv/bin/pytest -q --strict-markers --forbid-skips -W error \
+  tests/live/test_gateway_text.py tests/live/test_gateway_tools.py
 ```
+
+The exact deterministic release commands are:
+
+```bash
+.venv/bin/pytest -q tests/gateway tests/integration
+make check
+make release-offline
+```
+
+They select no subscription model. The directory-based `integration` target
+automatically includes the official-client and real-Pi tool compatibility
+tests, both of which use deterministic fake SDK sessions.
 
 ## Superseded legacy Phase 0 feasibility record
 
 Everything below this heading describes the earlier fail-closed probe design,
 its Agent SDK 0.2.148 pin, and its negative Phase 0 verdict. It is retained for
 audit history and is not the launch or verification contract for the current
-Agent SDK 0.2.152 text gateway above. In particular,
+Agent SDK 0.2.152 gateway above. In particular,
 `RUN_LIVE_CLAUDE_TESTS=1` is the legacy probe opt-in; current gateway live tests
 use `CLAUDE_PROXY_LIVE=1` plus `CLAUDE_PROXY_LIVE_MODEL`.
 

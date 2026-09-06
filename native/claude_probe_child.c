@@ -57,6 +57,7 @@ int main(int argc, char **argv) {
     bool stubborn = false;
     bool exit_after_write = false;
     bool spawn_descendant = false;
+    bool spawn_stubborn_descendant = false;
     const char *exit_marker = NULL;
     int descriptor;
 
@@ -74,7 +75,8 @@ int main(int argc, char **argv) {
         strcmp(argv[1], "--output-path") != 0 ||
         (argc == 4 && strcmp(argv[3], "--stubborn") != 0 &&
          strcmp(argv[3], "--exit-after-write") != 0 &&
-         strcmp(argv[3], "--spawn-descendant") != 0) ||
+         strcmp(argv[3], "--spawn-descendant") != 0 &&
+         strcmp(argv[3], "--spawn-stubborn-descendant") != 0) ||
         (argc == 5 && (strcmp(argv[3], "--exit-on-marker") != 0 ||
          argv[4][0] != '/'))) {
         return PROBE_EXIT;
@@ -86,6 +88,8 @@ int main(int argc, char **argv) {
         strcmp(argv[3], "--exit-after-write") == 0;
     spawn_descendant = argc == 4 &&
         strcmp(argv[3], "--spawn-descendant") == 0;
+    spawn_stubborn_descendant = argc == 4 &&
+        strcmp(argv[3], "--spawn-stubborn-descendant") == 0;
     if (argc == 5) {
         exit_marker = argv[4];
     }
@@ -157,6 +161,16 @@ int main(int argc, char **argv) {
     }
     if (spawn_descendant && fork() < 0) {
         return PROBE_EXIT;
+    }
+    if (spawn_stubborn_descendant) {
+        pid_t descendant = fork();
+
+        if (descendant < 0) {
+            return PROBE_EXIT;
+        }
+        if (descendant == 0) {
+            (void)signal(SIGTERM, SIG_IGN);
+        }
     }
     if (stubborn) {
         (void)signal(SIGTERM, SIG_IGN);

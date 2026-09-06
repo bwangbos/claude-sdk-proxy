@@ -56,6 +56,18 @@ static uint64_t control_deadline(void) {
         (uint64_t)now.tv_nsec + 5000000000ULL;
 }
 
+static bool deadline_reached(uint64_t deadline) {
+    struct timespec now;
+    uint64_t current;
+
+    if (deadline == 0U || clock_gettime(CLOCK_MONOTONIC_RAW, &now) < 0) {
+        return true;
+    }
+    current = (uint64_t)now.tv_sec * 1000000000ULL +
+        (uint64_t)now.tv_nsec;
+    return current >= deadline;
+}
+
 static int hex_nibble(char value) {
     if (value >= '0' && value <= '9') {
         return value - '0';
@@ -331,7 +343,9 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
     bool cleanup = false;
     bool child_reaped = false;
     bool internal_lost = false;
+    bool external_lost = false;
     bool fallback_consumed = false;
+    uint64_t orphan_deadline = 0U;
     int child_status = 0;
 
     if (parse_nonce(arguments->allocation_nonce, nonce) < 0) {
@@ -348,13 +362,18 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
                 return ANCHOR_FAIL_DEAD_EXIT;
             }
         }
-        if (cleanup && term_seen != 0 && child_reaped) {
+        if (external_lost && deadline_reached(orphan_deadline)) {
+            (void)killpg(getpgrp(), SIGKILL);
+            _exit(ANCHOR_FAIL_DEAD_EXIT);
+        }
+        if (!external_lost && cleanup && term_seen != 0 && child_reaped) {
             return 0;
         }
         controls[0].fd = internal_lost ? -1 : CPL_ANCHOR_INTERNAL_CONTROL_FD;
         controls[0].events = POLLIN;
         controls[0].revents = 0;
-        controls[1].fd = internal_lost && running ? arguments->control_fd : -1;
+        controls[1].fd = internal_lost && running && !external_lost ?
+            arguments->control_fd : -1;
         controls[1].events = POLLIN;
         controls[1].revents = 0;
         if (poll(controls, 2U, 10) < 0) {
@@ -396,24 +415,29 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
                 fallback_consumed || frame.payload_length != 0U ||
                 frame.type != CPL_CONTROL_SELF_TERM_REQUEST ||
                 cpl_control_phase_accept(&phase, frame.type, false) != CPL_OK) {
-                continue;
+                /* EOF is commonly POLLIN|POLLHUP. Do not hot-loop on it. */
+                if ((controls[1].revents &
+                        (POLLHUP | POLLERR | POLLNVAL)) == 0) {
+                    continue;
+                }
+            } else {
+                if (
+                    cpl_journal_bootstrap_append(journal,
+                        CPL_CONTROL_SELF_TERM_REQUEST, frame.payload,
+                        frame.payload_length,
+                        control_deadline(), &bootstrap) != CPL_OK ||
+                    cpl_journal_bootstrap_certify(journal,
+                        CPL_CONTROL_SELF_TERM_REQUEST, frame.payload,
+                        frame.payload_length, control_deadline(),
+                        &certified) != CPL_OK ||
+                    killpg(getpgrp(), SIGTERM) < 0 ||
+                    cpl_journal_mark_unconfirmed(journal,
+                        CPL_UNCONFIRMED_PROOF_UNAVAILABLE,
+                        control_deadline(), &unconfirmed) != CPL_OK) {
+                    return ANCHOR_FAIL_DEAD_EXIT;
+                }
+                fallback_consumed = true;
             }
-            if (
-                cpl_journal_bootstrap_append(journal,
-                    CPL_CONTROL_SELF_TERM_REQUEST, frame.payload,
-                    frame.payload_length,
-                    control_deadline(), &bootstrap) != CPL_OK ||
-                cpl_journal_bootstrap_certify(journal,
-                    CPL_CONTROL_SELF_TERM_REQUEST, frame.payload,
-                    frame.payload_length, control_deadline(),
-                    &certified) != CPL_OK ||
-                killpg(getpgrp(), SIGTERM) < 0 ||
-                cpl_journal_mark_unconfirmed(journal,
-                    CPL_UNCONFIRMED_PROOF_UNAVAILABLE,
-                    control_deadline(), &unconfirmed) != CPL_OK) {
-                return ANCHOR_FAIL_DEAD_EXIT;
-            }
-            fallback_consumed = true;
         }
         if ((controls[0].revents & (POLLHUP | POLLERR)) != 0 && !running) {
             return ANCHOR_FAIL_DEAD_EXIT;
@@ -422,9 +446,22 @@ static int anchor_control_loop(const struct anchor_arguments *arguments,
             internal_lost = true;
             (void)close(CPL_ANCHOR_INTERNAL_CONTROL_FD);
         }
-        if ((controls[1].revents & (POLLHUP | POLLERR)) != 0 && running) {
-            for (;;) {
-                pause();
+        if ((controls[1].revents &
+                (POLLHUP | POLLERR | POLLNVAL)) != 0 && running &&
+            !external_lost) {
+            /* No retaining supervisor or controller remains. The live anchor
+             * owns this exact group incarnation, so terminate it without
+             * authorizing filesystem cleanup or trusting a reused PGID. */
+            external_lost = true;
+            cleanup = true;
+            orphan_deadline = monotonic_deadline();
+            (void)close(arguments->control_fd);
+            (void)cpl_journal_mark_unconfirmed(journal,
+                CPL_UNCONFIRMED_PROOF_UNAVAILABLE,
+                control_deadline(), &unconfirmed);
+            if (killpg(getpgrp(), SIGTERM) < 0) {
+                (void)killpg(getpgrp(), SIGKILL);
+                _exit(ANCHOR_FAIL_DEAD_EXIT);
             }
         }
     }

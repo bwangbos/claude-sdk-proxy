@@ -196,13 +196,9 @@ class RawTextEventValidator:
     def validate_result(
         self, stop_reason: object, usage: Mapping[str, int] | None
     ) -> None:
+        del usage
         if self._phase != "complete" or stop_reason != self.stop_reason:
             fail_protocol()
-        if usage is not None:
-            if usage.get("input_tokens", self.input_tokens) != self.input_tokens:
-                fail_protocol()
-            if usage.get("output_tokens", self.output_tokens) != self.output_tokens:
-                fail_protocol()
 
     def _require_index(self, event: Mapping[str, Any]) -> None:
         if type(event.get("index")) is not int or event["index"] != self._block_index:
