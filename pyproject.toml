@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "claude-sdk-proxy"
 version = "0.0.0"
 description = "Private localhost Claude Agent SDK text gateway and historical probes"
-readme = "docs/feasibility/README.md"
+readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "claude-agent-sdk==0.2.152",
