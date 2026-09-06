@@ -243,6 +243,21 @@ async def test_sdk_session_normalizes_only_complete_native_refusal(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
+    "tools", [(), (_echo_definition(),)], ids=["no-tools", "tools"]
+)
+async def test_sdk_session_rejects_refusal_replacing_partial_raw_message(
+    tmp_path: Path, tools: tuple[ToolDefinition, ...]
+) -> None:
+    partial = raw_text_events("partial before refusal", "sdk-1")[:3]
+    valid_refusal = refusal_response(tools_enabled=bool(tools))
+    messages = (valid_refusal[0], *partial, *valid_refusal[1:])
+
+    with pytest.raises(BackendFailure):
+        await _collect_sdk_refusal(tmp_path, messages, tools=tools)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
     "case",
     [
         "missing-notice",

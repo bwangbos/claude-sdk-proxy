@@ -347,6 +347,7 @@ class SdkSession:
                             terminal_boundary is not None
                             or self._awaiting_submit
                             or refusal_category is not None
+                            or (raw is not None and not raw.complete)
                         ):
                             self._fail_protocol()
                         if self._awaiting_echo:
