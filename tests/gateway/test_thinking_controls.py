@@ -240,6 +240,20 @@ def test_anthropic_unknown_nested_control_field_is_rejected(
     assert "unknown" in raised.value.reason
 
 
+@pytest.mark.parametrize("field", ["thinking", "output_config"])
+@pytest.mark.parametrize("value", ["adaptive", [], 1, True])
+def test_anthropic_non_object_nested_control_is_rejected(
+    field: str, value: object
+) -> None:
+    body = _anthropic_body()
+    body[field] = value
+
+    with pytest.raises(RequestValidationError) as raised:
+        parse_anthropic_request(body, frozenset({"claude-sonnet-4-6"}))
+
+    assert raised.value.field == field
+
+
 @pytest.mark.parametrize("display", ["full", "", 1, True])
 def test_anthropic_invalid_thinking_display_is_rejected(display: object) -> None:
     body = _anthropic_body()
