@@ -200,7 +200,31 @@ Anthropic documents that automated Opus safeguards can flag normal conversations
 the account-specific trigger here remains unknown. See [Anthropic's explanation
 of Opus model safeguards](https://support.claude.com/en/articles/16049681-why-claude-switched-models-in-your-conversation-with-opus-5).
 
-## Configuration and operational limits
+## Final offline release gate and review
+
+Source/test revision: `94a1769`. The controller exported only tracked files to a
+fresh temporary snapshot, linked the installed environment, and ran:
+
+```bash
+UV_NO_SYNC=1 PYTHONPATH=/private/tmp/claude-thinking-final.fa0fp1/src \
+  make -C /private/tmp/claude-thinking-final.fa0fp1 release-offline
+```
+
+The gate rebuilt native helpers and exited successfully: **1,757 tests passed**
+(676 unit, 222 Darwin, 827 gateway, 32 integration), with strict markers, no
+skips, and warnings treated as errors. Ruff passed for the full tracked snapshot;
+mypy reported no issues in 44 source files. The post-run process check found no
+proxy anchor, supervisor, or probe-child helpers left running.
+
+The independent whole-branch reviewer identified three Important boundary bugs
+and two minor issues. The grouped correction addressed tool-enabled refusal
+handling, faithful Anthropic empty-refusal replay, malformed thinking-type
+validation, README text selection, and the refusal-negative fixture. Scoped
+re-review approved all five at `94a1769`, with no new breakage or remaining
+findings. Live evidence remains the bounded matrix and successful bidirectional
+runs above; the upstream refusal limitation is not claimed eliminated.
+
+## Local activation status
 
 - The README configuration advertises only `off`, `low`, `medium`, `high`,
   `xhigh`, and `max`; Pi's `minimal` slot maps to `null` and is hidden.

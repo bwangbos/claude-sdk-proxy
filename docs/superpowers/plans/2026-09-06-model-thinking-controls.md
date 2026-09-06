@@ -147,14 +147,14 @@ const events = streamSimple(model, context, {
 - [x] Run bounded live SDK probes for each model/level advertised in the local Pi config. Assert actual SDK options and returned model identity, completed response, thinking handling where returned, a tool continuation, and a post-answer switch. Do not infer effort success from answer wording or require adaptive thinking to appear on every trivial prompt. Use existing `CLAUDE_PROXY_LIVE=1` opt-in pattern and close all clients in `finally`/context managers.
 - [x] If a live combination fails, investigate with its actual diagnostic reason; do not advertise it or silently downgrade it. Record unavailable account models separately from code failures. No unbounded model/effort sweep.
 - [ ] Add normal Pi entries for verified Sonnet and Opus models under the existing local providers. Keep `reasoning: true` only where verified, hide unsupported levels via `thinkingLevelMap`, and leave local direct-model providers untouched. If the currently running proxy allowlist lacks the new models, report the needed restart command rather than restarting it without permission.
-- [ ] Run the full offline release gate from a fresh tracked snapshot so user-owned untracked research is excluded: `UV_NO_SYNC=1 PYTHONPATH="$task_snapshot/src" make -C "$task_snapshot" release-offline`, with the existing `.venv` symlinked into that snapshot. Run the live test selection separately and report exact pass counts and limitations.
-- [ ] Request an independent code review before declaring the feature complete. Address findings with regressions and repeat affected checks. Commit code/tests/docs only; do not stage local research or Pi secrets. Report branch, verification, configuration changes, and whether the running proxy still needs a restart.
+- [x] Run the full offline release gate from a fresh tracked snapshot so user-owned untracked research is excluded: `UV_NO_SYNC=1 PYTHONPATH="$task_snapshot/src" make -C "$task_snapshot" release-offline`, with the existing `.venv` symlinked into that snapshot. Run the live test selection separately and report exact pass counts and limitations.
+- [x] Request an independent code review before declaring the feature complete. Address findings with regressions and repeat affected checks. Commit code/tests/docs only; do not stage local research or Pi secrets. Report branch, verification, configuration changes, and whether the running proxy still needs a restart.
 
 ## Research and Review Notes
 
 - Task-scoped implementation and review are complete through `db0d31c`. Actual Pi bidirectional Sonnet/high → Opus/low → Sonnet/high tool roundtrips passed through both API dialects; the longer flow's upstream refusals were reproduced independently without proxy switching and are documented honestly.
 - Local Pi/service activation is intentionally pending restart authorization. Ready-to-apply normal provider entries are documented in README; no running configuration was changed.
-- Final whole-branch review and a fresh final offline release gate remain separate completion checks.
+- Final whole-branch review found three Important and two minor defects, all fixed and approved in scoped re-review at `94a1769`. Fresh tracked-snapshot release gate at that revision passed 1,757 tests, Ruff, and mypy (44 files). No helper processes remained afterward. Local activation remains the only unchecked operational step above.
 
 - SDK reference: https://code.claude.com/docs/en/agent-sdk/python#thinkingconfig
 - Effort capabilities: https://platform.claude.com/docs/en/build-with-claude/effort
@@ -163,3 +163,18 @@ const events = streamSimple(model, context, {
 - Installed SDK exposes `set_model` but no equivalent public effort setter; one replacement path is deliberately simpler than two mutation mechanisms.
 - Anthropic requires one thinking mode across an assistant turn including its tool-use loop. Therefore a result submission is not a settings-switch boundary. The normal Pi between-turn selector remains supported.
 - Plan self-review: all seven acceptance requirements map to Tasks 1–4; no new provider adapter, process manager, routing framework, or native component is introduced.
+
+## Implementation decisions and tradeoffs
+
+These decisions were recorded during subagent execution, in chronological order.
+
+1. Preserve optional thinking `display`, because stock Pi sends `summarized`. Cost if wrong: another small public option to maintain.
+2. Share the strict SDK message validator across text and tool streams, with native-history projection callsites. Cost if wrong: a wider regression surface than separate parsers.
+3. Accept correctly indexed multiple text blocks for text/thinking/text output. Cost if wrong: relaxing the previous single-text-block restriction needs malformed-order and typed/raw consistency coverage.
+4. Buffer thinking after the first tool block until the tool boundary seals, then publish the suffix in original order. Cost if wrong: delayed display of post-tool reasoning and additional ordering requirements.
+5. Publish tool invocations in validated raw-ID order, not callback-arrival order. Cost if wrong: changed observable ordering; reverse-callback and missing/duplicate callback regressions protect associations.
+6. Accept exact schema/session/active-phase `thinking_tokens` progress events and ignore their estimates for accounting. Cost if wrong: additional protocol surface; malformed phase/session checks remain necessary.
+7. Recognize only the exact deterministic Pi projection of already-stored native history, preserving native signed blocks. Cost if wrong: wider transcript-equivalence rules; altered content, ambiguity, busy/stale requests, and the current pending assistant stay guarded. Unsigned input is never authenticated.
+8. Leave local Pi configuration and the running proxy unchanged until coordinated activation is authorized. Cost if wrong: one additional activation step; avoids configuring new controls against the old server.
+9. Recognize only the fully correlated native refusal sequence, retain raw usage, and expose existing public refusal stop reasons. Cost if wrong: wider terminal protocol surface requiring malformed/error/replay/recovery tests. Never fabricate an answer, retry, or downgrade.
+10. Render empty Anthropic refusals as `content: []`, normalize empty assistant arrays to the existing canonical empty-text representation, and admit only that singleton empty assistant shape for replay in both dialects. Public transcripts cannot authenticate refusal metadata. Cost if wrong: clients can submit structurally identical empty assistant messages; empty users, multiple empty blocks, malformed messages, blockless successful backend output, and pending-tool violations remain rejected.
