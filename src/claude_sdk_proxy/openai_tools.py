@@ -8,6 +8,7 @@ from typing import cast
 from claude_sdk_proxy.domain import (
     CanonicalBlock,
     CanonicalMessage,
+    ImageBlock,
     RequestValidationError,
     TextBlock,
     ToolCallBlock,
@@ -15,6 +16,7 @@ from claude_sdk_proxy.domain import (
     ToolResultBlock,
     UnsupportedFeature,
 )
+from claude_sdk_proxy.images import openai_image
 
 _FUNCTION_TOOL_FIELDS = {"type", "function"}
 _FUNCTION_FIELDS = {"name", "description", "parameters"}
@@ -90,7 +92,12 @@ def parse_openai_messages(
             system = _system_message(raw, index)
             index += 1
         elif role == "user":
-            messages.append(CanonicalMessage("user", _text_content(raw, "user")))
+            if isinstance(raw.get("content"), list):
+                if set(raw) - _MESSAGE_FIELDS:
+                    raise _message_field_error(raw)
+                messages.append(CanonicalMessage("user", _user_parts(raw["content"])))
+            else:
+                messages.append(CanonicalMessage("user", _text_content(raw, "user")))
             index += 1
         elif role == "assistant":
             messages.append(_assistant_message(raw))
@@ -144,6 +151,24 @@ def _text_content_parts(content: list[object]) -> str:
             )
         text.append(value)
     return "".join(text)
+
+
+def _user_parts(content: object) -> tuple[TextBlock | ImageBlock, ...]:
+    if not isinstance(content, list):
+        raise RequestValidationError("messages", "content must be an array")
+    parts: list[TextBlock | ImageBlock] = []
+    for raw in content:
+        if isinstance(raw, Mapping) and raw.get("type") == "image_url":
+            parts.append(openai_image(raw))
+        else:
+            parts.append(TextBlock(_text_content_parts([raw])))
+    if parts and all(isinstance(part, TextBlock) for part in parts):
+        return (
+            TextBlock(
+                "".join(part.text for part in parts if isinstance(part, TextBlock))
+            ),
+        )
+    return tuple(parts)
 
 
 def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
@@ -217,11 +242,18 @@ def _tool_results(
         identifier, content = raw.get("tool_call_id"), raw.get("content")
         if not isinstance(identifier, str) or _CALL_ID.fullmatch(identifier) is None:
             raise RequestValidationError("messages", "tool result ID is invalid")
-        if not isinstance(content, str):
+        if isinstance(content, list):
+            parts = tuple(
+                part.text if isinstance(part, TextBlock) else part
+                for part in _user_parts(content)
+            )
+        elif isinstance(content, str):
+            parts = (content,)
+        else:
             raise RequestValidationError(
                 "messages", "tool result content must be a string"
             )
-        results.append(ToolResultBlock(identifier, (content,), False))
+        results.append(ToolResultBlock(identifier, parts, False))
         index += 1
     return tuple(results), index
 

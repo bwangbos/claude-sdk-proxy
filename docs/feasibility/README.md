@@ -1,6 +1,6 @@
 # Claude Agent SDK gateway and historical probes
 
-This package ships a private localhost text-and-caller-tool gateway and retains the earlier
+This package ships a private localhost text/image-and-caller-tool gateway and retains the earlier
 trusted-local feasibility probes as historical comparator evidence. The
 authoritative offline release gate, including the real Pi provider integration,
 is:
@@ -14,7 +14,7 @@ Live subscription checks remain separately opt-in.
 ## Current runnable gateway
 
 The current implementation is a private, single-user compatibility gateway for
-fresh, linear text and caller-owned tool conversations. It uses the Claude Agent
+fresh, linear text/image and caller-owned tool conversations. It uses the Claude Agent
 SDK and the Claude login already available to the process. Run it from the same
 normal host login context where `claude` is authenticated; a sandboxed process
 may not be able to read the macOS Keychain item even though the CLI works in a
@@ -119,7 +119,30 @@ through terminal text and reopens only if a later boundary generates tools. A
 missing deferred callback therefore loses the session rather than allowing a
 terminal answer to commit.
 
-### Pi configuration
+### Images
+
+Both endpoints accept inline PNG, JPEG, GIF, and WebP user inputs. Anthropic
+uses native base64 `image` blocks; OpenAI uses `image_url` blocks with base64
+data URLs. Successful tool results can include images: native Anthropic
+`tool_result.content` blocks, or the proxy's OpenAI extension accepting a
+text/`image_url` array in a tool message. Image bytes and order are preserved
+through SDK transport, replay identity, and imported history. Return error
+results as text; image error results are unsupported.
+
+The entire submitted history is limited to 20 images, 3 MiB decoded per image,
+and 12 MiB decoded overall. Encoding, size, and MIME signatures are checked
+locally; the backend validates image decoding and dimensions. No image URL
+fetching, PDF/audio/video input, image generation, or non-`auto` OpenAI image
+detail controls are provided.
+
+For Pi image attachments and screenshot tools, use the
+[Anthropic vision provider configuration](../../README.md#pi-with-images-and-screenshots).
+Pi's OpenAI provider detaches image tool results into an additional user turn;
+the gateway does not guess their tool IDs. Anthropic system text-block arrays
+and ephemeral content-block cache hints are accepted for stock Pi compatibility.
+Hints are advisory and do not control backend caching.
+
+### Pi configuration (text)
 
 Add this provider to `~/.pi/agent/models.json`:
 
@@ -178,7 +201,7 @@ snapshot into a fresh ephemeral SDK session and continues from it. No Pi adapter
 or compaction-specific prompt handling exists in the gateway.
 
 The rewritten snapshot must still be a structurally complete supported
-transcript and end with a text user message. A rewrite cannot cross an unresolved
+transcript and end with a text/image user message. A rewrite cannot cross an unresolved
 tool-call boundary: submit every pending tool result and finish that model turn
 before compacting.
 
@@ -197,15 +220,15 @@ old idle lineage remains eligible for normal least-recently-used eviction.
 
 ### Supported boundary
 
-- Supported: text and caller-owned function tools in streaming and non-streaming
+- Supported: text, inline images, and caller-owned function tools in streaming and non-streaming
   calls, including mixed text/calls, parallel calls, repeated tool rounds,
   reverse-order result submission by public ID, exact system/user strings,
   retries of completed requests, append-only continuations that originated
   through this running gateway, and complete imported or rewritten transcripts
-  at completed text boundaries. Imported completed tool calls/results retain
+  at completed boundaries. Imported completed tool calls/results retain
   their native structured roles and are not flattened into prompt text.
   Successful tool results may be empty; Anthropic non-empty results may set
-  `is_error: true`. OpenAI results are text-only and have no supported structured
+  `is_error: true` for text-only errors. OpenAI results have no supported structured
   error flag.
 - Anthropic controls: omit `tool_choice`, or use `{"type":"auto"}` with
   `disable_parallel_tool_use` omitted or `false`. `any`, `tool`, `none`, named
@@ -218,14 +241,14 @@ old idle lineage remains eligible for normal least-recently-used eviction.
   not provide exact output-token enforcement through this path.
 - Unsupported: rebasing a busy session or an unresolved tool boundary,
   concurrent branches/forks under one explicit session ID, mixed text and
-  tool-result blocks in one user turn, non-text tool results, exact sampling/stop
+  tool-result blocks in one user turn, non-text/image tool results, exact sampling/stop
   controls, reasoning controls, public or multi-user service, and recovery of
   live conversations after the gateway restarts. A restart loses every
   suspended tool call, retained transcript, and replay entry.
 - Limits: at most 128 tool definitions; each name is 1–64 ASCII letters,
   digits, `_`, or `-`; each UTF-8 description is at most 8 KiB; each canonical
   JSON Schema is at most 64 KiB and all schemas together at most 512 KiB; each
-  canonical argument object is at most 256 KiB. Each joined UTF-8 result is at
+  canonical argument object is at most 256 KiB. Each joined UTF-8 result text is at
   most 256 KiB and one result batch is at most 1 MiB. JSON Schemas must be
   self-contained; only resolvable fragment references are accepted and no
   network or filesystem retrieval occurs. Schema and argument JSON is limited
@@ -275,7 +298,8 @@ credentials. Run it from the normal authenticated host context:
 ```bash
 CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet \
   .venv/bin/pytest -q --strict-markers --forbid-skips -W error \
-  tests/live/test_gateway_text.py tests/live/test_gateway_tools.py
+  tests/live/test_gateway_text.py tests/live/test_gateway_tools.py \
+  tests/live/test_gateway_images.py
 ```
 
 The exact deterministic release commands are:

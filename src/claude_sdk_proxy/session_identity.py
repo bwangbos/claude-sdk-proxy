@@ -7,11 +7,13 @@ from typing import cast
 
 from claude_sdk_proxy.domain import (
     CanonicalMessage,
+    ImageBlock,
     TextBlock,
     TextRequest,
     ToolCallBlock,
     ToolDefinition,
 )
+from claude_sdk_proxy.images import render_image
 from claude_sdk_proxy.tool_contract import JsonValue, plain_json
 
 
@@ -32,6 +34,8 @@ def _canonical_message(message: CanonicalMessage) -> dict[str, object]:
     for block in message.blocks:
         if isinstance(block, TextBlock):
             item: dict[str, object] = {"type": "text", "text": block.text}
+        elif isinstance(block, ImageBlock):
+            item = render_image(block)
         elif isinstance(block, ToolCallBlock):
             item = {
                 "type": "tool_call",
@@ -43,7 +47,10 @@ def _canonical_message(message: CanonicalMessage) -> dict[str, object]:
             item = {
                 "type": "tool_result",
                 "tool_call_id": block.tool_call_id,
-                "content": list(block.content),
+                "content": [
+                    render_image(part) if isinstance(part, ImageBlock) else part
+                    for part in block.content
+                ],
                 "is_error": block.is_error,
             }
         blocks.append(item)

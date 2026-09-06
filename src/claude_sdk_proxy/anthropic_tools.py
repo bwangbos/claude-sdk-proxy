@@ -7,6 +7,7 @@ from typing import cast
 from claude_sdk_proxy.domain import (
     CanonicalBlock,
     CanonicalMessage,
+    ImageBlock,
     RequestValidationError,
     Role,
     TextBlock,
@@ -15,6 +16,7 @@ from claude_sdk_proxy.domain import (
     ToolResultBlock,
     UnsupportedFeature,
 )
+from claude_sdk_proxy.images import anthropic_image
 
 _MESSAGE_FIELDS = {"role", "content"}
 _TOOL_FIELDS = {"name", "description", "input_schema"}
@@ -24,6 +26,36 @@ _TOOL_RESULT_FIELDS = {"type", "tool_use_id", "content", "is_error"}
 _TOOL_CHOICE_FIELDS = {"type", "name", "disable_parallel_tool_use"}
 _UNSUPPORTED_MESSAGE_FIELDS = {"tool_use_id", "tool_call_id", "tool_calls"}
 _TOOL_ID = re.compile(r"toolu_[A-Za-z0-9_-]+")
+
+
+def without_cache_hint(raw: Mapping[str, object]) -> Mapping[str, object]:
+    if "cache_control" not in raw:
+        return raw
+    hint = raw["cache_control"]
+    if (
+        not isinstance(hint, Mapping)
+        or set(hint) - {"type", "ttl"}
+        or hint.get("type") != "ephemeral"
+        or hint.get("ttl", "5m") not in ("5m", "1h")
+    ):
+        raise RequestValidationError("messages", "cache hint is invalid")
+    return {key: value for key, value in raw.items() if key != "cache_control"}
+
+
+def parse_system_blocks(value: list[object]) -> str:
+    parts: list[str] = []
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            raise RequestValidationError("system", "system blocks must be text")
+        raw = without_cache_hint(raw)
+        if (
+            set(raw) != {"type", "text"}
+            or raw.get("type") != "text"
+            or not isinstance(raw.get("text"), str)
+        ):
+            raise RequestValidationError("system", "system blocks must be text")
+        parts.append(cast(str, raw["text"]))
+    return "".join(parts)
 
 
 def parse_anthropic_tools(body: Mapping[str, object]) -> tuple[ToolDefinition, ...]:
@@ -114,7 +146,10 @@ def _parse_content(
 def _parse_block(raw: object, role: Role) -> CanonicalBlock:
     if not isinstance(raw, Mapping):
         raise RequestValidationError("messages", "content blocks must be objects")
+    raw = without_cache_hint(raw)
     kind = raw.get("type")
+    if kind == "image" and role == "user":
+        return anthropic_image(raw)
     if kind == "text":
         if set(raw) - _TEXT_BLOCK_FIELDS or not isinstance(raw.get("text"), str):
             raise RequestValidationError("messages", "text blocks must contain text")
@@ -149,20 +184,25 @@ def _parse_block(raw: object, role: Role) -> CanonicalBlock:
             raise RequestValidationError(
                 "messages", "tool result error flag must be boolean"
             )
-        return ToolResultBlock(identifier, _parse_result_text(raw), is_error)
+        return ToolResultBlock(identifier, _parse_result_content(raw), is_error)
     raise UnsupportedFeature("messages", "content block type is not supported")
 
 
-def _parse_result_text(raw: Mapping[str, object]) -> tuple[str, ...]:
+def _parse_result_content(raw: Mapping[str, object]) -> tuple[str | ImageBlock, ...]:
     content = raw.get("content")
     if isinstance(content, str):
         return (content,)
     if not isinstance(content, list):
-        raise RequestValidationError("messages", "tool result content must be text")
-    text: list[str] = []
+        raise RequestValidationError("messages", "tool result must be text or array")
+    text: list[str | ImageBlock] = []
     for block in content:
+        if isinstance(block, Mapping):
+            block = without_cache_hint(block)
+        if isinstance(block, Mapping) and block.get("type") == "image":
+            text.append(anthropic_image(block))
+            continue
         if not isinstance(block, Mapping) or block.get("type") != "text":
-            raise UnsupportedFeature("messages", "tool result blocks must be text")
+            raise UnsupportedFeature("messages", "tool result must be text or image")
         if set(block) - _TEXT_BLOCK_FIELDS or not isinstance(block.get("text"), str):
             raise RequestValidationError("messages", "text blocks must contain text")
         text.append(cast(str, block["text"]))

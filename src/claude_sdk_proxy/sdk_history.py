@@ -15,10 +15,12 @@ from claude_agent_sdk._cli_version import __cli_version__
 
 from claude_sdk_proxy.domain import (
     CanonicalMessage,
+    ImageBlock,
     TextBlock,
     ToolCallBlock,
     ToolResultBlock,
 )
+from claude_sdk_proxy.images import render_content
 from claude_sdk_proxy.tool_contract import JsonValue, plain_json
 
 
@@ -69,7 +71,9 @@ def _entries(
     entries: list[SessionStoreEntry] = []
     for message in history:
         if message.role == "user":
-            if all(isinstance(block, TextBlock) for block in message.blocks):
+            if all(
+                isinstance(block, (TextBlock, ImageBlock)) for block in message.blocks
+            ):
                 prompt_id = str(uuid.uuid4())
             elif prompt_id is None:
                 raise ValueError("seed tool result has no prior prompt")
@@ -132,7 +136,7 @@ def _user_entries(
     parent_uuid: str | None,
     prompt_id: str,
 ) -> list[SessionStoreEntry]:
-    if all(isinstance(block, TextBlock) for block in message.blocks):
+    if all(isinstance(block, (TextBlock, ImageBlock)) for block in message.blocks):
         entry_uuid = str(uuid.uuid4())
         return [
             cast(
@@ -146,7 +150,16 @@ def _user_entries(
                         parent_uuid=parent_uuid,
                     ),
                     "type": "user",
-                    "message": {"role": "user", "content": message.require_text()},
+                    "message": {
+                        "role": "user",
+                        "content": render_content(
+                            cast(tuple[TextBlock | ImageBlock, ...], message.blocks)
+                        )
+                        if any(
+                            isinstance(block, ImageBlock) for block in message.blocks
+                        )
+                        else message.require_text(),
+                    },
                     "permissionMode": "dontAsk",
                     "promptId": prompt_id,
                     "promptSource": "sdk",
@@ -162,7 +175,7 @@ def _user_entries(
         except KeyError:
             raise ValueError("seed tool result has no prior call") from None
         entry_uuid = str(uuid.uuid4())
-        rendered = [{"type": "text", "text": text} for text in block.content]
+        rendered = render_content(block.content)
         result: dict[str, Any] = {
             "type": "tool_result",
             "tool_use_id": internal_id,
@@ -185,7 +198,10 @@ def _user_entries(
                     "message": {"role": "user", "content": [result]},
                     "promptId": prompt_id,
                     "toolUseResult": (
-                        "Error: " + "\n".join(block.content)
+                        "Error: "
+                        + "\n".join(
+                            part for part in block.content if isinstance(part, str)
+                        )
                         if block.is_error
                         else rendered
                     ),

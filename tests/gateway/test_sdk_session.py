@@ -939,7 +939,7 @@ async def test_tool_session_exposes_only_generated_caller_tools(
         assert client.options.thinking == {"type": "disabled"}
         assert client.options.strict_mcp_config is True
         assert client.options.permission_mode == "dontAsk"
-        assert client.options.max_buffer_size == 8 * 1024 * 1024
+        assert client.options.max_buffer_size == 40 * 1024 * 1024
         assert client.options.system_prompt == caller_system
         assert client.options.cwd == tmp_path
         assert client.options.include_partial_messages is True
@@ -970,7 +970,7 @@ async def test_text_session_keeps_empty_tool_configuration_and_large_buffer(
         assert client.options is not None
         assert client.options.mcp_servers == {}
         assert client.options.allowed_tools == []
-        assert client.options.max_buffer_size == 8 * 1024 * 1024
+        assert client.options.max_buffer_size == 40 * 1024 * 1024
     finally:
         await session.close()
 
@@ -1736,6 +1736,43 @@ async def test_callback_after_seal_cannot_join_the_next_tool_epoch(
             _ = [event async for event in generation]
     finally:
         await session.close()
+
+
+@pytest.mark.parametrize("failure", [None, "required_argument", "typed_mismatch"])
+def test_raw_tool_validator_empty_argument_delta(failure: str | None) -> None:
+    definition = ToolDefinition(
+        "screenshot", "Return an image", {"type": "object", "properties": {}}
+    )
+    if failure == "required_argument":
+        definition = echo_definition(name="screenshot")
+    validator = RawSdkMessageValidator((definition,))
+    messages = list(
+        raw_tool_events((("sdk-a", "mcp__caller_tools_v1__screenshot", "{}"),), "sdk-1")
+    )
+    delta = messages[2]
+    assert isinstance(delta, StreamEvent)
+    delta.event["delta"]["partial_json"] = ""
+    if failure == "typed_mismatch":
+        assistant = messages[4]
+        assert isinstance(assistant, AssistantMessage)
+        assistant.content[0] = ToolUseBlock(
+            "sdk-a", "mcp__caller_tools_v1__screenshot", {"different": 1}
+        )
+
+    def observe() -> None:
+        for message in messages:
+            if isinstance(message, StreamEvent):
+                validator.observe(message.event)
+            else:
+                validator.validate_assistant(message)
+
+    if failure:
+        with pytest.raises(BackendFailure, match="protocol"):
+            observe()
+    else:
+        observe()
+        assert validator.complete
+        assert dict(validator.tool_calls[0].arguments) == {}
 
 
 def test_raw_tool_validator_rejects_arguments_outside_caller_schema() -> None:

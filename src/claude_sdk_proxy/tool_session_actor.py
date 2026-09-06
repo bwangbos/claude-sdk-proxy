@@ -10,6 +10,7 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
     ConversationEvent,
+    Prompt,
     SdkSessionProtocol,
     TextBlock,
     TextDelta,
@@ -130,7 +131,7 @@ class ToolSessionActor:
 
     def _admit_prompt_locked(self, response: ToolResponse) -> None:
         request = response.request
-        if not isinstance(request.next_input, str):
+        if isinstance(request.next_input, tuple):
             raise SessionMismatch("request transcript does not match conversation")
         self.state = ToolSessionState.GENERATING
         self._current = response
@@ -174,7 +175,7 @@ class ToolSessionActor:
         elif error is not None and self.state is not ToolSessionState.CLOSED:
             asyncio.create_task(self._fail(_redact_backend(error)))
 
-    async def _run(self, prompt: str) -> None:
+    async def _run(self, prompt: Prompt) -> None:
         try:
             if not self._started:
                 await self._with_generation_deadline(self.backend.start())

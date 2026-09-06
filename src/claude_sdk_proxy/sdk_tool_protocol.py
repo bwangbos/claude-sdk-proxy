@@ -399,7 +399,10 @@ class RawSdkMessageValidator:
         self, parts: list[str], public_name: str
     ) -> Mapping[str, JsonValue]:
         try:
-            parsed = json.loads("".join(parts))
+            # Parameterless tools can emit an empty input_json_delta for the
+            # initial empty input object. Typed input and schema are
+            # still checked before publishing the call.
+            parsed = json.loads("".join(parts) or "{}")
         except json.JSONDecodeError, RecursionError:
             fail_protocol()
         return self._validated_arguments(parsed, public_name)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,9 +27,17 @@ from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     Dialect,
+    ImagePrompt,
+    Prompt,
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
+)
+from claude_sdk_proxy.images import (
+    ResultIdentity,
+    anthropic_image,
+    render_content,
+    result_identity,
 )
 from claude_sdk_proxy.sdk_history import seed_history
 from claude_sdk_proxy.sdk_metadata import (
@@ -55,7 +63,7 @@ def _discard_stderr(_: str) -> None:
 
 class SdkClientProtocol(Protocol):
     async def connect(self) -> None: ...
-    async def query(self, prompt: str) -> None: ...
+    async def query(self, prompt: str | AsyncIterable[dict[str, Any]]) -> None: ...
     def receive_response(self) -> AsyncIterator[Any]: ...
     async def disconnect(self) -> None: ...
 
@@ -115,9 +123,9 @@ class SdkSession:
         self._epoch_needs_begin = False
         self._epoch_needs_completion = False
         self._expected_internal_ids: set[str] = set()
-        self._expected_echo_values: dict[str, tuple[str, bool]] = {}
+        self._expected_echo_values: dict[str, tuple[ResultIdentity, bool]] = {}
         self._echo_ids: set[str] = set()
-        self._echo_values: dict[str, tuple[str, bool]] = {}
+        self._echo_values: dict[str, tuple[ResultIdentity, bool]] = {}
 
     @staticmethod
     def _new_directory() -> TemporaryDirectory[str]:
@@ -185,7 +193,8 @@ class SdkSession:
             include_partial_messages=True,
             thinking={"type": "disabled"},
             stderr=_discard_stderr,
-            max_buffer_size=8 * 1024 * 1024,
+            # Tool-result envelopes can contain the image data twice.
+            max_buffer_size=40 * 1024 * 1024,
             env={"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"},
             extra_args={
                 "restricted": None,
@@ -212,7 +221,7 @@ class SdkSession:
             if directory is not None:
                 directory.cleanup()
 
-    async def stream_turn(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_turn(self, prompt: Prompt) -> AsyncIterator[ConversationEvent]:
         async for event in self.stream_generation(prompt):
             if isinstance(event, ToolCall) or (
                 isinstance(event, Completed) and event.stop_reason == "tool_use"
@@ -220,7 +229,9 @@ class SdkSession:
                 self._fail_protocol()
             yield event
 
-    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(
+        self, prompt: Prompt
+    ) -> AsyncIterator[ConversationEvent]:
         client = self._client
         if client is None:
             raise BackendFailure("Agent SDK query failed")
@@ -230,7 +241,21 @@ class SdkSession:
         terminal_boundary: Completed | None = None
         prefetched: asyncio.Future[_ReceivedSdkMessage] | None = None
         try:
-            await client.query(prompt)
+            if isinstance(prompt, ImagePrompt):
+
+                async def structured_prompt() -> AsyncIterator[dict[str, Any]]:
+                    yield {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": render_content(prompt.blocks),
+                        },
+                        "parent_tool_use_id": None,
+                    }
+
+                await client.query(structured_prompt())
+            else:
+                await client.query(prompt)
             response = client.receive_response()
             while True:
                 try:
@@ -604,11 +629,33 @@ class SdkSession:
         self._echo_values = {}
 
     @staticmethod
-    def _normalize_echo_content(value: object) -> str:
+    def _normalize_echo_content(value: object) -> ResultIdentity:
         if isinstance(value, str):
             return value
         if not isinstance(value, list):
             fail_protocol()
+        if any(
+            isinstance(block, Mapping) and block.get("type") == "image"
+            for block in value
+        ):
+            parts = []
+            for block in value:
+                if not isinstance(block, Mapping):
+                    fail_protocol()
+                if block.get("type") == "image":
+                    try:
+                        parts.append(anthropic_image(block))
+                    except ValueError:
+                        fail_protocol()
+                elif (
+                    set(block) == {"type", "text"}
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                ):
+                    parts.append(block["text"])
+                else:
+                    fail_protocol()
+            return result_identity(parts)
         text: list[str] = []
         for block in value:
             if (

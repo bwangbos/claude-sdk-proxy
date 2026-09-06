@@ -20,6 +20,7 @@ responses. The calling harness remains responsible for executing its own tools.
 - OpenAI Chat Completions at `POST /v1/chat/completions`
 - Anthropic Messages at `POST /v1/messages`
 - Streaming and non-streaming text responses
+- Image inputs and image tool results (PNG, JPEG, GIF, and WebP)
 - Caller-owned function tools, including parallel calls and repeated tool rounds
 - Stock [Pi](https://github.com/earendil-works/pi-mono) tool use without a custom adapter
 - Pi automatic compaction and `/compact`
@@ -151,6 +152,53 @@ No Pi adapter or extension is required. Keep `supportsStrictMode: false` in the
 provider configuration; Pi otherwise adds a tool-definition field outside the
 proxy's supported subset.
 
+### Pi with images and screenshots
+
+For image attachments and tools that return screenshots, add this separate
+provider under `providers`. It uses Pi's stock Anthropic transport, which keeps
+images attached to the tool result that produced them. No extension is required.
+Keep your existing text provider if you want to continue using it.
+
+```json
+"claude-subscription-vision": {
+  "baseUrl": "http://127.0.0.1:8317",
+  "api": "anthropic-messages",
+  "apiKey": "local-placeholder",
+  "headers": {"anthropic-beta": ""},
+  "compat": {
+    "supportsEagerToolInputStreaming": false,
+    "supportsStrictTools": false,
+    "supportsCacheControlOnTools": false
+  },
+  "models": [
+    {
+      "id": "sonnet",
+      "name": "Claude subscription (local vision)",
+      "reasoning": false,
+      "input": ["text", "image"],
+      "contextWindow": 200000,
+      "maxTokens": 16384,
+      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    }
+  ]
+}
+```
+
+Restart the proxy and Pi after updating, then run:
+
+```bash
+pi --provider claude-subscription-vision --model sonnet
+```
+
+Ask Pi to read an image file, or attach one. The beta header and compatibility
+flags above disable optional features outside the proxy's supported subset.
+Do not switch API dialects in the middle of an active tool round.
+
+Pi `0.85.1`'s OpenAI transport moves tool-returned images into an extra user
+message, separating them from their tool call IDs. That layout is not supported
+by this proxy; use the Anthropic provider above for Pi's image workflows.
+Other OpenAI clients can still send image inputs directly.
+
 ## Use another client
 
 Any harness that can target an OpenAI Chat Completions or Anthropic Messages
@@ -194,6 +242,51 @@ print(response.content[0].text)
 The API key values satisfy client-library validation only. They are not used to
 authenticate with Claude.
 
+### Image inputs
+
+Images are sent as native image blocks, not descriptions injected into prompt
+text. For example, using the OpenAI client initialized above:
+
+```python
+import base64
+from pathlib import Path
+
+image = base64.b64encode(Path("screenshot.png").read_bytes()).decode("ascii")
+response = client.chat.completions.create(
+    model="sonnet",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What is visible in this screenshot?"},
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/png;base64,{image}"
+            }},
+        ],
+    }],
+)
+print(response.choices[0].message.content)
+```
+
+Anthropic requests use its native
+[`image` content block](https://platform.claude.com/docs/en/build-with-claude/vision):
+
+```json
+{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BASE64_IMAGE_BYTES"}}
+```
+
+Text and image blocks retain their order. Successful Anthropic `tool_result`
+content can contain the same text/image blocks. The OpenAI endpoint additionally
+accepts text/`image_url` arrays in `role: "tool"` content as a **proxy extension**;
+not every OpenAI client supports that shape. Tool images remain correlated by
+call ID, including in replay and imported/rebased histories.
+
+Limits apply to the **entire submitted transcript**, including tool results:
+20 images, 3 MiB decoded per image, and 12 MiB decoded in total. Use canonical
+base64 for PNG, JPEG, GIF, or WebP. The proxy checks encoding, size, and MIME
+signatures; Claude still validates image decoding and dimensions. Remote URLs,
+file URLs, non-`auto` OpenAI image detail, image error results, PDFs, audio, and
+image generation are not supported. Return tool failures as text.
+
 ## API surface
 
 | Method | Path | Purpose |
@@ -211,6 +304,8 @@ such as `charset=utf-8` are accepted.
 Supported:
 
 - Text messages, including OpenAI text-only content-block arrays
+- Embedded images in user messages and successful tool results
+- Anthropic system text-block arrays and advisory content-block cache hints
 - Caller-provided function tools with self-contained JSON Schemas
 - Mixed text and tool calls, parallel calls, and multiple tool rounds
 - Streaming usage frames and normal non-streaming usage objects
@@ -219,7 +314,7 @@ Supported:
 
 Intentionally unsupported:
 
-- Images, files, audio, and other multimodal input or tool results
+- PDFs, arbitrary files, audio, video, remote image URLs, and image generation
 - OpenAI Responses API
 - Exact temperature, sampling, stop-sequence, or reasoning controls
 - Forced, named, required, or disabled-per-turn tool choice
@@ -230,6 +325,8 @@ Intentionally unsupported:
 
 `max_tokens` and `max_completion_tokens` are accepted as advisory values. The
 Agent SDK path does not provide exact output-token enforcement.
+Anthropic ephemeral `cache_control` hints on content blocks are accepted but
+not forwarded; caching remains controlled by the SDK/backend.
 
 ## Tools
 
@@ -262,7 +359,7 @@ conversations into one lineage.
 When a harness compacts or otherwise rewrites a completed transcript, the proxy
 imports the complete replacement snapshot into a fresh ephemeral SDK session.
 This is how Pi automatic compaction and `/compact` work without a Pi-specific
-adapter. The snapshot must be structurally complete, end with a text user turn,
+adapter. The snapshot must be structurally complete, end with a text/image user turn,
 and contain no unresolved tool boundary.
 
 Restarting the proxy clears all active sessions, suspended tool calls, imported

@@ -15,6 +15,7 @@ from referencing.exceptions import CannotDetermineSpecification
 from referencing.jsonschema import DRAFT202012, UnknownDialect
 
 from claude_sdk_proxy.domain import (
+    ImageBlock,
     RequestValidationError,
     ToolDefinition,
     ToolResultBlock,
@@ -231,10 +232,16 @@ def validate_tool_results(
                 "messages", "tool result error flag must be boolean"
             )
         if not isinstance(result.content, tuple) or any(
-            not isinstance(item, str) for item in result.content
+            not isinstance(item, (str, ImageBlock)) for item in result.content
         ):
             raise RequestValidationError("messages", "tool result content must be text")
-        text = "".join(result.content)
+        text = "".join(part for part in result.content if isinstance(part, str))
+        if result.is_error and any(
+            isinstance(part, ImageBlock) for part in result.content
+        ):
+            raise RequestValidationError(
+                "messages", "image error results are unsupported"
+            )
         encoded = text.encode()
         if result.is_error and not encoded:
             raise RequestValidationError("messages", "error result must not be empty")
@@ -248,6 +255,10 @@ def validate_tool_results(
                 "messages", "tool results exceed their size limit"
             )
         validated.append(result)
+    from claude_sdk_proxy.domain import CanonicalMessage
+    from claude_sdk_proxy.images import validate_image_budget
+
+    validate_image_budget((CanonicalMessage("user", tuple(validated)),))
     return tuple(sorted(validated, key=lambda item: item.tool_call_id))
 
 

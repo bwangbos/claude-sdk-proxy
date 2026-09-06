@@ -8,6 +8,7 @@ from typing import Any, cast
 from claude_sdk_proxy.anthropic_tools import (
     parse_anthropic_messages,
     parse_anthropic_tools,
+    parse_system_blocks,
     validate_anthropic_tool_choice,
 )
 from claude_sdk_proxy.domain import (
@@ -63,7 +64,12 @@ def parse_anthropic_request(
         raise RequestValidationError("model", "model is not configured")
     system = ""
     if "system" in body:
-        system = required_string(body, "system")
+        value = body["system"]
+        system = (
+            parse_system_blocks(value)
+            if isinstance(value, list)
+            else required_string(body, "system")
+        )
     max_tokens = body.get("max_tokens")
     if type(max_tokens) is not int or max_tokens <= 0:
         raise RequestValidationError("max_tokens", "must be a positive integer")

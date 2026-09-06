@@ -24,6 +24,25 @@ class TextBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageBlock:
+    media_type: str
+    data: str
+
+    def __post_init__(self) -> None:
+        from claude_sdk_proxy.images import validate_image
+
+        validate_image(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePrompt:
+    blocks: tuple[TextBlock | ImageBlock, ...]
+
+
+type Prompt = str | ImagePrompt
+
+
+@dataclass(frozen=True, slots=True)
 class ToolCallBlock:
     id: str
     name: str
@@ -39,14 +58,14 @@ class ToolCallBlock:
 @dataclass(frozen=True, slots=True)
 class ToolResultBlock:
     tool_call_id: str
-    content: tuple[str, ...]
+    content: tuple[str | ImageBlock, ...]
     is_error: bool
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "content", tuple(self.content))
 
 
-type CanonicalBlock = TextBlock | ToolCallBlock | ToolResultBlock
+type CanonicalBlock = TextBlock | ImageBlock | ToolCallBlock | ToolResultBlock
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -201,12 +220,15 @@ class TextRequest:
             if not blocks:
                 raise RequestValidationError("messages", "blocks must not be empty")
             if message.role == "user":
-                if all(isinstance(item, TextBlock) for item in blocks):
+                if all(isinstance(item, (TextBlock, ImageBlock)) for item in blocks):
                     if prior_call_ids is not None:
                         raise RequestValidationError(
                             "messages", "tool results must match prior calls"
                         )
-                    if not message.require_text():
+                    if (
+                        not any(isinstance(item, ImageBlock) for item in blocks)
+                        and not message.require_text()
+                    ):
                         raise ValueError("message content must not be empty")
                     normalized_messages.append(message)
                     prior_call_ids = None
@@ -255,21 +277,26 @@ class TextRequest:
         if normalized_messages[-1].role != "user":
             raise ValueError("conversation must end with a user message")
         object.__setattr__(self, "messages", tuple(normalized_messages))
+        from claude_sdk_proxy.images import validate_image_budget
+
+        validate_image_budget(self.messages)
 
     @property
-    def next_input(self) -> str | tuple[ToolResultBlock, ...]:
+    def next_input(self) -> Prompt | tuple[ToolResultBlock, ...]:
         last = self.messages[-1]
         if all(isinstance(item, TextBlock) for item in last.blocks):
             return last.require_text()
+        if all(isinstance(item, (TextBlock, ImageBlock)) for item in last.blocks):
+            return ImagePrompt(cast(tuple[TextBlock | ImageBlock, ...], last.blocks))
         if all(isinstance(item, ToolResultBlock) for item in last.blocks):
             return cast(tuple[ToolResultBlock, ...], last.blocks)
         raise RequestValidationError("messages", "final user blocks are invalid")
 
     @property
-    def next_prompt(self) -> str:
+    def next_prompt(self) -> Prompt:
         value = self.next_input
-        if not isinstance(value, str):
-            raise ValueError("conversation must end with a text user message")
+        if isinstance(value, tuple):
+            raise ValueError("conversation must end with a text/image user message")
         return value
 
 
@@ -285,7 +312,7 @@ type ConversationEvent = InputUsage | TextDelta | ToolCall | Completed
 
 class SdkSessionProtocol(Protocol):
     async def start(self) -> None: ...
-    def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]: ...
+    def stream_generation(self, prompt: Prompt) -> AsyncIterator[ConversationEvent]: ...
     async def submit_tool_results(
         self, results: Iterable[ToolResultBlock]
     ) -> None: ...

@@ -108,7 +108,7 @@ class SessionRegistry:
                     raise SessionMismatch(
                         "request transcript does not match conversation"
                     ) from None
-                if not isinstance(request.next_input, str):
+                if isinstance(request.next_input, tuple):
                     raise
                 return self._new_entry(request, explicit_id, True), None, entry
             return entry, replay, None
@@ -150,7 +150,7 @@ class SessionRegistry:
         return None
 
     def _fresh(self, request: TextRequest, sid: str, explicit: bool) -> SessionEntry:
-        if not isinstance(request.next_input, str):
+        if isinstance(request.next_input, tuple):
             raise SessionMismatch("request transcript is not a fresh conversation")
         self._make_room_for_fresh()
         entry = self._new_entry(request, sid, explicit)

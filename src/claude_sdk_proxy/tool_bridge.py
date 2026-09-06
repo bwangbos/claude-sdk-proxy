@@ -15,6 +15,7 @@ from mcp.server import Server, ServerRequestContext
 from mcp.types import (
     CallToolRequestParams,
     CallToolResult,
+    ImageContent,
     ListToolsResult,
     PaginatedRequestParams,
     TextContent,
@@ -24,11 +25,13 @@ from mcp.types import (
 from claude_sdk_proxy.domain import (
     BackendFailure,
     Dialect,
+    ImageBlock,
     RequestValidationError,
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
 )
+from claude_sdk_proxy.images import ResultIdentity, result_identity
 from claude_sdk_proxy.tool_contract import (
     JsonValue,
     canonical_json,
@@ -334,7 +337,7 @@ class ToolBridge:
 
     def resolve(
         self, results: Iterable[ToolResultBlock]
-    ) -> dict[str, tuple[str, bool]]:
+    ) -> dict[str, tuple[ResultIdentity, bool]]:
         """Atomically validate and deliver one complete caller result batch."""
         validated = validate_tool_results(results)
         result_ids = {result.tool_call_id for result in validated}
@@ -357,13 +360,13 @@ class ToolBridge:
 
         self._epoch_sealed = True
         self._epoch_resolved = True
-        expected_echoes: dict[str, tuple[str, bool]] = {}
+        expected_echoes: dict[str, tuple[ResultIdentity, bool]] = {}
         for pending in pending_batch:
             pending.delivered = True
             result = by_id[pending.invocation.public_id]
             pending.future.set_result(result)
             expected_echoes[pending.internal_id] = (
-                "".join(result.content),
+                result_identity(result.content),
                 result.is_error,
             )
         return expected_echoes
@@ -452,7 +455,12 @@ class ToolBridge:
             result = await pending.future
             return CallToolResult(
                 content=[
-                    TextContent(type="text", text=text) for text in result.content
+                    ImageContent(
+                        type="image", mime_type=text.media_type, data=text.data
+                    )
+                    if isinstance(text, ImageBlock)
+                    else TextContent(type="text", text=text)
+                    for text in result.content
                 ],
                 is_error=result.is_error,
             )
