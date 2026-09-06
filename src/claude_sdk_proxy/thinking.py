@@ -92,13 +92,13 @@ def parse_anthropic_thinking(
     if not isinstance(raw, Mapping):
         _invalid("thinking", "must be an object or null")
     mode = raw.get("type")
-    if mode not in {"disabled", "adaptive", "enabled"}:
+    if not isinstance(mode, str) or mode not in {"disabled", "adaptive", "enabled"}:
         _invalid("thinking", "type must be disabled, adaptive, or enabled")
     allowed = {
         "disabled": {"type"},
         "adaptive": {"type", "display"},
         "enabled": {"type", "budget_tokens", "display"},
-    }[cast(str, mode)]
+    }[mode]
     if set(raw) - allowed:
         _invalid("thinking", "contains unknown fields")
 

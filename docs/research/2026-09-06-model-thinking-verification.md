@@ -180,6 +180,22 @@ uncorrelated, partial-output, and ordinary SDK error sequences still fail closed
 Regression coverage includes JSON/SSE, both dialects, replay/recovery, tool
 boundaries, and cleanup.
 
+The final review correction extends this deterministic evidence to empty refusals
+with tools configured, including refusal after a completed tool-result boundary.
+Anthropic JSON and assembled SSE consistently use `content: []`; replay normalizes
+that empty assistant array to the existing canonical singleton empty text block.
+The same singleton is accepted in either dialect because public transcripts cannot
+authenticate a refusal reason. Empty users, malformed blocks, multiple empty text
+blocks, incomplete tool results, and ordinary blockless successful SDK output are
+still rejected. Tests cover exact retry without generation, implicit and explicit
+continuation, model/effort switches with signed native history and seed preservation,
+raw usage, absence of diagnostic text, durable state, and cleanup. Real loopback
+HTTP exercises JSON/SSE in both dialects with and without tools. Non-string
+`thinking.type` containers/scalars fail as request validation before session creation;
+the raw tool-content refusal negative now has a correctly initialized positive
+control. This is local review-fix evidence only: prior live observations are
+unchanged, and final full offline release approval remains controller-owned.
+
 Anthropic documents that automated Opus safeguards can flag normal conversations;
 the account-specific trigger here remains unknown. See [Anthropic's explanation
 of Opus model safeguards](https://support.claude.com/en/articles/16049681-why-claude-switched-models-in-your-conversation-with-opus-5).

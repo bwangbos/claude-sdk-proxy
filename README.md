@@ -324,11 +324,23 @@ response = client.messages.create(
     output_config={"effort": "high"},
     messages=[{"role": "user", "content": "Reply with OK"}],
 )
-print(response.content[0].text)
+print("".join(block.text for block in response.content if block.type == "text"))
 ```
 
 The API key values satisfy client-library validation only. They are not used to
 authenticate with Claude.
+
+An empty native refusal is a terminal response, not answer text: Anthropic JSON
+returns `content: []`, and Anthropic SSE emits no content blocks; OpenAI returns
+empty answer content with `finish_reason: "content_filter"`. Raw usage is retained.
+Append that assistant response unchanged and then a new user message to continue;
+an exact retry replays the terminal response without another generation.
+Anthropic empty assistant arrays normalize to the same canonical singleton empty
+text block as `content: ""` (or one empty text block). This narrow structural replay
+allowance also supports OpenAI's empty assistant content: public transcripts cannot
+authenticate why an assistant was empty. Empty user messages, multiple empty text
+blocks, malformed thinking blocks, and incomplete tool-result boundaries remain
+invalid. Native signed history is retained when continuing or switching models.
 
 ### Image inputs
 

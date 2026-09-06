@@ -11,6 +11,7 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
     ConversationEvent,
+    InputUsage,
     Prompt,
     SdkSessionProtocol,
     TextBlock,
@@ -416,6 +417,15 @@ def _assistant_message(events: tuple[ConversationEvent, ...]) -> CanonicalMessag
         elif isinstance(event, ToolCall):
             blocks.append(ToolCallBlock(event.id, event.name, event.arguments))
     if not blocks:
+        if (
+            events
+            and isinstance(events[-1], Completed)
+            and events[-1].stop_reason == "refusal"
+            and all(isinstance(event, InputUsage) for event in events[:-1])
+        ):
+            # The SDK validates the native refusal transaction. No answer was
+            # emitted, but its terminal history must remain replayable.
+            return CanonicalMessage.assistant_text("")
         raise BackendFailure("Agent SDK query failed")
     return CanonicalMessage("assistant", tuple(blocks))
 

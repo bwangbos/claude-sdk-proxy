@@ -141,6 +141,10 @@ def _parse_content(
         return content
     if not isinstance(content, list):
         raise RequestValidationError("messages", "content must be a string or array")
+    # Empty refusal JSON and assembled SSE have no content blocks. Keep their
+    # replay identical to the existing canonical empty assistant text entry.
+    if not content and role == "assistant":
+        return ""
     blocks = tuple(_parse_block(item, role) for item in content)
     return blocks
 

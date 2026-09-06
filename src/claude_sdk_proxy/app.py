@@ -282,7 +282,11 @@ async def _nonstream_response(
         await abort_best_effort(lease)
         response = error_response(dialect, BackendFailure("missing completion"))
         return cast(Response, monitor.wrap(response))
-    rendered = tuple(blocks) if blocks or request.tools else (TextBlock(""),)
+    rendered: tuple[TextBlock | ToolCall | ThinkingBlock | RedactedThinkingBlock, ...]
+    if not blocks and completed.stop_reason == "refusal":
+        rendered = () if dialect == "anthropic" else (TextBlock(""),)
+    else:
+        rendered = tuple(blocks) if blocks or request.tools else (TextBlock(""),)
     payload = (
         render_openai_response(
             request_id,

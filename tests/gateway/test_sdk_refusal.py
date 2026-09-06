@@ -401,14 +401,20 @@ async def test_sdk_session_rejects_raw_content_in_native_refusal(
             "content_block": content_block,
         },
     )
-    messages = list(refusal_response())
+    tools = (_echo_definition(),) if block_type == "tool_use" else ()
+    valid = refusal_response(tools_enabled=bool(tools))
+    assert await _collect_sdk_refusal(tmp_path, valid, tools=tools) == [
+        InputUsage(24, 948, 43),
+        Completed("refusal", RAW_USAGE),
+    ]
+    messages = list(valid)
     messages.insert(3, content)
 
     with pytest.raises(BackendFailure) as caught:
         await _collect_sdk_refusal(
             tmp_path,
             tuple(messages),
-            tools=(_echo_definition(),) if block_type == "tool_use" else (),
+            tools=tools,
         )
     assert "private" not in str(caught.value)
 
@@ -494,7 +500,7 @@ def _assert_http_refusal(dialect: str, stream: bool, response: Any) -> None:
         return
     payload = response.json
     if dialect == "anthropic":
-        assert payload["content"] == [{"type": "text", "text": ""}]
+        assert payload["content"] == []
         assert payload["stop_reason"] == "refusal"
         assert payload["usage"] == {
             "input_tokens": 24,

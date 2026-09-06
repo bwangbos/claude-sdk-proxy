@@ -333,9 +333,10 @@ class TextRequest:
                 if (
                     all(isinstance(item, TextBlock) for item in blocks)
                     and not message.require_text()
-                    # A reasoning-only completion has no OpenAI answer text;
-                    # its public replay remains valid even without metadata.
-                    and self.dialect != "openai"
+                    # Empty refusal replay (and OpenAI reasoning-only replay)
+                    # uses exactly one empty text block. Public history cannot
+                    # authenticate why it is empty; accept only this structure.
+                    and blocks != (TextBlock(""),)
                 ):
                     raise ValueError("message content must not be empty")
                 normalized_messages.append(message)

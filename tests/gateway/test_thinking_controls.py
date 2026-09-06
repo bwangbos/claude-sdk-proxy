@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from claude_sdk_proxy.anthropic_api import parse_anthropic_request
+from claude_sdk_proxy.app import create_app
 from claude_sdk_proxy.domain import (
     CanonicalMessage,
     RequestValidationError,
@@ -14,11 +15,50 @@ from claude_sdk_proxy.sdk_session import SdkSession
 from claude_sdk_proxy.session_identity import request_fingerprint
 from claude_sdk_proxy.sessions import SessionConflict, SessionRegistry
 from claude_sdk_proxy.thinking import ThinkingOptions
+from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.fakes import (
     FakeSdkClient,
     FakeSessionFactory,
     FixedTemporaryDirectory,
 )
+
+
+@pytest.mark.parametrize("mode", [[], {}, None, True, 1, 1.5])
+def test_anthropic_nonstring_thinking_type_is_a_validation_error(mode: object) -> None:
+    with pytest.raises(RequestValidationError) as caught:
+        parse_anthropic_request(
+            {
+                "model": "sonnet",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "hello"}],
+                "thinking": {"type": mode},
+            },
+            frozenset({"sonnet"}),
+        )
+    assert caught.value.field == "thinking"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", [[], {}, None, True, 1, 1.5])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_http_nonstring_thinking_type_fails_before_backend(mode, stream):
+    factory = FakeSessionFactory(())
+    app = create_app(models=("sonnet",), session_factory=factory)
+    async with lifespan_app(app):
+        response = await post_json(
+            app,
+            "/v1/messages",
+            {
+                "model": "sonnet",
+                "max_tokens": 128,
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hello"}],
+                "thinking": {"type": mode},
+            },
+        )
+    assert response.status == 400
+    assert response.json["error"]["type"] == "invalid_request"
+    assert factory.sessions == []
 
 
 def test_openai_high_reaches_normalized_request() -> None:
