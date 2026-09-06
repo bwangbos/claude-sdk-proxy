@@ -172,6 +172,13 @@ def _user_parts(content: object) -> tuple[TextBlock | ImageBlock, ...]:
 
 
 def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
+    # SDK response dumps include these fields even when the feature is absent.
+    nullable_metadata = {"refusal", "annotations", "audio", "function_call"}
+    raw = {
+        key: value
+        for key, value in raw.items()
+        if key not in nullable_metadata or value is not None
+    }
     if set(raw) - _ASSISTANT_FIELDS:
         raise _message_field_error(raw)
     calls = raw.get("tool_calls")
@@ -182,9 +189,12 @@ def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
     blocks: list[CanonicalBlock] = []
     content = raw.get("content")
     if isinstance(content, str):
-        blocks.append(TextBlock(content))
+        if content:
+            blocks.append(TextBlock(content))
     elif isinstance(content, list):
-        blocks.append(TextBlock(_text_content_parts(content)))
+        text = _text_content_parts(content)
+        if text:
+            blocks.append(TextBlock(text))
     elif content is not None:
         raise RequestValidationError("messages", "assistant content must be a string")
     blocks.extend(_tool_call(item) for item in calls)

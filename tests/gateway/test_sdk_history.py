@@ -4,14 +4,74 @@ import uuid
 from pathlib import Path
 
 import pytest
+from claude_agent_sdk import project_key_for_directory
 
 from claude_sdk_proxy.domain import (
     CanonicalMessage,
     TextBlock,
     ToolCallBlock,
     ToolResultBlock,
+    ToolResultPrompt,
 )
 from claude_sdk_proxy.sdk_history import seed_history
+from claude_sdk_proxy.sdk_session import SdkSession
+from tests.gateway.fakes import FakeSdkClient, FixedTemporaryDirectory, sdk_response
+
+
+@pytest.mark.anyio
+async def test_imported_results_are_seeded_before_empty_continuation(tmp_path):
+    results = (
+        ToolResultBlock("call_a", ("one",), False),
+        ToolResultBlock("call_b", ("two",), True),
+    )
+    history = (
+        CanonicalMessage.user_text("use both"),
+        CanonicalMessage(
+            "assistant",
+            (
+                ToolCallBlock("call_a", "lookup", {"key": "a"}),
+                ToolCallBlock("call_b", "lookup", {"key": "b"}),
+            ),
+        ),
+        CanonicalMessage("user", results),
+    )
+    client = FakeSdkClient(responses=(sdk_response("recovered", session_id="sdk-1"),))
+    session = SdkSession(
+        "sonnet",
+        "",
+        history=history,
+        directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+        client_factory=lambda options: client.capture_options(options),
+    )
+    try:
+        await session.start()
+        prompt = ToolResultPrompt(results)
+        _ = [event async for event in session.stream_turn(prompt)]
+        assert client.prompts == [""]
+        options = client.options
+        entries = await options.session_store.load(
+            {
+                "project_key": project_key_for_directory(tmp_path),
+                "session_id": options.resume,
+            }
+        )
+        ids = [entry["message"]["content"][0]["id"] for entry in entries[1:3]]
+        assert [entry["message"]["content"][0] for entry in entries[3:]] == [
+            {
+                "type": "tool_result",
+                "tool_use_id": ids[0],
+                "content": [{"type": "text", "text": "one"}],
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": ids[1],
+                "content": [{"type": "text", "text": "two"}],
+                "is_error": True,
+            },
+        ]
+        assert client.tool_handler_count == 0
+    finally:
+        await session.close()
 
 
 @pytest.mark.anyio

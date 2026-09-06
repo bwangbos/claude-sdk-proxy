@@ -308,7 +308,8 @@ Supported:
 - Anthropic system text-block arrays and advisory content-block cache hints
 - Caller-provided function tools with self-contained JSON Schemas
 - Mixed text and tool calls, parallel calls, and multiple tool rounds
-- Streaming usage frames and normal non-streaming usage objects
+- Streaming usage frames and non-streaming usage objects, including cache counters
+- Standard OpenAI SDK assistant-message dumps with null optional metadata
 - Completed-request replay and linear continuation
 - Complete imported or rewritten transcripts at completed boundaries
 
@@ -321,12 +322,23 @@ Intentionally unsupported:
 - `parallel_tool_calls: false`
 - Branching one explicit session ID into concurrent histories
 - Public hosting, multiple users, or API-key authentication
-- Durable conversation recovery after the proxy process restarts
+- Durable server-side storage (clients must retain and resend complete transcripts)
 
 `max_tokens` and `max_completion_tokens` are accepted as advisory values. The
 Agent SDK path does not provide exact output-token enforcement.
 Anthropic ephemeral `cache_control` hints on content blocks are accepted but
 not forwarded; caching remains controlled by the SDK/backend.
+Known optional OpenAI fields set to `null` are treated as absent; unknown fields
+and non-null unsupported controls are still rejected. The OpenAI `user` field
+is accepted as advisory metadata, not as a conversation identifier.
+
+Usage is reported per public response, not as cumulative SDK-session totals.
+Anthropic keeps `input_tokens`, `cache_read_input_tokens`, and
+`cache_creation_input_tokens` separate. OpenAI `prompt_tokens` includes all three;
+`prompt_tokens_details.cached_tokens` and `cache_write_tokens` break out cache
+reads and writes. Cache detail fields are omitted if the backend did not supply
+them. `total_tokens` is the full prompt count plus output. An Anthropic
+`input_tokens` value of 2 can therefore be valid for a heavily cached turn.
 
 ## Tools
 
@@ -336,8 +348,9 @@ The gateway publishes each tool call with an opaque public ID and waits for the
 harness to return exactly one result for every call.
 
 Parallel results may be returned in any order. Correlation is always by the
-public call ID—never by tool name, arguments, or position. A pending tool round
-must be completed before compaction or transcript rebasing.
+public call ID—never by tool name, arguments, or position. A replacement
+transcript must include a complete result batch for any pending tool calls;
+partial batches and changed pending call definitions are rejected.
 
 The detailed [gateway reference](docs/feasibility/README.md) contains complete
 Anthropic and OpenAI tool request examples, schema limits, timeout behavior, and
@@ -353,17 +366,29 @@ per-conversation header, it may send:
 X-Claude-Proxy-Session: conversation-specific-id
 ```
 
-Do not configure one static value globally; that would collapse unrelated
-conversations into one lineage.
+The proxy returns this header on admitted responses, and clients may send the
+returned value on subsequent requests, including conversations that started
+without it. Do not configure one static value globally; that would collapse
+unrelated conversations into one lineage. Stateless clients sharing identical
+prefixes are inherently ambiguous: use distinct per-conversation headers for
+parallel chats. OpenAI `user` does not disambiguate sessions.
 
 When a harness compacts or otherwise rewrites a completed transcript, the proxy
 imports the complete replacement snapshot into a fresh ephemeral SDK session.
 This is how Pi automatic compaction and `/compact` work without a Pi-specific
-adapter. The snapshot must be structurally complete, end with a text/image user turn,
-and contain no unresolved tool boundary.
+adapter. The snapshot must be structurally complete and end with either a
+text/image user turn or a complete tool-result batch. For a result-ending import,
+the proxy seeds native history with both calls and results, then sends an empty
+SDK continuation signal; it adds no natural-language instruction and does not
+execute the historical calls again. A suspended conversation can be replaced
+only when its exact pending calls and complete result IDs match the snapshot.
+In-flight requests, changed configuration, and stale identified heads still
+fail closed; recovery is not an unconditional retry after any error.
 
 Restarting the proxy clears all active sessions, suspended tool calls, imported
-history, and replay entries.
+history, and replay entries. A client can recover by submitting its complete
+transcript, including already-executed tool results; the proxy cannot reconstruct
+history or missing results on its own.
 
 ## Server options
 
@@ -373,7 +398,9 @@ uv run claude-proxy \
   [--port 8317] \
   [--model MODEL]... \
   [--max-sessions 8] \
-  [--tool-result-timeout 300]
+  [--tool-result-timeout 300] \
+  [--log PATH] \
+  [--log-json]
 ```
 
 - `--host` accepts loopback IP addresses only.
@@ -417,11 +444,29 @@ uses text-content arrays, which older proxy builds rejected.
 Start the proxy from the same normal macOS login context. Sandboxes and detached
 services may not have access to the Keychain credential used by Claude.
 
-### `session_mismatch` or `session_conflict`
+### `session_mismatch` or `request_in_flight` (HTTP 409)
 
 Keep the model, system prompt, tool definitions, and dialect stable for a
 conversation. Do not reuse one explicit session header for unrelated chats, and
 do not continue a stale transcript head after a newer turn has committed.
+The error includes a stable `reason` (for example `system_changed`, `stale_head`,
+`tool_ids_mismatch`, or `ambiguous_session`) and guidance about the session header.
+Wait for active work to finish before retrying `request_in_flight`; use a unique
+session header when the requests actually belong to different conversations.
+
+Every HTTP response includes an `X-Request-ID`. For opt-in diagnostics:
+
+```bash
+uv run claude-proxy --model sonnet --log proxy.jsonl --log-json
+```
+
+`--log PATH` appends readable metadata by default; add `--log-json` for JSON lines.
+`--log-json` alone writes to stderr. Logs contain request IDs, hashed session
+references, selection/rebase/replay decisions, safe rejection reasons, and HTTP
+status—not prompts, tool arguments/results, credentials, or raw session keys.
+New log files are created with owner-only permissions. Logs are not rotated;
+choose a suitable path and retention policy. Include the request ID and relevant
+diagnostic lines when reporting a failure.
 
 ### Changes do not take effect
 

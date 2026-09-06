@@ -4,6 +4,7 @@ import asyncio
 import re
 import uuid
 
+from claude_sdk_proxy.diagnostics import record, session_reference
 from claude_sdk_proxy.domain import (
     CanonicalMessage,
     ConversationEvent,
@@ -22,7 +23,7 @@ from claude_sdk_proxy.session_turn import SessionMismatch as SessionMismatch
 from claude_sdk_proxy.session_turn import SessionTimeout as SessionTimeout
 from claude_sdk_proxy.session_turn import ToolTurnLease as ToolTurnLease
 from claude_sdk_proxy.session_turn import TurnLease as TurnLease
-from claude_sdk_proxy.tool_session_actor import ToolSessionActor
+from claude_sdk_proxy.tool_session_actor import ToolSessionActor, ToolSessionState
 
 _EXPLICIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 type SessionEntry = Conversation | ToolSessionActor
@@ -64,8 +65,16 @@ class SessionRegistry:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("session registry is closed")
-            entry, replay, replaced = self._select(
-                request, explicit_id, fingerprint
+            entry, replay, replaced = self._select(request, explicit_id, fingerprint)
+            record(
+                "session_selected",
+                action="rebase"
+                if replaced is not None
+                else "replay"
+                if replay is not None
+                else "admit",
+                session=session_reference(entry.external_id),
+                identified=explicit_id is not None,
             )
             self._reserve(replaced or entry, fingerprint)
             if replaced is not None:
@@ -95,7 +104,7 @@ class SessionRegistry:
         SessionEntry | None,
     ]:
         if explicit_id is not None:
-            entry = self._explicit.get(explicit_id)
+            entry = self._explicit.get(explicit_id) or self._implicit.get(explicit_id)
             if entry is None:
                 return self._fresh(request, explicit_id, True), None, None
             self._validate_config(entry, request)
@@ -103,14 +112,14 @@ class SessionRegistry:
                 replay = self._existing(entry, request, fingerprint)
             except SessionMismatch:
                 if self._is_stale_request(entry, request):
-                    raise
-                if not self._evictable(entry):
-                    raise SessionMismatch(
-                        "request transcript does not match conversation"
-                    ) from None
-                if isinstance(request.next_input, tuple):
-                    raise
-                return self._new_entry(request, explicit_id, True), None, entry
+                    raise SessionMismatch("request transcript is stale") from None
+                if not self._can_rebase(entry, request):
+                    raise SessionMismatch("conversation has pending tools") from None
+                return (
+                    self._new_entry(request, entry.external_id, entry.explicit),
+                    None,
+                    entry,
+                )
             return entry, replay, None
         entries = tuple(self._implicit.values())
         exact = [
@@ -134,7 +143,43 @@ class SessionRegistry:
         if continuations:
             entry = continuations[0]
             return entry, self._existing(entry, request, fingerprint), None
+        # A complete result batch can identify a suspended implicit conversation
+        # even when earlier history was rewritten. Never infer by tool position.
+        value = request.next_input
+        if isinstance(value, tuple):
+            ids = {result.tool_call_id for result in value}
+            pending = [
+                item
+                for item in entries
+                if isinstance(item, ToolSessionActor) and item.pending_call_ids & ids
+            ]
+            if len(pending) > 1:
+                raise SessionMismatch(
+                    "request transcript matches multiple conversations"
+                )
+            if pending:
+                entry = pending[0]
+                self._validate_config(entry, request)
+                self._reject_busy(entry, fingerprint)
+                if not self._can_rebase(entry, request):
+                    raise SessionMismatch("conversation has pending tools")
+                return self._new_entry(request, entry.external_id, False), None, entry
         return self._fresh(request, uuid.uuid4().hex, False), None, None
+
+    def _can_rebase(self, entry: SessionEntry, request: TextRequest) -> bool:
+        if self._evictable(entry):
+            return True
+        if (
+            isinstance(entry, ToolSessionActor)
+            and entry.state is ToolSessionState.WAITING_FOR_TOOLS
+            and entry.in_flight_fingerprint is None
+            and isinstance(request.next_input, tuple)
+        ):
+            entry.validate_continuation(request)
+            if not messages_equal(request.messages[-2:-1], entry.transcript[-1:]):
+                raise SessionMismatch("pending tool calls changed")
+            return True
+        return False
 
     def _existing(
         self, entry: SessionEntry, request: TextRequest, fingerprint: str
@@ -150,8 +195,6 @@ class SessionRegistry:
         return None
 
     def _fresh(self, request: TextRequest, sid: str, explicit: bool) -> SessionEntry:
-        if isinstance(request.next_input, tuple):
-            raise SessionMismatch("request transcript is not a fresh conversation")
         self._make_room_for_fresh()
         entry = self._new_entry(request, sid, explicit)
         target = self._explicit if explicit else self._implicit
@@ -162,13 +205,24 @@ class SessionRegistry:
         self, request: TextRequest, sid: str, explicit: bool
     ) -> SessionEntry:
         history = request.messages[:-1]
+        # The native resume loader discards trailing unresolved calls. Import
+        # their complete results too; the SDK uses an empty continuation signal.
+        backend_history = (
+            request.messages if isinstance(request.next_input, tuple) else history
+        )
+        record(
+            "session_created",
+            mode="import" if history else "fresh",
+            session=session_reference(sid),
+            messages=len(request.messages),
+        )
         if history:
             backend = self._session_factory(
                 request.model,
                 request.system,
                 tools=request.tools,
                 dialect=request.dialect,
-                history=history,
+                history=backend_history,
             )
         else:
             backend = self._session_factory(
@@ -210,6 +264,7 @@ class SessionRegistry:
         fingerprint: str,
     ) -> None:
         installed = False
+        already_removed = False
         try:
             try:
                 async with asyncio.timeout(self._turn_timeout_seconds):
@@ -218,11 +273,28 @@ class SessionRegistry:
                 raise SessionTimeout("SDK turn timed out") from None
             async with self._lock:
                 target = self._explicit if replaced.explicit else self._implicit
-                if (
-                    not self._closed
-                    and target.get(replaced.external_id) is replaced
-                    and replaced.in_flight_fingerprint == fingerprint
+                current = self._explicit.get(
+                    replaced.external_id
+                ) or self._implicit.get(replaced.external_id)
+                old_closed = (
+                    isinstance(replaced, ToolSessionActor)
+                    and replaced.state is ToolSessionState.CLOSED
+                )
+                already_removed = current is None and old_closed
+                if not self._closed and (
+                    already_removed
+                    or (
+                        current is replaced
+                        and (
+                            replaced.in_flight_fingerprint == fingerprint or old_closed
+                        )
+                    )
                 ):
+                    # Expiry can remove the suspended actor during startup.
+                    # This self-contained import remains valid, but must not
+                    # overwrite a new owner or bypass the capacity limit.
+                    if already_removed:
+                        self._make_room_for_fresh()
                     target[replaced.external_id] = candidate
                     replaced.in_flight_fingerprint = None
                     self._use_counter += 1
@@ -235,11 +307,16 @@ class SessionRegistry:
             cleanup = asyncio.create_task(
                 self._cancel_rebase(candidate, replaced, fingerprint)
             )
+            cleanup.add_done_callback(self._consume_task)
             await asyncio.shield(cleanup)
             raise
         if not installed:
-            await self._discard_entry(candidate)
-            raise RuntimeError("conversation changed during rebase")
+            cleanup = asyncio.create_task(self._discard_entry(candidate))
+            cleanup.add_done_callback(self._consume_task)
+            await asyncio.shield(cleanup)
+            raise SessionConflict("conversation is busy")
+        if already_removed:
+            return  # Its removal already scheduled backend teardown.
         cleanup = asyncio.create_task(self._discard_entry(replaced))
         try:
             await asyncio.shield(cleanup)

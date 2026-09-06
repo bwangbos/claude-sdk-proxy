@@ -398,7 +398,10 @@ async def test_anthropic_session_mismatch_uses_anthropic_error_envelope() -> Non
         "type": "error",
         "error": {
             "type": "session_mismatch",
-            "message": "Session transcript does not match",
+            "message": "Session system prompt changed. "
+            "Use a unique X-Claude-Proxy-Session per conversation; "
+            "retry only after active work completes.",
+            "reason": "system_changed",
         },
     }
 

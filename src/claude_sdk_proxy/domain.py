@@ -39,7 +39,7 @@ class ImagePrompt:
     blocks: tuple[TextBlock | ImageBlock, ...]
 
 
-type Prompt = str | ImagePrompt
+type Prompt = str | ImagePrompt | ToolResultPrompt
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +63,13 @@ class ToolResultBlock:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "content", tuple(self.content))
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultPrompt:
+    """A complete result batch used only to resume imported native history."""
+
+    results: tuple[ToolResultBlock, ...]
 
 
 type CanonicalBlock = TextBlock | ImageBlock | ToolCallBlock | ToolResultBlock
@@ -155,6 +162,8 @@ class ToolCall:
 @dataclass(frozen=True, slots=True)
 class InputUsage:
     input_tokens: int
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,7 +305,7 @@ class TextRequest:
     def next_prompt(self) -> Prompt:
         value = self.next_input
         if isinstance(value, tuple):
-            raise ValueError("conversation must end with a text/image user message")
+            return ToolResultPrompt(value)
         return value
 
 

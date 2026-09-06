@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -28,6 +29,7 @@ from claude_sdk_proxy.asgi_stream import (
     cleanup_best_effort,
     close_best_effort,
 )
+from claude_sdk_proxy.diagnostics import DiagnosticContextMiddleware
 from claude_sdk_proxy.domain import (
     BackendFailure,
     Completed,
@@ -95,6 +97,7 @@ def create_app(
         ],
         lifespan=lifespan,
     )
+    app.add_middleware(DiagnosticContextMiddleware)
     app.state.allowed_models = allowed_models
     app.state.model_order = models
     return app
@@ -155,9 +158,18 @@ async def _handle(request: Request, *, dialect: str) -> Response:
         response = error_response(dialect, error)
         return response if monitor is None else cast(Response, monitor.wrap(response))
     request_id = ("chatcmpl_" if dialect == "openai" else "msg_") + uuid.uuid4().hex
+    created = _completion_created() if dialect == "openai" else 0
     if parsed.stream:
-        return await _stream_response(dialect, request_id, parsed, lease, monitor)
-    return await _nonstream_response(dialect, request_id, parsed, lease, monitor)
+        return await _stream_response(
+            dialect, request_id, parsed, lease, monitor, created
+        )
+    return await _nonstream_response(
+        dialect, request_id, parsed, lease, monitor, created
+    )
+
+
+def _completion_created() -> int:
+    return int(time.time())
 
 
 async def _stream_response(
@@ -166,6 +178,7 @@ async def _stream_response(
     request: TextRequest,
     lease: TurnLeaseProtocol,
     monitor: DisconnectMonitor,
+    created: int,
 ) -> Response:
     stream = cast(ClosableEventStream, lease.stream())
     try:
@@ -188,13 +201,14 @@ async def _stream_response(
                 lease,
                 stream,
                 first,
-                encode_openai_start(request_id, request.model),
+                encode_openai_start(request_id, request.model, created=created),
                 lambda event: encode_openai_event(
                     request_id,
                     request.model,
                     event,
                     request.include_usage,
                     openai_state,
+                    created=created,
                 ),
                 lambda error: encode_openai_error(
                     error_detail(error).code, error_detail(error).message
@@ -209,7 +223,7 @@ async def _stream_response(
             encode_anthropic_start(
                 request_id,
                 request.model,
-                first.input_tokens if isinstance(first, InputUsage) else 0,
+                first if isinstance(first, InputUsage) else 0,
                 request.tools,
                 anthropic_state,
             ),
@@ -229,6 +243,7 @@ async def _nonstream_response(
     request: TextRequest,
     lease: TurnLeaseProtocol,
     monitor: DisconnectMonitor,
+    created: int,
 ) -> Response:
     stream = cast(ClosableEventStream, lease.stream())
     blocks: list[TextBlock | ToolCall] = []
@@ -262,14 +277,21 @@ async def _nonstream_response(
         await abort_best_effort(lease)
         response = error_response(dialect, BackendFailure("missing completion"))
         return cast(Response, monitor.wrap(response))
-    renderer = (
-        render_openai_response if dialect == "openai" else render_anthropic_response
-    )
     rendered = (
         tuple(blocks)
         if request.tools
         else "".join(block.text for block in blocks if isinstance(block, TextBlock))
     )
-    payload = renderer(request_id, request.model, rendered, completed)
+    payload = (
+        render_openai_response(
+            request_id,
+            request.model,
+            rendered,
+            completed,
+            created=created,
+        )
+        if dialect == "openai"
+        else render_anthropic_response(request_id, request.model, rendered, completed)
+    )
     response = JSONResponse(payload, headers=lease.response_headers)
     return cast(Response, monitor.wrap(response))

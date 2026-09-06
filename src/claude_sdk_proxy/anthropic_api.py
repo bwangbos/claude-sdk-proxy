@@ -115,7 +115,7 @@ def render_anthropic_response(
 def encode_anthropic_start(
     request_id: str,
     model: str,
-    input_tokens: int = 0,
+    input_tokens: int | InputUsage = 0,
     tools: tuple[ToolDefinition, ...] = (),
     state: AnthropicStreamState | None = None,
 ) -> tuple[bytes, ...]:
@@ -124,6 +124,11 @@ def encode_anthropic_start(
         state.tools_enabled = tools_enabled
         state.open_text_index = None if tools_enabled else 0
         state.next_block_index = 0 if tools_enabled else 1
+    input_usage = (
+        _input_usage(input_tokens)
+        if isinstance(input_tokens, InputUsage)
+        else {"input_tokens": input_tokens}
+    )
     start = _sse(
         "message_start",
         {
@@ -136,7 +141,7 @@ def encode_anthropic_start(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                "usage": {**input_usage, "output_tokens": 0},
             },
         },
     )
@@ -226,10 +231,23 @@ def _anthropic_stop_reason(reason: str | None) -> str:
 
 
 def _anthropic_usage(usage: Mapping[str, Any] | None) -> dict[str, int]:
-    return {
+    normalized = {
         "input_tokens": usage_counter(usage, "input_tokens"),
         "output_tokens": usage_counter(usage, "output_tokens"),
     }
+    for field in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        if usage is not None and field in usage:
+            normalized[field] = usage_counter(usage, field)
+    return normalized
+
+
+def _input_usage(usage: InputUsage) -> dict[str, int]:
+    normalized = {"input_tokens": usage.input_tokens}
+    for field in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        value = getattr(usage, field)
+        if value is not None:
+            normalized[field] = value
+    return normalized
 
 
 def _response_block(block: TextBlock | ToolCall) -> dict[str, object]:

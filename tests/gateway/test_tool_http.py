@@ -692,10 +692,13 @@ def _assert_exact_tool_sse(
         )
         assert _normalize_response_id(_sse_records(body)) == expected
         return
+    records = _normalize_response_id(_sse_records(body))
+    created = records[0][1]["created"]
+    assert type(created) is int and created > 0
     first = {
         "id": "<response>",
         "object": "chat.completion.chunk",
-        "created": 0,
+        "created": created,
         "model": "sonnet",
         "choices": [
             {
@@ -761,7 +764,7 @@ def _assert_exact_tool_sse(
                 {
                     "id": "<response>",
                     "object": "chat.completion.chunk",
-                    "created": 0,
+                    "created": created,
                     "model": "sonnet",
                     "choices": [],
                     "usage": {
@@ -774,7 +777,7 @@ def _assert_exact_tool_sse(
             [None, "[DONE]"],
         ]
     )
-    assert _normalize_response_id(_sse_records(body)) == expected
+    assert records == expected
 
 
 def _assert_exact_final_sse(dialect: str, body: bytes) -> None:
@@ -828,10 +831,12 @@ def _assert_exact_final_sse(dialect: str, body: bytes) -> None:
             ["message_stop", {"type": "message_stop"}],
         ]
         return
+    created = records[0][1]["created"]
+    assert type(created) is int and created > 0
     chunk = {
         "id": "<response>",
         "object": "chat.completion.chunk",
-        "created": 0,
+        "created": created,
         "model": "sonnet",
     }
     assert records == [

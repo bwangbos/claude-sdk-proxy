@@ -173,16 +173,12 @@ async def _openai_create(
         request["stream_options"] = {"include_usage": True}
     response = await client.chat.completions.create(**request, stream=stream)
     if not stream:
-        dumped = response.model_dump(exclude_none=True)
+        dumped = response.model_dump()
         message = dumped["choices"][0]["message"]
         return {
-            "message": {
-                key: message[key]
-                for key in ("role", "content", "tool_calls")
-                if key in message
-            },
+            "message": message,
             "finish_reason": dumped["choices"][0]["finish_reason"],
-            "usage": dumped["usage"],
+            "usage": response.usage.model_dump(exclude_none=True),
         }
 
     content: list[str] = []

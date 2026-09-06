@@ -7,6 +7,7 @@ from typing import Any
 
 from starlette.responses import JSONResponse
 
+from claude_sdk_proxy.diagnostics import record
 from claude_sdk_proxy.domain import RequestValidationError, UnsupportedFeature
 from claude_sdk_proxy.session_turn import (
     SessionCapacity,
@@ -22,6 +23,85 @@ class ErrorDetail:
     code: str
     message: str
     param: str | None = None
+    reason: str | None = None
+
+
+_SESSION_REASONS = {
+    "pending tool calls changed": (
+        "pending_calls_changed",
+        "Pending tool call definitions changed.",
+    ),
+    "invalid explicit session ID": (
+        "invalid_session_id",
+        "Invalid session identifier.",
+    ),
+    "request transcript matches multiple conversations": (
+        "ambiguous_session",
+        "Transcript matches multiple conversations.",
+    ),
+    "request transcript does not match conversation": (
+        "transcript_changed",
+        "Transcript differs from the selected conversation.",
+    ),
+    "request transcript is stale": (
+        "stale_head",
+        "Transcript is an older conversation head.",
+    ),
+    "request transcript is not a fresh conversation": (
+        "missing_session",
+        "Tool results require a matching session or complete imported history.",
+    ),
+    "session model does not match": ("model_changed", "Session model changed."),
+    "session system does not match": (
+        "system_changed",
+        "Session system prompt changed.",
+    ),
+    "session tool configuration does not match": (
+        "configuration_changed",
+        "Session tools or API dialect changed.",
+    ),
+    "tool results are required": (
+        "tool_results_required",
+        "Pending calls require tool results.",
+    ),
+    "tool results do not match pending calls": (
+        "tool_ids_mismatch",
+        "Tool result IDs do not match the pending calls.",
+    ),
+    "conversation is no longer active": (
+        "session_closed",
+        "Session is no longer active.",
+    ),
+    "conversation has pending tools": (
+        "pending_tools",
+        "Complete pending tool calls before replacing this conversation.",
+    ),
+    "request is already in flight": (
+        "duplicate_in_flight",
+        "This request is already in flight.",
+    ),
+    "conversation is busy": ("session_busy", "The selected conversation is busy."),
+}
+
+
+def _session_error(error: SessionMismatch | SessionConflict) -> ErrorDetail:
+    reason, message = _SESSION_REASONS.get(
+        str(error), ("session_mismatch", "Session transcript does not match.")
+    )
+    code = (
+        "request_in_flight"
+        if isinstance(error, SessionConflict)
+        else "session_mismatch"
+    )
+    record("request_rejected", code=code, reason=reason, status=409)
+    return ErrorDetail(
+        409,
+        code,
+        message + " Use a unique X-Claude-Proxy-Session per conversation; "
+        "retry only after active work completes.",
+        "messages",
+        reason,
+    )
 
 
 def error_detail(error: Exception) -> ErrorDetail:
@@ -38,11 +118,11 @@ def error_detail(error: Exception) -> ErrorDetail:
             )
         return ErrorDetail(400, "invalid_request", "Invalid request", error.field)
     if isinstance(error, SessionConflict):
-        return ErrorDetail(409, "request_in_flight", "Request is already in flight")
+        return _session_error(error)
     if isinstance(error, SessionCapacity):
         return ErrorDetail(503, "session_capacity", "Session capacity is exhausted")
     if isinstance(error, SessionMismatch):
-        return ErrorDetail(409, "session_mismatch", "Session transcript does not match")
+        return _session_error(error)
     if isinstance(error, SessionTimeout):
         return ErrorDetail(504, "backend_timeout", "Backend turn timed out")
     return ErrorDetail(502, "backend_error", "Backend request failed")
@@ -68,4 +148,6 @@ def error_response(
             "type": "error",
             "error": {"type": detail.code, "message": detail.message},
         }
+    if detail.reason is not None:
+        payload["error"]["reason"] = detail.reason
     return JSONResponse(payload, status_code=detail.status, headers=headers)

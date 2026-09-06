@@ -39,6 +39,7 @@ _SUPPORTED_FIELDS = {
     "tools",
     "tool_choice",
     "parallel_tool_calls",
+    "user",
 }
 _UNSUPPORTED_FIELDS = {
     "temperature",
@@ -50,6 +51,11 @@ _UNSUPPORTED_FIELDS = {
     "audio",
     "reasoning_effort",
 }
+_NULLABLE_OPTIONAL_FIELDS = (_SUPPORTED_FIELDS | _UNSUPPORTED_FIELDS) - {
+    "model",
+    "messages",
+    "user",
+}
 
 
 @dataclass(slots=True)
@@ -60,7 +66,15 @@ class OpenAIStreamState:
 def parse_openai_request(
     body: Mapping[str, object], allowed_models: frozenset[str]
 ) -> TextRequest:
+    body = {
+        field: value
+        for field, value in body.items()
+        if value is not None or field not in _NULLABLE_OPTIONAL_FIELDS
+    }
     reject_fields(body, _SUPPORTED_FIELDS, _UNSUPPORTED_FIELDS)
+    user = body.get("user")
+    if user is not None and not isinstance(user, str):
+        raise RequestValidationError("user", "must be a string or null")
     model = required_string(body, "model")
     if model not in allowed_models:
         raise RequestValidationError("model", "model is not configured")
@@ -94,12 +108,14 @@ def render_openai_response(
     model: str,
     blocks: str | tuple[TextBlock | ToolCall, ...],
     completed: Completed,
+    *,
+    created: int = 0,
 ) -> dict[str, object]:
     normalized = (TextBlock(blocks),) if isinstance(blocks, str) else blocks
     return {
         "id": request_id,
         "object": "chat.completion",
-        "created": 0,
+        "created": created,
         "model": model,
         "choices": [
             {
@@ -113,8 +129,19 @@ def render_openai_response(
     }
 
 
-def encode_openai_start(request_id: str, model: str) -> tuple[bytes, ...]:
-    return (_sse(_chunk(request_id, model, {"role": "assistant", "content": ""})),)
+def encode_openai_start(
+    request_id: str, model: str, *, created: int = 0
+) -> tuple[bytes, ...]:
+    return (
+        _sse(
+            _chunk(
+                request_id,
+                model,
+                {"role": "assistant", "content": ""},
+                created=created,
+            )
+        ),
+    )
 
 
 def encode_openai_event(
@@ -123,11 +150,15 @@ def encode_openai_event(
     event: ConversationEvent,
     include_usage: bool,
     state: OpenAIStreamState | None = None,
+    *,
+    created: int = 0,
 ) -> tuple[bytes, ...]:
     if isinstance(event, InputUsage):
         return ()
     if isinstance(event, TextDelta):
-        return (_sse(_chunk(request_id, model, {"content": event.text})),)
+        return (
+            _sse(_chunk(request_id, model, {"content": event.text}, created=created)),
+        )
     if isinstance(event, ToolCall):
         index = 0 if state is None else state.next_tool_index
         if state is not None:
@@ -152,6 +183,7 @@ def encode_openai_event(
                             }
                         ]
                     },
+                    created=created,
                 )
             ),
         )
@@ -162,6 +194,7 @@ def encode_openai_event(
         model,
         {},
         finish_reason=_openai_stop_reason(event.stop_reason),
+        created=created,
     )
     chunks = [_sse(terminal)]
     if include_usage:
@@ -170,7 +203,7 @@ def encode_openai_event(
                 {
                     "id": request_id,
                     "object": "chat.completion.chunk",
-                    "created": 0,
+                    "created": created,
                     "model": model,
                     "choices": [],
                     "usage": _openai_usage(event.usage),
@@ -220,11 +253,12 @@ def _chunk(
     delta: dict[str, object],
     *,
     finish_reason: str | None = None,
+    created: int = 0,
 ) -> dict[str, object]:
     return {
         "id": request_id,
         "object": "chat.completion.chunk",
-        "created": 0,
+        "created": created,
         "model": model,
         "choices": [
             {
@@ -251,14 +285,25 @@ def _openai_stop_reason(reason: str | None) -> str:
         raise ValueError("unsupported stop reason") from None
 
 
-def _openai_usage(usage: Mapping[str, Any] | None) -> dict[str, int]:
+def _openai_usage(usage: Mapping[str, Any] | None) -> dict[str, object]:
     input_tokens = usage_counter(usage, "input_tokens")
     output_tokens = usage_counter(usage, "output_tokens")
-    return {
-        "prompt_tokens": input_tokens,
+    cache_read = usage_counter(usage, "cache_read_input_tokens")
+    cache_creation = usage_counter(usage, "cache_creation_input_tokens")
+    prompt_tokens = input_tokens + cache_read + cache_creation
+    normalized: dict[str, object] = {
+        "prompt_tokens": prompt_tokens,
         "completion_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
+        "total_tokens": prompt_tokens + output_tokens,
     }
+    details: dict[str, int] = {}
+    if usage is not None and "cache_read_input_tokens" in usage:
+        details["cached_tokens"] = cache_read
+    if usage is not None and "cache_creation_input_tokens" in usage:
+        details["cache_write_tokens"] = cache_creation
+    if details:
+        normalized["prompt_tokens_details"] = details
+    return normalized
 
 
 def _response_message(

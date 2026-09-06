@@ -8,6 +8,7 @@ from collections.abc import Sequence
 import uvicorn
 
 from claude_sdk_proxy.app import create_app
+from claude_sdk_proxy.diagnostics import close_logging, configure_logging
 
 
 def _port(value: str) -> int:
@@ -38,6 +39,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", action="append")
     parser.add_argument("--max-sessions", type=_positive, default=8)
     parser.add_argument(
+        "--log", metavar="PATH", help="Append redacted diagnostics to a file"
+    )
+    parser.add_argument(
+        "--log-json",
+        action="store_true",
+        help="Emit JSON diagnostics (stderr unless --log is set)",
+    )
+    parser.add_argument(
         "--tool-result-timeout",
         type=_positive_finite_float,
         default=300.0,
@@ -64,7 +73,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except ValueError as error:
         parser.error(str(error))
-    uvicorn.run(app, host=str(host), port=args.port)
+    handler = None
+    try:
+        if args.log is not None or args.log_json:
+            handler = configure_logging(args.log, args.log_json)
+        uvicorn.run(app, host=str(host), port=args.port)
+    finally:
+        if handler is not None:
+            close_logging(handler, file_output=args.log is not None)
     return 0
 
 

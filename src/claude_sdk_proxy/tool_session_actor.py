@@ -131,8 +131,6 @@ class ToolSessionActor:
 
     def _admit_prompt_locked(self, response: ToolResponse) -> None:
         request = response.request
-        if isinstance(request.next_input, tuple):
-            raise SessionMismatch("request transcript does not match conversation")
         self.state = ToolSessionState.GENERATING
         self._current = response
         self._generation_deadline = self._now() + self.generation_timeout

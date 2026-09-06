@@ -32,6 +32,7 @@ from claude_sdk_proxy.domain import (
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
+    ToolResultPrompt,
 )
 from claude_sdk_proxy.images import (
     ResultIdentity,
@@ -45,6 +46,7 @@ from claude_sdk_proxy.sdk_metadata import (
     validate_system_message,
 )
 from claude_sdk_proxy.sdk_text_protocol import (
+    USAGE_FIELDS,
     RawTextEventValidator,
     fail_protocol,
     normalize_usage,
@@ -110,6 +112,14 @@ class SdkSession:
         self._sdk_session_id: str | None = None
         self._tools = validate_tool_definitions(tools)
         self._history = tuple(history)
+        self._seeded_result_prompt = bool(
+            self._history
+            and self._history[-1].role == "user"
+            and self._history[-1].blocks
+            and all(
+                isinstance(block, ToolResultBlock) for block in self._history[-1].blocks
+            )
+        )
         self._bridge = ToolBridge(self._tools, dialect) if self._tools else None
         self._expected_sdk_tools = (
             self._bridge.allowed_tools if self._bridge is not None else ()
@@ -241,7 +251,18 @@ class SdkSession:
         terminal_boundary: Completed | None = None
         prefetched: asyncio.Future[_ReceivedSdkMessage] | None = None
         try:
-            if isinstance(prompt, ImagePrompt):
+            if isinstance(prompt, ToolResultPrompt):
+                if not self._seeded_result_prompt or self._history[
+                    -1
+                ] != CanonicalMessage("user", prompt.results):
+                    self._fail_protocol()
+                self._seeded_result_prompt = False
+                # Seed calls AND results atomically. Resuming with a dangling
+                # tool_use causes the native loader to discard it. An empty
+                # query continues the completed native history without adding
+                # a natural-language instruction or rerunning caller tools.
+                await client.query("")
+            elif isinstance(prompt, ImagePrompt):
 
                 async def structured_prompt() -> AsyncIterator[dict[str, Any]]:
                     yield {
@@ -447,7 +468,7 @@ class SdkSession:
         origin = message.origin
         if origin is not None and not self._human_origin(origin):
             self._fail_protocol()
-        usage = normalize_usage(message.usage, ("input_tokens", "output_tokens"))
+        usage = normalize_usage(message.usage, USAGE_FIELDS)
         del usage
         if message.stop_reason != boundary_stop_reason:
             self._fail_protocol()
@@ -559,12 +580,7 @@ class SdkSession:
 
     @staticmethod
     def _text_boundary_usage(raw: RawTextEventValidator) -> dict[str, int]:
-        if raw.input_tokens is None or raw.output_tokens is None:
-            fail_protocol()
-        return {
-            "input_tokens": raw.input_tokens,
-            "output_tokens": raw.output_tokens,
-        }
+        return raw.boundary_usage
 
     def _observe_result_echo(self, message: UserMessage) -> None:
         if (

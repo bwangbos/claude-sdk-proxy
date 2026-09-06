@@ -11,6 +11,17 @@ _PROTOCOL_ERROR = "Agent SDK protocol failure"
 _STOP_REASONS = frozenset(
     {"end_turn", "max_tokens", "model_context_window_exceeded", "refusal"}
 )
+USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+_INPUT_USAGE_FIELDS = (
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
 
 
 def fail_protocol() -> Never:
@@ -43,6 +54,8 @@ class RawTextEventValidator:
         self._text: list[str] = []
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
+        self._input_usage: dict[str, int] = {}
+        self._latest_output_tokens: int | None = None
         self.stop_reason: str | None = None
         self._assistant_text: str | None = None
         self._allow_seeded_history = allow_seeded_history
@@ -94,12 +107,20 @@ class RawTextEventValidator:
             value = message.get(field)
             if value is not None and (not isinstance(value, str) or not value):
                 fail_protocol()
-        usage = normalize_usage(message.get("usage"), ("input_tokens",))
+        usage = normalize_usage(message.get("usage"), USAGE_FIELDS)
         if usage is None or "input_tokens" not in usage:
             fail_protocol()
+        self._input_usage = {
+            field: usage[field] for field in _INPUT_USAGE_FIELDS if field in usage
+        }
+        self._latest_output_tokens = usage.get("output_tokens")
         self.input_tokens = usage["input_tokens"]
         self._phase = "block_start"
-        return InputUsage(self.input_tokens)
+        return InputUsage(
+            self.input_tokens,
+            self._input_usage.get("cache_read_input_tokens"),
+            self._input_usage.get("cache_creation_input_tokens"),
+        )
 
     def _block_start(self, event: Mapping[str, Any]) -> None:
         if self._phase != "block_start":
@@ -161,13 +182,10 @@ class RawTextEventValidator:
         context = event.get("context_management")
         if not isinstance(context, Mapping) or dict(context) != {"applied_edits": []}:
             fail_protocol()
-        usage = normalize_usage(
-            event.get("usage"), ("input_tokens", "output_tokens")
-        )
+        usage = normalize_usage(event.get("usage"), USAGE_FIELDS)
         if usage is None or "output_tokens" not in usage:
             fail_protocol()
-        if usage.get("input_tokens", self.input_tokens) != self.input_tokens:
-            fail_protocol()
+        self._reconcile_usage(usage)
         self.stop_reason = delta["stop_reason"]
         self.output_tokens = usage["output_tokens"]
         self._phase = "message_stop"
@@ -194,7 +212,29 @@ class RawTextEventValidator:
             fail_protocol()
         if self._assistant_text is not None or complete_text != "".join(self._text):
             fail_protocol()
+        usage = normalize_usage(message.usage, USAGE_FIELDS)
+        if usage is not None:
+            self._reconcile_usage(usage)
+            if "output_tokens" in usage:
+                self._latest_output_tokens = usage["output_tokens"]
         self._assistant_text = complete_text
+
+    @property
+    def boundary_usage(self) -> dict[str, int]:
+        if self.output_tokens is None:
+            fail_protocol()
+        return {**self._input_usage, "output_tokens": self.output_tokens}
+
+    def _reconcile_usage(self, usage: Mapping[str, int]) -> None:
+        for field in _INPUT_USAGE_FIELDS:
+            if field in usage and usage[field] != self._input_usage.get(field):
+                fail_protocol()
+        if (
+            "output_tokens" in usage
+            and self._latest_output_tokens is not None
+            and usage["output_tokens"] < self._latest_output_tokens
+        ):
+            fail_protocol()
 
     def validate_result(
         self, stop_reason: object, usage: Mapping[str, int] | None

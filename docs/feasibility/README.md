@@ -201,9 +201,12 @@ snapshot into a fresh ephemeral SDK session and continues from it. No Pi adapter
 or compaction-specific prompt handling exists in the gateway.
 
 The rewritten snapshot must still be a structurally complete supported
-transcript and end with a text/image user message. A rewrite cannot cross an unresolved
-tool-call boundary: submit every pending tool result and finish that model turn
-before compacting.
+transcript and end with a text/image user message or complete tool-result batch.
+A suspended session can be replaced only when its exact pending calls and result
+IDs match; unresolved calls and partial batches are rejected. Result-ending
+imports seed calls and results together and use an empty SDK continuation signal,
+without rerunning historical caller operations. See the root README for recovery
+limits, request IDs, and opt-in diagnostic logging.
 
 Most clients can use transcript matching without a custom header. A client that
 can set per-conversation headers may send a unique

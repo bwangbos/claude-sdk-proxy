@@ -10,6 +10,7 @@ from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from claude_sdk_proxy.domain import InputUsage, TextDelta, ToolDefinition
 from claude_sdk_proxy.sdk_text_protocol import (
+    USAGE_FIELDS,
     fail_protocol,
     normalize_usage,
     valid_message_diagnostics,
@@ -76,6 +77,8 @@ class RawSdkMessageValidator:
         self._assistant_validated_blocks: set[int] = set()
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
+        self._input_usage: dict[str, int] = {}
+        self._latest_output_tokens: int | None = None
         self.stop_reason: str | None = None
         self._allow_seeded_history = allow_seeded_history
 
@@ -111,10 +114,7 @@ class RawSdkMessageValidator:
     def boundary_usage(self) -> dict[str, int]:
         if self.input_tokens is None or self.output_tokens is None:
             fail_protocol()
-        return {
-            "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens,
-        }
+        return {**self._input_usage, "output_tokens": self.output_tokens}
 
     @property
     def tool_calls(self) -> tuple[RawToolCall, ...]:
@@ -198,6 +198,11 @@ class RawSdkMessageValidator:
             ):
                 fail_protocol()
         self._assistant_validated_blocks.update(raw_indices)
+        usage = normalize_usage(message.usage, USAGE_FIELDS)
+        if usage is not None:
+            self._reconcile_usage(usage)
+            if "output_tokens" in usage:
+                self._latest_output_tokens = usage["output_tokens"]
 
     def _message_start(self, event: Mapping[str, Any]) -> InputUsage:
         if self._phase != "message_start":
@@ -226,12 +231,26 @@ class RawSdkMessageValidator:
             value = message.get(field)
             if value is not None and (not isinstance(value, str) or not value):
                 fail_protocol()
-        usage = normalize_usage(message.get("usage"), ("input_tokens",))
+        usage = normalize_usage(message.get("usage"), USAGE_FIELDS)
         if usage is None or "input_tokens" not in usage:
             fail_protocol()
+        self._input_usage = {
+            field: usage[field]
+            for field in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+            if field in usage
+        }
+        self._latest_output_tokens = usage.get("output_tokens")
         self.input_tokens = usage["input_tokens"]
         self._phase = "block_start"
-        return InputUsage(self.input_tokens)
+        return InputUsage(
+            self.input_tokens,
+            self._input_usage.get("cache_read_input_tokens"),
+            self._input_usage.get("cache_creation_input_tokens"),
+        )
 
     def _block_start(self, event: Mapping[str, Any]) -> None:
         if self._phase != "block_start" or (
@@ -359,14 +378,28 @@ class RawSdkMessageValidator:
         context = event.get("context_management")
         if not isinstance(context, Mapping) or dict(context) != {"applied_edits": []}:
             fail_protocol()
-        usage = normalize_usage(event.get("usage"), ("input_tokens", "output_tokens"))
+        usage = normalize_usage(event.get("usage"), USAGE_FIELDS)
         if usage is None or "output_tokens" not in usage:
             fail_protocol()
-        if usage.get("input_tokens", self.input_tokens) != self.input_tokens:
-            fail_protocol()
+        self._reconcile_usage(usage)
         self.stop_reason = cast(str, delta["stop_reason"])
         self.output_tokens = usage["output_tokens"]
         self._phase = "message_stop"
+
+    def _reconcile_usage(self, usage: Mapping[str, int]) -> None:
+        for field in (
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
+            if field in usage and usage[field] != self._input_usage.get(field):
+                fail_protocol()
+        if (
+            "output_tokens" in usage
+            and self._latest_output_tokens is not None
+            and usage["output_tokens"] < self._latest_output_tokens
+        ):
+            fail_protocol()
 
     def _message_stop(self, event: Mapping[str, Any]) -> None:
         if self._phase != "message_stop" or (
