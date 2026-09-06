@@ -123,6 +123,14 @@ class RawSdkMessageValidator:
         return self._phase == "complete"
 
     @property
+    def thinking_active(self) -> bool:
+        return (
+            self._phase == "block_delta"
+            and self._current is not None
+            and self._current.kind == "thinking"
+        )
+
+    @property
     def has_tools(self) -> bool:
         return any(block.kind == "tool_use" for block in self._blocks)
 

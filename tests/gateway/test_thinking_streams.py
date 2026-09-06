@@ -607,3 +607,95 @@ def test_text_thinking_text_interleaving_preserves_signed_order_and_public_text(
         (CanonicalMessage.assistant_text("answeranswer"),),
         dialect="openai",
     )
+
+
+def thinking_progress(**overrides):
+    from claude_agent_sdk import SystemMessage
+
+    return SystemMessage(
+        "thinking_tokens",
+        {
+            "type": "system",
+            "subtype": "thinking_tokens",
+            "estimated_tokens": 50,
+            "estimated_tokens_delta": 50,
+            "session_id": "sdk-thinking",
+            "uuid": "progress",
+            **overrides,
+        },
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tools_enabled", [False, True])
+async def test_live_thinking_token_progress_is_not_output_or_usage(
+    tmp_path, tools_enabled
+):
+    raw = thinking_response()
+    client = FakeSdkClient(((*raw[:2], thinking_progress(), *raw[2:]),))
+    app = create_app(
+        models=("sonnet",),
+        session_factory=lambda model, system, **kw: SdkSession(
+            model,
+            system,
+            **kw,
+            directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+            client_factory=client.capture_options,
+        ),
+    )
+    body = {"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}
+    if tools_enabled:
+        body["tools"] = [
+            {
+                "type": "function",
+                "function": {"name": "echo", "parameters": {"type": "object"}},
+            }
+        ]
+    async with lifespan_app(app):
+        response = await post_json(app, "/v1/chat/completions", body)
+    assert response.status == 200, response.json
+    assert response.json["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "reasoning summary",
+    }
+    assert response.json["usage"]["completion_tokens"] == 17
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "overrides,index",
+    [
+        ({"estimated_tokens": None}, 2),
+        ({"estimated_tokens": True}, 2),
+        ({"estimated_tokens": -1}, 2),
+        ({"estimated_tokens_delta": -1}, 2),
+        ({"estimated_tokens_delta": 51}, 2),
+        ({"estimated_tokens_delta": 2**63}, 2),
+        ({"session_id": "different"}, 2),
+        ({"uuid": ""}, 2),
+        ({"unexpected": "field"}, 2),
+        ({}, 0),
+        ({}, 8),
+        ({}, 13),
+    ],
+)
+async def test_thinking_progress_remains_strictly_scoped(tmp_path, overrides, index):
+    from claude_sdk_proxy.domain import BackendFailure
+
+    raw = thinking_response()
+    client = FakeSdkClient(
+        ((*raw[:index], thinking_progress(**overrides), *raw[index:]),)
+    )
+    session = SdkSession(
+        "sonnet",
+        "",
+        directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+        client_factory=client.capture_options,
+    )
+    await session.start()
+    try:
+        with pytest.raises(BackendFailure):
+            _ = [event async for event in session.stream_generation("hi")]
+    finally:
+        await session.close()

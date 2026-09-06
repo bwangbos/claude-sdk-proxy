@@ -402,6 +402,10 @@ class SdkSession:
                         self._awaiting_echo and message.subtype != "status"
                     ):
                         self._fail_protocol()
+                    if message.subtype == "thinking_tokens" and (
+                        raw is None or not raw.thinking_active
+                    ):
+                        self._fail_protocol()
                     self._observe_session_id(
                         validate_system_message(
                             message,

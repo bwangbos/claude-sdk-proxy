@@ -150,7 +150,7 @@ def _parse_block(raw: object, role: Role) -> CanonicalBlock:
         raise RequestValidationError("messages", "content blocks must be objects")
     raw = without_cache_hint(raw)
     kind = raw.get("type")
-    if kind in {"thinking", "redacted_thinking"}:
+    if isinstance(kind, str) and kind in {"thinking", "redacted_thinking"}:
         if role != "assistant":
             raise RequestValidationError(
                 "messages", "thinking blocks require assistant"

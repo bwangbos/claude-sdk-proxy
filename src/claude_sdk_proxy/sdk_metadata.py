@@ -28,13 +28,31 @@ def validate_system_message(
     servers = [{"name": name, "status": "connected"} for name in expected_mcp_servers]
     if (
         not isinstance(data, Mapping)
-        or message.subtype not in {"init", "status"}
+        or message.subtype not in {"init", "status", "thinking_tokens"}
         or data.get("type") != "system"
         or data.get("subtype") != message.subtype
         or not _identifier(data.get("uuid"))
     ):
         _fail()
-    if message.subtype == "status":
+    if message.subtype == "thinking_tokens":
+        total = data.get("estimated_tokens")
+        delta = data.get("estimated_tokens_delta")
+        if (
+            set(data)
+            != {
+                "type",
+                "subtype",
+                "estimated_tokens",
+                "estimated_tokens_delta",
+                "session_id",
+                "uuid",
+            }
+            or type(total) is not int
+            or type(delta) is not int
+            or not 0 <= delta <= total <= _COUNTER_MAX
+        ):
+            _fail()
+    elif message.subtype == "status":
         if data.get("status") != "requesting":
             _fail()
     elif (

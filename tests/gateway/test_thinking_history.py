@@ -326,3 +326,24 @@ async def test_interleaved_thinking_continuation_keeps_order_and_one_result_batc
         }
         assert client.tool_handler_count == 2
         assert client.prompts == ["go"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", [[], {}])
+async def test_malformed_anthropic_block_type_is_a_client_error(kind):
+    from tests.gateway.fakes import FakeSessionFactory
+
+    factory = FakeSessionFactory(("unused",))
+    app = create_app(models=("sonnet",), session_factory=factory)
+    async with lifespan_app(app):
+        response = await post_json(
+            app,
+            "/v1/messages",
+            {
+                "model": "sonnet",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": [{"type": kind}]}],
+            },
+        )
+    assert response.status == 400
+    assert factory.created == 0
