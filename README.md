@@ -1,6 +1,6 @@
 # Claude SDK Proxy
 
-A private, local HTTP compatibility gateway that lets OpenAI- and
+An MIT-licensed, local HTTP compatibility gateway that lets OpenAI- and
 Anthropic-compatible agent harnesses use the Claude login already available on
 your machine.
 
@@ -466,3 +466,10 @@ gateway and this README are the current usage path.
 - Built-in Claude Code tools and ambient configuration are disabled.
 - Do not put the gateway behind a public reverse proxy or expose its port to
   other machines.
+
+## License
+
+This project is open source under the [MIT License](LICENSE).
+Dependencies, including the Claude Agent SDK, retain their own licenses.
+Using Claude services remains subject to the terms governing your account;
+this project's license does not replace those terms.
