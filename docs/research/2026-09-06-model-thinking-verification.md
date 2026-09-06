@@ -105,7 +105,37 @@ tests/integration/test_pi_thinking.py
 44 passed in 0.91s
 ```
 
-## Live post-tool switch limitation
+## Live bidirectional post-tool switching
+
+At commit `db0d31c`, actual Pi completed the following sequence through **both**
+API transports, using the real subscription SDK and no custom session header:
+
+1. Sonnet/high: two echo tool calls, tool results, and answer `4`.
+2. Opus/low: answer `7`.
+3. Sonnet/high: answer `15`.
+
+Captured SDK model identities were `claude-sonnet-5`, `claude-opus-5`, and
+`claude-sonnet-5`; configured efforts were `high`, `low`, and `high`. The tool
+result request retained the first turn's effort. Neither run emitted a refusal
+notice, retried a generation, or used a fallback. Both temporary servers and SDK
+clients closed normally. The Anthropic check was:
+
+```bash
+CLAUDE_PROXY_LIVE=1 .venv/bin/pytest --strict-markers --forbid-skips -W error \
+  tests/live/test_thinking_controls.py::test_live_pi_anthropic_bidirectional_switch_roundtrip -q
+```
+
+Result: `1 passed in 8.53s`. A separate controller-run OpenAI probe used the same
+`LiveSdkFactory`, `serve`, and `run_pi_thinking` helpers with dialect `openai`,
+scenario `roundtrip`, first model/effort `sonnet`/`high`, and second model/effort
+`opus`/`low`. It exited successfully after checking the resolved models, outgoing
+efforts `high/high/low/high`, stop reasons `toolUse/stop/stop/stop`, both tool
+results, answers `4/7/15`, absent custom session headers, and no refusal notices.
+
+These successful runs verify bidirectional switching; they do not guarantee
+that the upstream service will answer every later request.
+
+## Upstream refusal investigation and handling
 
 The live Anthropic flow completed a Sonnet/high two-tool turn and its answer,
 then the SDK emitted `model_refusal_no_fallback` with category
@@ -124,14 +154,35 @@ CLAUDE_PROXY_LIVE=1 UV_CACHE_DIR=/private/tmp/claude-sdk-proxy-uv-cache \
 
 Result: `1 failed in 7.40s`, at the first Opus turn after the successful Sonnet
 tool continuation. The test remains an opt-in, honest detector; it is not
-skipped, retried, or weakened. Therefore fresh Sonnet/Opus controls are live
-verified, and Pi switching/replay is concretely verified offline, but live
-post-tool cross-model completion is not verified in this environment.
+skipped, retried, or weakened. This was the initial result, before the independent
+diagnosis and successful bidirectional runs recorded above.
 
 The SDK history importer currently attributes historical assistant seed entries
 to the target model. That is a provenance risk worth monitoring, but it was not
 changed without evidence tying it to this refusal. Native signed history was
 not stripped or converted as a workaround.
+
+Independent native SDK controls subsequently reproduced the same refusal on an
+unchanged Opus turn, including a pure Opus session that never switched models,
+imported history, or resumed a session. A same-client public `set_model` control
+also reproduced it. Faithful native-history and proxy-imported-history controls
+both completed the first follow-up before the later refusal. Consequently,
+switching, resume, importer provenance, and signed-history conversion are not
+necessary causes; no evidence justified changing them as a workaround.
+
+The observed SDK refusal has a complete raw message boundary with authoritative
+input/cache usage and zero output, plus a correlated refusal notice, synthetic
+diagnostic assistant, and terminal result. The proxy now recognizes that exact
+validated sequence and exposes Anthropic `stop_reason: refusal` or OpenAI
+`finish_reason: content_filter`. It does not expose the synthetic diagnostic as
+an answer, substitute its zero usage, or retry/downgrade the model. Malformed,
+uncorrelated, partial-output, and ordinary SDK error sequences still fail closed.
+Regression coverage includes JSON/SSE, both dialects, replay/recovery, tool
+boundaries, and cleanup.
+
+Anthropic documents that automated Opus safeguards can flag normal conversations;
+the account-specific trigger here remains unknown. See [Anthropic's explanation
+of Opus model safeguards](https://support.claude.com/en/articles/16049681-why-claude-switched-models-in-your-conversation-with-opus-5).
 
 ## Configuration and operational limits
 
