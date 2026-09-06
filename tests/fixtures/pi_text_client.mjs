@@ -33,6 +33,7 @@ const model = {
     supportsReasoningEffort: false,
     supportsStore: true,
     supportsUsageInStreaming: true,
+    supportsStrictMode: false,
     maxTokensField: "max_tokens",
   },
 };

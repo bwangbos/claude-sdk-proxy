@@ -686,9 +686,9 @@ async def test_live_stock_pi_agent_completes_tool_loop_with_provider_config_only
         "baseUrl": f"{base_url}/v1",
     }
     assert result["packageVersions"] == {
-        "pi-coding-agent": "0.84.4",
-        "pi-agent-core": "0.84.4",
-        "pi-ai": "0.84.4",
+        "pi-coding-agent": "0.85.1",
+        "pi-agent-core": "0.85.1",
+        "pi-ai": "0.85.1",
     }
     assert result["customSessionHeaders"] == []
     assert result["executions"] == [{"value": "first"}, {"value": "second"}]

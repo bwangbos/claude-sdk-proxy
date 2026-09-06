@@ -184,9 +184,9 @@ async def test_real_pi_agent_executes_repeated_tools_with_provider_config_only(
         "baseUrl": f"{base_url}/v1",
     }
     assert result["packageVersions"] == {
-        "pi-coding-agent": "0.84.4",
-        "pi-agent-core": "0.84.4",
-        "pi-ai": "0.84.4",
+        "pi-coding-agent": "0.85.1",
+        "pi-agent-core": "0.85.1",
+        "pi-ai": "0.85.1",
     }
     assert result["customSessionHeaders"] == []
     assert result["requestCount"] == 4

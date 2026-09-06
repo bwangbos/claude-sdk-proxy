@@ -23,6 +23,7 @@ _ASSISTANT_FIELDS = _MESSAGE_FIELDS | {"tool_calls"}
 _TOOL_MESSAGE_FIELDS = {"role", "tool_call_id", "content"}
 _TOOL_CALL_FIELDS = {"id", "type", "function"}
 _TOOL_CALL_FUNCTION_FIELDS = {"name", "arguments"}
+_TEXT_CONTENT_PART_FIELDS = {"type", "text"}
 _CALL_ID = re.compile(r"call_[A-Za-z0-9_-]+")
 
 
@@ -119,8 +120,30 @@ def _text_content(raw: Mapping[str, object], role: str) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        raise UnsupportedFeature("messages", "content blocks are not supported")
+        return _text_content_parts(content)
     raise RequestValidationError("messages", f"{role} content must be a string")
+
+
+def _text_content_parts(content: list[object]) -> str:
+    text: list[str] = []
+    for raw in content:
+        if not isinstance(raw, Mapping):
+            raise RequestValidationError("messages", "content blocks must be objects")
+        if raw.get("type") != "text":
+            raise UnsupportedFeature(
+                "messages", "only text content blocks are supported"
+            )
+        if set(raw) - _TEXT_CONTENT_PART_FIELDS:
+            raise RequestValidationError(
+                "messages", "text content block fields are invalid"
+            )
+        value = raw.get("text")
+        if not isinstance(value, str):
+            raise RequestValidationError(
+                "messages", "text content block text must be a string"
+            )
+        text.append(value)
+    return "".join(text)
 
 
 def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
@@ -135,9 +158,9 @@ def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
     content = raw.get("content")
     if isinstance(content, str):
         blocks.append(TextBlock(content))
+    elif isinstance(content, list):
+        blocks.append(TextBlock(_text_content_parts(content)))
     elif content is not None:
-        if isinstance(content, list):
-            raise UnsupportedFeature("messages", "content blocks are not supported")
         raise RequestValidationError("messages", "assistant content must be a string")
     blocks.extend(_tool_call(item) for item in calls)
     return CanonicalMessage("assistant", tuple(blocks))
@@ -148,7 +171,7 @@ def _assistant_text(raw: Mapping[str, object]) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        raise UnsupportedFeature("messages", "content blocks are not supported")
+        return _text_content_parts(content)
     raise RequestValidationError("messages", "assistant content must be a string")
 
 

@@ -135,6 +135,7 @@ Add this provider to `~/.pi/agent/models.json`:
         "supportsReasoningEffort": false,
         "supportsStore": true,
         "supportsUsageInStreaming": true,
+        "supportsStrictMode": false,
         "maxTokensField": "max_tokens"
       },
       "models": [
@@ -170,7 +171,7 @@ loop are supported; do not configure sampling or reasoning options. The Pi
 provider's normal `store: false` and streaming-usage fields are accepted, as is
 the advisory `max_tokens` field added by Pi's ordinary `streamSimple` path.
 
-Pi 0.84.4's automatic context compaction and `/compact` both work through the
+Pi 0.85.1's automatic context compaction and `/compact` both work through the
 normal provider configuration. When Pi replaces old turns with its summary
 message and retained recent turns, the gateway imports that complete rewritten
 snapshot into a fresh ephemeral SDK session and continues from it. No Pi adapter

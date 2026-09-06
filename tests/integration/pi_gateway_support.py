@@ -30,7 +30,7 @@ from tests.gateway.fakes import FakeConversationSession
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_text_client.mjs"
 TOOL_FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_tool_client.mjs"
 INSTALL_PI = (
-    "install pi with: npm install -g @earendil-works/pi-coding-agent@0.84.4"
+    "install pi with: npm install -g @earendil-works/pi-coding-agent@0.85.1"
 )
 
 

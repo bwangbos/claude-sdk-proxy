@@ -77,6 +77,43 @@ def test_openai_parser_preserves_exact_text_roles() -> None:
     assert request.include_usage is False
 
 
+def test_openai_parser_accepts_text_only_content_blocks() -> None:
+    request = parse_openai_request(
+        {
+            "model": "sonnet",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "system"}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hel"},
+                        {"type": "text", "text": "lo"},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "answer"}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "next"}],
+                },
+            ],
+        },
+        allowed_models=frozenset({"sonnet"}),
+    )
+
+    assert request.system == "system"
+    assert request.messages == (
+        CanonicalMessage("user", "hello"),
+        CanonicalMessage("assistant", "answer"),
+        CanonicalMessage("user", "next"),
+    )
+
+
 @pytest.mark.parametrize(
     "field,value", [("temperature", 0), ("top_p", 1), ("stop", ["x"])]
 )
@@ -142,7 +179,15 @@ def test_openai_parser_accepts_only_planned_pi_defaults() -> None:
             {
                 "model": "sonnet",
                 "messages": [
-                    {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AA=="},
+                            }
+                        ],
+                    }
                 ],
             },
             "messages",
