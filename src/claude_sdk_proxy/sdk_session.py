@@ -20,6 +20,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk import (
     ToolResultBlock as SdkToolResultBlock,
 )
+from claude_agent_sdk.types import ThinkingConfig
 
 from claude_sdk_proxy.domain import (
     BackendFailure,
@@ -52,6 +53,7 @@ from claude_sdk_proxy.sdk_text_protocol import (
     normalize_usage,
 )
 from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+from claude_sdk_proxy.thinking import ThinkingOptions
 from claude_sdk_proxy.tool_bridge import ToolBridge, ToolInvocation
 from claude_sdk_proxy.tool_contract import (
     validate_tool_definitions,
@@ -101,6 +103,7 @@ class SdkSession:
         tools: Iterable[ToolDefinition] = (),
         dialect: Dialect = "anthropic",
         history: Iterable[CanonicalMessage] = (),
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> None:
         self._model = model
         self._system = system
@@ -112,6 +115,7 @@ class SdkSession:
         self._sdk_session_id: str | None = None
         self._tools = validate_tool_definitions(tools)
         self._history = tuple(history)
+        self._thinking = thinking
         self._seeded_result_prompt = bool(
             self._history
             and self._history[-1].role == "user"
@@ -183,6 +187,20 @@ class SdkSession:
             if self._history
             else None
         )
+        thinking: ThinkingConfig
+        if self._thinking.mode == "disabled":
+            thinking = {"type": "disabled"}
+        elif self._thinking.mode == "adaptive":
+            thinking = {"type": "adaptive"}
+            if self._thinking.display is not None:
+                thinking["display"] = self._thinking.display
+        else:
+            budget = self._thinking.budget_tokens
+            if budget is None:
+                raise ValueError("enabled thinking requires budget_tokens")
+            thinking = {"type": "enabled", "budget_tokens": budget}
+            if self._thinking.display is not None:
+                thinking["display"] = self._thinking.display
         return ClaudeAgentOptions(
             model=self._model,
             system_prompt=self._system,
@@ -201,7 +219,8 @@ class SdkSession:
             plugins=[],
             cwd=cwd,
             include_partial_messages=True,
-            thinking={"type": "disabled"},
+            thinking=thinking,
+            effort=self._thinking.effort,
             stderr=_discard_stderr,
             # Tool-result envelopes can contain the image data twice.
             max_buffer_size=40 * 1024 * 1024,

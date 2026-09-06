@@ -26,6 +26,7 @@ from claude_sdk_proxy.text_api import (
     required_string,
     usage_counter,
 )
+from claude_sdk_proxy.thinking import parse_openai_thinking
 from claude_sdk_proxy.tool_contract import JsonValue, canonical_json
 
 _SUPPORTED_FIELDS = {
@@ -40,6 +41,7 @@ _SUPPORTED_FIELDS = {
     "tool_choice",
     "parallel_tool_calls",
     "user",
+    "reasoning_effort",
 }
 _UNSUPPORTED_FIELDS = {
     "temperature",
@@ -49,7 +51,6 @@ _UNSUPPORTED_FIELDS = {
     "response_format",
     "modalities",
     "audio",
-    "reasoning_effort",
 }
 _NULLABLE_OPTIONAL_FIELDS = (_SUPPORTED_FIELDS | _UNSUPPORTED_FIELDS) - {
     "model",
@@ -78,6 +79,7 @@ def parse_openai_request(
     model = required_string(body, "model")
     if model not in allowed_models:
         raise RequestValidationError("model", "model is not configured")
+    thinking = parse_openai_thinking(body, model)
     stream = boolean(body, "stream")
     if "store" in body and body["store"] is not False:
         raise RequestValidationError("store", "must be exactly false")
@@ -96,6 +98,7 @@ def parse_openai_request(
             include_usage,
             dialect="openai",
             tools=tools,
+            thinking=thinking,
         )
     except RequestValidationError:
         raise

@@ -28,6 +28,7 @@ from claude_sdk_proxy.sessions import (
     SessionTimeout,
     ToolSessionActor,
 )
+from claude_sdk_proxy.thinking import ThinkingOptions
 
 
 def echo_tool(*, description: str = "echo") -> ToolDefinition:
@@ -172,7 +173,9 @@ class ToolFactory:
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
         history: tuple[CanonicalMessage, ...] = (),
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> ToolSession:
+        del thinking
         self.calls.append((model, system, tools, dialect))
         self.histories.append(history)
         session = next(self._sessions)

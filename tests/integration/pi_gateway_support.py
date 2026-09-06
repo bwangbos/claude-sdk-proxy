@@ -25,6 +25,7 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
+from claude_sdk_proxy.thinking import ThinkingOptions
 from tests.gateway.fakes import FakeConversationSession
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_text_client.mjs"
@@ -66,8 +67,9 @@ class SequenceSessionFactory:
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
         history: tuple[CanonicalMessage, ...] = (),
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> IntegrationSession:
-        del model, system, tools, dialect
+        del model, system, tools, dialect, thinking
         self.histories.append(history)
         outputs, stall = next(self._specifications)
         session = IntegrationSession(outputs, stall=stall)

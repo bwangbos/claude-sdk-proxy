@@ -22,6 +22,7 @@ from claude_sdk_proxy.sessions import (
     SessionTimeout,
     TurnLease,
 )
+from claude_sdk_proxy.thinking import ThinkingOptions
 from tests.gateway.fakes import FakeConversationSession, FakeSessionFactory
 
 
@@ -108,8 +109,9 @@ class BlockingSessionFactory:
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> BlockingConversationSession:
-        del model, system, tools, dialect
+        del model, system, tools, dialect, thinking
         session = BlockingConversationSession("answer", self.started, self.release)
         self.sessions.append(session)
         return session
@@ -153,8 +155,9 @@ class RebaseFailureFactory:
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
         history: tuple[CanonicalMessage, ...] = (),
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> FakeConversationSession:
-        del model, system, tools, dialect
+        del model, system, tools, dialect, thinking
         self.histories.append(history)
         session: FakeConversationSession
         if self.sessions:
@@ -177,8 +180,9 @@ class RebaseSequenceFactory:
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
         history: tuple[CanonicalMessage, ...] = (),
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> FakeConversationSession:
-        del model, system, tools, dialect, history
+        del model, system, tools, dialect, history, thinking
         return next(self._sessions)
 
 
@@ -601,8 +605,9 @@ async def test_timeout_during_start_invalidates_and_closes_session() -> None:
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> BlockingStartSession:
-        del model, system, tools, dialect
+        del model, system, tools, dialect, thinking
         session = BlockingStartSession("unused")
         sessions.append(session)
         return session
@@ -703,8 +708,9 @@ async def test_incomplete_backend_stream_invalidates_session() -> None:
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> IncompleteSession:
-        del model, system, tools, dialect
+        del model, system, tools, dialect, thinking
         session = IncompleteSession("partial")
         sessions.append(session)
         return session

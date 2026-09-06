@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, cast
 
+from claude_sdk_proxy.thinking import ThinkingOptions
+
 type CapabilityStatus = Literal["pass", "fail", "untested"]
 type Role = Literal["user", "assistant"]
 type Dialect = Literal["anthropic", "openai"]
@@ -189,6 +191,7 @@ class TextRequest:
     include_usage: bool = False
     dialect: Dialect = "anthropic"
     tools: tuple[ToolDefinition, ...] = ()
+    thinking: ThinkingOptions = ThinkingOptions()
 
     def __post_init__(self) -> None:
         from claude_sdk_proxy.tool_contract import (
@@ -338,6 +341,7 @@ class SdkSessionFactory(Protocol):
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
         history: tuple[CanonicalMessage, ...] = (),
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> SdkSessionProtocol: ...
 
 

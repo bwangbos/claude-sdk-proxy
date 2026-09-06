@@ -23,6 +23,7 @@ from claude_sdk_proxy.session_turn import SessionMismatch as SessionMismatch
 from claude_sdk_proxy.session_turn import SessionTimeout as SessionTimeout
 from claude_sdk_proxy.session_turn import ToolTurnLease as ToolTurnLease
 from claude_sdk_proxy.session_turn import TurnLease as TurnLease
+from claude_sdk_proxy.thinking import ThinkingOptions
 from claude_sdk_proxy.tool_session_actor import ToolSessionActor, ToolSessionState
 
 _EXPLICIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -216,7 +217,7 @@ class SessionRegistry:
             session=session_reference(sid),
             messages=len(request.messages),
         )
-        if history:
+        if history and request.thinking == ThinkingOptions():
             backend = self._session_factory(
                 request.model,
                 request.system,
@@ -224,12 +225,29 @@ class SessionRegistry:
                 dialect=request.dialect,
                 history=backend_history,
             )
+        elif history:
+            backend = self._session_factory(
+                request.model,
+                request.system,
+                tools=request.tools,
+                dialect=request.dialect,
+                history=backend_history,
+                thinking=request.thinking,
+            )
+        elif request.thinking == ThinkingOptions():
+            backend = self._session_factory(
+                request.model,
+                request.system,
+                tools=request.tools,
+                dialect=request.dialect,
+            )
         else:
             backend = self._session_factory(
                 request.model,
                 request.system,
                 tools=request.tools,
                 dialect=request.dialect,
+                thinking=request.thinking,
             )
         if not request.tools:
             entry: SessionEntry = Conversation(
@@ -238,6 +256,7 @@ class SessionRegistry:
                 request.model,
                 request.system,
                 request.dialect,
+                request.thinking,
                 history,
                 backend,
             )
@@ -248,6 +267,7 @@ class SessionRegistry:
                 request.model,
                 request.system,
                 request.dialect,
+                request.thinking,
                 request.tools,
                 backend,
                 self._turn_timeout_seconds,
@@ -413,7 +433,11 @@ class SessionRegistry:
 
     @staticmethod
     def _config_matches(entry: SessionEntry, request: TextRequest) -> bool:
-        if request.model != entry.model or request.system != entry.system:
+        if (
+            request.model != entry.model
+            or request.system != entry.system
+            or request.thinking != entry.thinking
+        ):
             return False
         if isinstance(entry, Conversation):
             return not request.tools and request.dialect == entry.dialect
@@ -424,6 +448,8 @@ class SessionRegistry:
             raise SessionMismatch("session model does not match")
         if request.system != entry.system:
             raise SessionMismatch("session system does not match")
+        if request.thinking != entry.thinking:
+            raise SessionMismatch("session thinking configuration does not match")
         if not self._config_matches(entry, request):
             raise SessionMismatch("session tool configuration does not match")
 

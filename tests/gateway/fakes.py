@@ -25,6 +25,7 @@ from claude_sdk_proxy.domain import (
     TextDelta,
     ToolDefinition,
 )
+from claude_sdk_proxy.thinking import ThinkingOptions
 
 
 class FixedTemporaryDirectory:
@@ -410,6 +411,7 @@ class FakeSessionFactory:
         self._outputs = iter(outputs)
         self.sessions: list[FakeConversationSession] = []
         self.histories: list[tuple[CanonicalMessage, ...]] = []
+        self.thinking_options: list[ThinkingOptions] = []
 
     @property
     def created(self) -> int:
@@ -423,9 +425,11 @@ class FakeSessionFactory:
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
         history: tuple[CanonicalMessage, ...] = (),
+        thinking: ThinkingOptions = ThinkingOptions(),
     ) -> FakeConversationSession:
         del model, system, tools, dialect
         self.histories.append(history)
+        self.thinking_options.append(thinking)
         session = FakeConversationSession(next(self._outputs))
         self.sessions.append(session)
         return session

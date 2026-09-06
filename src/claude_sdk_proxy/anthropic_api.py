@@ -28,6 +28,7 @@ from claude_sdk_proxy.text_api import (
     required_string,
     usage_counter,
 )
+from claude_sdk_proxy.thinking import parse_anthropic_thinking
 from claude_sdk_proxy.tool_contract import JsonValue, canonical_json, plain_json
 
 _SUPPORTED_FIELDS = {
@@ -38,13 +39,14 @@ _SUPPORTED_FIELDS = {
     "stream",
     "tools",
     "tool_choice",
+    "thinking",
+    "output_config",
 }
 _UNSUPPORTED_FIELDS = {
     "temperature",
     "top_p",
     "top_k",
     "stop_sequences",
-    "thinking",
 }
 
 
@@ -62,6 +64,7 @@ def parse_anthropic_request(
     model = required_string(body, "model")
     if model not in allowed_models:
         raise RequestValidationError("model", "model is not configured")
+    thinking = parse_anthropic_thinking(body, model)
     system = ""
     if "system" in body:
         value = body["system"]
@@ -73,6 +76,13 @@ def parse_anthropic_request(
     max_tokens = body.get("max_tokens")
     if type(max_tokens) is not int or max_tokens <= 0:
         raise RequestValidationError("max_tokens", "must be a positive integer")
+    if (
+        thinking.budget_tokens is not None
+        and thinking.budget_tokens >= max_tokens
+    ):
+        raise RequestValidationError(
+            "thinking", "budget_tokens must be less than max_tokens"
+        )
     stream = boolean(body, "stream")
     tools = parse_anthropic_tools(body)
     validate_anthropic_tool_choice(body)
@@ -86,6 +96,7 @@ def parse_anthropic_request(
             stream,
             dialect="anthropic",
             tools=tools,
+            thinking=thinking,
         )
     except RequestValidationError:
         raise

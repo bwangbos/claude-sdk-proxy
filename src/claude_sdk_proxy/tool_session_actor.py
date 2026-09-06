@@ -25,6 +25,7 @@ from claude_sdk_proxy.session_turn import (
     SessionMismatch,
     SessionTimeout,
 )
+from claude_sdk_proxy.thinking import ThinkingOptions
 
 
 class ToolSessionState(Enum):
@@ -59,6 +60,7 @@ class ToolSessionActor:
     model: str
     system: str
     dialect: str
+    thinking: ThinkingOptions
     tools: tuple[ToolDefinition, ...]
     backend: SdkSessionProtocol
     generation_timeout: float
@@ -87,6 +89,7 @@ class ToolSessionActor:
             request.model == self.model
             and request.system == self.system
             and request.dialect == self.dialect
+            and request.thinking == self.thinking
             and tools_equal(request.tools, self.tools)
         )
 

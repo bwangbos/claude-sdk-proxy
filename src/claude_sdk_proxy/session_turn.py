@@ -14,6 +14,7 @@ from claude_sdk_proxy.domain import (
     TextRequest,
 )
 from claude_sdk_proxy.replay_stream import ReplayStream
+from claude_sdk_proxy.thinking import ThinkingOptions
 
 if TYPE_CHECKING:
     from claude_sdk_proxy.sessions import SessionRegistry
@@ -49,6 +50,7 @@ class Conversation:
     model: str
     system: str
     dialect: str
+    thinking: ThinkingOptions
     transcript: tuple[CanonicalMessage, ...]
     backend: SdkSessionProtocol
     in_flight_fingerprint: str | None = None

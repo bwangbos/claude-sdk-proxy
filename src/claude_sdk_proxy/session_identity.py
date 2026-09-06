@@ -64,6 +64,12 @@ def request_fingerprint(request: TextRequest) -> str:
         "dialect": request.dialect,
         "model": request.model,
         "system": request.system,
+        "thinking": {
+            "mode": request.thinking.mode,
+            "effort": request.thinking.effort,
+            "budget_tokens": request.thinking.budget_tokens,
+            "display": request.thinking.display,
+        },
         "tools": [
             _canonical_tool(tool)
             for tool in sorted(request.tools, key=lambda item: item.name)
