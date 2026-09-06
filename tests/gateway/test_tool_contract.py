@@ -119,6 +119,49 @@ def test_gateway_request_accepts_complete_result_turn_in_any_order() -> None:
     assert request.messages[-1].blocks == request.next_input
 
 
+def test_text_request_accepts_adjacent_text_users_in_imported_history() -> None:
+    request = TextRequest(
+        model="sonnet",
+        system="",
+        messages=(
+            CanonicalMessage.user_text("compaction summary"),
+            CanonicalMessage.user_text("first kept turn"),
+            CanonicalMessage.assistant_text("kept answer"),
+            CanonicalMessage.user_text("continue"),
+        ),
+        max_tokens=None,
+        stream=True,
+    )
+
+    assert request.next_prompt == "continue"
+
+
+def test_text_request_rejects_new_prompt_directly_after_tool_results() -> None:
+    with pytest.raises(RequestValidationError, match="followed by assistant"):
+        TextRequest(
+            model="sonnet",
+            system="",
+            messages=(
+                CanonicalMessage.user_text("call it"),
+                CanonicalMessage(
+                    "assistant",
+                    (ToolCallBlock("call_a", "lookup", {"key": "a"}),),
+                ),
+                CanonicalMessage("user", (ToolResultBlock("call_a", ("one",), False),)),
+                CanonicalMessage.user_text("continue"),
+            ),
+            max_tokens=None,
+            stream=True,
+            tools=(
+                ToolDefinition(
+                    "lookup",
+                    "look up",
+                    {"type": "object", "additionalProperties": True},
+                ),
+            ),
+        )
+
+
 def test_gateway_request_rejects_mixed_user_text_and_tool_results() -> None:
     with pytest.raises(RequestValidationError) as error:
         tool_request(

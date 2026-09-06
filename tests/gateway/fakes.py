@@ -18,6 +18,7 @@ from mcp.server import Server
 from mcp.types import CallToolRequestParams, CallToolResult
 
 from claude_sdk_proxy.domain import (
+    CanonicalMessage,
     Completed,
     ConversationEvent,
     Dialect,
@@ -408,6 +409,7 @@ class FakeSessionFactory:
     def __init__(self, outputs: tuple[str, ...]) -> None:
         self._outputs = iter(outputs)
         self.sessions: list[FakeConversationSession] = []
+        self.histories: list[tuple[CanonicalMessage, ...]] = []
 
     @property
     def created(self) -> int:
@@ -420,8 +422,10 @@ class FakeSessionFactory:
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        history: tuple[CanonicalMessage, ...] = (),
     ) -> FakeConversationSession:
         del model, system, tools, dialect
+        self.histories.append(history)
         session = FakeConversationSession(next(self._outputs))
         self.sessions.append(session)
         return session

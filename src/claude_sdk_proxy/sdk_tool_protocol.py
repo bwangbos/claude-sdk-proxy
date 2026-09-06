@@ -9,7 +9,11 @@ from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from claude_sdk_proxy.domain import InputUsage, TextDelta, ToolDefinition
-from claude_sdk_proxy.sdk_text_protocol import fail_protocol, normalize_usage
+from claude_sdk_proxy.sdk_text_protocol import (
+    fail_protocol,
+    normalize_usage,
+    valid_message_diagnostics,
+)
 from claude_sdk_proxy.tool_contract import (
     JsonValue,
     canonical_json,
@@ -49,7 +53,12 @@ class _RawBlock:
 class RawSdkMessageValidator:
     """Validate one raw assistant message and its typed SDK counterpart."""
 
-    def __init__(self, definitions: tuple[ToolDefinition, ...]) -> None:
+    def __init__(
+        self,
+        definitions: tuple[ToolDefinition, ...],
+        *,
+        allow_seeded_history: bool = False,
+    ) -> None:
         normalized = validate_tool_definitions(definitions)
         self._public_names = {definition.name for definition in normalized}
         self._validators: dict[str, Any] = {}
@@ -68,6 +77,7 @@ class RawSdkMessageValidator:
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
         self.stop_reason: str | None = None
+        self._allow_seeded_history = allow_seeded_history
 
     def observe(self, event: Mapping[str, Any]) -> InputUsage | TextDelta | None:
         event_type = event.get("type")
@@ -208,7 +218,9 @@ class RawSdkMessageValidator:
             fail_protocol()
         if message.get("stop_details") is not None:
             fail_protocol()
-        if message.get("diagnostics") is not None:
+        if not valid_message_diagnostics(
+            message.get("diagnostics"), self._allow_seeded_history
+        ):
             fail_protocol()
         for field in ("model", "id"):
             value = message.get(field)

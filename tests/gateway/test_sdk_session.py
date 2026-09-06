@@ -24,6 +24,7 @@ from claude_agent_sdk import (
     ThinkingBlock,
     ToolUseBlock,
     UserMessage,
+    project_key_for_directory,
 )
 from claude_agent_sdk import (
     ToolResultBlock as SdkToolResultBlock,
@@ -31,6 +32,7 @@ from claude_agent_sdk import (
 
 from claude_sdk_proxy.domain import (
     BackendFailure,
+    CanonicalMessage,
     Completed,
     InputUsage,
     TextDelta,
@@ -39,6 +41,7 @@ from claude_sdk_proxy.domain import (
     ToolResultBlock,
 )
 from claude_sdk_proxy.sdk_session import SdkSession
+from claude_sdk_proxy.sdk_text_protocol import valid_message_diagnostics
 from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
 from tests.gateway.fakes import (
     FakeSdkClient,
@@ -105,6 +108,57 @@ async def test_sdk_session_excludes_safe_mode_from_restricted_options(
         "disable-slash-commands": None,
         "no-session-persistence": None,
     }
+
+
+@pytest.mark.anyio
+async def test_sdk_session_resumes_seeded_history_without_prompt_encoding(
+    tmp_path: Path,
+) -> None:
+    client = FakeSdkClient(responses=(sdk_response("new", session_id="sdk-1"),))
+    history = (
+        CanonicalMessage.user_text("old question"),
+        CanonicalMessage.assistant_text("old answer"),
+    )
+    session = SdkSession(
+        model="sonnet",
+        system="system",
+        history=history,
+        directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+        client_factory=lambda options: client.capture_options(options),
+    )
+
+    await session.start()
+    await session.close()
+
+    assert client.options is not None
+    assert client.options.resume is not None
+    assert client.options.session_store is not None
+    assert "no-session-persistence" not in client.options.extra_args
+    entries = await client.options.session_store.load(
+        {
+            "project_key": project_key_for_directory(tmp_path),
+            "session_id": client.options.resume,
+        }
+    )
+    assert entries is not None
+    assert [entry["message"]["role"] for entry in entries] == [
+        "user",
+        "assistant",
+    ]
+    assert entries[0]["message"]["content"] == "old question"
+    assert entries[1]["message"]["content"] == [{"type": "text", "text": "old answer"}]
+
+
+def test_seeded_history_allows_only_the_observed_resume_diagnostic() -> None:
+    diagnostic = {"cache_miss_reason": {"type": "previous_message_not_found"}}
+
+    assert valid_message_diagnostics(None, False)
+    assert valid_message_diagnostics(diagnostic, True)
+    assert not valid_message_diagnostics(diagnostic, False)
+    assert not valid_message_diagnostics(
+        {"cache_miss_reason": {"type": "different"}}, True
+    )
+    assert not valid_message_diagnostics({**diagnostic, "unexpected": "secret"}, True)
 
 
 @pytest.mark.anyio
@@ -1641,7 +1695,9 @@ async def test_sdk_session_rejects_callback_set_that_does_not_match_raw_calls(
     messages = raw_tool_events(
         (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
     )
-    session, client = make_tool_session(tmp_path, messages, start_tool_callbacks=False)
+    session, client = make_tool_session(
+        tmp_path, messages, start_tool_callbacks=False
+    )
     await session.start()
     client.start_tool_callback(callback_name, callback_arguments, internal_id="sdk-a")
     try:
@@ -1888,9 +1944,7 @@ async def test_serial_deferred_callback_delivers_stored_result_before_final_text
         *raw_text_events("done", "sdk-1"),
         result_message(),
     )
-    session, client = make_tool_session(
-        tmp_path, messages, start_tool_callbacks=False
-    )
+    session, client = make_tool_session(tmp_path, messages, start_tool_callbacks=False)
     await session.start()
     client.start_tool_callback("echo", {"v": 1}, internal_id="sdk-a")
     generation = session.stream_generation("go")

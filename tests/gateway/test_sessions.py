@@ -134,6 +134,54 @@ class IncompleteSession(FakeConversationSession):
         yield TextDelta(self._text)
 
 
+class FailingStartSession(FakeConversationSession):
+    async def start(self) -> None:
+        self.start_count += 1
+        raise RuntimeError("seeded resume failed")
+
+
+class RebaseFailureFactory:
+    def __init__(self) -> None:
+        self.sessions: list[FakeConversationSession] = []
+        self.histories: list[tuple[CanonicalMessage, ...]] = []
+
+    def __call__(
+        self,
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+        history: tuple[CanonicalMessage, ...] = (),
+    ) -> FakeConversationSession:
+        del model, system, tools, dialect
+        self.histories.append(history)
+        session: FakeConversationSession
+        if self.sessions:
+            session = FailingStartSession("unused")
+        else:
+            session = FakeConversationSession("answer")
+        self.sessions.append(session)
+        return session
+
+
+class RebaseSequenceFactory:
+    def __init__(self, sessions: tuple[FakeConversationSession, ...]) -> None:
+        self._sessions = iter(sessions)
+
+    def __call__(
+        self,
+        model: str,
+        system: str,
+        *,
+        tools: tuple[ToolDefinition, ...] = (),
+        dialect: Dialect = "anthropic",
+        history: tuple[CanonicalMessage, ...] = (),
+    ) -> FakeConversationSession:
+        del model, system, tools, dialect, history
+        return next(self._sessions)
+
+
 @pytest.mark.anyio
 async def test_completed_duplicate_replays_without_new_sdk_turn() -> None:
     factory = FakeSessionFactory(outputs=("answer",))
@@ -385,33 +433,114 @@ async def test_implicit_lookup_ignores_identical_explicit_session() -> None:
 
 
 @pytest.mark.anyio
-async def test_imported_assistant_history_is_rejected_before_sdk_creation() -> None:
-    factory = FakeSessionFactory(outputs=("unused",))
+async def test_imported_assistant_history_seeds_a_fresh_sdk_session() -> None:
+    factory = FakeSessionFactory(outputs=("continued",))
     registry = SessionRegistry(factory)
+    request = continuation_request("imported", "assistant", "new")
 
-    with pytest.raises(SessionMismatch, match="transcript"):
-        await registry.open_turn(
-            continuation_request("imported", "assistant", "new"),
-            explicit_id=None,
-        )
+    lease = await registry.open_turn(request, explicit_id=None)
 
-    assert factory.created == 0
+    assert await collect(lease.stream()) == completed_events("continued")
+    assert factory.created == 1
+    assert factory.histories == [request.messages[:-1]]
+    assert factory.sessions[0].prompts == ["new"]
 
 
 @pytest.mark.anyio
-async def test_edited_assistant_history_is_rejected_before_new_sdk_turn() -> None:
-    factory = FakeSessionFactory(outputs=("answer",))
+async def test_edited_assistant_history_atomically_rebases_explicit_session() -> None:
+    factory = FakeSessionFactory(outputs=("answer", "rebased"))
+    registry = SessionRegistry(factory)
+    first = await registry.open_turn(first_request("hello"), explicit_id="lineage")
+    await collect(first.stream())
+    request = continuation_request("hello", "edited", "next")
+
+    replacement = await registry.open_turn(request, explicit_id="lineage")
+
+    assert await collect(replacement.stream()) == completed_events("rebased")
+    assert factory.created == 2
+    assert factory.sessions[0].prompts == ["hello"]
+    assert factory.sessions[0].close_count == 1
+    assert factory.histories[1] == request.messages[:-1]
+    assert factory.sessions[1].prompts == ["next"]
+
+
+@pytest.mark.anyio
+async def test_failed_explicit_rebase_preserves_the_original_session() -> None:
+    factory = RebaseFailureFactory()
     registry = SessionRegistry(factory)
     first = await registry.open_turn(first_request("hello"), explicit_id="lineage")
     await collect(first.stream())
 
-    with pytest.raises(SessionMismatch, match="transcript"):
+    with pytest.raises(RuntimeError, match="seeded resume failed"):
         await registry.open_turn(
             continuation_request("hello", "edited", "next"),
             explicit_id="lineage",
         )
 
-    assert factory.sessions[0].prompts == ["hello"]
+    continuation = await registry.open_turn(
+        continuation_request("hello", "answer", "still here"),
+        explicit_id="lineage",
+    )
+    assert await collect(continuation.stream()) == completed_events("answer")
+    assert factory.sessions[0].prompts == ["hello", "still here"]
+    assert factory.sessions[0].close_count == 0
+    assert factory.sessions[1].close_count == 1
+
+
+@pytest.mark.anyio
+async def test_cancelled_explicit_rebase_releases_the_original_session() -> None:
+    original = FakeConversationSession("answer")
+    candidate = BlockingStartSession("unused")
+    registry = SessionRegistry(RebaseSequenceFactory((original, candidate)))
+    first = await registry.open_turn(first_request("hello"), explicit_id="lineage")
+    await collect(first.stream())
+    rebasing = asyncio.create_task(
+        registry.open_turn(
+            continuation_request("hello", "edited", "next"),
+            explicit_id="lineage",
+        )
+    )
+    await candidate.start_entered.wait()
+
+    rebasing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await rebasing
+
+    continuation = await registry.open_turn(
+        continuation_request("hello", "answer", "still here"),
+        explicit_id="lineage",
+    )
+    assert await collect(continuation.stream()) == completed_events("answer")
+    assert original.prompts == ["hello", "still here"]
+    assert original.close_count == 0
+    assert candidate.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_timed_out_explicit_rebase_preserves_the_original_session() -> None:
+    original = FakeConversationSession("answer")
+    candidate = BlockingStartSession("unused")
+    registry = SessionRegistry(
+        RebaseSequenceFactory((original, candidate)), turn_timeout_seconds=0.01
+    )
+    first = await registry.open_turn(first_request("hello"), explicit_id="lineage")
+    await collect(first.stream())
+
+    with pytest.raises(SessionTimeout, match="timed out"):
+        await registry.open_turn(
+            continuation_request("hello", "edited", "next"),
+            explicit_id="lineage",
+        )
+
+    continuation = await registry.open_turn(
+        continuation_request("hello", "answer", "still here"),
+        explicit_id="lineage",
+    )
+    assert await collect(continuation.stream()) == completed_events("answer")
+    assert original.prompts == ["hello", "still here"]
+    assert original.close_count == 0
+    assert candidate.start_count == 1
+    assert candidate.close_count == 1
 
 
 @pytest.mark.anyio

@@ -152,6 +152,81 @@ def _append_results(
     )
 
 
+@pytest.mark.parametrize("dialect", ["anthropic", "openai"])
+async def test_live_rebase_preserves_completed_tool_history(
+    live_model: str, dialect: Dialect
+) -> None:
+    marker = f"COBALT_{dialect.upper()}_7Q2"
+    tools = [
+        _tool(
+            dialect,
+            name="history_probe",
+            description="Historical probe; do not call it again.",
+            schema=_schema(field="request", values=["one"]),
+        )
+    ]
+    public_id = "toolu_imported" if dialect == "anthropic" else "call_imported"
+    if dialect == "anthropic":
+        assistant: dict[str, Any] = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": public_id,
+                    "name": "history_probe",
+                    "input": {"request": "one"},
+                }
+            ],
+        }
+    else:
+        assistant = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": public_id,
+                    "type": "function",
+                    "function": {
+                        "name": "history_probe",
+                        "arguments": '{"request":"one"}',
+                    },
+                }
+            ],
+        }
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Run the historical probe once."},
+        assistant,
+    ]
+    _append_results(dialect, messages, [(public_id, marker, False)])
+    messages.extend(
+        [
+            {"role": "assistant", "content": "The historical result was saved."},
+            {
+                "role": "user",
+                "content": (
+                    "The completed historical tool result was a codeword. "
+                    "Do not call any tool. Return only that exact codeword."
+                ),
+            },
+        ]
+    )
+    app = create_app(models=(live_model,))
+
+    async with lifespan_app(app):
+        response = await _send(
+            app,
+            live_model,
+            dialect,
+            messages,
+            tools,
+            f"rebase-history-{dialect}",
+        )
+
+    rendered = _assistant_message(dialect, response)
+    assert _calls(dialect, rendered) == []
+    assert _text(dialect, rendered) == marker
+
+
 async def _send(
     app: Any,
     model: str,

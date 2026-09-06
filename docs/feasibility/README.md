@@ -170,22 +170,16 @@ loop are supported; do not configure sampling or reasoning options. The Pi
 provider's normal `store: false` and streaming-usage fields are accepted, as is
 the advisory `max_tokens` field added by Pi's ordinary `streamSimple` path.
 
-Pi 0.84.4 enables automatic context compaction by default, and `/compact`
-performs the same lossy history replacement manually. Both produce a rewritten
-transcript that this append-only gateway must reject. Add the following key to
-the existing `~/.pi/agent/settings.json`, or to `.pi/settings.json` for only the
-current project, and do not invoke `/compact` while using this provider:
+Pi 0.84.4's automatic context compaction and `/compact` both work through the
+normal provider configuration. When Pi replaces old turns with its summary
+message and retained recent turns, the gateway imports that complete rewritten
+snapshot into a fresh ephemeral SDK session and continues from it. No Pi adapter
+or compaction-specific prompt handling exists in the gateway.
 
-```json
-{
-  "compaction": {
-    "enabled": false
-  }
-}
-```
-
-Disabling auto-compaction does not make very long sessions unlimited; start a
-new Pi session before the model context is exhausted.
+The rewritten snapshot must still be a structurally complete supported
+transcript and end with a text user message. A rewrite cannot cross an unresolved
+tool-call boundary: submit every pending tool result and finish that model turn
+before compacting.
 
 Most clients can use transcript matching without a custom header. A client that
 can set per-conversation headers may send a unique
@@ -193,15 +187,25 @@ can set per-conversation headers may send a unique
 begin with identical text. Never configure one static value globally: that
 would collapse all conversations into one lineage.
 
+With a per-conversation header, a divergent completed transcript atomically
+replaces that ID's idle SDK session only after the replacement starts
+successfully. If the replacement cannot start, or admission is cancelled before
+the swap, the old session remains usable.
+Without a header, a rewritten transcript starts a new implicit lineage and the
+old idle lineage remains eligible for normal least-recently-used eviction.
+
 ### Supported boundary
 
 - Supported: text and caller-owned function tools in streaming and non-streaming
   calls, including mixed text/calls, parallel calls, repeated tool rounds,
   reverse-order result submission by public ID, exact system/user strings,
-  retries of completed requests, and append-only continuations that originated
-  through this running gateway. Successful tool results may be empty; Anthropic
-  non-empty results may set `is_error: true`. OpenAI results are text-only and
-  have no supported structured error flag.
+  retries of completed requests, append-only continuations that originated
+  through this running gateway, and complete imported or rewritten transcripts
+  at completed text boundaries. Imported completed tool calls/results retain
+  their native structured roles and are not flattened into prompt text.
+  Successful tool results may be empty; Anthropic non-empty results may set
+  `is_error: true`. OpenAI results are text-only and have no supported structured
+  error flag.
 - Anthropic controls: omit `tool_choice`, or use `{"type":"auto"}` with
   `disable_parallel_tool_use` omitted or `false`. `any`, `tool`, `none`, named
   choice, and `disable_parallel_tool_use: true` are rejected.
@@ -211,11 +215,12 @@ would collapse all conversations into one lineage.
   rejected.
 - Advisory only: `max_tokens` and `max_completion_tokens`; the Agent SDK does
   not provide exact output-token enforcement through this path.
-- Unsupported: imported assistant histories, edits, branching, mixed text and
-  tool-result blocks in one user turn, non-text tool results, exact
-  sampling/stop controls, reasoning controls, public or multi-user service, and
-  recovery of live conversations after the gateway restarts. A restart loses
-  every suspended tool call, retained transcript, and replay entry.
+- Unsupported: rebasing a busy session or an unresolved tool boundary,
+  concurrent branches/forks under one explicit session ID, mixed text and
+  tool-result blocks in one user turn, non-text tool results, exact sampling/stop
+  controls, reasoning controls, public or multi-user service, and recovery of
+  live conversations after the gateway restarts. A restart loses every
+  suspended tool call, retained transcript, and replay entry.
 - Limits: at most 128 tool definitions; each name is 1–64 ASCII letters,
   digits, `_`, or `-`; each UTF-8 description is at most 8 KiB; each canonical
   JSON Schema is at most 64 KiB and all schemas together at most 512 KiB; each
@@ -228,7 +233,8 @@ would collapse all conversations into one lineage.
 - Capacity: at most 8 sessions are retained by default. Fresh admission at the
   limit evicts the least-recently-used idle session. In-flight and
   replay-reserved sessions are never evicted; if all retained sessions are busy,
-  both dialects return HTTP 503 with `session_capacity`.
+  both dialects return HTTP 503 with `session_capacity`. Replacing an explicit
+  session ID does not consume an additional retained-session slot.
 - Timeouts: generation waits up to 300 seconds. A published tool boundary waits
   up to `--tool-result-timeout` seconds (default `300.0`); expiry closes and
   removes that session. Backend teardown is bounded to 5 seconds.
@@ -247,7 +253,9 @@ For a tool session, the proxy creates one in-process MCP server named
 SDK/provider inject its native schema and standard tool-use instructions. The
 proxy does not append tool prose to the caller's system string or final user
 text. Built-ins, ambient settings, MCP servers, skills, plugins, subagents,
-auto-memory, slash commands, and session persistence remain disabled.
+auto-memory, slash commands, and durable session persistence remain disabled.
+Imported history is materialized only into the Agent SDK's ephemeral session
+store for the lifetime of that in-process conversation.
 
 The real Pi provider integration suite uses actual Uvicorn and localhost HTTP
 but deterministic fake SDK sessions, so it never invokes a model:

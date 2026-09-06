@@ -162,6 +162,7 @@ class ToolFactory:
         self._sessions = iter(sessions)
         self.sessions: list[ToolSession] = []
         self.calls: list[tuple[str, str, tuple[ToolDefinition, ...], str]] = []
+        self.histories: list[tuple[CanonicalMessage, ...]] = []
 
     def __call__(
         self,
@@ -170,11 +171,45 @@ class ToolFactory:
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        history: tuple[CanonicalMessage, ...] = (),
     ) -> ToolSession:
         self.calls.append((model, system, tools, dialect))
+        self.histories.append(history)
         session = next(self._sessions)
         self.sessions.append(session)
         return session
+
+
+@pytest.mark.anyio
+async def test_idle_tool_session_rebases_with_the_same_tools() -> None:
+    original = ToolSession((final_boundary("original"),))
+    rebased = ToolSession((final_boundary("rebased"),))
+    factory = ToolFactory((original, rebased))
+    registry = SessionRegistry(factory)
+    first = first_request(tools=(echo_tool(),))
+    first_lease = await registry.open_turn(first, explicit_id="lineage")
+    await collect(first_lease.stream())
+    rewritten = TextRequest(
+        first.model,
+        first.system,
+        (
+            CanonicalMessage.user_text("compacted summary"),
+            CanonicalMessage.assistant_text("kept answer"),
+            CanonicalMessage.user_text("continue"),
+        ),
+        first.max_tokens,
+        first.stream,
+        dialect=first.dialect,
+        tools=first.tools,
+    )
+
+    lease = await registry.open_turn(rewritten, explicit_id="lineage")
+
+    assert await collect(lease.stream()) == list(final_boundary("rebased"))
+    assert factory.histories == [(), rewritten.messages[:-1]]
+    assert rebased.start_count == 1
+    assert rebased.prompts == ["continue"]
+    assert original.close_count == 1
 
 
 class BoundaryBarrierSession(ToolSession):
