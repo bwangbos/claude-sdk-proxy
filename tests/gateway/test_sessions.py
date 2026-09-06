@@ -517,6 +517,33 @@ async def test_cancelled_explicit_rebase_releases_the_original_session() -> None
 
 
 @pytest.mark.anyio
+async def test_timed_out_explicit_rebase_preserves_the_original_session() -> None:
+    original = FakeConversationSession("answer")
+    candidate = BlockingStartSession("unused")
+    registry = SessionRegistry(
+        RebaseSequenceFactory((original, candidate)), turn_timeout_seconds=0.01
+    )
+    first = await registry.open_turn(first_request("hello"), explicit_id="lineage")
+    await collect(first.stream())
+
+    with pytest.raises(SessionTimeout, match="timed out"):
+        await registry.open_turn(
+            continuation_request("hello", "edited", "next"),
+            explicit_id="lineage",
+        )
+
+    continuation = await registry.open_turn(
+        continuation_request("hello", "answer", "still here"),
+        explicit_id="lineage",
+    )
+    assert await collect(continuation.stream()) == completed_events("answer")
+    assert original.prompts == ["hello", "still here"]
+    assert original.close_count == 0
+    assert candidate.start_count == 1
+    assert candidate.close_count == 1
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("changed", ["model", "system"])
 async def test_explicit_session_rejects_configuration_change(changed: str) -> None:
     factory = FakeSessionFactory(outputs=("answer",))

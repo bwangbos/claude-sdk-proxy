@@ -211,7 +211,11 @@ class SessionRegistry:
     ) -> None:
         installed = False
         try:
-            await candidate.backend.start()
+            try:
+                async with asyncio.timeout(self._turn_timeout_seconds):
+                    await candidate.backend.start()
+            except TimeoutError:
+                raise SessionTimeout("SDK turn timed out") from None
             async with self._lock:
                 target = self._explicit if replaced.explicit else self._implicit
                 if (
