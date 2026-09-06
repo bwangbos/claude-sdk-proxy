@@ -30,6 +30,7 @@ from tests.gateway.fakes import FakeConversationSession
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_text_client.mjs"
 TOOL_FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_tool_client.mjs"
+THINKING_FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_thinking_client.mjs"
 INSTALL_PI = (
     "install pi with: npm install -g @earendil-works/pi-coding-agent@0.85.1"
 )
@@ -138,6 +139,10 @@ def pi_ai_module() -> Path:
     return _pi_module("pi-ai", Path("dist/api/openai-completions.js"))
 
 
+def pi_ai_compat_module() -> Path:
+    return _pi_module("pi-ai", Path("dist/compat.js"))
+
+
 def pi_agent_module() -> Path:
     return _pi_module("pi-agent-core", Path("dist/index.js"))
 
@@ -229,6 +234,46 @@ async def run_pi_tool(base_url: str) -> dict[str, Any]:
     if process.returncode != 0:
         pytest.fail(
             f"Pi tool fixture failed ({process.returncode}): "
+            f"{stderr.decode(errors='replace')}"
+        )
+    return json.loads(stdout)
+
+
+async def run_pi_thinking(
+    base_url: str,
+    dialect: str,
+    *,
+    scenario: str = "flow",
+    first_model: str = "sonnet",
+    first_reasoning: str = "high",
+    second_model: str = "opus",
+    second_reasoning: str = "low",
+    timeout_seconds: float = 5,
+) -> dict[str, Any]:
+    env = {
+        **os.environ,
+        "PI_AI_COMPAT_MODULE": str(pi_ai_compat_module()),
+        "PROXY_BASE_URL": base_url,
+        "PI_FIRST_MODEL": first_model,
+        "PI_FIRST_REASONING": first_reasoning,
+        "PI_SECOND_MODEL": second_model,
+        "PI_SECOND_REASONING": second_reasoning,
+    }
+    process = await asyncio.create_subprocess_exec(
+        "node",
+        str(THINKING_FIXTURE),
+        scenario,
+        dialect,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await communicate_or_reap(
+        process, timeout_seconds=timeout_seconds
+    )
+    if process.returncode != 0:
+        pytest.fail(
+            f"Pi thinking fixture failed ({process.returncode}): "
             f"{stderr.decode(errors='replace')}"
         )
     return json.loads(stdout)

@@ -14,6 +14,7 @@ from claude_sdk_proxy.domain import (
 )
 from claude_sdk_proxy.session_identity import (
     messages_equal,
+    replay_messages_equal,
     request_fingerprint,
 )
 from claude_sdk_proxy.session_teardown import SessionTeardown
@@ -447,15 +448,15 @@ class SessionRegistry:
 
     @staticmethod
     def _is_continuation(entry: SessionEntry, request: TextRequest) -> bool:
-        return bool(entry.transcript) and messages_equal(
-            request.messages[:-1], entry.transcript, dialect=request.dialect
+        return bool(entry.transcript) and replay_messages_equal(
+            entry.transcript, request.messages[:-1], dialect=request.dialect
         )
 
     @staticmethod
     def _is_stale_request(entry: SessionEntry, request: TextRequest) -> bool:
         count = len(request.messages)
-        return count <= len(entry.transcript) and messages_equal(
-            request.messages, entry.transcript[:count], dialect=request.dialect
+        return count <= len(entry.transcript) and replay_messages_equal(
+            entry.transcript[:count], request.messages, dialect=request.dialect
         )
 
     @staticmethod

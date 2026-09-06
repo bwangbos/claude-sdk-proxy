@@ -8,7 +8,10 @@ from claude_sdk_proxy.domain import CanonicalMessage, TextBlock, ThinkingBlock
 from claude_sdk_proxy.openai_api import parse_openai_request
 from claude_sdk_proxy.sdk_history import seed_history
 from claude_sdk_proxy.sdk_session import SdkSession
-from claude_sdk_proxy.session_identity import request_fingerprint
+from claude_sdk_proxy.session_identity import (
+    replay_messages_equal,
+    request_fingerprint,
+)
 from tests.gateway.asgi_client import _LIFESPAN_STATES, lifespan_app, post_json
 from tests.gateway.fakes import FakeSdkClient, FixedTemporaryDirectory, sdk_response
 from tests.gateway.test_thinking_streams import thinking_response
@@ -213,6 +216,28 @@ def test_native_signed_history_identity_is_dialect_specific(dialect, expected):
     )
     right = (CanonicalMessage.assistant_text("answer"),)
     assert messages_equal(left, right, dialect=dialect) is expected
+
+
+@pytest.mark.parametrize("dialect", ["anthropic", "openai"])
+def test_pi_cross_model_projection_match_is_exact(dialect):
+    stored = (
+        CanonicalMessage(
+            "assistant", (ThinkingBlock("native", "sig"), TextBlock("answer"))
+        ),
+    )
+    projected = (
+        CanonicalMessage("assistant", (TextBlock("native"), TextBlock("answer"))),
+    )
+    if dialect == "openai":
+        projected = (CanonicalMessage.assistant_text("nativeanswer"),)
+
+    assert replay_messages_equal(stored, projected, dialect=dialect)
+    edited = (
+        CanonicalMessage(
+            "assistant", (*projected[0].blocks[:-1], TextBlock("edited"))
+        ),
+    )
+    assert not replay_messages_equal(stored, edited, dialect=dialect)
 
 
 @pytest.mark.anyio

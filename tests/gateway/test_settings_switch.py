@@ -218,6 +218,107 @@ async def test_openai_setting_switch_seeds_stored_native_history() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("dialect", ["openai", "anthropic"])
+async def test_pi_cross_model_thinking_projection_keeps_native_lineage(
+    dialect: str,
+) -> None:
+    """Catch exact Pi cross-model thinking flattening becoming a fresh import."""
+    sonnet = NativeThinkingSession("sonnet answer")
+    opus = NativeThinkingSession("opus answer")
+    switched_back = FakeConversationSession("sonnet again")
+    factory = RecordingFactory((sonnet, opus, switched_back))
+    registry = SessionRegistry(factory)
+    first = replace(first_request("first"), dialect=dialect)
+
+    def replay_assistant(text: str, *, same_model: bool) -> CanonicalMessage:
+        if dialect == "anthropic" and same_model:
+            return CanonicalMessage(
+                "assistant",
+                (
+                    ThinkingBlock("native reasoning", "signed"),
+                    TextBlock(text),
+                ),
+            )
+        if same_model:
+            return CanonicalMessage.assistant_text(text)
+        if dialect == "anthropic":
+            return CanonicalMessage(
+                "assistant",
+                (TextBlock("native reasoning"), TextBlock(text)),
+            )
+        return CanonicalMessage.assistant_text(f"native reasoning{text}")
+
+    try:
+        await collect((await registry.open_turn(first, None)).stream())
+        on_opus = replace(
+            first,
+            model="opus",
+            messages=(
+                first.messages[0],
+                replay_assistant("sonnet answer", same_model=False),
+                CanonicalMessage.user_text("second"),
+            ),
+        )
+        await collect((await registry.open_turn(on_opus, None)).stream())
+
+        still_opus = replace(
+            on_opus,
+            messages=(
+                *on_opus.messages[:-1],
+                on_opus.messages[-1],
+                replay_assistant("opus answer", same_model=True),
+                CanonicalMessage.user_text("third"),
+            ),
+        )
+        await collect((await registry.open_turn(still_opus, None)).stream())
+
+        back_on_sonnet = replace(
+            still_opus,
+            model="sonnet",
+            messages=(
+                first.messages[0],
+                replay_assistant("sonnet answer", same_model=True),
+                CanonicalMessage.user_text("second"),
+                replay_assistant("opus answer", same_model=False),
+                CanonicalMessage.user_text("third"),
+                replay_assistant("opus answer", same_model=False),
+                CanonicalMessage.user_text("fourth"),
+            ),
+        )
+        await collect((await registry.open_turn(back_on_sonnet, None)).stream())
+
+        assert factory.models == ["sonnet", "opus", "sonnet"]
+        assert factory.histories[-1] == (
+            first.messages[0],
+            CanonicalMessage(
+                "assistant",
+                (
+                    ThinkingBlock("native reasoning", "signed"),
+                    TextBlock("sonnet answer"),
+                ),
+            ),
+            CanonicalMessage.user_text("second"),
+            CanonicalMessage(
+                "assistant",
+                (
+                    ThinkingBlock("native reasoning", "signed"),
+                    TextBlock("opus answer"),
+                ),
+            ),
+            CanonicalMessage.user_text("third"),
+            CanonicalMessage(
+                "assistant",
+                (
+                    ThinkingBlock("native reasoning", "signed"),
+                    TextBlock("opus answer"),
+                ),
+            ),
+        )
+    finally:
+        await registry.close()
+
+
+@pytest.mark.anyio
 async def test_setting_switch_retry_replays_without_another_replacement() -> None:
     old = FakeConversationSession("saved answer")
     replacement = FakeConversationSession("continued answer")

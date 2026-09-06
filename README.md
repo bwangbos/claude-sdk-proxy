@@ -99,8 +99,10 @@ Expected health response:
 
 ## Configure Pi
 
-Add the following provider under `providers` in `~/.pi/agent/models.json`. Merge
-it with any providers already in that file rather than replacing them.
+Add either or both providers below under `providers` in
+`~/.pi/agent/models.json`. Merge them with providers already in that file rather
+than replacing the file. The OpenAI transport is the simplest general-purpose
+choice; use the Anthropic transport when tool results can contain images.
 
 ```json
 {
@@ -112,7 +114,7 @@ it with any providers already in that file rather than replacing them.
       "apiKey": "local-placeholder",
       "compat": {
         "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
+        "supportsReasoningEffort": true,
         "supportsStore": true,
         "supportsUsageInStreaming": true,
         "supportsStrictMode": false,
@@ -121,9 +123,102 @@ it with any providers already in that file rather than replacing them.
       "models": [
         {
           "id": "sonnet",
-          "name": "Claude subscription (local)",
-          "reasoning": false,
-          "input": ["text"],
+          "name": "Claude Sonnet subscription",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": ["text", "image"],
+          "contextWindow": 200000,
+          "maxTokens": 16384,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "opus",
+          "name": "Claude Opus subscription",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": ["text", "image"],
+          "contextWindow": 200000,
+          "maxTokens": 16384,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    },
+    "claude-subscription-vision": {
+      "name": "Claude subscription local vision",
+      "baseUrl": "http://127.0.0.1:8317",
+      "api": "anthropic-messages",
+      "apiKey": "local-placeholder",
+      "headers": {"anthropic-beta": ""},
+      "compat": {
+        "forceAdaptiveThinking": true,
+        "supportsEagerToolInputStreaming": false,
+        "supportsStrictTools": false,
+        "supportsCacheControlOnTools": false
+      },
+      "models": [
+        {
+          "id": "sonnet",
+          "name": "Claude Sonnet subscription",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": ["text", "image"],
+          "contextWindow": 200000,
+          "maxTokens": 16384,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "opus",
+          "name": "Claude Opus subscription",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": ["text", "image"],
           "contextWindow": 200000,
           "maxTokens": 16384,
           "cost": {
@@ -142,9 +237,11 @@ it with any providers already in that file rather than replacing them.
 The placeholder key is intentionally non-secret. The proxy ignores it and uses
 the local Claude login of the process running the server.
 
-Start Pi with its ordinary tools:
+Start the proxy with both advertised aliases, then start Pi with its ordinary
+tools:
 
 ```bash
+uv run claude-proxy --model sonnet --model opus
 pi --provider claude-subscription-local --model sonnet
 ```
 
@@ -152,39 +249,27 @@ No Pi adapter or extension is required. Keep `supportsStrictMode: false` in the
 provider configuration; Pi otherwise adds a tool-definition field outside the
 proxy's supported subset.
 
+Pi's reasoning selector exposes `off`, `low`, `medium`, `high`, `xhigh`, and
+`max`. `off` maps to the OpenAI value `none`; Pi's unsupported `minimal` slot is
+hidden by mapping it to `null`. If controls are omitted from an API request,
+thinking remains disabled. An accepted effort does not guarantee a visible
+thinking summary: the backend may return no summary for a simple prompt, and
+OpenAI's default display mode may omit one.
+
+Model and effort can change only after a completed assistant answer. Keep the
+API dialect, system prompt, and tool definitions fixed, and never switch while
+tool results are still pending. Pi needs no fixed `X-Claude-Proxy-Session`
+header; the proxy recognizes its exact replay shape while retaining native
+signed history. The deterministic integration suite verifies Sonnet/high to
+Opus/low, another unchanged Opus turn, and a switch back to Sonnet/high through
+both transports. See the
+[verification record](docs/research/2026-09-06-model-thinking-verification.md)
+for the separate live evidence and its current post-tool switch limitation.
+
 ### Pi with images and screenshots
 
-For image attachments and tools that return screenshots, add this separate
-provider under `providers`. It uses Pi's stock Anthropic transport, which keeps
-images attached to the tool result that produced them. No extension is required.
-Keep your existing text provider if you want to continue using it.
-
-```json
-"claude-subscription-vision": {
-  "baseUrl": "http://127.0.0.1:8317",
-  "api": "anthropic-messages",
-  "apiKey": "local-placeholder",
-  "headers": {"anthropic-beta": ""},
-  "compat": {
-    "supportsEagerToolInputStreaming": false,
-    "supportsStrictTools": false,
-    "supportsCacheControlOnTools": false
-  },
-  "models": [
-    {
-      "id": "sonnet",
-      "name": "Claude subscription (local vision)",
-      "reasoning": false,
-      "input": ["text", "image"],
-      "contextWindow": 200000,
-      "maxTokens": 16384,
-      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
-    }
-  ]
-}
-```
-
-Restart the proxy and Pi after updating, then run:
+Restart the proxy and Pi after updating the configuration, then select the
+Anthropic transport:
 
 ```bash
 pi --provider claude-subscription-vision --model sonnet
@@ -192,7 +277,7 @@ pi --provider claude-subscription-vision --model sonnet
 
 Ask Pi to read an image file, or attach one. The beta header and compatibility
 flags above disable optional features outside the proxy's supported subset.
-Do not switch API dialects in the middle of an active tool round.
+Do not switch API dialects within one conversation.
 
 Pi `0.85.1`'s OpenAI transport moves tool-returned images into an extra user
 message, separating them from their tool call IDs. That layout is not supported
@@ -217,6 +302,7 @@ client = OpenAI(
 response = client.chat.completions.create(
     model="sonnet",
     messages=[{"role": "user", "content": "Reply with OK"}],
+    reasoning_effort="high",
 )
 print(response.choices[0].message.content)
 ```
@@ -234,6 +320,8 @@ client = Anthropic(
 response = client.messages.create(
     model="sonnet",
     max_tokens=128,
+    thinking={"type": "adaptive", "display": "summarized"},
+    output_config={"effort": "high"},
     messages=[{"role": "user", "content": "Reply with OK"}],
 )
 print(response.content[0].text)
@@ -312,12 +400,15 @@ Supported:
 - Standard OpenAI SDK assistant-message dumps with null optional metadata
 - Completed-request replay and linear continuation
 - Complete imported or rewritten transcripts at completed boundaries
+- Disabled or adaptive thinking with `low`, `medium`, `high`, `xhigh`, or `max`
+  effort on the configured Sonnet and Opus aliases
+- Model or effort changes at completed assistant-answer boundaries
 
 Intentionally unsupported:
 
 - PDFs, arbitrary files, audio, video, remote image URLs, and image generation
 - OpenAI Responses API
-- Exact temperature, sampling, stop-sequence, or reasoning controls
+- Exact temperature, sampling, or stop-sequence controls
 - Forced, named, required, or disabled-per-turn tool choice
 - `parallel_tool_calls: false`
 - Branching one explicit session ID into concurrent histories
@@ -343,9 +434,11 @@ them. `total_tokens` is the full prompt count plus output. An Anthropic
 ## Tools
 
 Tool definitions must be sent on every request in a tool-enabled conversation
-and must remain unchanged along with the model, system prompt, and API dialect.
-The gateway publishes each tool call with an opaque public ID and waits for the
-harness to return exactly one result for every call.
+and must remain unchanged along with the system prompt and API dialect. Model
+and effort must remain unchanged until every pending tool result has completed;
+they may change after the assistant's completed answer. The gateway publishes
+each tool call with an opaque public ID and waits for the harness to return
+exactly one result for every call.
 
 Parallel results may be returned in any order. Correlation is always by the
 public call ID—never by tool name, arguments, or position. A replacement

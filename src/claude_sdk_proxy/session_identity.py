@@ -123,6 +123,66 @@ def messages_equal(
     ) == tuple(_canonical_message(message, dialect=dialect) for message in right)
 
 
+def replay_messages_equal(
+    stored: tuple[CanonicalMessage, ...],
+    replayed: tuple[CanonicalMessage, ...],
+    *,
+    dialect: str = "anthropic",
+) -> bool:
+    """Match exact native history or Pi's exact cross-model projection.
+
+    Pi keeps the original model tag on every assistant message. When the active
+    model changes, Pi converts that message's non-redacted thinking to ordinary
+    text and drops redacted thinking before sending HTTP. Match that precise
+    projection per assistant message so older and newer model turns may coexist,
+    while continuing to retain the authenticated native transcript.
+    """
+    if len(stored) != len(replayed):
+        return False
+    for native, public in zip(stored, replayed, strict=True):
+        expected = _canonical_message(native, dialect=dialect)
+        actual = _canonical_message(public, dialect=dialect)
+        if expected == actual:
+            continue
+        if _pi_cross_model_message(native, dialect=dialect) != actual:
+            return False
+    return True
+
+
+def _pi_cross_model_message(
+    message: CanonicalMessage, *, dialect: str
+) -> dict[str, object]:
+    if message.role != "assistant":
+        return _canonical_message(message, dialect=dialect)
+    if dialect == "openai":
+        thinking = "".join(
+            block.thinking
+            for block in message.blocks
+            if isinstance(block, ThinkingBlock) and block.thinking.strip()
+        )
+        answer = "".join(
+            block.text for block in message.blocks if isinstance(block, TextBlock)
+        )
+        blocks = (
+            *((TextBlock(thinking + answer),) if thinking or answer else ()),
+            *(
+                block
+                for block in message.blocks
+                if isinstance(block, (ImageBlock, ToolCallBlock))
+            ),
+        )
+    else:
+        blocks = tuple(
+            TextBlock(block.thinking)
+            if isinstance(block, ThinkingBlock)
+            else block
+            for block in message.blocks
+            if not isinstance(block, RedactedThinkingBlock)
+            and not (isinstance(block, ThinkingBlock) and not block.thinking.strip())
+        )
+    return _canonical_message(CanonicalMessage("assistant", blocks), dialect=dialect)
+
+
 def fixed_config_matches(
     request: TextRequest,
     *,
@@ -151,6 +211,7 @@ def tools_equal(
 __all__ = [
     "fixed_config_matches",
     "messages_equal",
+    "replay_messages_equal",
     "request_fingerprint",
     "tools_equal",
 ]
