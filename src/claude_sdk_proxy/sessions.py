@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
+from dataclasses import replace
 
 from claude_sdk_proxy.diagnostics import record, session_reference
 from claude_sdk_proxy.domain import (
@@ -108,7 +109,18 @@ class SessionRegistry:
             entry = self._explicit.get(explicit_id) or self._implicit.get(explicit_id)
             if entry is None:
                 return self._fresh(request, explicit_id, True), None, None
-            self._validate_config(entry, request)
+            self._validate_fixed_config(entry, request)
+            if not entry.matches_generation_config(request):
+                self._reject_busy(entry, fingerprint)
+                if self._is_stale_request(entry, request):
+                    raise SessionMismatch("request transcript is stale")
+                if not self._is_continuation(entry, request):
+                    raise SessionMismatch(
+                        "request transcript does not match conversation"
+                    )
+                if not self._evictable(entry):
+                    raise SessionMismatch("conversation has pending tools")
+                return self._settings_replacement(entry, request), None, entry
             try:
                 replay = self._existing(entry, request, fingerprint)
             except SessionMismatch:
@@ -136,13 +148,18 @@ class SessionRegistry:
         continuations = [
             item
             for item in entries
-            if self._config_matches(item, request)
+            if item.matches_fixed_config(request)
             and self._is_continuation(item, request)
         ]
         if len(continuations) > 1:
             raise SessionMismatch("request transcript matches multiple conversations")
         if continuations:
             entry = continuations[0]
+            if not entry.matches_generation_config(request):
+                self._reject_busy(entry, fingerprint)
+                if not self._evictable(entry):
+                    raise SessionMismatch("conversation has pending tools")
+                return self._settings_replacement(entry, request), None, entry
             return entry, self._existing(entry, request, fingerprint), None
         # A complete result batch can identify a suspended implicit conversation
         # even when earlier history was rewritten. Never infer by tool position.
@@ -166,6 +183,14 @@ class SessionRegistry:
                     raise SessionMismatch("conversation has pending tools")
                 return self._new_entry(request, entry.external_id, False), None, entry
         return self._fresh(request, uuid.uuid4().hex, False), None, None
+
+    def _settings_replacement(
+        self, entry: SessionEntry, request: TextRequest
+    ) -> SessionEntry:
+        seeded = replace(
+            request, messages=entry.transcript + request.messages[-1:]
+        )
+        return self._new_entry(seeded, entry.external_id, entry.explicit)
 
     def _can_rebase(self, entry: SessionEntry, request: TextRequest) -> bool:
         if self._evictable(entry):
@@ -435,25 +460,22 @@ class SessionRegistry:
 
     @staticmethod
     def _config_matches(entry: SessionEntry, request: TextRequest) -> bool:
-        if (
-            request.model != entry.model
-            or request.system != entry.system
-            or request.thinking != entry.thinking
-        ):
-            return False
-        if isinstance(entry, Conversation):
-            return not request.tools and request.dialect == entry.dialect
         return entry.matches_config(request)
 
-    def _validate_config(self, entry: SessionEntry, request: TextRequest) -> None:
-        if request.model != entry.model:
-            raise SessionMismatch("session model does not match")
+    def _validate_fixed_config(
+        self, entry: SessionEntry, request: TextRequest
+    ) -> None:
         if request.system != entry.system:
             raise SessionMismatch("session system does not match")
-        if request.thinking != entry.thinking:
-            raise SessionMismatch("session thinking configuration does not match")
-        if not self._config_matches(entry, request):
+        if request.dialect != entry.dialect:
+            raise SessionMismatch("session dialect does not match")
+        if not entry.matches_fixed_config(request):
             raise SessionMismatch("session tool configuration does not match")
+
+    def _validate_config(self, entry: SessionEntry, request: TextRequest) -> None:
+        self._validate_fixed_config(entry, request)
+        if not entry.matches_generation_config(request):
+            raise SessionMismatch("session generation configuration does not match")
 
     async def _commit(
         self,

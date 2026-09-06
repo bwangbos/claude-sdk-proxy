@@ -21,7 +21,7 @@ from claude_sdk_proxy.domain import (
     ToolCallBlock,
     ToolDefinition,
 )
-from claude_sdk_proxy.session_identity import tools_equal
+from claude_sdk_proxy.session_identity import fixed_config_matches
 from claude_sdk_proxy.session_turn import (
     SessionConflict,
     SessionMismatch,
@@ -86,13 +86,20 @@ class ToolSessionActor:
     _wait_token: int = 0
     _resume: asyncio.Event = field(default_factory=asyncio.Event)
 
+    def matches_fixed_config(self, request: TextRequest) -> bool:
+        return fixed_config_matches(
+            request,
+            system=self.system,
+            dialect=self.dialect,
+            tools=self.tools,
+        )
+
+    def matches_generation_config(self, request: TextRequest) -> bool:
+        return request.model == self.model and request.thinking == self.thinking
+
     def matches_config(self, request: TextRequest) -> bool:
-        return (
-            request.model == self.model
-            and request.system == self.system
-            and request.dialect == self.dialect
-            and request.thinking == self.thinking
-            and tools_equal(request.tools, self.tools)
+        return self.matches_fixed_config(request) and self.matches_generation_config(
+            request
         )
 
     def validate_continuation(self, request: TextRequest) -> None:

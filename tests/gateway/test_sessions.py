@@ -548,17 +548,15 @@ async def test_timed_out_explicit_rebase_preserves_the_original_session() -> Non
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("changed", ["model", "system"])
-async def test_explicit_session_rejects_configuration_change(changed: str) -> None:
+async def test_explicit_session_rejects_system_change() -> None:
     factory = FakeSessionFactory(outputs=("answer",))
     registry = SessionRegistry(factory)
     first = await registry.open_turn(first_request("hello"), explicit_id="lineage")
     await collect(first.stream())
-    kwargs = {changed: "different"}
 
-    with pytest.raises(SessionMismatch, match=changed):
+    with pytest.raises(SessionMismatch, match="system"):
         await registry.open_turn(
-            continuation_request("hello", "answer", "next", **kwargs),
+            continuation_request("hello", "answer", "next", system="different"),
             explicit_id="lineage",
         )
 

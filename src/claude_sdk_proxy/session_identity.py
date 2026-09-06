@@ -123,6 +123,21 @@ def messages_equal(
     ) == tuple(_canonical_message(message, dialect=dialect) for message in right)
 
 
+def fixed_config_matches(
+    request: TextRequest,
+    *,
+    system: str,
+    dialect: str,
+    tools: tuple[ToolDefinition, ...],
+) -> bool:
+    """Match conversation-wide settings that cannot change between turns."""
+    return (
+        request.system == system
+        and request.dialect == dialect
+        and tools_equal(request.tools, tools)
+    )
+
+
 def tools_equal(
     left: tuple[ToolDefinition, ...], right: tuple[ToolDefinition, ...]
 ) -> bool:
@@ -133,4 +148,9 @@ def tools_equal(
     )
 
 
-__all__ = ["messages_equal", "request_fingerprint", "tools_equal"]
+__all__ = [
+    "fixed_config_matches",
+    "messages_equal",
+    "request_fingerprint",
+    "tools_equal",
+]

@@ -17,6 +17,7 @@ from claude_sdk_proxy.domain import (
     ThinkingCompleted,
 )
 from claude_sdk_proxy.replay_stream import ReplayStream
+from claude_sdk_proxy.session_identity import fixed_config_matches
 from claude_sdk_proxy.thinking import ThinkingOptions
 
 if TYPE_CHECKING:
@@ -59,6 +60,19 @@ class Conversation:
     in_flight_fingerprint: str | None = None
     replay: dict[str, tuple[ConversationEvent, ...]] = field(default_factory=dict)
     last_used: int = 0
+
+    def matches_fixed_config(self, request: TextRequest) -> bool:
+        return fixed_config_matches(
+            request, system=self.system, dialect=self.dialect, tools=()
+        )
+
+    def matches_generation_config(self, request: TextRequest) -> bool:
+        return request.model == self.model and request.thinking == self.thinking
+
+    def matches_config(self, request: TextRequest) -> bool:
+        return self.matches_fixed_config(request) and self.matches_generation_config(
+            request
+        )
 
 
 @dataclass(slots=True)

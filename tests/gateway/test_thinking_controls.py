@@ -12,7 +12,7 @@ from claude_sdk_proxy.domain import (
 from claude_sdk_proxy.openai_api import parse_openai_request
 from claude_sdk_proxy.sdk_session import SdkSession
 from claude_sdk_proxy.session_identity import request_fingerprint
-from claude_sdk_proxy.sessions import SessionMismatch, SessionRegistry
+from claude_sdk_proxy.sessions import SessionConflict, SessionRegistry
 from claude_sdk_proxy.thinking import ThinkingOptions
 from tests.gateway.fakes import (
     FakeSdkClient,
@@ -388,7 +388,7 @@ async def test_registry_passes_normalized_thinking_to_session_factory() -> None:
 
 
 @pytest.mark.anyio
-async def test_explicit_session_rejects_changed_thinking_configuration() -> None:
+async def test_explicit_session_rejects_thinking_change_during_active_turn() -> None:
     factory = FakeSessionFactory(outputs=("answer",))
     registry = SessionRegistry(factory)
     request = TextRequest(
@@ -401,7 +401,7 @@ async def test_explicit_session_rejects_changed_thinking_configuration() -> None
     )
     await registry.open_turn(request, explicit_id="thinking-session")
 
-    with pytest.raises(SessionMismatch, match="thinking"):
+    with pytest.raises(SessionConflict, match="busy"):
         await registry.open_turn(
             replace(
                 request,
