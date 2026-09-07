@@ -120,16 +120,17 @@ extracting credentials.
 ## Release implementation verification
 
 The final implementation verification kept live observations distinct from
-deterministic synthetic coverage. The production-path probe was updated to send
-the already-authorized eight-message request through the real OpenAI-compatible
-HTTP endpoint with the configured `off` or `auto` policy. It records only HTTP
-status, model/provenance headers, response model, finish reason, error reason,
-and tool-call count, then stops at the response boundary without executing a
-generated tool. The environment approval gate rejected the run because it could
-not independently establish authorization for the private payload. No bypass or
-alternate benchmark was attempted. Consequently, strict-off refusal versus
-auto replacement was not newly observed through the production HTTP path in
-this run; the isolated native live observations above remain the live evidence.
+deterministic synthetic coverage. The production-path probe was updated for a
+captured private eight-message request pending explicit reauthorization through
+the real OpenAI-compatible HTTP endpoint with the configured `off` or `auto`
+policy. It records only HTTP status, model/provenance headers, response model,
+finish reason, error reason, and tool-call count, then stops at the response
+boundary without executing a generated tool. The environment approval gate
+rejected the run because it could not independently establish authorization for
+the private payload. No bypass or alternate benchmark was attempted.
+Consequently, strict-off refusal versus auto replacement was not newly observed
+through the production HTTP path in this run; the isolated native live
+observations above remain the live evidence.
 
 Deterministic production tests separately cover the implemented behavior for
 both HTTP dialects and JSON/SSE responses: default and per-request policy,
