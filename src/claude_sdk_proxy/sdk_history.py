@@ -24,6 +24,7 @@ from claude_sdk_proxy.domain import (
 )
 from claude_sdk_proxy.images import render_content
 from claude_sdk_proxy.tool_contract import JsonValue, plain_json
+from claude_sdk_proxy.tool_namespace import SDK_TOOL_PREFIX
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,7 +248,7 @@ def _assistant_entries(
             internal_id = "toolu_rebase_" + uuid.uuid4().hex
             internal_tools[block.id] = (internal_id, entry_uuid)
             sdk_name = sdk_tool_names.get(
-                block.name, f"mcp__caller_tools_v1__{block.name}"
+                block.name, f"{SDK_TOOL_PREFIX}{block.name}"
             )
             content = {
                 "type": "tool_use",

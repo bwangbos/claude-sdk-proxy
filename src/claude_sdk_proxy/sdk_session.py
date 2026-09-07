@@ -59,6 +59,7 @@ from claude_sdk_proxy.tool_contract import (
     validate_tool_definitions,
     validate_tool_results,
 )
+from claude_sdk_proxy.tool_namespace import SDK_MCP_SERVER_NAME
 
 
 def _discard_stderr(_: str) -> None:
@@ -129,7 +130,7 @@ class SdkSession:
             self._bridge.allowed_tools if self._bridge is not None else ()
         )
         self._expected_mcp_servers = (
-            ("caller_tools_v1",) if self._bridge is not None else ()
+            (SDK_MCP_SERVER_NAME,) if self._bridge is not None else ()
         )
         self._awaiting_submit = False
         self._awaiting_echo = False
@@ -209,7 +210,7 @@ class SdkSession:
             skills=[],
             setting_sources=[],
             mcp_servers=(
-                {"caller_tools_v1": self._bridge.mcp_server}
+                {SDK_MCP_SERVER_NAME: self._bridge.mcp_server}
                 if self._bridge is not None
                 else {}
             ),

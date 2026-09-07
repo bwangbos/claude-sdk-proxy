@@ -132,11 +132,11 @@ def test_bridge_exposes_one_isolated_server_and_generated_allowlist() -> None:
     )
 
     assert bridge.server_config["type"] == "sdk"
-    assert bridge.server_config["name"] == "caller_tools_v1"
+    assert bridge.server_config["name"] == "caller_tools"
     assert isinstance(bridge.server_config["instance"], Server)
     assert bridge.allowed_tools == (
-        "mcp__caller_tools_v1__alpha",
-        "mcp__caller_tools_v1__zeta",
+        "mcp__caller_tools__alpha",
+        "mcp__caller_tools__zeta",
     )
 
 
@@ -154,7 +154,7 @@ async def test_one_handler_parks_until_its_result_is_resolved() -> None:
     assert invocation.name == "echo"
     assert invocation.arguments == {"v": 7}
     assert isinstance(invocation.arguments, MappingProxyType)
-    assert invocation.sdk_name == "mcp__caller_tools_v1__echo"
+    assert invocation.sdk_name == "mcp__caller_tools__echo"
     assert not task.done()
 
     bridge.resolve((ToolResultBlock("toolu_a", ("seven",), False),))

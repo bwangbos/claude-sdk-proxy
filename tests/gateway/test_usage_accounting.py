@@ -395,7 +395,7 @@ async def test_asgi_repeated_tools_preserve_each_raw_boundary_usage(
         "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 1235,
     }
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     tool_raw = _attach_boundary_usage(
         raw_tool_events(
             (
@@ -629,7 +629,7 @@ async def test_text_boundary_rejects_output_snapshot_regression(
         )
 
 def test_tool_boundary_accepts_increasing_interim_output_snapshots() -> None:
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     raw = list(raw_tool_events((("sdk-a", sdk_name, '{"v":1}'),), "sdk-1"))
     start = raw[0]
     assert not isinstance(start, AssistantMessage)

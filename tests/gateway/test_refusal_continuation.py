@@ -233,7 +233,7 @@ async def test_http_refusal_after_completed_tool_result_boundary(
     native = (
         _init(tools_enabled=True),
         *raw_tool_events(
-            (("sdk-tool", "mcp__caller_tools_v1__echo", '{"value":"one"}'),), "sdk-1"
+            (("sdk-tool", "mcp__caller_tools__echo", '{"value":"one"}'),), "sdk-1"
         ),
         UserMessage(
             [SdkToolResultBlock("sdk-tool", [{"type": "text", "text": "one"}], None)],

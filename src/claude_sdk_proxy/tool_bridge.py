@@ -41,8 +41,8 @@ from claude_sdk_proxy.tool_contract import (
     validate_tool_definitions,
     validate_tool_results,
 )
+from claude_sdk_proxy.tool_namespace import SDK_MCP_SERVER_NAME, SDK_TOOL_PREFIX
 
-_SERVER_NAME = "caller_tools_v1"
 _MAX_RESULT_CHARS = 256 * 1024
 _PUBLIC_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _PROTOCOL_FAILURE = "SDK tool protocol failure"
@@ -141,14 +141,14 @@ class ToolBridge:
             )
 
         server: Server[object] = Server(
-            _SERVER_NAME,
+            SDK_MCP_SERVER_NAME,
             version="1.0.0",
             on_list_tools=on_list_tools,
             on_call_tool=on_call_tool,
         )
         self.mcp_server: McpSdkServerConfig = {
             "type": "sdk",
-            "name": _SERVER_NAME,
+            "name": SDK_MCP_SERVER_NAME,
             "instance": server,
         }
         self.server_config = self.mcp_server
@@ -489,7 +489,7 @@ class ToolBridge:
 
     @staticmethod
     def _sdk_name(public_name: str) -> str:
-        return f"mcp__{_SERVER_NAME}__{public_name}"
+        return f"{SDK_TOOL_PREFIX}{public_name}"
 
 
 def _plain_json_object(value: Mapping[str, object]) -> dict[str, Any]:

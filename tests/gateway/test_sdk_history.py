@@ -75,8 +75,12 @@ async def test_imported_results_are_seeded_before_empty_continuation(tmp_path):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "sdk_tool_names", [{"lookup": "mcp__caller_tools__lookup"}, {}]
+)
 async def test_seed_history_preserves_roles_text_and_completed_tools(
     tmp_path: Path,
+    sdk_tool_names: dict[str, str],
 ) -> None:
     history = (
         CanonicalMessage.user_text("use lookup"),
@@ -95,7 +99,7 @@ async def test_seed_history_preserves_roles_text_and_completed_tools(
         history,
         cwd=tmp_path,
         model="sonnet",
-        sdk_tool_names={"lookup": "mcp__caller_tools_v1__lookup"},
+        sdk_tool_names=sdk_tool_names,
     )
     key = {
         "project_key": seeded.project_key,
@@ -120,7 +124,7 @@ async def test_seed_history_preserves_roles_text_and_completed_tools(
     assert entries[1]["message"]["id"] == entries[2]["message"]["id"]
     assert entries[1]["requestId"] == entries[2]["requestId"]
     assert [entries[1]["apiBlockIndex"], entries[2]["apiBlockIndex"]] == [0, 1]
-    assert assistant_tool["name"] == "mcp__caller_tools_v1__lookup"
+    assert assistant_tool["name"] == "mcp__caller_tools__lookup"
     assert assistant_tool["input"] == {"key": "color"}
     assert assistant_tool["caller"] == {"type": "direct"}
     internal_id = assistant_tool["id"]
@@ -170,7 +174,7 @@ async def test_seed_history_splits_parallel_results_into_native_entries(
         history,
         cwd=tmp_path,
         model="sonnet",
-        sdk_tool_names={"lookup": "mcp__caller_tools_v1__lookup"},
+        sdk_tool_names={"lookup": "mcp__caller_tools__lookup"},
     )
     entries = await seeded.store.load(
         {"project_key": seeded.project_key, "session_id": seeded.session_id}

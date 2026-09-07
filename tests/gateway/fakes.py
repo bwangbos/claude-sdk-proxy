@@ -129,7 +129,7 @@ class FakeSdkClient:
         for block in message.content:
             if type(block) is not ToolUseBlock:
                 continue
-            prefix = "mcp__caller_tools_v1__"
+            prefix = "mcp__caller_tools__"
             if not block.name.startswith(prefix):
                 continue
             self.start_tool_callback(
@@ -150,7 +150,7 @@ class FakeSdkClient:
     ) -> None:
         assert self.options is not None
         assert isinstance(self.options.mcp_servers, dict)
-        config = self.options.mcp_servers["caller_tools_v1"]
+        config = self.options.mcp_servers["caller_tools"]
         server = cast(Server[Any], config["instance"])
         entry = server.get_request_handler("tools/call")
         assert entry is not None

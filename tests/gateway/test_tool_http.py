@@ -1288,7 +1288,7 @@ async def test_http_repeated_tool_rounds_reverse_parallel_results_and_replay(
 async def test_real_sdk_http_boundaries_usage_bridge_replay_and_wire(
     tmp_path: Path, dialect: str, path: str, stream: bool
 ) -> None:
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     messages = (
         *raw_tool_events(
             (("sdk-a", sdk_name, '{"v":1}'), ("sdk-b", sdk_name, '{"v":1}')),
@@ -1407,7 +1407,7 @@ async def test_real_sdk_anthropic_accepts_empty_and_multiblock_tool_results(
     stream: bool,
     result_content: list[dict[str, str]],
 ) -> None:
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     messages = (
         *raw_tool_events(
             (("sdk-result-shape", sdk_name, '{"v":1}'),),
@@ -1476,7 +1476,7 @@ async def test_real_sdk_disconnect_after_usage_before_tool_commit_aborts(
 ) -> None:
     raw_blocked = asyncio.Event()
     raw_release = asyncio.Event()
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     client = FakeSdkClient(
         responses=(
             raw_tool_events(
@@ -1519,7 +1519,7 @@ async def test_real_sdk_disconnect_after_usage_before_tool_commit_aborts(
 async def test_real_sdk_disconnect_after_complete_tool_wire_keeps_actor(
     tmp_path: Path, dialect: str, path: str, terminal_chunk: bytes
 ) -> None:
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     messages = (
         *raw_tool_events(
             (("sdk-private-call", sdk_name, '{"v":1}'),),
@@ -1594,7 +1594,7 @@ async def test_real_sdk_oversized_raw_tool_arguments_are_redacted_http_errors(
                 (
                     (
                         "sdk-internal-oversized",
-                        "mcp__caller_tools_v1__echo",
+                        "mcp__caller_tools__echo",
                         encoded,
                     ),
                 ),

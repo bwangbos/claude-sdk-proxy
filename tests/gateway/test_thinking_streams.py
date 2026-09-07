@@ -396,7 +396,7 @@ def interleaved_tool_response():
                         "content_block": {
                             "type": "tool_use",
                             "id": f"sdk-{index}",
-                            "name": "mcp__caller_tools_v1__echo",
+                            "name": "mcp__caller_tools__echo",
                             "input": {},
                             "caller": {"type": "direct"},
                         },
@@ -410,7 +410,7 @@ def interleaved_tool_response():
                     }
                 ),
                 AssistantMessage(
-                    [ToolUseBlock(f"sdk-{index}", "mcp__caller_tools_v1__echo", {})],
+                    [ToolUseBlock(f"sdk-{index}", "mcp__caller_tools__echo", {})],
                     "sonnet",
                 ),
                 frame({"type": "content_block_stop", "index": index}),

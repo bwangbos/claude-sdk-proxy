@@ -83,7 +83,7 @@ async def test_generated_sdk_mcp_rule_is_recorded_without_override() -> None:
     result = await run_tool_bridge_probe(_exact_model(), "generated_name_rule", 1)
 
     assert result.evidence["naming_rule_version"] == 1
-    assert result.evidence["server_identity"] == "caller_tools_v1"
+    assert result.evidence["server_identity"] == "caller_tools"
     assert set(result.evidence["observed_generated_names"]) == {
         "echo",
         "snake_case",

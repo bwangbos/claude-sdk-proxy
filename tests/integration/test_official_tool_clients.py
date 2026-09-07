@@ -63,7 +63,7 @@ def _tool_app(tmp_path: Path, client: FakeSdkClient):
 
 
 def _sdk_messages(rounds: int) -> tuple[Any, ...]:
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     messages: list[Any] = [
         *raw_tool_events(
             (
@@ -402,7 +402,7 @@ async def test_official_clients_complete_tool_rounds_over_real_http(
 async def test_anthropic_client_preserves_nonempty_explicit_tool_error(
     tmp_path: Path,
 ) -> None:
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     messages = (
         *raw_tool_events(
             (("sdk-error", sdk_name, '{"v":1}'),),
@@ -457,7 +457,7 @@ async def test_anthropic_client_preserves_nonempty_explicit_tool_error(
 async def test_anthropic_client_rejects_empty_error_before_sdk_resume(
     tmp_path: Path,
 ) -> None:
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     messages = (
         *raw_tool_events(
             (("sdk-error", sdk_name, '{"v":1}'),),

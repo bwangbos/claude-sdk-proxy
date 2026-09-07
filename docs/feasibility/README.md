@@ -269,7 +269,7 @@ For request IDs, safe session rejection reasons, and `--log`/`--log-json`, see
 [troubleshooting and diagnostics](../../README.md#troubleshooting).
 
 For a tool session, the proxy creates one in-process MCP server named
-`caller_tools_v1`, exposes only the tools from the request, and lets the Agent
+`caller_tools`, exposes only the tools from the request, and lets the Agent
 SDK/provider inject its native schema and standard tool-use instructions. The
 proxy does not append tool prose to the caller's system string or final user
 text. Built-ins, ambient settings, MCP servers, skills, plugins, subagents,

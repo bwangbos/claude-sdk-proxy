@@ -932,8 +932,8 @@ async def test_tool_session_exposes_only_generated_caller_tools(
     await session.start()
     try:
         assert client.options is not None
-        assert set(client.options.mcp_servers) == {"caller_tools_v1"}
-        assert client.options.allowed_tools == ["mcp__caller_tools_v1__echo"]
+        assert set(client.options.mcp_servers) == {"caller_tools"}
+        assert client.options.allowed_tools == ["mcp__caller_tools__echo"]
         assert client.options.tools == []
         assert client.options.skills == []
         assert client.options.setting_sources == []
@@ -979,12 +979,12 @@ async def test_text_session_keeps_empty_tool_configuration_and_large_buffer(
 
 
 @pytest.mark.anyio
-async def test_stream_generation_emits_one_native_tool_boundary_then_final_text(
+async def test_unversioned_tool_namespace_routes_callback_result_and_final_text(
     tmp_path: Path,
 ) -> None:
     messages = (
         *raw_tool_events(
-            (("sdk-tool-1", "mcp__caller_tools_v1__echo", '{"v":1}'),),
+            (("sdk-tool-1", "mcp__caller_tools__echo", '{"v":1}'),),
             "sdk-1",
             input_tokens=3,
             output_tokens=2,
@@ -1040,7 +1040,7 @@ async def test_tool_error_echo_accepts_live_rate_limit_message_before_echo(
 ) -> None:
     messages = (
         *raw_tool_events(
-            (("sdk-tool-1", "mcp__caller_tools_v1__echo", '{"v":1}'),),
+            (("sdk-tool-1", "mcp__caller_tools__echo", '{"v":1}'),),
             "sdk-1",
         ),
         live_rate_limit(),
@@ -1075,8 +1075,8 @@ async def test_parallel_native_results_may_arrive_in_separate_user_messages(
     messages = (
         *raw_tool_events(
             (
-                ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
-                ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":1}'),
+                ("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),
+                ("sdk-b", "mcp__caller_tools__echo", '{"v":1}'),
             ),
             "sdk-1",
         ),
@@ -1128,7 +1128,7 @@ async def test_success_result_echo_accepts_empty_and_multiple_text_blocks(
 ) -> None:
     messages = (
         *raw_tool_events(
-            (("sdk-tool-1", "mcp__caller_tools_v1__echo", '{"v":1}'),),
+            (("sdk-tool-1", "mcp__caller_tools__echo", '{"v":1}'),),
             "sdk-1",
         ),
         UserMessage(
@@ -1159,8 +1159,8 @@ async def test_parallel_native_result_echoes_must_match_exact_internal_ids(
     messages = (
         *raw_tool_events(
             (
-                ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
-                ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":1}'),
+                ("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),
+                ("sdk-b", "mcp__caller_tools__echo", '{"v":1}'),
             ),
             "sdk-1",
         ),
@@ -1208,7 +1208,7 @@ async def test_success_result_echo_requires_exact_observed_tool_use_result_envel
 ) -> None:
     messages = (
         *raw_tool_events(
-            (("sdk-tool-1", "mcp__caller_tools_v1__echo", '{"v":1}'),),
+            (("sdk-tool-1", "mcp__caller_tools__echo", '{"v":1}'),),
             "sdk-1",
         ),
         UserMessage(
@@ -1273,7 +1273,7 @@ async def test_sdk_session_rejects_malformed_or_mismatched_native_result_echo(
 ) -> None:
     messages = (
         *raw_tool_events(
-            (("sdk-tool-1", "mcp__caller_tools_v1__echo", '{"v":1}'),),
+            (("sdk-tool-1", "mcp__caller_tools__echo", '{"v":1}'),),
             "sdk-1",
         ),
         echo,
@@ -1314,7 +1314,13 @@ async def test_sdk_session_rejects_user_message_outside_result_echo_phase(
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "sdk_name",
-    ["Bash", "echo", "mcp__other__echo", "mcp__caller_tools_v1__unknown"],
+    [
+        "Bash",
+        "echo",
+        "mcp__other__echo",
+        "mcp__caller_tools_v1__echo",
+        "mcp__caller_tools__unknown",
+    ],
 )
 async def test_sdk_session_rejects_non_generated_or_unknown_raw_tool_names(
     tmp_path: Path, sdk_name: str
@@ -1339,7 +1345,7 @@ async def test_sdk_session_rejects_malformed_or_oversized_raw_arguments(
 ) -> None:
     raw = list(
         raw_tool_events(
-            (("sdk-tool-1", "mcp__caller_tools_v1__echo", '{"v":1}'),),
+            (("sdk-tool-1", "mcp__caller_tools__echo", '{"v":1}'),),
             "sdk-1",
         )
     )
@@ -1362,14 +1368,14 @@ async def test_sdk_session_rejects_raw_and_typed_tool_call_mismatch(
 ) -> None:
     messages = list(
         raw_tool_events(
-            (("sdk-tool-1", "mcp__caller_tools_v1__echo", '{"v":1}'),),
+            (("sdk-tool-1", "mcp__caller_tools__echo", '{"v":1}'),),
             "sdk-1",
         )
     )
     assistant = messages[4]
     assert isinstance(assistant, AssistantMessage)
     assistant.content[0] = ToolUseBlock(
-        "sdk-tool-1", "mcp__caller_tools_v1__echo", {"v": 2}
+        "sdk-tool-1", "mcp__caller_tools__echo", {"v": 2}
     )
     session, _ = make_tool_session(tmp_path, tuple(messages))
     await session.start()
@@ -1386,8 +1392,8 @@ async def test_tool_enabled_system_init_requires_exact_generated_metadata(
 ) -> None:
     expected = live_system(
         "init",
-        tools=["mcp__caller_tools_v1__echo"],
-        mcp_servers=[{"name": "caller_tools_v1", "status": "connected"}],
+        tools=["mcp__caller_tools__echo"],
+        mcp_servers=[{"name": "caller_tools", "status": "connected"}],
     )
     messages = (expected, *raw_text_events("done", "sdk-1"), result_message())
     session, _ = make_tool_session(tmp_path, messages)
@@ -1405,27 +1411,27 @@ async def test_tool_enabled_system_init_requires_exact_generated_metadata(
     ("tools", "servers"),
     [
         (
-            ["mcp__caller_tools_v1__echo", "Bash"],
-            [{"name": "caller_tools_v1", "status": "connected"}],
+            ["mcp__caller_tools__echo", "Bash"],
+            [{"name": "caller_tools", "status": "connected"}],
         ),
         (
-            ["mcp__caller_tools_v1__echo"] * 2,
-            [{"name": "caller_tools_v1", "status": "connected"}],
+            ["mcp__caller_tools__echo"] * 2,
+            [{"name": "caller_tools", "status": "connected"}],
         ),
         (
-            ["mcp__caller_tools_v1__echo"],
+            ["mcp__caller_tools__echo"],
             [
-                {"name": "caller_tools_v1", "status": "connected"},
+                {"name": "caller_tools", "status": "connected"},
                 {"name": "ambient", "status": "connected"},
             ],
         ),
         (
-            ["mcp__caller_tools_v1__echo"],
-            [{"name": "caller_tools_v1", "status": "failed"}],
+            ["mcp__caller_tools__echo"],
+            [{"name": "caller_tools", "status": "failed"}],
         ),
         (
             ["mcp__other__echo"],
-            [{"name": "caller_tools_v1", "status": "connected"}],
+            [{"name": "caller_tools", "status": "connected"}],
         ),
     ],
 )
@@ -1449,8 +1455,8 @@ async def test_tool_boundary_preserves_text_before_publication_order(
     messages = (
         *raw_tool_events(
             (
-                ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
-                ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),
+                ("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),
+                ("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),
             ),
             "sdk-1",
             text="calling: ",
@@ -1489,11 +1495,11 @@ async def test_stream_generation_supports_two_native_tool_rounds(
 ) -> None:
     messages = (
         *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
         ),
         UserMessage([SdkToolResultBlock("sdk-a", "first", False)]),
         *raw_tool_events(
-            (("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),),
+            (("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),),
             "sdk-1",
             input_tokens=6,
             output_tokens=3,
@@ -1560,8 +1566,8 @@ async def test_sdk_session_rejects_missing_parallel_native_result_echo(
     messages = (
         *raw_tool_events(
             (
-                ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
-                ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),
+                ("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),
+                ("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),
             ),
             "sdk-1",
         ),
@@ -1592,7 +1598,7 @@ async def test_sdk_session_rejects_raw_tool_block_followed_by_text(
     tmp_path: Path,
 ) -> None:
     messages = list(
-        raw_tool_events((("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1")
+        raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1")
     )
     messages[4:4] = [
         StreamEvent(
@@ -1634,7 +1640,7 @@ async def test_sdk_session_rejects_parent_attributed_raw_tool_block(
     tmp_path: Path,
 ) -> None:
     messages = list(
-        raw_tool_events((("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1")
+        raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1")
     )
     raw_start = messages[1]
     assert isinstance(raw_start, StreamEvent)
@@ -1655,7 +1661,7 @@ async def test_sdk_session_rejects_handler_publication_without_matching_raw_call
 ) -> None:
     raw = raw_text_events("answer", "sdk-1")
     injected = AssistantMessage(
-        [ToolUseBlock("sdk-a", "mcp__caller_tools_v1__echo", {"v": 1})],
+        [ToolUseBlock("sdk-a", "mcp__caller_tools__echo", {"v": 1})],
         "sonnet",
         session_id="sdk-1",
     )
@@ -1674,7 +1680,7 @@ async def test_text_compatibility_wrapper_fails_closed_on_native_tool_boundary(
     tmp_path: Path,
 ) -> None:
     messages = raw_tool_events(
-        (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+        (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
     )
     session, _ = make_tool_session(tmp_path, messages)
     await session.start()
@@ -1694,7 +1700,7 @@ async def test_sdk_session_rejects_callback_set_that_does_not_match_raw_calls(
     tmp_path: Path, callback_name: str, callback_arguments: dict[str, object]
 ) -> None:
     messages = raw_tool_events(
-        (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+        (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
     )
     session, client = make_tool_session(tmp_path, messages, start_tool_callbacks=False)
     await session.start()
@@ -1712,11 +1718,11 @@ async def test_callback_after_seal_cannot_join_the_next_tool_epoch(
 ) -> None:
     messages = (
         *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
         ),
         UserMessage([SdkToolResultBlock("sdk-a", "first", False)]),
         *raw_tool_events(
-            (("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),), "sdk-1"
+            (("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),), "sdk-1"
         ),
     )
     session, client = make_tool_session(tmp_path, messages)
@@ -1746,7 +1752,7 @@ def test_raw_tool_validator_empty_argument_delta(failure: str | None) -> None:
         definition = echo_definition(name="screenshot")
     validator = RawSdkMessageValidator((definition,))
     messages = list(
-        raw_tool_events((("sdk-a", "mcp__caller_tools_v1__screenshot", "{}"),), "sdk-1")
+        raw_tool_events((("sdk-a", "mcp__caller_tools__screenshot", "{}"),), "sdk-1")
     )
     delta = messages[2]
     assert isinstance(delta, StreamEvent)
@@ -1755,7 +1761,7 @@ def test_raw_tool_validator_empty_argument_delta(failure: str | None) -> None:
         assistant = messages[4]
         assert isinstance(assistant, AssistantMessage)
         assistant.content[0] = ToolUseBlock(
-            "sdk-a", "mcp__caller_tools_v1__screenshot", {"different": 1}
+            "sdk-a", "mcp__caller_tools__screenshot", {"different": 1}
         )
 
     def observe() -> None:
@@ -1777,7 +1783,7 @@ def test_raw_tool_validator_empty_argument_delta(failure: str | None) -> None:
 def test_raw_tool_validator_rejects_arguments_outside_caller_schema() -> None:
     validator = RawSdkMessageValidator((echo_definition(),))
     messages = raw_tool_events(
-        (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":"secret"}'),), "sdk-1"
+        (("sdk-a", "mcp__caller_tools__echo", '{"v":"secret"}'),), "sdk-1"
     )
 
     with pytest.raises(BackendFailure, match="protocol") as error:
@@ -1793,7 +1799,7 @@ def test_raw_tool_validator_rejects_arguments_outside_caller_schema() -> None:
 def test_raw_tool_validator_accepts_live_direct_caller_attribution() -> None:
     validator = RawSdkMessageValidator((echo_definition(),))
     messages = list(
-        raw_tool_events((("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1")
+        raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1")
     )
     start = messages[1]
     assert isinstance(start, StreamEvent)
@@ -1812,7 +1818,7 @@ def test_raw_tool_validator_accepts_live_direct_caller_attribution() -> None:
 def test_raw_tool_validator_rejects_missing_caller_attribution() -> None:
     validator = RawSdkMessageValidator((echo_definition(),))
     messages = list(
-        raw_tool_events((("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1")
+        raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1")
     )
     start = messages[1]
     assert isinstance(start, StreamEvent)
@@ -1827,7 +1833,7 @@ def test_raw_tool_validator_rejects_missing_caller_attribution() -> None:
 
 
 def test_raw_tool_validator_accepts_live_per_block_parallel_typed_messages() -> None:
-    sdk_name = "mcp__caller_tools_v1__echo"
+    sdk_name = "mcp__caller_tools__echo"
     validator = RawSdkMessageValidator((echo_definition(),))
     messages = list(
         raw_tool_events(
@@ -1871,7 +1877,7 @@ def test_raw_tool_validator_rejects_non_direct_caller_attribution(
 ) -> None:
     validator = RawSdkMessageValidator((echo_definition(),))
     messages = list(
-        raw_tool_events((("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1")
+        raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1")
     )
     start = messages[1]
     assert isinstance(start, StreamEvent)
@@ -1892,7 +1898,7 @@ async def test_deferred_handler_that_never_arrives_fails_closed_after_result(
     tmp_path: Path,
 ) -> None:
     messages = raw_tool_events(
-        (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+        (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
     )
     session, _ = make_tool_session(tmp_path, messages, start_tool_callbacks=False)
     await session.start()
@@ -1915,8 +1921,8 @@ async def test_missing_deferred_callback_rejects_arriving_terminal_boundary(
     messages = (
         *raw_tool_events(
             (
-                ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
-                ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),
+                ("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),
+                ("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),
             ),
             "sdk-1",
         ),
@@ -1964,8 +1970,8 @@ async def test_serial_deferred_callback_delivers_stored_result_before_final_text
     messages = (
         *raw_tool_events(
             (
-                ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
-                ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),
+                ("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),
+                ("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),
             ),
             "sdk-1",
         ),
@@ -2009,8 +2015,8 @@ async def test_same_loop_incoming_first_stays_fatal_after_exact_callback_complet
 ) -> None:
     raw_tools = raw_tool_events(
         (
-            ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
-            ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),
+            ("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),
+            ("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),
         ),
         "sdk-1",
     )
@@ -2073,8 +2079,8 @@ async def test_same_loop_callback_first_accepts_immediately_following_item(
 ) -> None:
     raw_tools = raw_tool_events(
         (
-            ("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),
-            ("sdk-b", "mcp__caller_tools_v1__echo", '{"v":2}'),
+            ("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),
+            ("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),
         ),
         "sdk-1",
     )
@@ -2140,7 +2146,7 @@ async def test_user_message_while_awaiting_submit_fails_closed(
 ) -> None:
     messages = (
         *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
         ),
         UserMessage([SdkToolResultBlock("sdk-a", "secret", False)]),
     )
@@ -2164,7 +2170,7 @@ async def test_user_message_after_complete_result_echo_fails_closed(
 ) -> None:
     messages = (
         *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
         ),
         UserMessage([SdkToolResultBlock("sdk-a", "one", False)]),
         UserMessage([SdkToolResultBlock("sdk-a", "secret-extra", False)]),
@@ -2192,7 +2198,7 @@ async def test_prefetched_user_message_keeps_awaiting_submit_phase(
     delivered = asyncio.Event()
     messages = (
         *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
         ),
         UserMessage([SdkToolResultBlock("sdk-a", "one", False)]),
         *raw_text_events("done", "sdk-1"),
@@ -2231,7 +2237,7 @@ async def test_prefetched_user_message_received_after_submit_is_accepted(
     delivered = asyncio.Event()
     messages = (
         *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools_v1__echo", '{"v":1}'),), "sdk-1"
+            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
         ),
         UserMessage([SdkToolResultBlock("sdk-a", "one", False)]),
         *raw_text_events("done", "sdk-1"),

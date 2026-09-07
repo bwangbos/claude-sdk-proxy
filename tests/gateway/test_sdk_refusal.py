@@ -55,9 +55,9 @@ def _init(
             "session_id": session_id,
             "uuid": "init-1",
             "model": "claude-opus-5",
-            "tools": ["mcp__caller_tools_v1__echo"] if tools_enabled else [],
+            "tools": ["mcp__caller_tools__echo"] if tools_enabled else [],
             "mcp_servers": (
-                [{"name": "caller_tools_v1", "status": "connected"}]
+                [{"name": "caller_tools", "status": "connected"}]
                 if tools_enabled
                 else []
             ),
@@ -388,7 +388,7 @@ async def test_sdk_session_rejects_raw_content_in_native_refusal(
         content_block = {
             "type": "tool_use",
             "id": "tool-private",
-            "name": "mcp__caller_tools_v1__echo",
+            "name": "mcp__caller_tools__echo",
             "input": {},
             "caller": {"type": "direct"},
         }

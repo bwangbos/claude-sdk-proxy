@@ -32,8 +32,8 @@ from claude_sdk_proxy.tool_contract import (
     validate_tool_arguments,
     validate_tool_definitions,
 )
+from claude_sdk_proxy.tool_namespace import SDK_TOOL_PREFIX
 
-_SDK_PREFIX = "mcp__caller_tools_v1__"
 _TEXT_STOP_REASONS = frozenset(
     {"end_turn", "max_tokens", "model_context_window_exceeded", "refusal"}
 )
@@ -636,9 +636,9 @@ class RawSdkMessageValidator:
         self._phase = "complete"
 
     def _public_name(self, sdk_name: str) -> str:
-        if not sdk_name.startswith(_SDK_PREFIX):
+        if not sdk_name.startswith(SDK_TOOL_PREFIX):
             fail_protocol()
-        public_name = sdk_name.removeprefix(_SDK_PREFIX)
+        public_name = sdk_name.removeprefix(SDK_TOOL_PREFIX)
         if public_name not in self._public_names:
             fail_protocol()
         return public_name
