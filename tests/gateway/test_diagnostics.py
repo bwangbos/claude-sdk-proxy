@@ -12,6 +12,64 @@ from tests.gateway.fakes import FakeSessionFactory
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("watcher", [False, True])
+async def test_tool_continuation_backend_logs_use_current_request_id(caplog, watcher):
+    import asyncio
+
+    from claude_sdk_proxy.diagnostics import record
+    from claude_sdk_proxy.domain import ModelFallbackDisabled
+    from tests.gateway.test_tool_http import RepeatedRoundSession, tool_body
+
+    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+
+    class FailingContinuation(RepeatedRoundSession):
+        async def stream_generation(self, prompt):
+            for event in self.boundary:
+                yield event
+            await self._resume.wait()
+            if watcher:
+                await asyncio.Event().wait()
+            record("model_fallback_blocked", fallback_model="claude-opus-4-8")
+            raise ModelFallbackDisabled()
+
+        async def wait_failure(self):
+            if not watcher:
+                await asyncio.Event().wait()
+            await self._resume.wait()
+            raise ModelFallbackDisabled()
+
+    backend = FailingContinuation(())
+    app = create_app(models=("sonnet",), session_factory=lambda *a, **k: backend)
+    body = tool_body("openai")
+    async with lifespan_app(app):
+        first = await post_json(app, "/v1/chat/completions", body)
+        assistant = first.json["choices"][0]["message"]
+        second = await post_json(
+            app,
+            "/v1/chat/completions",
+            {
+                **body,
+                "messages": [
+                    *body["messages"],
+                    assistant,
+                    {"role": "tool", "tool_call_id": "call_one", "content": "ok"},
+                ],
+            },
+        )
+    assert first.status == 200
+    assert second.status == 502
+    assert first.headers["x-request-id"] != second.headers["x-request-id"]
+    records = [
+        r.msg
+        for r in caplog.records
+        if isinstance(r.msg, dict)
+        and r.msg.get("event") in {"model_fallback_blocked", "backend_failure"}
+    ]
+    assert records
+    assert all(r["request_id"] == second.headers["x-request-id"] for r in records)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("stream", [False, True])
 async def test_request_ids_cover_validation_errors_and_success(stream):
     app = create_app(models=("sonnet",), session_factory=FakeSessionFactory(("hello",)))

@@ -8,7 +8,11 @@ from typing import Any
 from starlette.responses import JSONResponse
 
 from claude_sdk_proxy.diagnostics import record
-from claude_sdk_proxy.domain import RequestValidationError, UnsupportedFeature
+from claude_sdk_proxy.domain import (
+    ModelFallbackDisabled,
+    RequestValidationError,
+    UnsupportedFeature,
+)
 from claude_sdk_proxy.session_turn import (
     SessionCapacity,
     SessionConflict,
@@ -105,6 +109,10 @@ def _session_error(error: SessionMismatch | SessionConflict) -> ErrorDetail:
 
 
 def error_detail(error: Exception) -> ErrorDetail:
+    if isinstance(error, ModelFallbackDisabled):
+        return ErrorDetail(
+            502, "backend_error", str(error), "model", "model_fallback_disabled"
+        )
     if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
         return ErrorDetail(400, "invalid_request", "Invalid request", "body")
     if isinstance(error, UnsupportedFeature):

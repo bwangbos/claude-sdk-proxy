@@ -947,7 +947,10 @@ async def test_tool_session_exposes_only_generated_caller_tools(
         assert client.options.cwd == tmp_path
         assert client.options.include_partial_messages is True
         assert client.options.settings is None
-        assert client.options.env == {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+        assert client.options.env == {
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
+        }
         assert client.options.extra_args == {
             "restricted": None,
             "disable-slash-commands": None,

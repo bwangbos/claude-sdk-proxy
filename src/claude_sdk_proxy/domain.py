@@ -415,6 +415,15 @@ class BackendFailure(RuntimeError):
     pass
 
 
+class ModelFallbackDisabled(BackendFailure):
+    """The SDK attempted a model switch despite the strict-model policy."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Automatic model fallback is disabled; no replacement answer was accepted"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class CapabilityReport:
     backend: str

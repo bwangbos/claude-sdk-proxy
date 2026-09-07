@@ -422,6 +422,23 @@ such as `charset=utf-8` are accepted.
 `GET /v1/models` lists that allowlist, not every model available to your Claude
 account. There is no automatic model fallback.
 
+The proxy disables the SDK's classifier-triggered model downgrade for every
+session using `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`. This is distinct from the
+SDK's `fallback_model` option for overload/unavailability. A supported native
+refusal ends as `refusal` (Anthropic) or `content_filter` (OpenAI), not a retry on
+another model. The recognized named categories include `cyber`, `bio`,
+`frontier_llm`, `general_harms`, and `reasoning_extraction`.
+
+If the runtime nevertheless emits a model-switch notice, the proxy stops that
+generation without accepting the replacement answer. JSON responses report
+HTTP 502 with `reason: "model_fallback_disabled"`; an already-started stream
+reports an explicit fallback-disabled error. This is a policy enforcement
+failure, not a completed refusal, and must not be scored as an answer from the
+requested model. There is no mixed-model opt-in in this release. Response
+`model` still names the requested alias; it is not an exact-version attestation.
+See the [verification notes](docs/research/2026-09-07-refusal-model-fidelity.md)
+for evidence and live-verification limitations.
+
 | Setting | OpenAI Chat Completions | Anthropic Messages |
 | --- | --- | --- |
 | Thinking off | Omit `reasoning_effort`, use `null`, or use `"none"` | Omit `thinking`, use `null`, or use `{"type":"disabled"}`; omit effort |
@@ -619,7 +636,11 @@ uv run claude-proxy --model sonnet --log proxy.jsonl --log-json
 `--log PATH` appends readable metadata by default; add `--log-json` for JSON lines.
 `--log-json` alone writes to stderr. Logs contain request IDs, hashed session
 references, selection/rebase/replay decisions, safe rejection reasons, and HTTP
-status—not prompts, tool arguments/results, credentials, or raw session keys.
+status. Backend failures also record the stage, exception class, allowlisted
+reason, and proxy code locations before exception redaction. A blocked fallback
+records the original and proposed replacement model IDs. Logs do not include
+prompts, tool arguments/results, credentials, raw session keys, upstream refusal
+explanations, exception text, or traceback locals.
 New log files are created with owner-only permissions. Logs are not rotated;
 choose a suitable path and retention policy. Include the request ID and relevant
 diagnostic lines when reporting a failure.

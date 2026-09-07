@@ -22,6 +22,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import ThinkingConfig
 
+from claude_sdk_proxy.diagnostics import record, record_backend_failure
 from claude_sdk_proxy.domain import (
     BackendFailure,
     CanonicalMessage,
@@ -29,6 +30,7 @@ from claude_sdk_proxy.domain import (
     ConversationEvent,
     Dialect,
     ImagePrompt,
+    ModelFallbackDisabled,
     Prompt,
     ToolCall,
     ToolDefinition,
@@ -43,6 +45,7 @@ from claude_sdk_proxy.images import (
 )
 from claude_sdk_proxy.sdk_history import seed_history
 from claude_sdk_proxy.sdk_metadata import (
+    validate_fallback_notice,
     validate_rate_limit_event,
     validate_refusal_notice,
     validate_system_message,
@@ -165,6 +168,7 @@ class SdkSession:
                 pass
             if isinstance(error, asyncio.CancelledError):
                 raise
+            record_backend_failure(error, "sdk_start")
             raise BackendFailure("Agent SDK query failed") from None
 
     async def _client_options(
@@ -225,7 +229,12 @@ class SdkSession:
             stderr=_discard_stderr,
             # Tool-result envelopes can contain the image data twice.
             max_buffer_size=40 * 1024 * 1024,
-            env={"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"},
+            env={
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+                # Refusals must not silently change the requested model.
+                # fallback_model controls overload, not classifier fallback.
+                "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
+            },
             extra_args={
                 "restricted": None,
                 "disable-slash-commands": None,
@@ -418,6 +427,17 @@ class SdkSession:
                         self._validate_result(message, terminal_boundary.stop_reason)
                         completed = terminal_boundary
                 elif type(message) is SystemMessage:
+                    if message.subtype == "model_refusal_fallback":
+                        session_id, original_model, fallback_model = (
+                            validate_fallback_notice(message)
+                        )
+                        self._observe_session_id(session_id)
+                        record(
+                            "model_fallback_blocked",
+                            original_model=original_model,
+                            fallback_model=fallback_model,
+                        )
+                        raise ModelFallbackDisabled()
                     if self._awaiting_submit or (
                         self._awaiting_echo and message.subtype != "status"
                     ):
@@ -455,19 +475,21 @@ class SdkSession:
                     self._observe_result_echo(message)
                 else:
                     self._fail_protocol()
-        except BackendFailure:
+            if failure is not None:
+                raise BackendFailure(failure)
+            if completed is None:
+                raise BackendFailure("Agent SDK stream ended without result")
+        except BackendFailure as error:
+            record_backend_failure(error, "sdk_generation")
             raise
-        except Exception:
+        except Exception as error:
+            record_backend_failure(error, "sdk_generation")
             raise BackendFailure("Agent SDK query failed") from None
         finally:
             if prefetched is not None:
                 if not prefetched.done():
                     prefetched.cancel()
                 await asyncio.gather(prefetched, return_exceptions=True)
-        if failure is not None:
-            raise BackendFailure(failure)
-        if completed is None:
-            raise BackendFailure("Agent SDK stream ended without result")
         yield completed
 
     async def submit_tool_results(self, results: Iterable[ToolResultBlock]) -> None:

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import traceback
 import uuid
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -14,12 +15,49 @@ from typing import Any, cast
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from claude_sdk_proxy.domain import ModelFallbackDisabled
+
 _request_id: ContextVar[str | None] = ContextVar("proxy_request_id", default=None)
 logger = logging.getLogger("claude_sdk_proxy.diagnostics")
 
 
+def current_request_id() -> str | None:
+    return _request_id.get()
+
+
+def bind_task_request_id(identifier: str | None) -> None:
+    """Refresh a dedicated actor task's context when its HTTP owner changes."""
+    _request_id.set(identifier)
+
+
 def record(event: str, **fields: str | int | bool | None) -> None:
     logger.info({"event": event, "request_id": _request_id.get(), **fields})
+
+
+def record_backend_failure(error: BaseException, stage: str) -> None:
+    """Record code locations and allowlisted reasons, never exception text/locals."""
+    reason = {
+        "Agent SDK protocol failure": "sdk_protocol_failure",
+        "Agent SDK query failed": "sdk_query_failed",
+        "Agent SDK stream ended without result": "sdk_missing_result",
+        "Agent SDK message after result": "sdk_message_after_result",
+        "SDK tool bridge closed": "tool_bridge_closed",
+    }.get(str(error), "backend_failure")
+    if isinstance(error, ModelFallbackDisabled):
+        reason = "model_fallback_disabled"
+    frames = traceback.extract_tb(error.__traceback__)
+    location = " > ".join(
+        f"{os.path.basename(frame.filename)}:{frame.name}:{frame.lineno}"
+        for frame in frames
+        if "/claude_sdk_proxy/" in frame.filename
+    )
+    record(
+        "backend_failure",
+        stage=stage,
+        reason=reason,
+        error_type=type(error).__name__,
+        location=location,
+    )
 
 
 def session_reference(identifier: str) -> str:

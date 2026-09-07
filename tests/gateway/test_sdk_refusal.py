@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -44,9 +45,7 @@ RAW_USAGE = {
 SYNTHETIC_DIAGNOSTIC = "private synthetic refusal diagnostic"
 
 
-def _init(
-    *, session_id: str = "sdk-1", tools_enabled: bool = False
-) -> SystemMessage:
+def _init(*, session_id: str = "sdk-1", tools_enabled: bool = False) -> SystemMessage:
     return SystemMessage(
         "init",
         {
@@ -89,9 +88,7 @@ def _raw_start(*, session_id: str = "sdk-1") -> StreamEvent:
     )
 
 
-def _notice(
-    *, session_id: str = "sdk-1", **changes: object
-) -> SystemMessage:
+def _notice(*, session_id: str = "sdk-1", **changes: object) -> SystemMessage:
     data: dict[str, object] = {
         "type": "system",
         "subtype": "model_refusal_no_fallback",
@@ -221,6 +218,153 @@ async def _collect_sdk_refusal(
         return [event async for event in session.stream_generation("prompt")]
     finally:
         await session.close()
+
+
+@pytest.mark.anyio
+async def test_sdk_session_disables_automatic_refusal_downgrade(tmp_path: Path) -> None:
+    client = FakeSdkClient(())
+    session = SdkSession(
+        "opus",
+        "",
+        directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+        client_factory=client.capture_options,
+    )
+    await session.start()
+    try:
+        assert client.options is not None
+        assert client.options.env["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"] == "1"
+    finally:
+        await session.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("category", ["cyber", "bio", "frontier_llm", "general_harms"])
+async def test_sdk_session_returns_classifier_refusal_without_downgrade(
+    tmp_path: Path,
+    category: str,
+) -> None:
+    messages = list(refusal_response())
+    messages[2] = _notice(api_refusal_category=category)
+    messages[4] = _raw_delta(
+        details={
+            "type": "refusal",
+            "category": category,
+            "explanation": "private classifier explanation",
+            "fallback_has_prefill_claim": False,
+        }
+    )
+    assert await _collect_sdk_refusal(tmp_path, tuple(messages)) == [
+        InputUsage(24, 948, 43),
+        Completed("refusal", RAW_USAGE),
+    ]
+
+
+@pytest.mark.anyio
+async def test_unexpected_sdk_fallback_is_explicit_and_never_publishes_replacement(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from claude_sdk_proxy.http_errors import error_detail
+    from claude_sdk_proxy.tool_session_actor import _redact_backend
+
+    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    data = {
+        **_notice(api_refusal_category="cyber").data,
+        "subtype": "model_refusal_fallback",
+        "trigger": "refusal",
+        "direction": "retry",
+        "scope": "session",
+        "fallback_model": "claude-opus-4-8",
+        "retracted_message_uuids": [],
+    }
+    messages = (
+        _init(),
+        _raw_start(),
+        SystemMessage("model_refusal_fallback", data),
+        *sdk_response("must not publish downgraded answer", "sdk-1"),
+    )
+    with pytest.raises(BackendFailure) as caught:
+        await _collect_sdk_refusal(tmp_path, messages)
+    detail = error_detail(_redact_backend(caught.value))
+    assert detail.reason == "model_fallback_disabled"
+    assert "fallback" in detail.message.lower()
+    records = [r.msg for r in caplog.records if isinstance(r.msg, dict)]
+    assert any(
+        r.get("event") == "model_fallback_blocked"
+        and r.get("fallback_model") == "claude-opus-4-8"
+        for r in records
+    )
+    assert "private" not in str(records)
+
+
+@pytest.mark.anyio
+async def test_protocol_failure_logs_location_without_sdk_payload(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    with pytest.raises(BackendFailure):
+        await _collect_sdk_refusal(tmp_path, (_notice(content="SECRET_PAYLOAD"),))
+    records = [r.msg for r in caplog.records if isinstance(r.msg, dict)]
+    failures = [r for r in records if r.get("event") == "backend_failure"]
+    assert failures
+    assert failures[0]["reason"] == "sdk_protocol_failure"
+    assert "sdk_session.py" in failures[0]["location"]
+    assert "SECRET_PAYLOAD" not in str(records)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("dialect", ["openai", "anthropic"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_http_fallback_failure_is_explicit_and_correlated(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    dialect: str,
+    stream: bool,
+) -> None:
+    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    notice = SystemMessage(
+        "model_refusal_fallback",
+        {
+            **_notice(api_refusal_category="cyber").data,
+            "subtype": "model_refusal_fallback",
+            "trigger": "refusal",
+            "direction": "retry",
+            "scope": "session",
+            "fallback_model": "claude-opus-4-8",
+            "retracted_message_uuids": [],
+        },
+    )
+    client = FakeSdkClient(((_init(), _raw_start(), notice),))
+
+    def factory(*args: Any, **kwargs: Any) -> SdkSession:
+        return SdkSession(
+            *args,
+            **kwargs,
+            directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+            client_factory=client.capture_options,
+        )
+
+    app = create_app(models=("sonnet",), session_factory=factory)
+    endpoint = "/v1/messages" if dialect == "anthropic" else "/v1/chat/completions"
+    async with lifespan_app(app):
+        response = await post_json(
+            app,
+            endpoint,
+            _http_body(dialect, [{"role": "user", "content": "hello"}], stream),
+        )
+    assert b"Automatic model fallback is disabled" in response.body
+    if not stream:
+        assert response.status == 502
+        assert response.json["error"]["reason"] == "model_fallback_disabled"
+    assert client.disconnected
+    records = [r.msg for r in caplog.records if isinstance(r.msg, dict)]
+    assert any(
+        r.get("event") == "model_fallback_blocked"
+        and r.get("request_id") == response.headers["x-request-id"]
+        for r in records
+    )
+    assert "private" not in str(records)
 
 
 @pytest.mark.anyio
@@ -430,14 +574,46 @@ async def test_ordinary_sdk_error_result_remains_a_failure(tmp_path: Path) -> No
         await _collect_sdk_refusal(tmp_path, messages)
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("missing_result", [False, True])
+async def test_terminal_sdk_failure_is_logged_before_redaction(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    missing_result: bool,
+) -> None:
+    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    messages = tuple(raw_text_events("answer", "sdk-1"))
+    if not missing_result:
+        messages += (_result(stop_reason="end_turn", terminal_reason="api_error"),)
+    with pytest.raises(BackendFailure):
+        await _collect_sdk_refusal(tmp_path, messages)
+    reason = "sdk_missing_result" if missing_result else "sdk_query_failed"
+    assert any(
+        isinstance(r.msg, dict)
+        and r.msg.get("stage") == "sdk_generation"
+        and r.msg.get("reason") == reason
+        for r in caplog.records
+    )
+
+
 class _HttpRefusalFactory:
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, category: str = "reasoning_extraction") -> None:
+        refusal = list(refusal_response())
+        refusal[2] = _notice(api_refusal_category=category)
+        refusal[4] = _raw_delta(
+            details={
+                "type": "refusal",
+                "category": category,
+                "explanation": "private classifier explanation",
+                "fallback_has_prefill_claim": False,
+            }
+        )
         self._clients: Iterator[FakeSdkClient] = iter(
             (
                 FakeSdkClient(
                     (
                         sdk_response("prior answer", "sdk-1"),
-                        refusal_response(),
+                        tuple(refusal),
                     )
                 ),
                 FakeSdkClient((sdk_response("recovered", "sdk-2"),)),
@@ -525,10 +701,14 @@ def _assert_http_refusal(dialect: str, stream: bool, response: Any) -> None:
 @pytest.mark.anyio
 @pytest.mark.parametrize("dialect", ["openai", "anthropic"])
 @pytest.mark.parametrize("stream", [False, True], ids=["json", "sse"])
+@pytest.mark.parametrize("category", ["reasoning_extraction", "cyber"])
 async def test_http_refusal_replays_and_can_recover_earlier_history(
-    tmp_path: Path, dialect: str, stream: bool
+    tmp_path: Path,
+    dialect: str,
+    stream: bool,
+    category: str,
 ) -> None:
-    factory = _HttpRefusalFactory(tmp_path)
+    factory = _HttpRefusalFactory(tmp_path, category)
     app = create_app(models=("sonnet",), session_factory=factory)
     path = "/v1/messages" if dialect == "anthropic" else "/v1/chat/completions"
     first_messages = [{"role": "user", "content": "first"}]

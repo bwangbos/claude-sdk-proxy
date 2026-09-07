@@ -5,6 +5,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+from claude_sdk_proxy.diagnostics import (
+    bind_task_request_id,
+    current_request_id,
+    record_backend_failure,
+)
 from claude_sdk_proxy.domain import (
     BackendFailure,
     CanonicalBlock,
@@ -12,6 +17,7 @@ from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     InputUsage,
+    ModelFallbackDisabled,
     Prompt,
     SdkSessionProtocol,
     TextBlock,
@@ -51,6 +57,7 @@ type StreamItem = ConversationEvent | StreamFailure | object
 class ToolResponse:
     request: TextRequest
     fingerprint: str
+    request_id: str | None = field(default_factory=current_request_id)
     queue: asyncio.Queue[StreamItem] = field(default_factory=asyncio.Queue)
     durable: bool = False
     detached: bool = False
@@ -194,6 +201,8 @@ class ToolSessionActor:
             events: list[ConversationEvent] = []
             tool_suffix_started = False
             while True:
+                if self._current is not None:
+                    bind_task_request_id(self._current.request_id)
                 event = await self._next_event(stream)
                 events.append(event)
                 response = self._current
@@ -223,6 +232,8 @@ class ToolSessionActor:
         except TimeoutError:
             await self._fail(SessionTimeout("SDK turn timed out"))
         except BaseException as error:
+            if self._current is not None:
+                bind_task_request_id(self._current.request_id)
             await self._fail(_redact_backend(error))
 
     async def _next_event(
@@ -337,6 +348,8 @@ class ToolSessionActor:
         except asyncio.CancelledError:
             return
         except BaseException as error:
+            if self._current is not None:
+                bind_task_request_id(self._current.request_id)
             await self._fail(_redact_backend(error))
         else:
             await self._fail(BackendFailure("Agent SDK query failed"))
@@ -431,6 +444,9 @@ def _assistant_message(events: tuple[ConversationEvent, ...]) -> CanonicalMessag
 
 
 def _redact_backend(error: BaseException) -> BaseException:
+    record_backend_failure(error, "tool_session")
+    if isinstance(error, ModelFallbackDisabled):
+        return error
     if isinstance(error, SessionTimeout):
         return error
     return BackendFailure("Agent SDK query failed")

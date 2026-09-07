@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from typing import Never
 
@@ -16,6 +17,13 @@ _RATE_LIMIT_TYPES = {
     "seven_day_opus",
     "seven_day_sonnet",
     "overage",
+}
+_REFUSAL_CATEGORIES = {
+    "cyber",
+    "bio",
+    "frontier_llm",
+    "reasoning_extraction",
+    "general_harms",
 }
 
 
@@ -88,7 +96,8 @@ def validate_refusal_notice(message: SystemMessage) -> tuple[str, str]:
         or set(data) != keys
         or data.get("type") != "system"
         or data.get("subtype") != message.subtype
-        or data.get("api_refusal_category") != "reasoning_extraction"
+        or not isinstance(data.get("api_refusal_category"), str)
+        or data["api_refusal_category"] not in _REFUSAL_CATEGORIES
         or not isinstance(data.get("api_refusal_explanation"), str)
         or not data["api_refusal_explanation"]
         or any(
@@ -103,6 +112,38 @@ def validate_refusal_notice(message: SystemMessage) -> tuple[str, str]:
     ):
         _fail()
     return data["session_id"], data["api_refusal_category"]
+
+
+def validate_fallback_notice(message: SystemMessage) -> tuple[str, str, str]:
+    """Recognize the SDK switch notice so strict policy can reject it explicitly."""
+    data = message.data
+    if (
+        not isinstance(data, Mapping)
+        or message.subtype != "model_refusal_fallback"
+        or data.get("type") != "system"
+        or data.get("subtype") != message.subtype
+        or data.get("trigger") != "refusal"
+        or data.get("direction") != "retry"
+        or data.get("scope") != "session"
+        or any(
+            not _identifier(data.get(key))
+            for key in (
+                "uuid",
+                "session_id",
+                "request_id",
+                "refused_user_message_uuid",
+            )
+        )
+        or any(
+            not isinstance(data.get(key), str)
+            or re.fullmatch(r"[a-zA-Z0-9._:-]{1,128}", data[key]) is None
+            for key in ("original_model", "fallback_model")
+        )
+        or not isinstance(data.get("retracted_message_uuids"), list)
+        or not all(_identifier(value) for value in data["retracted_message_uuids"])
+    ):
+        _fail()
+    return data["session_id"], data["original_model"], data["fallback_model"]
 
 
 def validate_rate_limit_event(message: RateLimitEvent) -> object:
