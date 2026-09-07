@@ -35,6 +35,7 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
     InputUsage,
+    ResponseIdentity,
     TextDelta,
     ToolCall,
     ToolDefinition,
@@ -61,7 +62,7 @@ async def test_sdk_session_reuses_one_client_for_two_turns(tmp_path: Path) -> No
         )
     )
     session = SdkSession(
-        model="sonnet",
+        model="claude-sonnet-5",
         system="system",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=lambda options: client.capture_options(options),
@@ -73,11 +74,13 @@ async def test_sdk_session_reuses_one_client_for_two_turns(tmp_path: Path) -> No
     await session.close()
 
     assert first == [
+        ResponseIdentity("sonnet-5", "sonnet-5", False),
         InputUsage(2),
         TextDelta("one"),
         Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
     ]
     assert second == [
+        ResponseIdentity("sonnet-5", "sonnet-5", False),
         InputUsage(2),
         TextDelta("two"),
         Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
@@ -93,7 +96,7 @@ async def test_sdk_session_excludes_safe_mode_from_restricted_options(
 ) -> None:
     client = FakeSdkClient(responses=(sdk_response("one", session_id="sdk-1"),))
     session = SdkSession(
-        model="sonnet",
+        model="claude-sonnet-5",
         system="system",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=lambda options: client.capture_options(options),
@@ -120,7 +123,7 @@ async def test_sdk_session_resumes_seeded_history_without_prompt_encoding(
         CanonicalMessage.assistant_text("old answer"),
     )
     session = SdkSession(
-        model="sonnet",
+        model="claude-sonnet-5",
         system="system",
         history=history,
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
@@ -168,13 +171,13 @@ async def test_sdk_session_rejects_built_in_tool_output(tmp_path: Path) -> None:
             (
                 AssistantMessage(
                     content=[ToolUseBlock(id="tool-1", name="Bash", input={})],
-                    model="sonnet",
+                    model="claude-sonnet-5",
                 ),
             ),
         )
     )
     session = SdkSession(
-        model="sonnet",
+        model="claude-sonnet-5",
         system="system",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=lambda options: client.capture_options(options),
@@ -219,7 +222,7 @@ async def test_sdk_session_rejects_raw_tool_blocks_before_completed(
         )
     )
     session = SdkSession(
-        model="sonnet",
+        model="claude-sonnet-5",
         system="system",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=lambda options: client.capture_options(options),
@@ -251,7 +254,7 @@ async def test_sdk_session_rejects_complete_tool_blocks_before_completed(
     client = FakeSdkClient(
         responses=(
             (
-                AssistantMessage(content=[block], model="sonnet"),
+                AssistantMessage(content=[block], model="claude-sonnet-5"),
                 ResultMessage(
                     subtype="success",
                     duration_ms=0,
@@ -266,7 +269,7 @@ async def test_sdk_session_rejects_complete_tool_blocks_before_completed(
         )
     )
     session = SdkSession(
-        model="sonnet",
+        model="claude-sonnet-5",
         system="system",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=lambda options: client.capture_options(options),
@@ -289,7 +292,7 @@ async def test_sdk_session_does_not_restart_after_close(tmp_path: Path) -> None:
         return client.capture_options(options)  # type: ignore[arg-type]
 
     session = SdkSession(
-        model="sonnet",
+        model="claude-sonnet-5",
         system="system",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=client_factory,
@@ -339,7 +342,7 @@ async def collect_sdk_response(
 ) -> list[object]:
     client = FakeSdkClient(responses=(messages,))
     session = SdkSession(
-        model="sonnet",
+        model="claude-sonnet-5",
         system="system",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=lambda options: client.capture_options(options),
@@ -360,6 +363,7 @@ async def test_sdk_session_accepts_only_complete_ordered_raw_text_sequence(
     events = await collect_sdk_response(tmp_path, messages)
 
     assert events == [
+        ResponseIdentity("sonnet-5", "sonnet-5", False),
         InputUsage(2),
         TextDelta("answer"),
         Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
@@ -371,12 +375,15 @@ async def test_sdk_session_accepts_observed_complete_assistant_placement(
     tmp_path: Path,
 ) -> None:
     raw = raw_text_events("answer", "sdk-1")
-    assistant = AssistantMessage([TextBlock("answer")], "sonnet", session_id="sdk-1")
+    assistant = AssistantMessage(
+        [TextBlock("answer")], "claude-sonnet-5", session_id="sdk-1"
+    )
     messages = (*raw[:3], assistant, *raw[3:], result_message())
 
     events = await collect_sdk_response(tmp_path, messages)
 
     assert events == [
+        ResponseIdentity("sonnet-5", "sonnet-5", False),
         InputUsage(2),
         TextDelta("answer"),
         Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
@@ -389,7 +396,7 @@ async def test_text_session_accepts_typed_text_split_across_blocks(
 ) -> None:
     raw = raw_text_events("answer", "sdk-1")
     assistant = AssistantMessage(
-        [TextBlock("ans"), TextBlock("wer")], "sonnet", session_id="sdk-1"
+        [TextBlock("ans"), TextBlock("wer")], "claude-sonnet-5", session_id="sdk-1"
     )
 
     events = await collect_sdk_response(
@@ -397,6 +404,7 @@ async def test_text_session_accepts_typed_text_split_across_blocks(
     )
 
     assert events == [
+        ResponseIdentity("sonnet-5", "sonnet-5", False),
         InputUsage(2),
         TextDelta("answer"),
         Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
@@ -432,7 +440,7 @@ async def test_text_session_accepts_sequential_raw_text_blocks(tmp_path: Path) -
         ),
         AssistantMessage(
             [TextBlock("one"), TextBlock("two")],
-            "sonnet",
+            "claude-sonnet-5",
             session_id="sdk-1",
         ),
     )
@@ -451,7 +459,9 @@ async def test_sdk_session_rejects_text_delta_after_complete_assistant_message(
     tmp_path: Path,
 ) -> None:
     raw = raw_text_events("a", "sdk-1")
-    assistant = AssistantMessage([TextBlock("a")], "sonnet", session_id="sdk-1")
+    assistant = AssistantMessage(
+        [TextBlock("a")], "claude-sonnet-5", session_id="sdk-1"
+    )
     late_delta = StreamEvent(
         uuid="event-late-delta",
         session_id="sdk-1",
@@ -507,7 +517,7 @@ async def test_sdk_session_rejects_raw_text_delta_before_block_start(
 async def test_sdk_session_requires_every_assistant_block_to_be_exact_text(
     tmp_path: Path, content: object
 ) -> None:
-    assistant = AssistantMessage(content, "sonnet")  # type: ignore[arg-type]
+    assistant = AssistantMessage(content, "claude-sonnet-5")  # type: ignore[arg-type]
 
     with pytest.raises(BackendFailure, match="protocol") as error:
         await collect_sdk_response(tmp_path, (assistant, result_message()))
@@ -605,7 +615,7 @@ async def test_sdk_session_rejects_parent_attributed_complete_message(
 ) -> None:
     message = AssistantMessage(
         [TextBlock("answer")],
-        "sonnet",
+        "claude-sonnet-5",
         parent_tool_use_id="tool-secret",
         session_id="sdk-1",
     )
@@ -657,6 +667,7 @@ async def test_sdk_session_normalizes_only_gateway_usage_counters(
         ),
     )
     assert events == [
+        ResponseIdentity("sonnet-5", "sonnet-5", False),
         InputUsage(2),
         TextDelta("answer"),
         Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
@@ -676,6 +687,7 @@ async def test_sdk_session_emits_message_start_input_usage_before_text(
         ),
     )
     assert events == [
+        ResponseIdentity("sonnet-5", "sonnet-5", False),
         InputUsage(7),
         TextDelta("answer"),
         Completed("end_turn", {"input_tokens": 7, "output_tokens": 1}),
@@ -693,7 +705,10 @@ async def test_sdk_session_rejects_malformed_message_start_usage(
     start = StreamEvent(
         uuid="event-start",
         session_id="sdk-1",
-        event={"type": "message_start", "message": {"usage": usage}},
+        event={
+            "type": "message_start",
+            "message": {"model": "claude-sonnet-5", "usage": usage},
+        },
     )
     with pytest.raises(BackendFailure, match="protocol") as error:
         await collect_sdk_response(
@@ -711,7 +726,7 @@ async def test_sdk_session_keeps_boundary_usage_when_aggregate_usage_differs(
         session_id="sdk-1",
         event={
             "type": "message_start",
-            "message": {"usage": {"input_tokens": 7}},
+            "message": {"model": "claude-sonnet-5", "usage": {"input_tokens": 7}},
         },
     )
     events = await collect_sdk_response(
@@ -737,7 +752,7 @@ async def test_sdk_session_requires_same_identity_across_turns(tmp_path: Path) -
         )
     )
     session = SdkSession(
-        "sonnet",
+        "claude-sonnet-5",
         "system",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=lambda options: client.capture_options(options),
@@ -815,6 +830,7 @@ async def test_sdk_session_allows_live_system_and_rate_messages(tmp_path: Path) 
         ),
     )
     assert events == [
+        ResponseIdentity("sonnet-5", "sonnet-5", False),
         InputUsage(2),
         TextDelta("answer"),
         Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
@@ -901,7 +917,7 @@ def make_tool_session(
         before_message_actions=before_message_actions,
     )
     session = SdkSession(
-        "sonnet",
+        "claude-sonnet-5",
         system,
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=lambda options: client.capture_options(options),
@@ -968,7 +984,7 @@ async def test_text_session_keeps_empty_tool_configuration_and_large_buffer(
 ) -> None:
     client = FakeSdkClient(responses=(sdk_response("done", "sdk-1"),))
     session = SdkSession(
-        "sonnet",
+        "claude-sonnet-5",
         "system",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=lambda options: client.capture_options(options),
@@ -1013,19 +1029,21 @@ async def test_unversioned_tool_namespace_routes_callback_result_and_final_text(
     generation = session.stream_generation("caller-final-text")
     try:
         boundary = await next_boundary(generation)
-        assert boundary[0] == InputUsage(3)
-        assert isinstance(boundary[1], ToolCall)
-        call = boundary[1]
+        assert boundary[0] == ResponseIdentity("sonnet-5", "sonnet-5", False)
+        assert boundary[1] == InputUsage(3)
+        assert isinstance(boundary[2], ToolCall)
+        call = boundary[2]
         assert call.name == "echo"
         assert dict(call.arguments) == {"v": 1}
         assert not call.id.startswith("sdk-tool")
-        assert boundary[2] == Completed(
+        assert boundary[3] == Completed(
             "tool_use", {"input_tokens": 3, "output_tokens": 2}
         )
 
         await session.submit_tool_results((ToolResultBlock(call.id, ("one",), False),))
         final = await next_boundary(generation)
         assert final == [
+            ResponseIdentity("sonnet-5", "sonnet-5", False),
             InputUsage(7),
             TextDelta("done"),
             Completed("end_turn", {"input_tokens": 7, "output_tokens": 4}),
@@ -1480,7 +1498,11 @@ async def test_tool_boundary_preserves_text_before_publication_order(
     generation = session.stream_generation("go")
     try:
         boundary = await next_boundary(generation)
-        assert boundary[0:2] == [InputUsage(3), TextDelta("calling: ")]
+        assert boundary[:3] == [
+            ResponseIdentity("sonnet-5", "sonnet-5", False),
+            InputUsage(3),
+            TextDelta("calling: "),
+        ]
         calls = [event for event in boundary if isinstance(event, ToolCall)]
         assert [dict(call.arguments) for call in calls] == [{"v": 1}, {"v": 2}]
         await session.submit_tool_results(
@@ -1538,6 +1560,7 @@ async def test_stream_generation_supports_two_native_tool_rounds(
             (ToolResultBlock(second_call.id, ("second",), False),)
         )
         assert await next_boundary(generation) == [
+            ResponseIdentity("sonnet-5", "sonnet-5", False),
             InputUsage(9),
             TextDelta("done"),
             Completed("end_turn", {"input_tokens": 9, "output_tokens": 4}),
@@ -1665,7 +1688,7 @@ async def test_sdk_session_rejects_handler_publication_without_matching_raw_call
     raw = raw_text_events("answer", "sdk-1")
     injected = AssistantMessage(
         [ToolUseBlock("sdk-a", "mcp__caller_tools__echo", {"v": 1})],
-        "sonnet",
+        "claude-sonnet-5",
         session_id="sdk-1",
     )
     messages = (*raw[:3], injected, *raw[3:], result_message())
@@ -1854,7 +1877,9 @@ def test_raw_tool_validator_accepts_live_per_block_parallel_typed_messages() -> 
         )
         messages.insert(
             stop,
-            AssistantMessage([ToolUseBlock(internal_id, sdk_name, {"v": 1})], "sonnet"),
+            AssistantMessage(
+                [ToolUseBlock(internal_id, sdk_name, {"v": 1})], "claude-sonnet-5"
+            ),
         )
 
     for message in messages:
@@ -1998,6 +2023,7 @@ async def test_serial_deferred_callback_delivers_stored_result_before_final_text
         )
         client.start_tool_callback("echo", {"v": 2}, internal_id="sdk-b")
         assert await next_boundary(generation) == [
+            ResponseIdentity("sonnet-5", "sonnet-5", False),
             InputUsage(2),
             TextDelta("done"),
             Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
@@ -2131,6 +2157,7 @@ async def test_same_loop_callback_first_accepts_immediately_following_item(
         await callback_completed.wait()
         release_next_item.set()
         assert await final_task == [
+            ResponseIdentity("sonnet-5", "sonnet-5", False),
             InputUsage(2),
             TextDelta("done"),
             Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),
@@ -2251,6 +2278,7 @@ async def test_prefetched_user_message_received_after_submit_is_accepted(
         await delivered.wait()
 
         assert await next_boundary(generation) == [
+            ResponseIdentity("sonnet-5", "sonnet-5", False),
             InputUsage(2),
             TextDelta("done"),
             Completed("end_turn", {"input_tokens": 2, "output_tokens": 1}),

@@ -18,6 +18,7 @@ from claude_sdk_proxy.domain import (
     Completed,
     InputUsage,
     RequestValidationError,
+    ResponseIdentity,
     TextDelta,
     ToolDefinition,
 )
@@ -56,13 +57,13 @@ def test_explicit_openai_completion_timestamp_is_consistent_across_outputs() -> 
 
     assert (
         _openai_payload(
-            encode_openai_start("chatcmpl_test", "sonnet", created=created)[0]
+            encode_openai_start("chatcmpl_test", "claude-sonnet-5", created=created)[0]
         )["created"]
         == created
     )
     chunks = encode_openai_event(
         "chatcmpl_test",
-        "sonnet",
+        "claude-sonnet-5",
         completed,
         include_usage=True,
         created=created,
@@ -73,14 +74,16 @@ def test_explicit_openai_completion_timestamp_is_consistent_across_outputs() -> 
     ]
     assert (
         render_openai_response(
-            "chatcmpl_test", "sonnet", "done", completed, created=created
+            "chatcmpl_test", "claude-sonnet-5", "done", completed, created=created
         )["created"]
         == created
     )
 
     # Existing callers that do not pass request context retain their old contract.
     assert (
-        _openai_payload(encode_openai_start("chatcmpl_test", "sonnet")[0])["created"]
+        _openai_payload(encode_openai_start("chatcmpl_test", "claude-sonnet-5")[0])[
+            "created"
+        ]
         == 0
     )
 
@@ -89,7 +92,7 @@ def test_explicit_openai_completion_timestamp_is_consistent_across_outputs() -> 
 def test_openai_user_and_known_null_optionals_are_advisory(user: str | None) -> None:
     request = parse_openai_request(
         {
-            "model": "sonnet",
+            "model": "claude-sonnet-5",
             "messages": [{"role": "user", "content": "go"}],
             "user": user,
             "tools": None,
@@ -99,7 +102,7 @@ def test_openai_user_and_known_null_optionals_are_advisory(user: str | None) -> 
             "max_completion_tokens": None,
             "temperature": None,
         },
-        frozenset({"sonnet"}),
+        frozenset({"claude-sonnet-5"}),
     )
 
     assert request.model == "sonnet-5"
@@ -107,10 +110,10 @@ def test_openai_user_and_known_null_optionals_are_advisory(user: str | None) -> 
     assert request.tools == ()
     assert request == parse_openai_request(
         {
-            "model": "sonnet",
+            "model": "claude-sonnet-5",
             "messages": [{"role": "user", "content": "go"}],
         },
-        frozenset({"sonnet"}),
+        frozenset({"claude-sonnet-5"}),
     )
 
 
@@ -121,11 +124,11 @@ def test_openai_advisory_normalization_does_not_ignore_invalid_values(
     with pytest.raises(RequestValidationError) as error:
         parse_openai_request(
             {
-                "model": "sonnet",
+                "model": "claude-sonnet-5",
                 "messages": [{"role": "user", "content": "go"}],
                 field: value,
             },
-            frozenset({"sonnet"}),
+            frozenset({"claude-sonnet-5"}),
         )
 
     assert error.value.field == field
@@ -164,7 +167,7 @@ async def test_asgi_captures_one_timestamp_for_the_entire_openai_completion(
     )
     app = _sdk_app(tmp_path, client)
     body: dict[str, object] = {
-        "model": "sonnet",
+        "model": "claude-sonnet-5",
         "messages": [{"role": "user", "content": "go"}],
         "stream": stream,
     }
@@ -203,14 +206,14 @@ def test_cache_usage_maps_without_fabricating_absent_optional_fields() -> None:
     completed = Completed("end_turn", usage)
 
     assert _anthropic_start_usage(
-        encode_anthropic_start("msg_test", "sonnet", boundary)
+        encode_anthropic_start("msg_test", "claude-sonnet-5", boundary)
     ) == {
         "input_tokens": 5,
         "output_tokens": 0,
         "cache_read_input_tokens": 700,
         "cache_creation_input_tokens": 11,
     }
-    assert render_anthropic_response("msg_test", "sonnet", "ok", completed)[
+    assert render_anthropic_response("msg_test", "claude-sonnet-5", "ok", completed)[
         "usage"
     ] == {
         "input_tokens": 5,
@@ -218,9 +221,9 @@ def test_cache_usage_maps_without_fabricating_absent_optional_fields() -> None:
         "cache_read_input_tokens": 700,
         "cache_creation_input_tokens": 11,
     }
-    openai_usage = render_openai_response("chatcmpl_test", "sonnet", "ok", completed)[
-        "usage"
-    ]
+    openai_usage = render_openai_response(
+        "chatcmpl_test", "claude-sonnet-5", "ok", completed
+    )["usage"]
     assert openai_usage == {
         "prompt_tokens": 716,
         "completion_tokens": 2,
@@ -238,9 +241,13 @@ def test_cache_usage_maps_without_fabricating_absent_optional_fields() -> None:
     absent = Completed("end_turn", {"input_tokens": 5, "output_tokens": 2})
     assert (
         "prompt_tokens_details"
-        not in render_openai_response("chatcmpl_test", "sonnet", "ok", absent)["usage"]
+        not in render_openai_response("chatcmpl_test", "claude-sonnet-5", "ok", absent)[
+            "usage"
+        ]
     )
-    assert render_anthropic_response("msg_test", "sonnet", "ok", absent)["usage"] == {
+    assert render_anthropic_response("msg_test", "claude-sonnet-5", "ok", absent)[
+        "usage"
+    ] == {
         "input_tokens": 5,
         "output_tokens": 2,
     }
@@ -260,7 +267,7 @@ async def test_sdk_boundary_preserves_cache_snapshot_and_checks_repetitions(
     raw[3:3] = [
         AssistantMessage(
             [TextBlock("done")],
-            "sonnet",
+            "claude-sonnet-5",
             usage={**cache_usage, "output_tokens": 2},
             session_id="sdk-1",
         )
@@ -283,6 +290,7 @@ async def test_sdk_boundary_preserves_cache_snapshot_and_checks_repetitions(
     )
 
     assert events == [
+        ResponseIdentity("sonnet-5", "sonnet-5", False),
         InputUsage(5, 700, 11),
         # The aggregate ResultMessage is validated but the raw boundary is published.
         # Text remains independently typed and is not replaced by usage reconciliation.
@@ -318,7 +326,7 @@ async def test_sdk_rejects_malformed_or_mismatched_repeated_cache_usage(
         }
     )
     assistant = AssistantMessage(
-        [TextBlock("done")], "sonnet", usage=dict(usage), session_id="sdk-1"
+        [TextBlock("done")], "claude-sonnet-5", usage=dict(usage), session_id="sdk-1"
     )
     raw[3:3] = [assistant]
     raw[-2].event["usage"].update(usage)
@@ -425,7 +433,7 @@ async def test_asgi_repeated_tools_preserve_each_raw_boundary_usage(
         3,
         AssistantMessage(
             [TextBlock("done")],
-            "sonnet",
+            "claude-sonnet-5",
             usage=dict(final_usage),
             session_id="sdk-real",
         ),
@@ -580,7 +588,7 @@ async def test_text_boundary_accepts_increasing_interim_output_snapshots(
     raw[3:3] = [
         AssistantMessage(
             [TextBlock("done")],
-            "sonnet",
+            "claude-sonnet-5",
             usage={
                 "input_tokens": 5,
                 "output_tokens": 33,
@@ -622,7 +630,7 @@ async def test_text_boundary_rejects_output_snapshot_regression(
     raw[3:3] = [
         AssistantMessage(
             [TextBlock("done")],
-            "sonnet",
+            "claude-sonnet-5",
             usage={"input_tokens": 5, "output_tokens": 33},
             session_id="sdk-1",
         )

@@ -180,6 +180,7 @@ def raw_text_events(
     input_tokens: int = 2,
     output_tokens: int = 1,
     stop_reason: str = "end_turn",
+    model: str = "claude-sonnet-5",
 ) -> tuple[StreamEvent, ...]:
     return (
         StreamEvent(
@@ -188,6 +189,7 @@ def raw_text_events(
             event={
                 "type": "message_start",
                 "message": {
+                    "model": model,
                     "usage": {"input_tokens": input_tokens, "output_tokens": 0}
                 },
             },
@@ -244,6 +246,7 @@ def raw_tool_events(
     text: str | None = None,
     input_tokens: int = 3,
     output_tokens: int = 2,
+    model: str = "claude-sonnet-5",
 ) -> tuple[StreamEvent | AssistantMessage, ...]:
     """Build one complete raw/typed native tool-use assistant boundary.
 
@@ -256,6 +259,7 @@ def raw_tool_events(
             event={
                 "type": "message_start",
                 "message": {
+                    "model": model,
                     "usage": {"input_tokens": input_tokens, "output_tokens": 0}
                 },
             },
@@ -337,7 +341,7 @@ def raw_tool_events(
         complete.append(ToolUseBlock(internal_id, sdk_name, json.loads(partial_json)))
     events.extend(
         [
-            AssistantMessage(complete, "sonnet", session_id=session_id),
+            AssistantMessage(complete, model, session_id=session_id),
             StreamEvent(
                 uuid="event-tool-delta",
                 session_id=session_id,
@@ -363,12 +367,12 @@ def raw_tool_events(
 
 
 def sdk_response(
-    text: str, session_id: str
+    text: str, session_id: str, *, model: str = "claude-sonnet-5"
 ) -> tuple[StreamEvent | AssistantMessage | ResultMessage, ...]:
-    raw = raw_text_events(text, session_id)
+    raw = raw_text_events(text, session_id, model=model)
     return (
         *raw[:3],
-        AssistantMessage([TextBlock(text)], "sonnet", session_id=session_id),
+        AssistantMessage([TextBlock(text)], model, session_id=session_id),
         *raw[3:],
         ResultMessage(
             subtype="success",

@@ -331,6 +331,11 @@ class ToolBridge:
         self._expected_by_internal.clear()
         self._callbacks_seen.clear()
 
+    @property
+    def has_epoch_activity(self) -> bool:
+        """Read-only activity in the current uncommitted native epoch."""
+        return bool(self._epoch_invocations or self._callbacks_seen or self._pending)
+
     async def begin_epoch(self) -> None:
         """Open admission only when a subsequent tool boundary begins."""
         await self.wait_epoch_complete()

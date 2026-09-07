@@ -136,6 +136,32 @@ class RawSdkMessageValidator:
         return any(block.kind == "tool_use" for block in self._blocks)
 
     @property
+    def tool_activity(self) -> bool:
+        return self.has_tools or (
+            self._current is not None and self._current.kind == "tool_use"
+        )
+
+    @property
+    def can_begin_fallback(self) -> bool:
+        return (
+            self._phase == "block_start"
+            and self._current is None
+            and not self.tool_activity
+            and not self._refusal_diagnostic
+        )
+
+    def observe_fallback_termination(
+        self, event: Mapping[str, Any], category: str
+    ) -> None:
+        # The observed discarded leg has no synthetic assistant diagnostic.
+        if event.get("type") == "message_delta":
+            self._refusal_message_delta(event, category, discarded=True)
+        elif event.get("type") == "message_stop":
+            self._message_stop(event)
+        else:
+            fail_protocol()
+
+    @property
     def boundary_usage(self) -> dict[str, int]:
         if self.input_tokens is None or self.output_tokens is None:
             fail_protocol()
@@ -465,10 +491,16 @@ class RawSdkMessageValidator:
                     )
                 ):
                     fail_protocol()
-                self._current.text.append(text)
+                self._current.text[:] = ["".join(self._current.text) + text]
                 self._current.saw_delta = True
                 thinking_delta = ThinkingDelta(self._block_index, text)
-                self._current.reasoning_events.append(thinking_delta)
+                retained = self._current.reasoning_events
+                if retained and isinstance(retained[-1], ThinkingDelta):
+                    retained[-1] = ThinkingDelta(
+                        self._block_index, retained[-1].text + text
+                    )
+                else:
+                    retained.append(thinking_delta)
                 return None if self._tool_suffix_started else thinking_delta
             if delta.get("type") == "signature_delta":
                 signature = delta.get("signature")
@@ -491,7 +523,7 @@ class RawSdkMessageValidator:
             if not isinstance(text, str):
                 fail_protocol()
             self._current.saw_delta = True
-            self._current.text.append(text)
+            self._current.text[:] = ["".join(self._current.text) + text]
             return TextDelta(text)
         if (
             set(delta) != {"type", "partial_json"}
@@ -502,7 +534,7 @@ class RawSdkMessageValidator:
         if not isinstance(partial, str) or self._current.json_parts is None:
             fail_protocol()
         self._current.saw_delta = True
-        self._current.json_parts.append(partial)
+        self._current.json_parts[:] = ["".join(self._current.json_parts) + partial]
         self._current.json_chars += len(partial)
         if self._current.json_chars > _MAX_RAW_ARGUMENT_CHARS:
             fail_protocol()
@@ -568,8 +600,14 @@ class RawSdkMessageValidator:
         self.output_tokens = usage["output_tokens"]
         self._phase = "message_stop"
 
-    def _refusal_message_delta(self, event: Mapping[str, Any], category: str) -> None:
-        if self._phase != "block_start" or self._blocks or self._current is not None:
+    def _refusal_message_delta(
+        self, event: Mapping[str, Any], category: str, *, discarded: bool = False
+    ) -> None:
+        if (
+            self._phase != "block_start"
+            or (self._blocks and not discarded)
+            or self._current is not None
+        ):
             fail_protocol()
         self._require_keys(event, {"type", "delta", "usage", "context_management"})
         delta = event.get("delta")
@@ -599,7 +637,11 @@ class RawSdkMessageValidator:
         if not isinstance(context, Mapping) or dict(context) != {"applied_edits": []}:
             fail_protocol()
         usage = normalize_usage(event.get("usage"), USAGE_FIELDS)
-        if usage is None or usage.get("output_tokens") != 0:
+        if (
+            usage is None
+            or "output_tokens" not in usage
+            or (not discarded and usage["output_tokens"] != 0)
+        ):
             fail_protocol()
         self._reconcile_usage(usage)
         self.stop_reason = "refusal"

@@ -115,7 +115,7 @@ def validate_refusal_notice(message: SystemMessage) -> tuple[str, str]:
 
 
 def validate_fallback_notice(message: SystemMessage) -> tuple[str, str, str]:
-    """Recognize the SDK switch notice so strict policy can reject it explicitly."""
+    """Validate the observed switch shape; unobserved retractions fail closed."""
     data = message.data
     if (
         not isinstance(data, Mapping)
@@ -125,6 +125,29 @@ def validate_fallback_notice(message: SystemMessage) -> tuple[str, str, str]:
         or data.get("trigger") != "refusal"
         or data.get("direction") != "retry"
         or data.get("scope") != "session"
+        or not isinstance(data.get("content"), str)
+        or set(data)
+        != {
+            "type",
+            "subtype",
+            "session_id",
+            "uuid",
+            "request_id",
+            "refused_user_message_uuid",
+            "original_model",
+            "fallback_model",
+            "content",
+            "api_refusal_category",
+            "api_refusal_explanation",
+            "trigger",
+            "direction",
+            "scope",
+            "retracted_message_uuids",
+        }
+        or not isinstance(data.get("api_refusal_category"), str)
+        or data["api_refusal_category"] not in _REFUSAL_CATEGORIES
+        or not isinstance(data.get("api_refusal_explanation"), str)
+        or not data["api_refusal_explanation"]
         or any(
             not _identifier(data.get(key))
             for key in (
@@ -139,8 +162,7 @@ def validate_fallback_notice(message: SystemMessage) -> tuple[str, str, str]:
             or re.fullmatch(r"[a-zA-Z0-9._:-]{1,128}", data[key]) is None
             for key in ("original_model", "fallback_model")
         )
-        or not isinstance(data.get("retracted_message_uuids"), list)
-        or not all(_identifier(value) for value in data["retracted_message_uuids"])
+        or data.get("retracted_message_uuids") != []
     ):
         _fail()
     return data["session_id"], data["original_model"], data["fallback_model"]

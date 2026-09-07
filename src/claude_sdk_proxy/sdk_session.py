@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    AsyncIterator,
+    Callable,
+    Iterable,
+    Mapping,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -33,6 +40,7 @@ from claude_sdk_proxy.domain import (
     ImagePrompt,
     ModelFallbackDisabled,
     Prompt,
+    ResponseIdentity,
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
@@ -44,6 +52,8 @@ from claude_sdk_proxy.images import (
     render_content,
     result_identity,
 )
+from claude_sdk_proxy.model_catalog import canonical_model
+from claude_sdk_proxy.sdk_fallback import FallbackBuffer
 from claude_sdk_proxy.sdk_history import seed_history
 from claude_sdk_proxy.sdk_metadata import (
     validate_fallback_notice,
@@ -288,6 +298,35 @@ class SdkSession:
     async def stream_generation(
         self, prompt: Prompt
     ) -> AsyncIterator[ConversationEvent]:
+        buffer = FallbackBuffer() if self._refusal_fallback == "auto" else None
+        native = self._stream_native(prompt, buffer)
+        try:
+            async for event in native:
+                if buffer is None:
+                    yield event
+                else:
+                    buffer.append(event)
+                    if isinstance(event, Completed):
+                        for accepted in buffer.release():
+                            yield accepted
+        except GeneratorExit:
+            # The actor may stop consuming at a committed response boundary.
+            # It owns session lifetime, including disconnect cleanup.
+            raise
+        except BaseException:
+            if buffer is not None:
+                buffer.discard()
+            try:
+                await self.close()
+            except BaseException:
+                pass
+            raise
+        finally:
+            await native.aclose()
+
+    async def _stream_native(
+        self, prompt: Prompt, buffer: FallbackBuffer | None
+    ) -> AsyncGenerator[ConversationEvent]:
         client = self._client
         if client is None:
             raise BackendFailure("Agent SDK query failed")
@@ -296,6 +335,8 @@ class SdkSession:
         raw: RawSdkMessageValidator | None = None
         terminal_boundary: Completed | None = None
         refusal_category: str | None = None
+        fallback_category: str | None = None
+        replacement_pending = False
         prefetched: asyncio.Future[_ReceivedSdkMessage] | None = None
         try:
             if isinstance(prompt, ToolResultPrompt):
@@ -377,6 +418,19 @@ class SdkSession:
                             or (raw is not None and not raw.complete)
                         ):
                             self._fail_protocol()
+                        if replacement_pending:
+                            if raw is None or not raw.complete:
+                                self._fail_protocol()
+                            self._model = "claude-opus-4-8"
+                            self._fallback_provenance = True
+                            replacement_pending = False
+                            fallback_category = None
+                        native_message = event.get("message")
+                        if (
+                            not isinstance(native_message, Mapping)
+                            or native_message.get("model") != self._model
+                        ):
+                            raise BackendFailure("backend_model_mismatch")
                         if self._awaiting_echo:
                             self._finish_echo()
                         raw = RawSdkMessageValidator(
@@ -384,8 +438,15 @@ class SdkSession:
                             allow_seeded_history=bool(self._history),
                         )
                     if raw is None:
-                        self._fail_protocol()
-                    if refusal_category is not None:
+                        raise BackendFailure(
+                            "backend_model_mismatch: Agent SDK protocol failure"
+                        )
+                    if buffer is not None:
+                        buffer.admit_raw(event)
+                    if fallback_category is not None:
+                        raw.observe_fallback_termination(event, fallback_category)
+                        normalized = None
+                    elif refusal_category is not None:
                         normalized = raw.observe_refusal(event, refusal_category)
                     else:
                         if event_type == "content_block_start":
@@ -400,11 +461,20 @@ class SdkSession:
                                 await self._bridge.begin_epoch()
                                 self._epoch_needs_begin = False
                         normalized = raw.observe(event)
+                    if event_type == "message_start":
+                        yield ResponseIdentity(
+                            canonical_model(self._requested_model),
+                            canonical_model(self._model),
+                            self._fallback_provenance,
+                        )
                     if normalized is not None:
                         yield normalized
                     if event_type == "message_stop":
                         if not raw.complete:
                             self._fail_protocol()
+                        if fallback_category is not None:
+                            replacement_pending = True
+                            continue
                         boundary = Completed(raw.stop_reason, raw.boundary_usage)
                         if raw.has_tools:
                             public_events, prefetched = await self._tool_boundary(
@@ -415,9 +485,17 @@ class SdkSession:
                         else:
                             terminal_boundary = boundary
                 elif isinstance(message, AssistantMessage):
-                    if raw is None or self._awaiting_echo or self._awaiting_submit:
+                    if raw is None:
+                        raise BackendFailure(
+                            "backend_model_mismatch: Agent SDK protocol failure"
+                        )
+                    if self._awaiting_echo or self._awaiting_submit:
+                        self._fail_protocol()
+                    if fallback_category is not None:
                         self._fail_protocol()
                     if refusal_category is None:
+                        if message.model != self._model:
+                            raise BackendFailure("backend_model_mismatch")
                         self._validate_assistant(message, raw)
                     else:
                         self._observe_session_id(message.session_id)
@@ -449,6 +527,38 @@ class SdkSession:
                             validate_fallback_notice(message)
                         )
                         self._observe_session_id(session_id)
+                        if buffer is not None:
+                            if (raw is not None and raw.tool_activity) or (
+                                self._bridge is not None
+                                and self._bridge.has_epoch_activity
+                            ):
+                                raise BackendFailure(
+                                    "fallback_tool_rollback_unsupported"
+                                )
+                            if (
+                                raw is None
+                                or not raw.can_begin_fallback
+                                or terminal_boundary is not None
+                                or refusal_category is not None
+                                or fallback_category is not None
+                                or replacement_pending
+                                or self._awaiting_submit
+                                or self._awaiting_echo
+                                or self._fallback_provenance
+                                or original_model != self._model
+                                or original_model != "claude-opus-5"
+                                or fallback_model != "claude-opus-4-8"
+                                or fallback_model not in self._allowed_backend_models
+                            ):
+                                raise BackendFailure("backend_model_mismatch")
+                            fallback_category = message.data["api_refusal_category"]
+                            buffer.discard()
+                            record(
+                                "model_fallback_accepted",
+                                original_model=original_model,
+                                fallback_model=fallback_model,
+                            )
+                            continue
                         record(
                             "model_fallback_blocked",
                             original_model=original_model,
@@ -470,6 +580,8 @@ class SdkSession:
                             self._fail_protocol()
                         session_id, refusal_category = validate_refusal_notice(message)
                         self._observe_session_id(session_id)
+                        if message.data["original_model"] != self._model:
+                            raise BackendFailure("backend_model_mismatch")
                         continue
                     if refusal_category is not None:
                         self._fail_protocol()
@@ -495,6 +607,10 @@ class SdkSession:
             if failure is not None:
                 raise BackendFailure(failure)
             if completed is None:
+                if raw is None:
+                    raise BackendFailure(
+                        "backend_model_mismatch: Agent SDK stream ended without result"
+                    )
                 raise BackendFailure("Agent SDK stream ended without result")
         except BackendFailure as error:
             record_backend_failure(error, "sdk_generation")

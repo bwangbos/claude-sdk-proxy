@@ -11,6 +11,7 @@ from claude_sdk_proxy.domain import (
     InputUsage,
     RedactedThinkingBlock,
     RequestValidationError,
+    ResponseIdentity,
     TextBlock,
     TextDelta,
     TextRequest,
@@ -162,7 +163,7 @@ def encode_openai_event(
     *,
     created: int = 0,
 ) -> tuple[bytes, ...]:
-    if isinstance(event, InputUsage):
+    if isinstance(event, (InputUsage, ResponseIdentity)):
         return ()
     if isinstance(event, ThinkingCompleted):
         return ()

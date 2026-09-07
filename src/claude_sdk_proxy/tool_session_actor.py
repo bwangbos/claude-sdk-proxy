@@ -19,6 +19,7 @@ from claude_sdk_proxy.domain import (
     InputUsage,
     ModelFallbackDisabled,
     Prompt,
+    ResponseIdentity,
     SdkSessionProtocol,
     TextBlock,
     TextDelta,
@@ -434,7 +435,10 @@ def _assistant_message(events: tuple[ConversationEvent, ...]) -> CanonicalMessag
             events
             and isinstance(events[-1], Completed)
             and events[-1].stop_reason == "refusal"
-            and all(isinstance(event, InputUsage) for event in events[:-1])
+            and all(
+                isinstance(event, (InputUsage, ResponseIdentity))
+                for event in events[:-1]
+            )
         ):
             # The SDK validates the native refusal transaction. No answer was
             # emitted, but its terminal history must remain replayable.

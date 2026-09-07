@@ -4,8 +4,14 @@ import json
 from dataclasses import replace
 
 import pytest
+from claude_agent_sdk import (
+    AssistantMessage,
+    StreamEvent,
+    SystemMessage,
+    UserMessage,
+    project_key_for_directory,
+)
 from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
-from claude_agent_sdk import UserMessage, project_key_for_directory
 
 from claude_sdk_proxy.anthropic_api import parse_anthropic_request
 from claude_sdk_proxy.app import create_app
@@ -114,7 +120,47 @@ class RefusalFactory:
         self.directories = []
 
     def __call__(self, model, system, *, history=(), **kwargs):
-        client = FakeSdkClient(next(self.responses))
+        from claude_sdk_proxy.model_catalog import backend_model
+
+        pinned = backend_model(model)
+        responses = []
+        for response in next(self.responses):
+            messages = []
+            for message in response:
+                if (
+                    isinstance(message, StreamEvent)
+                    and message.event.get("type") == "message_start"
+                ):
+                    message = replace(
+                        message,
+                        event={
+                            **message.event,
+                            "message": {
+                                **message.event["message"],
+                                "model": pinned,
+                            },
+                        },
+                    )
+                elif (
+                    isinstance(message, AssistantMessage)
+                    and message.model != "<synthetic>"
+                ):
+                    message = replace(message, model=pinned)
+                elif isinstance(message, SystemMessage):
+                    message = replace(
+                        message,
+                        data={
+                            **message.data,
+                            **{
+                                key: pinned
+                                for key in ("model", "original_model")
+                                if key in message.data
+                            },
+                        },
+                    )
+                messages.append(message)
+            responses.append(tuple(messages))
+        client = FakeSdkClient(tuple(responses))
         directory = FixedTemporaryDirectory(self.tmp_path / str(len(self.clients)))
         directory.path.mkdir()
         self.clients.append(client)

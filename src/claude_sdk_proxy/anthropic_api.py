@@ -17,6 +17,7 @@ from claude_sdk_proxy.domain import (
     InputUsage,
     RedactedThinkingBlock,
     RequestValidationError,
+    ResponseIdentity,
     TextBlock,
     TextDelta,
     TextRequest,
@@ -175,7 +176,7 @@ def encode_anthropic_event(
 ) -> tuple[bytes, ...]:
     del request_id, model
     enabled = state is not None and state.tools_enabled
-    if isinstance(event, InputUsage):
+    if isinstance(event, (InputUsage, ResponseIdentity)):
         return ()
     if isinstance(event, (ThinkingDelta, ThinkingCompleted)):
         if state is None:

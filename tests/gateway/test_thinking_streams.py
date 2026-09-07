@@ -24,7 +24,10 @@ def thinking_response() -> tuple[Any, ...]:
         frame(
             {
                 "type": "message_start",
-                "message": {"usage": {"input_tokens": 5, "output_tokens": 2}},
+                "message": {
+                    "model": "claude-sonnet-5",
+                    "usage": {"input_tokens": 5, "output_tokens": 2},
+                },
             }
         ),
         frame(
@@ -61,7 +64,7 @@ def thinking_response() -> tuple[Any, ...]:
         ),
         AssistantMessage(
             [SdkThinkingBlock("reasoning summary", "opaque-signature")],
-            "sonnet",
+            "claude-sonnet-5",
             session_id="sdk-thinking",
         ),
         frame({"type": "content_block_stop", "index": 0}),
@@ -79,7 +82,9 @@ def thinking_response() -> tuple[Any, ...]:
                 "delta": {"type": "text_delta", "text": "answer"},
             }
         ),
-        AssistantMessage([SdkTextBlock("answer")], "sonnet", session_id="sdk-thinking"),
+        AssistantMessage(
+            [SdkTextBlock("answer")], "claude-sonnet-5", session_id="sdk-thinking"
+        ),
         frame({"type": "content_block_stop", "index": 1}),
         frame(
             {
@@ -115,7 +120,7 @@ async def test_raw_thinking_is_reasoning_not_answer_and_usage_is_sdk_count(
 ):
     client = FakeSdkClient((thinking_response(),))
     app = create_app(
-        models=("sonnet",),
+        models=("claude-sonnet-5",),
         session_factory=lambda model, system, **kw: SdkSession(
             model,
             system,
@@ -124,7 +129,7 @@ async def test_raw_thinking_is_reasoning_not_answer_and_usage_is_sdk_count(
             client_factory=client.capture_options,
         ),
     )
-    body = {"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}
+    body = {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}
     if tools_enabled:
         body["tools"] = [
             {
@@ -148,7 +153,7 @@ async def test_raw_thinking_is_reasoning_not_answer_and_usage_is_sdk_count(
 async def test_stream_preserves_thinking_fields_and_block_indices(tmp_path, dialect):
     client = FakeSdkClient((thinking_response(),))
     app = create_app(
-        models=("sonnet",),
+        models=("claude-sonnet-5",),
         session_factory=lambda model, system, **kw: SdkSession(
             model,
             system,
@@ -158,7 +163,7 @@ async def test_stream_preserves_thinking_fields_and_block_indices(tmp_path, dial
         ),
     )
     body = {
-        "model": "sonnet",
+        "model": "claude-sonnet-5",
         "max_tokens": 100,
         "stream": True,
         "messages": [{"role": "user", "content": "hi"}],
@@ -227,7 +232,7 @@ def test_malformed_thinking_is_rejected(mutation):
         del events[4:6]
     elif mutation == "typed_mismatch":
         events[5] = AssistantMessage(
-            [SdkThinkingBlock("wrong", "opaque-signature")], "sonnet"
+            [SdkThinkingBlock("wrong", "opaque-signature")], "claude-sonnet-5"
         )
     else:
         events.insert(6, events[2])
@@ -272,7 +277,10 @@ def test_empty_display_and_redacted_blocks_keep_native_payload(kind, typed_mode)
         )
         block = {**block, "signature": "sig"}
     typed = parse_message(
-        {"type": "assistant", "message": {"model": "sonnet", "content": [block]}}
+        {
+            "type": "assistant",
+            "message": {"model": "claude-sonnet-5", "content": [block]},
+        }
     )
     assert isinstance(typed, AssistantMessage)
     if kind == "redacted_thinking":
@@ -317,7 +325,7 @@ async def test_disconnect_during_thinking_invalidates_uncommitted_session(
         (thinking_response(),), message_barriers={3: (entered, release)}
     )
     app = create_app(
-        models=("sonnet",),
+        models=("claude-sonnet-5",),
         session_factory=lambda model, system, **kw: SdkSession(
             model,
             system,
@@ -326,7 +334,7 @@ async def test_disconnect_during_thinking_invalidates_uncommitted_session(
             client_factory=client.capture_options,
         ),
     )
-    body = {"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}
+    body = {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}
     if tools_enabled:
         body["tools"] = [
             {
@@ -383,7 +391,8 @@ def interleaved_tool_response():
                     }
                 ),
                 AssistantMessage(
-                    [SdkThinkingBlock(f"reason-{index}", f"sig-{index}")], "sonnet"
+                    [SdkThinkingBlock(f"reason-{index}", f"sig-{index}")],
+                    "claude-sonnet-5",
                 ),
                 frame({"type": "content_block_stop", "index": index}),
             ]
@@ -411,7 +420,7 @@ def interleaved_tool_response():
                 ),
                 AssistantMessage(
                     [ToolUseBlock(f"sdk-{index}", "mcp__caller_tools__echo", {})],
-                    "sonnet",
+                    "claude-sonnet-5",
                 ),
                 frame({"type": "content_block_stop", "index": index}),
             ]
@@ -438,7 +447,7 @@ def interleaved_tool_response():
 async def test_thinking_between_tools_keeps_wire_order_after_sealing(tmp_path, stream):
     client = FakeSdkClient((interleaved_tool_response(),))
     app = create_app(
-        models=("sonnet",),
+        models=("claude-sonnet-5",),
         session_factory=lambda model, system, **kw: SdkSession(
             model,
             system,
@@ -448,7 +457,7 @@ async def test_thinking_between_tools_keeps_wire_order_after_sealing(tmp_path, s
         ),
     )
     body = {
-        "model": "sonnet",
+        "model": "claude-sonnet-5",
         "max_tokens": 100,
         "stream": stream,
         "tools": [{"name": "echo", "input_schema": {"type": "object"}}],
@@ -497,7 +506,9 @@ async def test_native_empty_display_and_raw_redacted_survive_http(
             original[0],
             original[1],
             original[4],
-            AssistantMessage([SdkThinkingBlock("", "opaque-signature")], "sonnet"),
+            AssistantMessage(
+                [SdkThinkingBlock("", "opaque-signature")], "claude-sonnet-5"
+            ),
             *original[6:],
         )
     else:
@@ -507,12 +518,12 @@ async def test_native_empty_display_and_raw_redacted_survive_http(
             frame(
                 {"type": "content_block_start", "index": 0, "content_block": expected}
             ),
-            AssistantMessage([], "sonnet"),
+            AssistantMessage([], "claude-sonnet-5"),
             *original[6:],
         )
     client = FakeSdkClient((events,))
     app = create_app(
-        models=("sonnet",),
+        models=("claude-sonnet-5",),
         session_factory=lambda model, system, **kw: SdkSession(
             model,
             system,
@@ -526,7 +537,7 @@ async def test_native_empty_display_and_raw_redacted_survive_http(
             app,
             "/v1/messages",
             {
-                "model": "sonnet",
+                "model": "claude-sonnet-5",
                 "max_tokens": 100,
                 "stream": stream,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -634,7 +645,7 @@ async def test_live_thinking_token_progress_is_not_output_or_usage(
     raw = thinking_response()
     client = FakeSdkClient(((*raw[:2], thinking_progress(), *raw[2:]),))
     app = create_app(
-        models=("sonnet",),
+        models=("claude-sonnet-5",),
         session_factory=lambda model, system, **kw: SdkSession(
             model,
             system,
@@ -643,7 +654,7 @@ async def test_live_thinking_token_progress_is_not_output_or_usage(
             client_factory=client.capture_options,
         ),
     )
-    body = {"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}
+    body = {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}
     if tools_enabled:
         body["tools"] = [
             {
@@ -688,7 +699,7 @@ async def test_thinking_progress_remains_strictly_scoped(tmp_path, overrides, in
         ((*raw[:index], thinking_progress(**overrides), *raw[index:]),)
     )
     session = SdkSession(
-        "sonnet",
+        "claude-sonnet-5",
         "",
         directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
         client_factory=client.capture_options,

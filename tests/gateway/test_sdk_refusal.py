@@ -21,6 +21,7 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
     InputUsage,
+    ResponseIdentity,
     ToolDefinition,
 )
 from claude_sdk_proxy.sdk_session import SdkSession
@@ -256,6 +257,7 @@ async def test_sdk_session_returns_classifier_refusal_without_downgrade(
         }
     )
     assert await _collect_sdk_refusal(tmp_path, tuple(messages)) == [
+        ResponseIdentity("opus-5", "opus-5", False),
         InputUsage(24, 948, 43),
         Completed("refusal", RAW_USAGE),
     ]
@@ -347,13 +349,13 @@ async def test_http_fallback_failure_is_explicit_and_correlated(
             client_factory=client.capture_options,
         )
 
-    app = create_app(models=("sonnet",), session_factory=factory)
+    app = create_app(models=("opus",), session_factory=factory)
     endpoint = "/v1/messages" if dialect == "anthropic" else "/v1/chat/completions"
     async with lifespan_app(app):
         response = await post_json(
             app,
             endpoint,
-            _http_body(dialect, [{"role": "user", "content": "hello"}], stream),
+            _opus_http_body(dialect, [{"role": "user", "content": "hello"}], stream),
         )
     assert b"Automatic model fallback is disabled" in response.body
     if not stream:
@@ -381,6 +383,7 @@ async def test_sdk_session_normalizes_only_complete_native_refusal(
     )
 
     assert events == [
+        ResponseIdentity("opus-5", "opus-5", False),
         InputUsage(24, 948, 43),
         Completed("refusal", RAW_USAGE),
     ]
@@ -550,6 +553,7 @@ async def test_sdk_session_rejects_raw_content_in_native_refusal(
     tools = (_echo_definition(),) if block_type == "tool_use" else ()
     valid = refusal_response(tools_enabled=bool(tools))
     assert await _collect_sdk_refusal(tmp_path, valid, tools=tools) == [
+        ResponseIdentity("opus-5", "opus-5", False),
         InputUsage(24, 948, 43),
         Completed("refusal", RAW_USAGE),
     ]
@@ -568,7 +572,7 @@ async def test_sdk_session_rejects_raw_content_in_native_refusal(
 @pytest.mark.anyio
 async def test_ordinary_sdk_error_result_remains_a_failure(tmp_path: Path) -> None:
     messages = (
-        *raw_text_events("answer", "sdk-1"),
+        *raw_text_events("answer", "sdk-1", model="claude-opus-5"),
         _result(stop_reason="end_turn", terminal_reason="api_error"),
     )
 
@@ -584,7 +588,7 @@ async def test_terminal_sdk_failure_is_logged_before_redaction(
     missing_result: bool,
 ) -> None:
     caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
-    messages = tuple(raw_text_events("answer", "sdk-1"))
+    messages = tuple(raw_text_events("answer", "sdk-1", model="claude-opus-5"))
     if not missing_result:
         messages += (_result(stop_reason="end_turn", terminal_reason="api_error"),)
     with pytest.raises(BackendFailure):
@@ -607,6 +611,7 @@ async def test_refusal_accepts_valid_rate_limit_metadata_before_result(
     messages = list(refusal_response())
     messages.insert(-1, live_rate_limit())
     assert await _collect_sdk_refusal(tmp_path, tuple(messages)) == [
+        ResponseIdentity("opus-5", "opus-5", False),
         InputUsage(24, 948, 43),
         Completed("refusal", RAW_USAGE),
     ]
@@ -628,11 +633,13 @@ class _HttpRefusalFactory:
             (
                 FakeSdkClient(
                     (
-                        sdk_response("prior answer", "sdk-1"),
+                        sdk_response("prior answer", "sdk-1", model="claude-opus-5"),
                         tuple(refusal),
                     )
                 ),
-                FakeSdkClient((sdk_response("recovered", "sdk-2"),)),
+                FakeSdkClient(
+                    (sdk_response("recovered", "sdk-2", model="claude-opus-5"),)
+                ),
             )
         )
         self.clients: list[FakeSdkClient] = []
@@ -663,8 +670,16 @@ class _HttpRefusalFactory:
 
 
 def _http_body(dialect: str, messages: list[dict[str, object]], stream: bool) -> dict:
+    body = _opus_http_body(dialect, messages, stream)
+    body["model"] = "sonnet"
+    return body
+
+
+def _opus_http_body(
+    dialect: str, messages: list[dict[str, object]], stream: bool
+) -> dict:
     body: dict[str, object] = {
-        "model": "sonnet",
+        "model": "opus",
         "messages": messages,
         "stream": stream,
     }
@@ -725,7 +740,7 @@ async def test_http_refusal_replays_and_can_recover_earlier_history(
     category: str,
 ) -> None:
     factory = _HttpRefusalFactory(tmp_path, category)
-    app = create_app(models=("sonnet",), session_factory=factory)
+    app = create_app(models=("opus",), session_factory=factory)
     path = "/v1/messages" if dialect == "anthropic" else "/v1/chat/completions"
     first_messages = [{"role": "user", "content": "first"}]
     refusal_messages = [
@@ -740,14 +755,16 @@ async def test_http_refusal_replays_and_can_recover_earlier_history(
     ]
 
     async with lifespan_app(app):
-        first = await post_json(app, path, _http_body(dialect, first_messages, False))
+        first = await post_json(
+            app, path, _opus_http_body(dialect, first_messages, False)
+        )
         session_id = first.headers["x-claude-proxy-session"]
         headers = {"x-claude-proxy-session": session_id}
         refused = await post_json(
-            app, path, _http_body(dialect, refusal_messages, stream), headers
+            app, path, _opus_http_body(dialect, refusal_messages, stream), headers
         )
         replay = await post_json(
-            app, path, _http_body(dialect, refusal_messages, stream), headers
+            app, path, _opus_http_body(dialect, refusal_messages, stream), headers
         )
         _assert_http_refusal(dialect, stream, refused)
         _assert_http_refusal(dialect, stream, replay)
@@ -755,7 +772,7 @@ async def test_http_refusal_replays_and_can_recover_earlier_history(
         assert entry.transcript[-1] == CanonicalMessage.assistant_text("")
         assert SYNTHETIC_DIAGNOSTIC not in repr(entry.transcript)
         recovered = await post_json(
-            app, path, _http_body(dialect, recovery_messages, False), headers
+            app, path, _opus_http_body(dialect, recovery_messages, False), headers
         )
 
     assert recovered.status == 200

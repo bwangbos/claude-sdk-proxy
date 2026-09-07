@@ -37,6 +37,7 @@ from claude_sdk_proxy.domain import (
     InputUsage,
     RedactedThinkingBlock,
     RequestValidationError,
+    ResponseIdentity,
     SdkSessionFactory,
     TextBlock,
     TextDelta,
@@ -215,6 +216,10 @@ async def _stream_response(
     stream = cast(ClosableEventStream, lease.stream())
     try:
         first = await anext(stream)
+        # Identity is transport metadata, not content; preserve initial usage
+        # framing while consuming that metadata separately.
+        if isinstance(first, ResponseIdentity):
+            first = await anext(stream)
     except asyncio.CancelledError:
         await cleanup_best_effort(lease, stream)
         if monitor.consume_disconnect_cancellation():
