@@ -501,9 +501,12 @@ class SdkSession:
                         self._observe_session_id(message.session_id)
                         raw.validate_refusal_assistant(message)
                 elif isinstance(message, ResultMessage):
+                    if raw is None:
+                        raise BackendFailure(
+                            "backend_model_mismatch: Agent SDK protocol failure"
+                        )
                     if (
-                        raw is None
-                        or terminal_boundary is None
+                        terminal_boundary is None
                         or self._awaiting_submit
                         or self._awaiting_echo
                     ):

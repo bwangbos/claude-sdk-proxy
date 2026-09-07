@@ -525,3 +525,31 @@ async def test_missing_raw_start_is_an_identity_failure(
 ) -> None:
     with pytest.raises(BackendFailure, match="backend_model_mismatch"):
         await collect(tmp_path, messages, "off")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("policy", ["off", "auto"])
+@pytest.mark.parametrize("is_error", [False, True], ids=["success", "refusal"])
+async def test_result_without_raw_start_rejects_identity_and_closes(
+    tmp_path: Path, policy: str, is_error: bool
+) -> None:
+    from tests.gateway.test_sdk_refusal import _result
+
+    result = _result() if is_error else pinned_response("claude-opus-5")[-1]
+    client = FakeSdkClient(((result,),))
+    session = SdkSession(
+        "opus-5",
+        "",
+        refusal_fallback=policy,
+        directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
+        client_factory=client.capture_options,
+    )
+    await session.start()
+    stream = session.stream_generation("go")
+    try:
+        with pytest.raises(BackendFailure, match="backend_model_mismatch"):
+            await anext(stream)
+        assert client.disconnected.is_set()
+    finally:
+        await stream.aclose()
+        await session.close()

@@ -102,3 +102,29 @@ This report is the only SDD artifact added by this task.
 - Confirmed strict refusal's zero-output validation and synthetic diagnostic correlation remain unchanged. Checked buffer reset per response and discarded leg; checked that original-tool failure never calls resolve or begins a replacement epoch.
 - `sdk_session.py` was already large; this change follows its existing owner/epoch structure and adds a narrow admission wrapper rather than a second session manager. Coalescing uses ordinary string concatenation, so the bound is payload retention, not a promise of constant-time append or a total RSS bound.
 - No known remaining correctness blocker within Task 3. Public identity reporting/recovery/error mapping remains deliberately gated Task 4 work. Native nonempty retractions and partial active-block rollback are not supported or claimed.
+
+## Review fix round 1
+
+Base: `a33395d`. Verified the review finding: a ResultMessage before any raw start entered the generic terminal protocol guard, unlike raw/typed messages. Split out `raw is None` before that guard and raise the same `backend_model_mismatch: Agent SDK protocol failure` used by the other missing-start paths. No buffering, policy, or coalescing behavior changed.
+
+Added four Result-only regressions covering success/refusal ResultMessages under strict and auto. Each requires the first `anext()` to fail with the identity reason (no identity/content is published) and verifies the native client was disconnected before test cleanup.
+
+```text
+UV_CACHE_DIR=/private/tmp/claude-sdk-proxy-uv-cache uv run pytest tests/gateway/test_sdk_fallback.py -q --tb=short
+RED: 4 failed, 43 passed in 0.36s
+All four failures: Expected regex 'backend_model_mismatch'; actual 'Agent SDK protocol failure'.
+
+UV_CACHE_DIR=/private/tmp/claude-sdk-proxy-uv-cache uv run pytest tests/gateway/test_sdk_fallback.py tests/gateway/test_sdk_refusal.py -q --tb=short
+GREEN: 121 passed in 0.41s
+
+UV_CACHE_DIR=/private/tmp/claude-sdk-proxy-uv-cache uv run mypy src/claude_sdk_proxy
+Success: no issues found in 48 source files
+
+UV_CACHE_DIR=/private/tmp/claude-sdk-proxy-uv-cache uv run ruff check src/claude_sdk_proxy/sdk_session.py tests/gateway/test_sdk_fallback.py
+All checks passed!
+
+git diff --check
+(no output; exit 0)
+```
+
+Self-review: the native Result boundary guard after a validated raw start remains unchanged. The reviewer-noted quadratic accumulated-string coalescing is explicitly deferred to final review as directed; this fix does not perform broad cleanup.
