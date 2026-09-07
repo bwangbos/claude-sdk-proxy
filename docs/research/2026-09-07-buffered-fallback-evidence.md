@@ -141,6 +141,46 @@ publication and fallback provenance are not live-verified through the production
 HTTP path; the isolated native switch above and synthetic implementation tests
 remain separate evidence, not a substitute for that missing comparison.
 
+### Offline diagnosis of the auto failure
+
+Redacted diagnostics localized the failure after
+`model_fallback_accepted` (`claude-opus-5` to `claude-opus-4-8`) and before the
+replacement leg, in `RawSdkMessageValidator._refusal_message_delta`. No prompt,
+response text, tool argument, credential, or raw exception text was logged.
+
+The SDK transport prefers its bundled CLI over the system installation. The
+runtime used by this check was therefore the wheel's bundled Claude Code
+2.1.259 Mach-O binary at
+`.venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude` (SHA-256
+`884baa38fe1a624be25c4a91568bf5a08b5cf4e7d7acf29b7760e3525d964898`), not the
+separately installed `claude` 2.1.261 executable.
+
+Static inspection of the embedded local runtime source explains the rejected
+shape. Near binary offset 180053205, `onRefusalFallbackBanner` closes a partial
+SDK stream through its `Qs` helper. That helper constructs `message_delta` with
+`context_management: null` and this delta:
+
+```json
+{"container":null,"stop_details":null,"stop_reason":"refusal","stop_sequence":null}
+```
+
+It then emits `message_stop`. Earlier in the runtime's API-stream handler (near
+offset 166278000), the original API refusal delta is used to create a
+`fallback_request`; that branch returns before the normal raw `stream_event`
+yield. Thus the post-banner closing delta exposed to the SDK consumer is the
+adapter-generated close above, not a faithful copy of the original API refusal
+details.
+
+The proxy currently requires the discarded-leg delta to have exactly
+`stop_reason`, `stop_sequence`, and `stop_details`, and then requires
+`stop_details` to contain the correlated refusal category and explanation.
+The runtime-generated `container` key causes the first exact-key check to fail;
+its null `stop_details` would also fail the following details check. This fully
+accounts for the observed failure location. It does not by itself authorize a
+compatibility change: accepting this synthetic close safely requires a focused
+contract decision and RED tests tying it to an already validated fallback
+banner, rather than generally weakening refusal validation.
+
 Deterministic production tests separately cover the implemented behavior for
 both HTTP dialects and JSON/SSE responses: default and per-request policy,
 configured-route enforcement, replacement-only publication, actual/requested
