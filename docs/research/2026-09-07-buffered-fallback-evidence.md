@@ -1,5 +1,21 @@
 # Buffered fallback evidence
 
+## Latest verified checkpoint
+
+Merged implementation `15ccede` passed the complete tracked-snapshot release
+gate on 2026-09-07: 676 unit, 222 Darwin lifecycle, 1,016 gateway, and 40
+integration tests (1,954 total), plus Ruff and strict mypy. Final review and
+scoped re-review had no remaining findings. Native message-ID separation and
+amortized text/thinking/tool-argument accumulation are included in this revision.
+
+Live production OpenAI JSON checks verified both strict Opus 5 refusal and
+automatic replacement by Opus 4.8, with truthful requested/actual/fallback
+metadata. The final native-ID/performance fix was also live-checked successfully.
+Checks stopped at returned tool calls without executing them. Live post-tool
+continuation and Anthropic/SSE fallback remain unverified; deterministic tests
+cover those paths. The dated investigation and failures below are retained as
+history, not unresolved release failures.
+
 ## Isolated native probes
 
 On 2026-09-07 the already-authorized eight-message harness transcript was
@@ -53,8 +69,10 @@ retraction support is claimed by these probes.
 ## Direct strict identity and capability probes
 
 On the same date, additional harmless probes used the installed
-`claude-agent-sdk` 0.2.152 and Claude Code 2.1.261. Each probe used the production
-`SdkSession` option/history builder, disabled refusal fallback, restricted
+`claude-agent-sdk` 0.2.152 and reported system Claude Code 2.1.261. That version
+check did not establish which executable the SDK selected; the later production
+investigation below identified its bundled 2.1.259 runtime. Each probe used the
+production `SdkSession` option/history builder, disabled refusal fallback, restricted
 `availableModels` to the three exact configured IDs, imposed a 60-second
 per-session timeout, and closed its isolated session. Output was limited to
 event classes/types, model IDs, block types, stop reasons, metadata field names,

@@ -74,6 +74,10 @@ claude -p "Reply with OK"
 Run the proxy from that same login context. A sandboxed process may be unable to
 read the macOS Keychain even when `claude` works in your terminal.
 
+The Agent SDK normally selects its bundled Claude Code executable. A successful
+system `claude` check establishes login access, not that the proxy uses that same
+CLI version. Keep the locked SDK dependency when reproducing runtime behavior.
+
 ## Quick start
 
 Clone the repository, install the locked dependencies, and start the default
@@ -300,6 +304,12 @@ launching the multi-model command; do not start a second server on the same port
 Confirm `/v1/models` lists the three canonical names. These Pi entries are explicit:
 adding a server alias alone does not add it to Pi's model picker.
 
+When upgrading an existing Pi configuration, replace its `sonnet`/`opus` model
+IDs with `sonnet-5`/`opus-5` and add `opus-4.8`. Preserve your existing provider
+names, URLs, and unrelated settings. Legacy aliases still work as API inputs,
+but Pi can treat a canonical response name as a model switch when its configured
+ID is an alias, interfering with signed-thinking tool continuations.
+
 No Pi adapter or extension is required. Use `/model` to choose Sonnet or Opus
 within the same provider, and `/thinking` or `Shift+Tab` to change thinking level.
 Keep `supportsStrictMode: false` in the provider configuration; Pi otherwise
@@ -328,7 +338,8 @@ not guarantee that Claude will answer every subsequent request.
 The example's `contextWindow` and `maxTokens` are client-side configuration,
 not discovered account limits or enforced backend caps. Zero costs disable
 Pi's per-token cost estimate; they do not mean the subscription is free or
-unlimited. Alias targets and available effort levels can change upstream.
+unlimited. The proxy's `sonnet`/`opus` compatibility aliases are pinned to version
+5; upstream model availability and accepted effort levels can still change.
 
 ### Pi with images and screenshots
 
@@ -364,7 +375,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="sonnet",
+    model="sonnet-5",
     messages=[{"role": "user", "content": "Reply with OK"}],
     reasoning_effort="high",
 )
@@ -382,7 +393,7 @@ client = Anthropic(
 )
 
 response = client.messages.create(
-    model="sonnet",
+    model="sonnet-5",
     max_tokens=128,
     thinking={"type": "adaptive", "display": "summarized"},
     output_config={"effort": "high"},
@@ -418,7 +429,7 @@ from pathlib import Path
 
 image = base64.b64encode(Path("screenshot.png").read_bytes()).decode("ascii")
 response = client.chat.completions.create(
-    model="sonnet",
+    model="sonnet-5",
     messages=[{
         "role": "user",
         "content": [
@@ -457,7 +468,7 @@ image generation are not supported. Return tool failures as text.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Minimal liveness response |
-| `GET` | `/v1/models` | Configured model aliases |
+| `GET` | `/v1/models` | Canonical configured model names |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat and function tools |
 | `POST` | `/v1/messages` | Anthropic-compatible messages and tools |
 
@@ -478,6 +489,9 @@ be in the server allowlist. A request can override the server setting with
 `X-Claude-Proxy-Refusal-Fallback: off` or `auto`. An invalid or repeated header
 is HTTP 400. This control is transport metadata and is never added to prompts.
 The feature is separate from overload fallback, which remains unconfigured.
+Keep the requested model and policy unchanged when submitting tool results,
+even if the preceding response reports `opus-4.8` as the actual model. On direct
+Sonnet 5 or Opus 4.8 requests, `auto` still buffers but adds no fallback route.
 
 ```bash
 curl http://127.0.0.1:8317/v1/chat/completions \
@@ -503,6 +517,10 @@ and on later responses recovered from the same live downgraded session. Replay
 is bounded to the existing in-memory live-session cache; it is not durable and
 is not extended by this feature. A fresh import after eviction or restart starts
 the requested pinned model and does not infer fallback provenance from history.
+Known-session rebasing and thinking-only changes preserve the active model and
+fallback provenance when the requested model and policy stay unchanged. Changing
+the model or policy after a completed answer starts a replacement without that
+provenance; switching from `auto` to `off` restores the requested pinned model.
 
 If native fallback tries to retract original-leg tool activity, the response
 fails with `fallback_tool_rollback_unsupported`, publishes no buffered output,
@@ -713,7 +731,8 @@ uv run claude-proxy --model sonnet-5 --log proxy.jsonl --log-json
 references, selection/rebase/replay decisions, safe rejection reasons, and HTTP
 status. Backend failures also record the stage, exception class, allowlisted
 reason, and proxy code locations before exception redaction. A blocked fallback
-records the original and proposed replacement model IDs. Logs do not include
+or accepted switch records the original and replacement model IDs. Logs do not
+include
 prompts, tool arguments/results, credentials, raw session keys, upstream refusal
 explanations, exception text, or traceback locals.
 New log files are created with owner-only permissions. Logs are not rotated;
@@ -733,6 +752,21 @@ configuration above.
 Pi needs `reasoning: true`, the model-level `thinkingLevelMap`, and the matching
 provider compatibility flags. Restart Pi after changing provider configuration.
 Changing `models.json` alone does not update a running proxy's allowlist or code.
+
+### Fallback fails or the first streaming event is delayed
+
+For Opus 5 auto fallback, configure both `opus-5` and `opus-4.8`; otherwise the
+request is rejected with HTTP 400 before a backend is launched. Auto mode waits
+for a complete response/tool boundary before sending headers or SSE content.
+Increase the client's first-byte timeout to accommodate generation time.
+
+HTTP 502 may include `backend_model_mismatch`, `fallback_buffer_limit`, or
+`fallback_tool_rollback_unsupported` in `error.reason`. These are failed turns,
+not completed answers. A strict stream can also fail after partial output; its
+error is not followed by a successful terminal marker. Use the request ID and
+metadata logs to diagnose a generic `backend_error`; do not assume every 502 is
+a refusal. A normal strict refusal uses the terminal refusal response described
+above, not HTTP 502.
 
 ## Development
 

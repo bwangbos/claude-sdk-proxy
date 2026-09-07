@@ -17,7 +17,7 @@ the [documentation index](../README.md) separates current references from archiv
 
 ## Current runnable gateway
 
-The current implementation is a private, single-user compatibility gateway for
+The current implementation is a local, single-user compatibility gateway for
 fresh, linear text/image and caller-owned tool conversations. It uses the Claude Agent
 SDK and the Claude login already available to the process. Run it from the same
 normal host login context where `claude` is authenticated; a sandboxed process
@@ -28,14 +28,17 @@ Install the locked dependencies and launch the default model on loopback:
 
 ```bash
 uv sync --dev
-uv run claude-proxy --model sonnet
+uv run claude-proxy --model sonnet-5
 ```
 
 The server listens at `http://127.0.0.1:8317`. It exposes
 `POST /v1/chat/completions`, `POST /v1/messages`, `GET /v1/models`, and
 `GET /health`. `--host` accepts loopback IP addresses only. Repeat `--model`
-to expose more than one configured Agent SDK model alias. `--max-sessions`
-sets the positive retained-session limit and defaults to 8.
+to expose more than one pinned model. The canonical choices are `sonnet-5`,
+`opus-5`, and `opus-4.8`; legacy `sonnet`/`opus` inputs normalize to version 5.
+`/v1/models` lists only configured canonical names, not the account's full model
+catalog. `--max-sessions` sets the positive retained-session limit and defaults
+to 8.
 `--tool-result-timeout` sets the positive finite number of seconds a suspended
 tool operation can wait for caller results and defaults to `300.0`. Both POST
 endpoints require `Content-Type: application/json`; normal media-type parameters
@@ -52,7 +55,7 @@ curl http://127.0.0.1:8317/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'X-Claude-Proxy-Session: example-anthropic' \
   -d '{
-    "model":"sonnet",
+    "model":"sonnet-5",
     "max_tokens":256,
     "messages":[{"role":"user","content":"Use lookup once for Boston."}],
     "tools":[{"name":"lookup","description":"Look up a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}]
@@ -64,7 +67,7 @@ append one user message containing exactly one `tool_result` per returned ID:
 
 ```json
 {
-  "model": "sonnet",
+  "model": "sonnet-5",
   "max_tokens": 256,
   "messages": [
     {"role": "user", "content": "Use lookup once for Boston."},
@@ -82,7 +85,7 @@ curl http://127.0.0.1:8317/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'X-Claude-Proxy-Session: example-openai' \
   -d '{
-    "model":"sonnet",
+    "model":"sonnet-5",
     "messages":[{"role":"user","content":"Use lookup once for Boston."}],
     "tools":[{"type":"function","function":{"name":"lookup","description":"Look up a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}]
   }'
@@ -93,7 +96,7 @@ each returned `tool_call_id`:
 
 ```json
 {
-  "model": "sonnet",
+  "model": "sonnet-5",
   "messages": [
     {"role": "user", "content": "Use lookup once for Boston."},
     {"role": "assistant", "content": null, "tool_calls": [{"id": "call_RETURNED_ID", "type": "function", "function": {"name": "lookup", "arguments": "{\"city\":\"Boston\"}"}}]},
@@ -104,11 +107,16 @@ each returned `tool_call_id`:
 ```
 
 Send each tool-result continuation to the same endpoint and with the same model,
-thinking configuration, system string, dialect, and canonical tool definitions
-as the request that produced the calls. Model/thinking may change after the
+thinking configuration, refusal-fallback policy, system string, dialect, and
+canonical tool definitions as the request that produced the calls. Model/thinking may change after the
 assistant finishes that turn; system/tools/dialect remain fixed. Parallel
 results may be returned in any order, but correlation is strictly by the public
 ID. Never infer correlation from tool name, arguments, or position.
+
+After auto fallback, keep the request's model unchanged for tool-result
+continuations: `model: "opus-5"` remains the requested route even when the
+response's actual model is `opus-4.8`. The known live session keeps using the
+validated replacement model.
 
 The SDK's private MCP callback metadata carries its native tool-use ID. The
 gateway validates that ID against the raw and typed assistant blocks and uses it
@@ -151,16 +159,17 @@ Hints are advisory and do not control backend caching.
 ### Pi configuration, thinking, and compaction
 
 Merge the [canonical Pi provider entries](../../README.md#configure-pi) into
-`~/.pi/agent/models.json`; they cover Sonnet and Opus in both API dialects,
-image inputs, and the verified thinking-level maps. This reference deliberately
+`~/.pi/agent/models.json`; they cover the three pinned models in both API dialects,
+verified thinking-level maps, and Sonnet 5/Opus 5 image inputs. Opus 4.8 is
+text-only in Pi until image input is verified. This reference deliberately
 links to one maintained configuration rather than duplicating it.
 
-Start the two-model proxy in one terminal (stop any existing server on that port
+Start the three-model proxy in one terminal (stop any existing server on that port
 first), then start Pi in another terminal with its ordinary tool set enabled:
 
 ```bash
-uv run claude-proxy --model sonnet --model opus
-pi --provider claude-subscription-local --model sonnet
+uv run claude-proxy --model sonnet-5 --model opus-5 --model opus-4.8
+pi --provider claude-subscription-local --model sonnet-5
 ```
 
 The dummy API key is deliberately non-secret; the gateway ignores it and uses
@@ -189,6 +198,36 @@ can set per-conversation headers may send a unique
 `X-Claude-Proxy-Session: <id>` to distinguish independent conversations that
 begin with identical text. Never configure one static value globally: that
 would collapse all conversations into one lineage.
+
+### Model identity and optional refusal fallback
+
+Strict fidelity is the default (`--refusal-fallback off`). To opt in to the
+native Opus 5 → Opus 4.8 classifier fallback, configure both models and use
+`--refusal-fallback auto`, or override one request with
+`X-Claude-Proxy-Refusal-Fallback: auto`. The header accepts exactly `off` or
+`auto`, once; invalid/repeated values or an unavailable target reject the request
+before generation. This is not overload retry or an arbitrary model router.
+
+Auto mode buffers one response until its answer/refusal/tool boundary, including
+when `stream: true`; headers and SSE frames arrive only afterward. It retains
+at most 64 MiB of normalized payload per response, not a total process-memory
+bound. Strict mode streams incrementally after validated model identity.
+
+Successful JSON/SSE uses the canonical actual model. Responses include
+`X-Claude-Proxy-Requested-Model` and `X-Claude-Proxy-Actual-Model`, plus
+`X-Claude-Proxy-Fallback: true` after a validated downgrade. Exact retained
+replays keep their original metadata. Known-session rebasing or thinking-only
+changes preserve the active model when the requested model/policy are unchanged;
+completed model/policy changes clear that provenance. Fresh imports after
+eviction/restart start the requested model. No durable replay is added.
+
+Malformed identity, buffer overflow, or original-leg tool retraction fails closed
+with no buffered output. The proxy closes/drains the session rather than
+fabricating tool results or rolling back individual callbacks. See the
+[model and fallback reference](../../README.md#model-and-thinking-controls) and
+[fallback troubleshooting](../../README.md#fallback-fails-or-the-first-streaming-event-is-delayed).
+
+### Transactional session replacement
 
 With a per-conversation header, a divergent completed transcript atomically
 replaces that ID's idle SDK session only after the replacement starts
@@ -292,7 +331,7 @@ app, the installed Agent SDK, and a stock Pi agent. It never inspects
 credentials. Run it from the normal authenticated host context:
 
 ```bash
-CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet \
+CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet-5 \
   .venv/bin/pytest -q --strict-markers --forbid-skips -W error \
   tests/live/test_gateway_text.py tests/live/test_gateway_tools.py \
   tests/live/test_gateway_images.py

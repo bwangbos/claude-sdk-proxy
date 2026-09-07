@@ -1,5 +1,11 @@
 # Classifier refusal and strict model fidelity
 
+> Historical checkpoint: this record predates pinned models and opt-in buffered
+> fallback. Strict mode remains the default, but statements below about no auto
+> mode and requested-alias response names are superseded. See the
+> [current model/fallback reference](../../README.md#model-and-thinking-controls)
+> and [subsequent verification](2026-09-07-buffered-fallback-evidence.md).
+
 ## Observed failure
 
 The custom harness captured a `model_refusal_fallback` system event with

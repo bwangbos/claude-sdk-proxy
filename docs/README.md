@@ -13,7 +13,9 @@
 - [Pinned-model and buffered-fallback evidence](research/2026-09-07-buffered-fallback-evidence.md):
   exact Sonnet 5, Opus 5, and Opus 4.8 identities; Opus 4.8 text/tool/thinking
   capability; isolated opt-in fallback observations; synthetic defensive
-  coverage; and remaining live-evidence limitations.
+  coverage; successful production-path fallback; the final 1,954-test checkpoint;
+  and remaining live-evidence limitations. It also explains the bundled-runtime
+  synthetic close that differed from the initial protocol assumptions.
 - [Harness compatibility verification](research/2026-09-06-harness-compatibility-verification.md):
   request normalization, transcript recovery, usage, diagnostics, and the
   native-clock fix. Counts describe that earlier checkpoint, not today's suite.
