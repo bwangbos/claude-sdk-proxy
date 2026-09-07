@@ -96,7 +96,7 @@ async def test_real_pi_openai_provider_against_gateway(
     factory = SequenceSessionFactory(tuple(specifications))
     timeout = 0.1 if scenario == "timeout" else 5.0
     app = create_app(
-        models=("sonnet",),
+        models=("sonnet-5",),
         session_factory=factory,
         turn_timeout_seconds=timeout,
     )
@@ -175,7 +175,7 @@ async def test_real_pi_agent_executes_repeated_tools_with_provider_config_only(
         del args, kwargs
         return session
 
-    app = create_app(models=("sonnet",), session_factory=factory)
+    app = create_app(models=("sonnet-5",), session_factory=factory)
     async with serve(app) as base_url:
         result = await run_pi_tool(base_url)
 
@@ -252,7 +252,7 @@ async def test_real_pi_provider_accepts_a_compacted_transcript_without_adapter()
     factory = SequenceSessionFactory(
         ((("first answer",), False), (("rebased answer",), False))
     )
-    app = create_app(models=("sonnet",), session_factory=factory)
+    app = create_app(models=("sonnet-5",), session_factory=factory)
 
     async with serve(app) as base_url:
         result = await run_pi(base_url, "rebase")

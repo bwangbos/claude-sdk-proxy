@@ -10,12 +10,16 @@
 - [Model/thinking verification](research/2026-09-06-model-thinking-verification.md):
   Sonnet/Opus effort matrix, real Pi bidirectional switching, native refusal
   investigation, final review, and the 1,757-test offline gate.
+- [Pinned-model and buffered-fallback evidence](research/2026-09-07-buffered-fallback-evidence.md):
+  exact Sonnet 5, Opus 5, and Opus 4.8 identities; Opus 4.8 text/tool/thinking
+  capability; isolated opt-in fallback observations; synthetic defensive
+  coverage; and remaining live-evidence limitations.
 - [Harness compatibility verification](research/2026-09-06-harness-compatibility-verification.md):
   request normalization, transcript recovery, usage, diagnostics, and the
   native-clock fix. Counts describe that earlier checkpoint, not today's suite.
 
-The implementation is merged into `main`. Updating Git does not restart a
-running proxy or edit local Pi settings; follow the root README to activate it.
+Updating Git does not restart a running proxy or edit local Pi settings; follow
+the root README to activate the revision you checked out.
 Live observations are dated, account-specific evidence, not guarantees about
 future Claude behavior or model availability.
 

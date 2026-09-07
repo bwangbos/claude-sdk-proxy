@@ -26,7 +26,7 @@ responses. The calling harness remains responsible for executing its own tools.
 - Pi automatic compaction and `/compact`
 - Generic full-transcript import and rebasing at completed turn boundaries
 - In-memory continuation, retry replay, bounded session capacity, and teardown
-- Multiple configured Claude model aliases
+- Version-pinned Sonnet 5, Opus 5, and Opus 4.8 model choices
 - Sonnet/Opus thinking controls and model/effort changes between completed turns
 - Separate reasoning streams, native signed-thinking replay, and refusal recovery
 
@@ -77,13 +77,13 @@ read the macOS Keychain even when `claude` works in your terminal.
 ## Quick start
 
 Clone the repository, install the locked dependencies, and start the default
-`sonnet` model:
+`sonnet-5` model:
 
 ```bash
 git clone https://github.com/bwangbos/claude-sdk-proxy.git
 cd claude-sdk-proxy
 uv sync --dev
-uv run claude-proxy --model sonnet
+uv run claude-proxy --model sonnet-5
 ```
 
 The server listens on `http://127.0.0.1:8317` by default. In another terminal:
@@ -124,8 +124,8 @@ choice; use the Anthropic transport when tool results can contain images.
       },
       "models": [
         {
-          "id": "sonnet",
-          "name": "Claude Sonnet subscription",
+          "id": "sonnet-5",
+          "name": "Claude Sonnet 5 subscription",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -147,8 +147,8 @@ choice; use the Anthropic transport when tool results can contain images.
           }
         },
         {
-          "id": "opus",
-          "name": "Claude Opus subscription",
+          "id": "opus-5",
+          "name": "Claude Opus 5 subscription",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -160,6 +160,29 @@ choice; use the Anthropic transport when tool results can contain images.
             "max": "max"
           },
           "input": ["text", "image"],
+          "contextWindow": 200000,
+          "maxTokens": 16384,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "opus-4.8",
+          "name": "Claude Opus 4.8 subscription (text only)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": ["text"],
           "contextWindow": 200000,
           "maxTokens": 16384,
           "cost": {
@@ -185,8 +208,8 @@ choice; use the Anthropic transport when tool results can contain images.
       },
       "models": [
         {
-          "id": "sonnet",
-          "name": "Claude Sonnet subscription",
+          "id": "sonnet-5",
+          "name": "Claude Sonnet 5 subscription",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -208,8 +231,8 @@ choice; use the Anthropic transport when tool results can contain images.
           }
         },
         {
-          "id": "opus",
-          "name": "Claude Opus subscription",
+          "id": "opus-5",
+          "name": "Claude Opus 5 subscription",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -229,6 +252,29 @@ choice; use the Anthropic transport when tool results can contain images.
             "cacheRead": 0,
             "cacheWrite": 0
           }
+        },
+        {
+          "id": "opus-4.8",
+          "name": "Claude Opus 4.8 subscription (text only)",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "input": ["text"],
+          "contextWindow": 200000,
+          "maxTokens": 16384,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
         }
       ]
     }
@@ -237,19 +283,21 @@ choice; use the Anthropic transport when tool results can contain images.
 ```
 
 The placeholder key is intentionally non-secret. The proxy ignores it and uses
-the local Claude login of the process running the server.
+the local Claude login of the process running the server. Opus 4.8 is intentionally
+listed as text-only: text, tools, and adaptive thinking are live-verified, but
+image input has not been verified for that exact pinned model.
 
-Start the proxy with both advertised aliases, then start Pi with its ordinary
-tools:
+Start the proxy with the three advertised pinned models, then start Pi with its
+ordinary tools:
 
 ```bash
-uv run claude-proxy --model sonnet --model opus
-pi --provider claude-subscription-local --model sonnet
+uv run claude-proxy --model sonnet-5 --model opus-5 --model opus-4.8
+pi --provider claude-subscription-local --model sonnet-5
 ```
 
 If the quick-start server is already running, stop it with `Ctrl+C` before
-launching the two-model command; do not start a second server on the same port.
-Confirm `/v1/models` lists both aliases. These custom Pi entries are explicit:
+launching the multi-model command; do not start a second server on the same port.
+Confirm `/v1/models` lists the three canonical names. These Pi entries are explicit:
 adding a server alias alone does not add it to Pi's model picker.
 
 No Pi adapter or extension is required. Use `/model` to choose Sonnet or Opus
@@ -288,7 +336,7 @@ Restart the proxy and Pi after updating the configuration, then select the
 Anthropic transport:
 
 ```bash
-pi --provider claude-subscription-vision --model sonnet
+pi --provider claude-subscription-vision --model sonnet-5
 ```
 
 Ask Pi to read an image file, or attach one. The beta header and compatibility
@@ -418,26 +466,48 @@ such as `charset=utf-8` are accepted.
 
 ### Model and thinking controls
 
-`model` must exactly match one of the server's repeated `--model` values.
-`GET /v1/models` lists that allowlist, not every model available to your Claude
-account. There is no automatic model fallback.
+`model` must resolve to one of the server's repeated `--model` values.
+`sonnet-5`, `opus-5`, and `opus-4.8` pin SDK models `claude-sonnet-5`,
+`claude-opus-5`, and `claude-opus-4-8`, respectively. Deprecated inputs
+`sonnet` and `opus` normalize to the first two pinned choices. `GET /v1/models`
+lists canonical configured names once, not every model available to the account.
 
-The proxy disables the SDK's classifier-triggered model downgrade for every
-session using `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`. This is distinct from the
-SDK's `fallback_model` option for overload/unavailability. A supported native
-refusal ends as `refusal` (Anthropic) or `content_filter` (OpenAI), not a retry on
-another model. The recognized named categories include `cyber`, `bio`,
-`frontier_llm`, `general_harms`, and `reasoning_extraction`.
+Classifier-refusal fallback is off by default. Enable the observed, bounded
+Opus 5 to Opus 4.8 native route with `--refusal-fallback auto`; both models must
+be in the server allowlist. A request can override the server setting with
+`X-Claude-Proxy-Refusal-Fallback: off` or `auto`. An invalid or repeated header
+is HTTP 400. This control is transport metadata and is never added to prompts.
+The feature is separate from overload fallback, which remains unconfigured.
 
-If the runtime nevertheless emits a model-switch notice, the proxy stops that
-generation without accepting the replacement answer. JSON responses report
-HTTP 502 with `reason: "model_fallback_disabled"`; an already-started stream
-reports an explicit fallback-disabled error. This is a policy enforcement
-failure, not a completed refusal, and must not be scored as an answer from the
-requested model. There is no mixed-model opt-in in this release. Response
-`model` still names the requested alias; it is not an exact-version attestation.
-See the [verification notes](docs/research/2026-09-07-refusal-model-fidelity.md)
-for evidence and live-verification limitations.
+```bash
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-Claude-Proxy-Refusal-Fallback: auto' \
+  -d '{"model":"opus-5","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Strict `off` mode preserves incremental streaming and returns an ordinary
+refusal without downgrading. `auto` buffers the whole public response until a
+terminal answer/refusal or tool-call boundary, so `stream: true` still returns
+normal SSE frames but only after that generation finishes. Clients must allow
+for the generation delay in their first-byte timeout. Retained normalized event
+payload is limited to 64 MiB per response; exceeding it fails with
+`fallback_buffer_limit`, publishes no buffered output, and closes the session.
+This is a payload ceiling, not a bound on total process memory.
+
+Successful responses include `X-Claude-Proxy-Requested-Model` and
+`X-Claude-Proxy-Actual-Model`; responses served after a validated switch also
+include `X-Claude-Proxy-Fallback: true`. Body and SSE `model` fields name the
+canonical actual model. These fields and headers are retained on exact replay
+and on later responses recovered from the same live downgraded session. Replay
+is bounded to the existing in-memory live-session cache; it is not durable and
+is not extended by this feature. A fresh import after eviction or restart starts
+the requested pinned model and does not infer fallback provenance from history.
+
+If native fallback tries to retract original-leg tool activity, the response
+fails with `fallback_tool_rollback_unsupported`, publishes no buffered output,
+and closes/drains the native session. The proxy never executes generated tools,
+fabricates results, or moves abandoned callback IDs into the replacement leg.
 
 | Setting | OpenAI Chat Completions | Anthropic Messages |
 | --- | --- | --- |
@@ -445,8 +515,9 @@ for evidence and live-verification limitations.
 | Adaptive effort | `reasoning_effort: "low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` | `thinking: {"type":"adaptive"}` with `output_config: {"effort":"high"}` (same five effort values for current aliases) |
 | Thinking display | No separate display request control | Add `display: "summarized"` or `"omitted"` inside active `thinking` |
 
-Both current `sonnet` and `opus` aliases support the listed levels in the
-[recorded live checks](docs/research/2026-09-06-model-thinking-verification.md).
+All three canonical models support the listed adaptive levels in the recorded
+live checks. Opus 4.8 image input remains unverified and is not advertised in the
+Pi example; Sonnet 5 and Opus 5 retain their verified text/image profiles.
 Pinned older model IDs have different capability rules; the proxy rejects
 unsupported model/control combinations with HTTP 400, without a silent
 downgrade. The legacy Anthropic `thinking: {"type":"enabled","budget_tokens":N}`
@@ -568,6 +639,7 @@ uv run claude-proxy \
   [--host 127.0.0.1] \
   [--port 8317] \
   [--model MODEL]... \
+  [--refusal-fallback {off,auto}] \
   [--max-sessions 8] \
   [--tool-result-timeout 300] \
   [--log PATH] \
@@ -575,7 +647,9 @@ uv run claude-proxy \
 ```
 
 - `--host` accepts loopback IP addresses only.
-- Repeat `--model` to expose multiple Agent SDK model aliases.
+- Repeat `--model` to expose multiple pinned models; the default is `sonnet-5`.
+- `--refusal-fallback` defaults to `off`; `auto` requires both `opus-5` and
+  `opus-4.8` when Opus 5 is configured.
 - Idle sessions are evicted least-recently-used when capacity is reached.
 - In-flight and tool-waiting sessions are never evicted.
 - If every retained session is busy, the API returns HTTP `503` with
@@ -583,10 +657,11 @@ uv run claude-proxy \
 - Generation and tool-result waits default to 300 seconds; backend teardown is
   bounded separately.
 
-Example with two model aliases:
+Example with all pinned models and opt-in fallback:
 
 ```bash
-uv run claude-proxy --model sonnet --model opus --max-sessions 16
+uv run claude-proxy --model sonnet-5 --model opus-5 --model opus-4.8 \
+  --refusal-fallback auto --max-sessions 16
 ```
 
 ## Troubleshooting
@@ -597,7 +672,7 @@ The provider entry does not start the gateway. Run the following in a separate
 terminal and confirm `/health` responds:
 
 ```bash
-uv run claude-proxy --model sonnet --model opus
+uv run claude-proxy --model sonnet-5 --model opus-5 --model opus-4.8
 ```
 
 ### Pi returns `param: "tools"`
@@ -630,7 +705,7 @@ session header when the requests actually belong to different conversations.
 Every HTTP response includes an `X-Request-ID`. For opt-in diagnostics:
 
 ```bash
-uv run claude-proxy --model sonnet --log proxy.jsonl --log-json
+uv run claude-proxy --model sonnet-5 --log proxy.jsonl --log-json
 ```
 
 `--log PATH` appends readable metadata by default; add `--log-json` for JSON lines.
@@ -652,8 +727,9 @@ updating the checkout.
 
 ### Opus is missing or thinking controls are rejected
 
-Check `/v1/models` for both aliases, restart the server with
-`--model sonnet --model opus`, and use the current Pi configuration above.
+Check `/v1/models` for the canonical choices, restart the server with
+`--model sonnet-5 --model opus-5 --model opus-4.8`, and use the current Pi
+configuration above.
 Pi needs `reasoning: true`, the model-level `thinkingLevelMap`, and the matching
 provider compatibility flags. Restart Pi after changing provider configuration.
 Changing `models.json` alone does not update a running proxy's allowlist or code.
@@ -678,7 +754,7 @@ make check
 Live subscription tests are separate and explicit because they invoke Claude:
 
 ```bash
-CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet \
+CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet-5 \
   .venv/bin/pytest -q --strict-markers --forbid-skips -W error \
   tests/live/test_gateway_text.py tests/live/test_gateway_tools.py
 ```

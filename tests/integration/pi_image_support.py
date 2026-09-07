@@ -23,7 +23,7 @@ def image_provider(base_url: str) -> dict:
         },
         "models": [
             {
-                "id": "sonnet",
+                "id": "sonnet-5",
                 "name": "Claude local images",
                 "reasoning": False,
                 "input": ["text", "image"],

@@ -68,7 +68,7 @@ const { streamSimple } = await import(moduleSpecifier(aiModuleName));
 const { Agent } = await import(moduleSpecifier(agentModuleName));
 
 const model = {
-  id: "sonnet",
+  id: "sonnet-5",
   name: "Claude subscription proxy",
   api: "openai-completions",
   provider: "claude-proxy",

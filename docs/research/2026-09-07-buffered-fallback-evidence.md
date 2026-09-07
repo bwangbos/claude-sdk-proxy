@@ -116,3 +116,40 @@ with the approved host permission succeeded. This was a probe-environment
 permission limitation, not model-availability evidence; live capability checks
 must have access to the normal authenticated runtime without printing or
 extracting credentials.
+
+## Release implementation verification
+
+The final implementation verification kept live observations distinct from
+deterministic synthetic coverage. The production-path probe was updated to send
+the already-authorized eight-message request through the real OpenAI-compatible
+HTTP endpoint with the configured `off` or `auto` policy. It records only HTTP
+status, model/provenance headers, response model, finish reason, error reason,
+and tool-call count, then stops at the response boundary without executing a
+generated tool. The environment approval gate rejected the run because it could
+not independently establish authorization for the private payload. No bypass or
+alternate benchmark was attempted. Consequently, strict-off refusal versus
+auto replacement was not newly observed through the production HTTP path in
+this run; the isolated native live observations above remain the live evidence.
+
+Deterministic production tests separately cover the implemented behavior for
+both HTTP dialects and JSON/SSE responses: default and per-request policy,
+configured-route enforcement, replacement-only publication, actual/requested
+headers and SSE model identity, fallback provenance through replay and recovery,
+bounded buffering, stale replay behavior, policy changes, malformed transitions,
+extra hops, disconnect/deadline cleanup, and explicit rejection/drain of
+discarded-leg tool activity. These fixtures are synthetic protocol coverage and
+are not claims that every defensive event order was seen live.
+
+The two existing Pi proxy providers were migrated to canonical `sonnet-5`,
+`opus-5`, and `opus-4.8` entries without changing their endpoints, credentials,
+compatibility settings, or unrelated providers. Sonnet 5 and Opus 5 retain the
+previously verified text/image profiles. Opus 4.8 advertises text, tools, and
+adaptive thinking but remains text-only in Pi because no live image-input check
+for that exact model was completed. Pi does not enable refusal fallback globally;
+the server default and request header remain the controls.
+
+A final harmless direct text-access check repeated the exact pinned models with
+fallback disabled. Sonnet 5, Opus 5, and Opus 4.8 each emitted an exact raw
+`message_start.model` before text, a matching typed assistant model, and a
+successful `end_turn` result. This reconfirmed account access without exercising
+the private refusal reproduction or expanding the capability claims above.

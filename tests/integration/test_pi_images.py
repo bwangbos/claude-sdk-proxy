@@ -39,7 +39,7 @@ async def test_stock_pi_read_returns_image_to_original_tool_call(tmp_path):
 
     session = ImageSession()
     app = create_app(
-        models=("sonnet",), session_factory=lambda *args, **kwargs: session
+        models=("sonnet-5",), session_factory=lambda *args, **kwargs: session
     )
     async with serve(app) as url:
         output = await run_pi_image(url, tmp_path)

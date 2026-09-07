@@ -5,9 +5,9 @@ const scenario = process.argv[2];
 const dialect = process.argv[3];
 const moduleName = process.env.PI_AI_COMPAT_MODULE;
 const baseUrl = process.env.PROXY_BASE_URL;
-const firstModelId = process.env.PI_FIRST_MODEL ?? "sonnet";
+const firstModelId = process.env.PI_FIRST_MODEL ?? "sonnet-5";
 const firstReasoning = process.env.PI_FIRST_REASONING ?? "high";
-const secondModelId = process.env.PI_SECOND_MODEL ?? "opus";
+const secondModelId = process.env.PI_SECOND_MODEL ?? "opus-5";
 const secondReasoning = process.env.PI_SECOND_REASONING ?? "low";
 
 if (!moduleName || !baseUrl) {

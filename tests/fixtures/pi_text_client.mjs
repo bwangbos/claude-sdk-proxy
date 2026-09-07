@@ -18,7 +18,7 @@ const moduleSpecifier = path.isAbsolute(moduleName)
 const { streamSimple } = await import(moduleSpecifier);
 
 const model = {
-  id: "sonnet",
+  id: "sonnet-5",
   name: "Claude subscription proxy",
   api: "openai-completions",
   provider: "claude-proxy",
