@@ -707,7 +707,7 @@ async def test_sdk_session_rejects_malformed_message_start_usage(
         session_id="sdk-1",
         event={
             "type": "message_start",
-            "message": {"model": "claude-sonnet-5", "usage": usage},
+            "message": {"model": "claude-sonnet-5", "id": "msg-text", "usage": usage},
         },
     )
     with pytest.raises(BackendFailure, match="protocol") as error:
@@ -726,7 +726,11 @@ async def test_sdk_session_keeps_boundary_usage_when_aggregate_usage_differs(
         session_id="sdk-1",
         event={
             "type": "message_start",
-            "message": {"model": "claude-sonnet-5", "usage": {"input_tokens": 7}},
+            "message": {
+                "model": "claude-sonnet-5",
+                "id": "msg-text",
+                "usage": {"input_tokens": 7},
+            },
         },
     )
     events = await collect_sdk_response(

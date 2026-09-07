@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from io import StringIO
 from typing import Any, cast
 
 from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
@@ -50,16 +51,18 @@ class RawToolCall:
 
 @dataclass(slots=True)
 class _RawBlock:
+    # Materialize accumulators only for typed validation or block completion.
     kind: str
-    text: list[str]
+    text: StringIO = dataclass_field(default_factory=StringIO)
     internal_id: str | None = None
     sdk_name: str | None = None
     public_name: str | None = None
-    json_parts: list[str] | None = None
+    json_parts: StringIO | None = None
     json_chars: int = 0
     arguments: Mapping[str, JsonValue] | None = None
     saw_delta: bool = False
-    signature: str = ""
+    saw_thinking_delta: bool = False
+    signature: StringIO = dataclass_field(default_factory=StringIO)
     data: str = ""
     reasoning_events: list[ThinkingDelta | ThinkingCompleted] = dataclass_field(
         default_factory=list
@@ -97,6 +100,7 @@ class RawSdkMessageValidator:
         self.stop_reason: str | None = None
         self._allow_seeded_history = allow_seeded_history
         self._refusal_diagnostic = False
+        self.message_id: str | None = None
 
     def observe(
         self, event: Mapping[str, Any]
@@ -266,16 +270,16 @@ class RawSdkMessageValidator:
             if type(typed) is SdkThinkingBlock:
                 if (
                     raw.kind != "thinking"
-                    or not raw.signature
-                    or typed.thinking != "".join(raw.text)
-                    or typed.signature != raw.signature
+                    or not raw.signature.tell()
+                    or typed.thinking != raw.text.getvalue()
+                    or typed.signature != raw.signature.getvalue()
                 ):
                     fail_protocol()
                 continue
             if type(typed) is TextBlock:
                 if typed_suffix_started or raw.kind != "text":
                     fail_protocol()
-                if not isinstance(typed.text, str) or typed.text != "".join(raw.text):
+                if not isinstance(typed.text, str) or typed.text != raw.text.getvalue():
                     fail_protocol()
                 continue
             if type(typed) is not ToolUseBlock or raw.kind != "tool_use":
@@ -374,6 +378,10 @@ class RawSdkMessageValidator:
             value = message.get(field)
             if value is not None and (not isinstance(value, str) or not value):
                 fail_protocol()
+        message_id = message.get("id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            fail_protocol()
+        self.message_id = message_id
         usage = normalize_usage(message.get("usage"), USAGE_FIELDS)
         if usage is None or "input_tokens" not in usage:
             fail_protocol()
@@ -414,7 +422,7 @@ class RawSdkMessageValidator:
                 or value.get("text") != ""
             ):
                 fail_protocol()
-            self._current = _RawBlock("text", [])
+            self._current = _RawBlock("text")
         elif block_type == "thinking":
             if (
                 set(value) != {"type", "thinking", "signature"}
@@ -422,14 +430,12 @@ class RawSdkMessageValidator:
                 or value.get("signature") != ""
             ):
                 fail_protocol()
-            self._current = _RawBlock("thinking", [])
+            self._current = _RawBlock("thinking")
         elif block_type == "redacted_thinking":
             data = value.get("data")
             if set(value) != {"type", "data"} or not isinstance(data, str) or not data:
                 fail_protocol()
-            self._current = _RawBlock(
-                "redacted_thinking", [], data=data, saw_delta=True
-            )
+            self._current = _RawBlock("redacted_thinking", data=data, saw_delta=True)
         elif block_type == "tool_use":
             if set(value) != {
                 "type",
@@ -453,11 +459,10 @@ class RawSdkMessageValidator:
             self._tool_suffix_started = True
             self._current = _RawBlock(
                 "tool_use",
-                [],
                 internal_id=internal_id,
                 sdk_name=sdk_name,
                 public_name=public_name,
-                json_parts=[],
+                json_parts=StringIO(),
             )
         else:
             fail_protocol()
@@ -484,23 +489,17 @@ class RawSdkMessageValidator:
                 if (
                     set(delta) - {"type", "thinking", "estimated_tokens"}
                     or not isinstance(text, str)
-                    or self._current.signature
+                    or self._current.signature.tell()
                     or (
                         estimate is not None
                         and (type(estimate) is not int or estimate < 0)
                     )
                 ):
                     fail_protocol()
-                self._current.text[:] = ["".join(self._current.text) + text]
+                self._current.text.write(text)
                 self._current.saw_delta = True
+                self._current.saw_thinking_delta = True
                 thinking_delta = ThinkingDelta(self._block_index, text)
-                retained = self._current.reasoning_events
-                if retained and isinstance(retained[-1], ThinkingDelta):
-                    retained[-1] = ThinkingDelta(
-                        self._block_index, retained[-1].text + text
-                    )
-                else:
-                    retained.append(thinking_delta)
                 return None if self._tool_suffix_started else thinking_delta
             if delta.get("type") == "signature_delta":
                 signature = delta.get("signature")
@@ -510,7 +509,7 @@ class RawSdkMessageValidator:
                     or not signature
                 ):
                     fail_protocol()
-                self._current.signature += signature
+                self._current.signature.write(signature)
                 self._current.saw_delta = True
                 return None
             fail_protocol()
@@ -523,7 +522,7 @@ class RawSdkMessageValidator:
             if not isinstance(text, str):
                 fail_protocol()
             self._current.saw_delta = True
-            self._current.text[:] = ["".join(self._current.text) + text]
+            self._current.text.write(text)
             return TextDelta(text)
         if (
             set(delta) != {"type", "partial_json"}
@@ -534,10 +533,10 @@ class RawSdkMessageValidator:
         if not isinstance(partial, str) or self._current.json_parts is None:
             fail_protocol()
         self._current.saw_delta = True
-        self._current.json_parts[:] = ["".join(self._current.json_parts) + partial]
         self._current.json_chars += len(partial)
         if self._current.json_chars > _MAX_RAW_ARGUMENT_CHARS:
             fail_protocol()
+        self._current.json_parts.write(partial)
         return None
 
     def _block_stop(self, event: Mapping[str, Any]) -> ThinkingCompleted | None:
@@ -551,12 +550,18 @@ class RawSdkMessageValidator:
         self._require_index(event)
         completed = None
         if self._current.kind == "thinking":
-            if not self._current.signature:
+            if not self._current.signature.tell():
                 fail_protocol()
             completed = ThinkingCompleted(
                 self._block_index,
-                ThinkingBlock("".join(self._current.text), self._current.signature),
+                ThinkingBlock(
+                    self._current.text.getvalue(), self._current.signature.getvalue()
+                ),
             )
+            if self._current.saw_thinking_delta:
+                self._current.reasoning_events.append(
+                    ThinkingDelta(self._block_index, self._current.text.getvalue())
+                )
         elif self._current.kind == "redacted_thinking":
             completed = ThinkingCompleted(
                 self._block_index, RedactedThinkingBlock(self._current.data)
@@ -750,13 +755,13 @@ class RawSdkMessageValidator:
             fail_protocol()
 
     def _parse_arguments(
-        self, parts: list[str], public_name: str
+        self, parts: StringIO, public_name: str
     ) -> Mapping[str, JsonValue]:
         try:
             # Parameterless tools can emit an empty input_json_delta for the
             # initial empty input object. Typed input and schema are
             # still checked before publishing the call.
-            parsed = json.loads("".join(parts) or "{}")
+            parsed = json.loads(parts.getvalue() or "{}")
         except json.JSONDecodeError, RecursionError:
             fail_protocol()
         return self._validated_arguments(parsed, public_name)

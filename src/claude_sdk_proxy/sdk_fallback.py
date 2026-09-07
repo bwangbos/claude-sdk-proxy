@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from io import StringIO
 from typing import Any, cast
 
 from claude_sdk_proxy.domain import (
@@ -22,6 +23,7 @@ class FallbackBuffer:
 
     A separate native admission counter includes signatures and arguments before
     their completed normalized events exist. Neither counter is a Python RSS cap.
+    StringIO accumulates each adjacent run without copying its prefix per delta.
     """
 
     def __init__(self, limit_bytes: int = 64 * 1024 * 1024) -> None:
@@ -29,6 +31,8 @@ class FallbackBuffer:
         self._bytes = 0
         self._native_bytes = 0
         self._events: list[ConversationEvent] = []
+        self._pending: TextDelta | ThinkingDelta | None = None
+        self._text = StringIO()
 
     def _check(self, size: int) -> None:
         if size > self._limit:
@@ -70,23 +74,42 @@ class FallbackBuffer:
             )
         self._check(self._bytes + size)
         self._bytes += size
-        previous = self._events[-1] if self._events else None
-        if isinstance(previous, TextDelta) and isinstance(event, TextDelta):
-            self._events[-1] = TextDelta(previous.text + event.text)
-        elif (
+        previous = self._pending
+        adjacent = (
+            isinstance(previous, TextDelta) and isinstance(event, TextDelta)
+        ) or (
             isinstance(previous, ThinkingDelta)
             and isinstance(event, ThinkingDelta)
             and previous.index == event.index
-        ):
-            self._events[-1] = ThinkingDelta(event.index, previous.text + event.text)
+        )
+        if not adjacent:
+            self._flush()
+        if isinstance(event, (TextDelta, ThinkingDelta)):
+            self._pending = event
+            self._text.write(event.text)
         else:
             self._events.append(event)
 
+    def _flush(self) -> None:
+        pending = self._pending
+        if pending is not None:
+            text = self._text.getvalue()
+            self._events.append(
+                TextDelta(text)
+                if isinstance(pending, TextDelta)
+                else ThinkingDelta(pending.index, text)
+            )
+            self._pending = None
+            self._text = StringIO()
+
     def discard(self) -> None:
         self._events.clear()
+        self._pending = None
+        self._text = StringIO()
         self._bytes = self._native_bytes = 0
 
     def release(self) -> tuple[ConversationEvent, ...]:
+        self._flush()
         events = tuple(self._events)
         self.discard()
         return events

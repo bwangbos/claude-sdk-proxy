@@ -190,6 +190,7 @@ def raw_text_events(
                 "type": "message_start",
                 "message": {
                     "model": model,
+                    "id": "msg-text",
                     "usage": {"input_tokens": input_tokens, "output_tokens": 0},
                 },
             },
@@ -260,6 +261,7 @@ def raw_tool_events(
                 "type": "message_start",
                 "message": {
                     "model": model,
+                    "id": "msg-tool",
                     "usage": {"input_tokens": input_tokens, "output_tokens": 0},
                 },
             },

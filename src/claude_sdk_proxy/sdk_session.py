@@ -421,6 +421,14 @@ class SdkSession:
                         if replacement_pending:
                             if raw is None or not raw.complete:
                                 self._fail_protocol()
+                            replacement_message = event.get("message")
+                            if (
+                                not isinstance(replacement_message, Mapping)
+                                or not isinstance(replacement_message.get("id"), str)
+                                or not replacement_message["id"].strip()
+                                or replacement_message["id"] == raw.message_id
+                            ):
+                                self._fail_protocol()
                             self._model = "claude-opus-4-8"
                             self._fallback_provenance = True
                             replacement_pending = False

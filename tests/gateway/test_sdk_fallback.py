@@ -33,10 +33,69 @@ def pinned_thinking(model: str) -> tuple[object, ...]:
         event = replace(event, session_id="sdk-1")
         if isinstance(event, StreamEvent) and event.event["type"] == "message_start":
             event.event["message"]["model"] = model
+            event.event["message"]["id"] = f"thinking-{model}"
         if isinstance(event, AssistantMessage):
             event = replace(event, model=model)
         events.append(event)
     return tuple(events)
+
+
+class _NoPrefixCopy(str):
+    """Detect quadratic prefix concatenation without wall-clock assertions."""
+
+    def __add__(self, other: str) -> str:
+        raise AssertionError("per-delta prefix copy")
+
+    def __radd__(self, other: str) -> str:
+        raise AssertionError("per-delta prefix copy")
+
+
+def test_buffer_fragment_accumulation_does_not_copy_prefix() -> None:
+    from claude_sdk_proxy.domain import ThinkingDelta
+    from claude_sdk_proxy.sdk_fallback import FallbackBuffer
+
+    buffer = FallbackBuffer(limit_bytes=12)
+    for event_type in (TextDelta, lambda text: ThinkingDelta(0, text)):
+        for _ in range(3):
+            buffer.append(event_type(_NoPrefixCopy("é")))
+    assert buffer.release() == (TextDelta("ééé"), ThinkingDelta(0, "ééé"))
+
+
+@pytest.mark.parametrize("kind", ["text", "thinking", "tool"])
+def test_native_fragment_accumulation_does_not_copy_prefix(kind: str) -> None:
+    from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+    from tests.gateway.test_thinking_streams import thinking_response
+
+    messages = (
+        raw_text_events("accepted", "sdk-1")
+        if kind == "text"
+        else thinking_response()
+        if kind == "thinking"
+        else raw_tool_events(
+            (("call-1", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
+        )
+    )
+    raw = RawSdkMessageValidator((echo_definition(),))
+    for message in messages:
+        if isinstance(message, StreamEvent):
+            event = message.event
+            delta = event.get("delta", {})
+            key = next(
+                (
+                    key
+                    for key in ("text", "thinking", "signature", "partial_json")
+                    if key in delta
+                ),
+                None,
+            )
+            if key is not None:
+                for char in delta[key]:
+                    raw.observe({**event, "delta": {**delta, key: _NoPrefixCopy(char)}})
+            else:
+                raw.observe(event)
+        elif isinstance(message, AssistantMessage):
+            raw.validate_assistant(message)
+    assert raw.complete
 
 
 @pytest.mark.anyio
@@ -89,6 +148,8 @@ async def test_auto_no_fallback_refusal_is_committed_only_after_result(
         "missing-replacement",
         "early-replacement",
         "unconfigured",
+        "missing-replacement-id",
+        "reused-replacement-id",
     ],
 )
 async def test_invalid_native_transition_never_releases_identity(
@@ -109,6 +170,12 @@ async def test_invalid_native_transition_never_releases_identity(
         messages = messages[:4]
     elif case == "early-replacement":
         del messages[2:4]
+    elif case in {"missing-replacement-id", "reused-replacement-id"}:
+        replacement = messages[4].event["message"]
+        if case == "missing-replacement-id":
+            replacement.pop("id")
+        else:
+            replacement["id"] = "msg-refusal"
     client = FakeSdkClient((tuple(messages),))
     session = SdkSession(
         "opus-5",
@@ -137,7 +204,12 @@ def test_native_payload_limit_precedes_validator_retention(payload: dict) -> Non
         buffer.admit_raw({"delta": payload})
 
 
-def test_tool_suffix_retains_coalesced_thinking_not_per_delta_events() -> None:
+@pytest.mark.parametrize("signature_only", [False, True])
+def test_tool_suffix_retains_coalesced_thinking_not_per_delta_events(
+    signature_only: bool,
+) -> None:
+    from claude_agent_sdk import ThinkingBlock as SdkThinkingBlock
+
     from claude_sdk_proxy.domain import ThinkingDelta, ToolDefinition
     from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
     from tests.gateway.test_thinking_streams import interleaved_tool_response
@@ -147,6 +219,8 @@ def test_tool_suffix_retains_coalesced_thinking_not_per_delta_events() -> None:
     for event in interleaved_tool_response():
         if isinstance(event, StreamEvent):
             if event.event.get("delta", {}).get("thinking") == "reason-2":
+                if signature_only:
+                    continue
                 for char in "reason-2":
                     raw.observe(
                         {
@@ -157,10 +231,14 @@ def test_tool_suffix_retains_coalesced_thinking_not_per_delta_events() -> None:
             else:
                 raw.observe(event.event)
         elif isinstance(event, AssistantMessage):
+            if signature_only and event.content == [
+                SdkThinkingBlock("reason-2", "sig-2")
+            ]:
+                event = replace(event, content=[SdkThinkingBlock("", "sig-2")])
             raw.validate_assistant(event)
-    assert [e for e in raw.tool_suffix if isinstance(e, ThinkingDelta)] == [
-        ThinkingDelta(2, "reason-2")
-    ]
+    assert [e for e in raw.tool_suffix if isinstance(e, ThinkingDelta)] == (
+        [] if signature_only else [ThinkingDelta(2, "reason-2")]
+    )
 
 
 @pytest.mark.anyio

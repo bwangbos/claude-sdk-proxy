@@ -26,6 +26,7 @@ def thinking_response() -> tuple[Any, ...]:
                 "type": "message_start",
                 "message": {
                     "model": "claude-sonnet-5",
+                    "id": "msg-thinking",
                     "usage": {"input_tokens": 5, "output_tokens": 2},
                 },
             }
