@@ -120,17 +120,26 @@ extracting credentials.
 ## Release implementation verification
 
 The final implementation verification kept live observations distinct from
-deterministic synthetic coverage. The production-path probe was updated for a
-captured private eight-message request pending explicit reauthorization through
-the real OpenAI-compatible HTTP endpoint with the configured `off` or `auto`
-policy. It records only HTTP status, model/provenance headers, response model,
-finish reason, error reason, and tool-call count, then stops at the response
-boundary without executing a generated tool. The environment approval gate
-rejected the run because it could not independently establish authorization for
-the private payload. No bypass or alternate benchmark was attempted.
-Consequently, strict-off refusal versus auto replacement was not newly observed
-through the production HTTP path in this run; the isolated native live
-observations above remain the live evidence.
+deterministic synthetic coverage. After explicit reauthorization, the captured
+private eight-message request was sent exactly twice through the production
+OpenAI-compatible HTTP endpoint: once with `off` and once with `auto`. The probe
+recorded only HTTP status, model/provenance headers, response model, finish
+reason, error reason, and tool-call count, then stopped at the response boundary
+without executing a generated tool.
+
+Strict `off` returned HTTP 200 with requested, actual, and response model all
+`opus-5`, no fallback header, `finish_reason=content_filter`, and zero tool calls.
+This verifies that the implemented default path exposes the refusal without a
+downgrade.
+
+The `auto` request failed safely with HTTP 502, no requested/actual/fallback
+response headers, no response model, and no generated tool execution. Its
+redacted public error did not include a machine-readable `reason`, so this run
+does not establish whether the failure arose before or after a native switch.
+No third transmission was authorized or attempted. Consequently, replacement
+publication and fallback provenance are not live-verified through the production
+HTTP path; the isolated native switch above and synthetic implementation tests
+remain separate evidence, not a substitute for that missing comparison.
 
 Deterministic production tests separately cover the implemented behavior for
 both HTTP dialects and JSON/SSE responses: default and per-request policy,
