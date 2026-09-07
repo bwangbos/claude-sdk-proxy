@@ -175,7 +175,7 @@ choice; use the Anthropic transport when tool results can contain images.
         },
         {
           "id": "opus-4.8",
-          "name": "Claude Opus 4.8 subscription (text only)",
+          "name": "Claude Opus 4.8 subscription",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -186,7 +186,7 @@ choice; use the Anthropic transport when tool results can contain images.
             "xhigh": "xhigh",
             "max": "max"
           },
-          "input": ["text"],
+          "input": ["text", "image"],
           "contextWindow": 200000,
           "maxTokens": 16384,
           "cost": {
@@ -259,7 +259,7 @@ choice; use the Anthropic transport when tool results can contain images.
         },
         {
           "id": "opus-4.8",
-          "name": "Claude Opus 4.8 subscription (text only)",
+          "name": "Claude Opus 4.8 subscription",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -270,7 +270,7 @@ choice; use the Anthropic transport when tool results can contain images.
             "xhigh": "xhigh",
             "max": "max"
           },
-          "input": ["text"],
+          "input": ["text", "image"],
           "contextWindow": 200000,
           "maxTokens": 16384,
           "cost": {
@@ -287,9 +287,10 @@ choice; use the Anthropic transport when tool results can contain images.
 ```
 
 The placeholder key is intentionally non-secret. The proxy ignores it and uses
-the local Claude login of the process running the server. Opus 4.8 is intentionally
-listed as text-only: text, tools, and adaptive thinking are live-verified, but
-image input has not been verified for that exact pinned model.
+the local Claude login of the process running the server. All three listed
+models support text and image input. Opus 4.8 image inputs, image tool results,
+and the stock Pi Anthropic image workflow are
+[live-verified](docs/research/2026-09-07-opus-4-8-vision-verification.md).
 
 Start the proxy with the three advertised pinned models, then start Pi with its
 ordinary tools:
@@ -534,8 +535,8 @@ fabricates results, or moves abandoned callback IDs into the replacement leg.
 | Thinking display | No separate display request control | Add `display: "summarized"` or `"omitted"` inside active `thinking` |
 
 All three canonical models support the listed adaptive levels in the recorded
-live checks. Opus 4.8 image input remains unverified and is not advertised in the
-Pi example; Sonnet 5 and Opus 5 retain their verified text/image profiles.
+live checks. All three models have verified text/image profiles; use Pi's
+Anthropic provider for image-returning tools, including on Opus 4.8.
 Pinned older model IDs have different capability rules; the proxy rejects
 unsupported model/control combinations with HTTP 400, without a silent
 downgrade. The legacy Anthropic `thinking: {"type":"enabled","budget_tokens":N}`

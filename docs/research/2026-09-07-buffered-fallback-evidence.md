@@ -1,5 +1,10 @@
 # Buffered fallback evidence
 
+> Subsequent capability update: [Opus 4.8 vision verification](2026-09-07-opus-4-8-vision-verification.md)
+> verified image inputs and image tool results. The text-only Pi restriction
+> recorded at the earlier checkpoints below has been removed. This does not
+> establish image-bearing automatic fallback or expand native retraction support.
+
 ## Latest verified checkpoint
 
 Merged implementation `15ccede` passed the complete tracked-snapshot release

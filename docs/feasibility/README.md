@@ -160,8 +160,8 @@ Hints are advisory and do not control backend caching.
 
 Merge the [canonical Pi provider entries](../../README.md#configure-pi) into
 `~/.pi/agent/models.json`; they cover the three pinned models in both API dialects,
-verified thinking-level maps, and Sonnet 5/Opus 5 image inputs. Opus 4.8 is
-text-only in Pi until image input is verified. This reference deliberately
+verified thinking-level maps, and image inputs on all three models. Opus 4.8
+image inputs and tool results have also been live-verified. This reference deliberately
 links to one maintained configuration rather than duplicating it.
 
 Start the three-model proxy in one terminal (stop any existing server on that port

@@ -2,6 +2,10 @@
 
 ## Current usage and verification
 
+- [Opus 4.8 vision verification](research/2026-09-07-opus-4-8-vision-verification.md):
+  direct images and image tool results through both APIs, image-history rebasing,
+  stock Pi's Anthropic read-tool workflow, and the text/image configuration update.
+
 - [Root README](../README.md): installation, canonical Pi configuration,
   model/thinking controls, images, compaction, diagnostics, and limitations.
 - [Gateway reference](feasibility/README.md#current-runnable-gateway): complete
