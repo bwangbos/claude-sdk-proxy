@@ -109,3 +109,42 @@ async def test_invalid_policy_value_is_400_in_both_dialects(path, body) -> None:
             app, path, body, {"x-claude-proxy-refusal-fallback": "AUTO"}
         )
     assert response.status == 400
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (
+            "/v1/chat/completions",
+            {"model": "opus-5", "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        (
+            "/v1/messages",
+            {
+                "model": "opus-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+            },
+        ),
+    ],
+)
+async def test_auto_header_is_gated_before_factory_launch(path, body) -> None:
+    launches = 0
+
+    def factory(*args, **kwargs):
+        nonlocal launches
+        launches += 1
+        raise AssertionError("gated auto policy reached the session factory")
+
+    app = create_app(
+        models=("opus-5", "opus-4.8"),
+        session_factory=factory,
+    )
+    async with lifespan_app(app):
+        response = await post_json(
+            app, path, body, {"x-claude-proxy-refusal-fallback": "auto"}
+        )
+
+    assert response.status == 400
+    assert launches == 0

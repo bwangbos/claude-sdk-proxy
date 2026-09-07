@@ -166,6 +166,12 @@ async def _handle(request: Request, *, dialect: str) -> Response:
             request.headers.getlist("x-claude-proxy-refusal-fallback"),
             cast(RefusalFallback, request.app.state.refusal_fallback),
         )
+        if policy == "auto":
+            raise RequestValidationError(
+                "X-Claude-Proxy-Refusal-Fallback",
+                "automatic refusal fallback is not available until buffering "
+                "is integrated",
+            )
         native_allowlist(parsed.model, request.app.state.model_order, policy)
         parsed = replace(parsed, refusal_fallback=policy)
         monitor = DisconnectMonitor(request.receive)
