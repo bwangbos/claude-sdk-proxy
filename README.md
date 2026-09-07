@@ -27,6 +27,8 @@ responses. The calling harness remains responsible for executing its own tools.
 - Generic full-transcript import and rebasing at completed turn boundaries
 - In-memory continuation, retry replay, bounded session capacity, and teardown
 - Multiple configured Claude model aliases
+- Sonnet/Opus thinking controls and model/effort changes between completed turns
+- Separate reasoning streams, native signed-thinking replay, and refusal recovery
 
 The current compatibility suite targets Pi `0.85.1`, Claude Agent SDK `0.2.152`,
 Python `3.14`, and macOS. Official OpenAI and Anthropic Python clients are also
@@ -245,8 +247,15 @@ uv run claude-proxy --model sonnet --model opus
 pi --provider claude-subscription-local --model sonnet
 ```
 
-No Pi adapter or extension is required. Keep `supportsStrictMode: false` in the
-provider configuration; Pi otherwise adds a tool-definition field outside the
+If the quick-start server is already running, stop it with `Ctrl+C` before
+launching the two-model command; do not start a second server on the same port.
+Confirm `/v1/models` lists both aliases. These custom Pi entries are explicit:
+adding a server alias alone does not add it to Pi's model picker.
+
+No Pi adapter or extension is required. Use `/model` to choose Sonnet or Opus
+within the same provider, and `/thinking` or `Shift+Tab` to change thinking level.
+Keep `supportsStrictMode: false` in the provider configuration; Pi otherwise
+adds a tool-definition field outside the
 proxy's supported subset.
 
 Pi's reasoning selector exposes `off`, `low`, `medium`, `high`, `xhigh`, and
@@ -264,7 +273,14 @@ signed history. The deterministic integration suite verifies Sonnet/high to
 Opus/low, another unchanged Opus turn, and a switch back to Sonnet/high through
 both transports. See the
 [verification record](docs/research/2026-09-06-model-thinking-verification.md)
-for the separate live evidence and its current post-tool switch limitation.
+for successful live bidirectional post-tool switches through both transports
+and the independently reproduced upstream refusal limitation. Switching does
+not guarantee that Claude will answer every subsequent request.
+
+The example's `contextWindow` and `maxTokens` are client-side configuration,
+not discovered account limits or enforced backend caps. Zero costs disable
+Pi's per-token cost estimate; they do not mean the subscription is free or
+unlimited. Alias targets and available effort levels can change upstream.
 
 ### Pi with images and screenshots
 
@@ -331,8 +347,9 @@ The API key values satisfy client-library validation only. They are not used to
 authenticate with Claude.
 
 An empty native refusal is a terminal response, not answer text: Anthropic JSON
-returns `content: []`, and Anthropic SSE emits no content blocks; OpenAI returns
-empty answer content with `finish_reason: "content_filter"`. Raw usage is retained.
+returns `content: []` with `stop_reason: "refusal"`, and Anthropic SSE emits no
+content blocks; OpenAI returns empty answer content with
+`finish_reason: "content_filter"`. Raw usage is retained.
 Append that assistant response unchanged and then a new user message to continue;
 an exact retry replays the terminal response without another generation.
 Anthropic empty assistant arrays normalize to the same canonical singleton empty
@@ -398,6 +415,36 @@ image generation are not supported. Return tool failures as text.
 
 Both POST endpoints require `Content-Type: application/json`. Normal parameters
 such as `charset=utf-8` are accepted.
+
+### Model and thinking controls
+
+`model` must exactly match one of the server's repeated `--model` values.
+`GET /v1/models` lists that allowlist, not every model available to your Claude
+account. There is no automatic model fallback.
+
+| Setting | OpenAI Chat Completions | Anthropic Messages |
+| --- | --- | --- |
+| Thinking off | Omit `reasoning_effort`, use `null`, or use `"none"` | Omit `thinking`, use `null`, or use `{"type":"disabled"}`; omit effort |
+| Adaptive effort | `reasoning_effort: "low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` | `thinking: {"type":"adaptive"}` with `output_config: {"effort":"high"}` (same five effort values for current aliases) |
+| Thinking display | No separate display request control | Add `display: "summarized"` or `"omitted"` inside active `thinking` |
+
+Both current `sonnet` and `opus` aliases support the listed levels in the
+[recorded live checks](docs/research/2026-09-06-model-thinking-verification.md).
+Pinned older model IDs have different capability rules; the proxy rejects
+unsupported model/control combinations with HTTP 400, without a silent
+downgrade. The legacy Anthropic `thinking: {"type":"enabled","budget_tokens":N}`
+form is accepted only for configured supported 4.5 IDs, with a positive integer
+budget below `max_tokens`; it is not the mode for the current aliases. These
+older-ID rules are parser-tested, not part of the Sonnet/Opus live matrix.
+
+Anthropic returns native `thinking`/`redacted_thinking` blocks, including signature
+deltas when streaming; preserve the assembled blocks unchanged on replay. OpenAI returns separate
+`reasoning_content` in assistant messages and streaming deltas, a compatibility
+extension rather than authenticated native thinking. The proxy retains native
+signed history for recognized continuations; unsigned OpenAI reasoning strings
+cannot reconstruct it after an unrelated import or restart. Reasoning summaries
+are not appended to answer text, and an accepted effort need not produce a
+visible summary.
 
 ### Compatibility boundary
 
@@ -487,8 +534,10 @@ the proxy seeds native history with both calls and results, then sends an empty
 SDK continuation signal; it adds no natural-language instruction and does not
 execute the historical calls again. A suspended conversation can be replaced
 only when its exact pending calls and complete result IDs match the snapshot.
-In-flight requests, changed configuration, and stale identified heads still
+In-flight requests, changed system/tools/dialect, and stale identified heads still
 fail closed; recovery is not an unconditional retry after any error.
+Model/thinking changes use the same replacement mechanism after a completed
+assistant turn, not while awaiting tool results.
 
 Restarting the proxy clears all active sessions, suspended tool calls, imported
 history, and replay entries. A client can recover by submitting its complete
@@ -531,7 +580,7 @@ The provider entry does not start the gateway. Run the following in a separate
 terminal and confirm `/health` responds:
 
 ```bash
-uv run claude-proxy --model sonnet
+uv run claude-proxy --model sonnet --model opus
 ```
 
 ### Pi returns `param: "tools"`
@@ -551,9 +600,11 @@ services may not have access to the Keychain credential used by Claude.
 
 ### `session_mismatch` or `request_in_flight` (HTTP 409)
 
-Keep the model, system prompt, tool definitions, and dialect stable for a
-conversation. Do not reuse one explicit session header for unrelated chats, and
-do not continue a stale transcript head after a newer turn has committed.
+Keep the system prompt, tool definitions, and dialect stable for a conversation.
+Model/thinking changes are allowed only between completed assistant turns;
+keep them unchanged during tool-result continuations. Do not reuse one explicit
+session header for unrelated chats, and do not continue a stale transcript head
+after a newer turn has committed.
 The error includes a stable `reason` (for example `system_changed`, `stale_head`,
 `tool_ids_mismatch`, or `ambiguous_session`) and guidance about the session header.
 Wait for active work to finish before retrying `request_in_flight`; use a unique
@@ -577,6 +628,14 @@ diagnostic lines when reporting a failure.
 
 The server does not hot-reload. Stop it with `Ctrl+C` and start it again after
 updating the checkout.
+
+### Opus is missing or thinking controls are rejected
+
+Check `/v1/models` for both aliases, restart the server with
+`--model sonnet --model opus`, and use the current Pi configuration above.
+Pi needs `reasoning: true`, the model-level `thinkingLevelMap`, and the matching
+provider compatibility flags. Restart Pi after changing provider configuration.
+Changing `models.json` alone does not update a running proxy's allowlist or code.
 
 ## Development
 
@@ -603,9 +662,9 @@ CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet \
   tests/live/test_gateway_text.py tests/live/test_gateway_tools.py
 ```
 
-The historical feasibility evidence and superseded probe design remain under
-[`docs/feasibility`](docs/feasibility/README.md) for auditability. The runnable
-gateway and this README are the current usage path.
+See the [documentation index](docs/README.md) for the current gateway reference,
+verification records, and historical designs. Old feasibility verdicts and
+implementation plans are audit records, not current feature restrictions.
 
 ## Security and privacy
 

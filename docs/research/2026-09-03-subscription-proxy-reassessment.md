@@ -2,6 +2,13 @@
 
 Date: 2026-09-03
 
+> **Historical design checkpoint:** This report motivated the initial SDK
+> gateway. Later implementation added caller tools, full-transcript import and
+> rebasing, Pi compaction, images, and model/thinking controls. Restrictions and
+> unproven capabilities below describe this date, not the current product.
+> Use the [root README](../../README.md) and [documentation index](../README.md)
+> for current usage and verification; no custom Pi adapter is required.
+
 ## Bottom line
 
 We should proceed, but with a narrower and more accurate product definition.

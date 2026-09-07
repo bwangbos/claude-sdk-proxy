@@ -193,8 +193,8 @@ raw usage, absence of diagnostic text, durable state, and cleanup. Real loopback
 HTTP exercises JSON/SSE in both dialects with and without tools. Non-string
 `thinking.type` containers/scalars fail as request validation before session creation;
 the raw tool-content refusal negative now has a correctly initialized positive
-control. This is local review-fix evidence only: prior live observations are
-unchanged, and final full offline release approval remains controller-owned.
+control. These are deterministic review-fix checks; prior live observations are
+unchanged. The completed final release gate is recorded below.
 
 Anthropic documents that automated Opus safeguards can flag normal conversations;
 the account-specific trigger here remains unknown. See [Anthropic's explanation
@@ -223,6 +223,10 @@ validation, README text selection, and the refusal-negative fixture. Scoped
 re-review approved all five at `94a1769`, with no new breakage or remaining
 findings. Live evidence remains the bounded matrix and successful bidirectional
 runs above; the upstream refusal limitation is not claimed eliminated.
+
+The feature was merged and pushed to `main` at `0df4a88`. A fresh tracked-snapshot
+release gate on that merged revision again passed all 1,757 tests, Ruff, and mypy;
+the post-run process check found no leftover proxy helpers.
 
 ## Local activation status
 

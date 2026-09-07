@@ -1,8 +1,8 @@
 # Claude Agent SDK gateway and historical probes
 
-This package ships a private localhost text/image-and-caller-tool gateway and retains the earlier
-trusted-local feasibility probes as historical comparator evidence. The
-authoritative offline release gate, including the real Pi provider integration,
+This package ships a single-user localhost text/image-and-caller-tool gateway
+and retains the earlier trusted-local feasibility probes as historical comparator
+evidence. The authoritative offline release gate, including the real Pi provider integration,
 is:
 
 ```console
@@ -10,6 +10,10 @@ make release-offline
 ```
 
 Live subscription checks remain separately opt-in.
+
+For installation and the canonical Pi configuration, start with the
+[root README](../../README.md). This page supplies detailed tool/session behavior;
+the [documentation index](../README.md) separates current references from archives.
 
 ## Current runnable gateway
 
@@ -67,7 +71,7 @@ append one user message containing exactly one `tool_result` per returned ID:
     {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_RETURNED_ID", "name": "lookup", "input": {"city": "Boston"}}]},
     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_RETURNED_ID", "content": "sunny"}]}
   ],
-  "tools": [{"name": "lookup", "description": "Look up a city", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": false}}
+  "tools": [{"name": "lookup", "description": "Look up a city", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": false}}]
 }
 ```
 
@@ -99,8 +103,10 @@ each returned `tool_call_id`:
 }
 ```
 
-Send each continuation to the same endpoint and with the same model, system
-string, dialect, and canonical tool definitions as the first request. Parallel
+Send each tool-result continuation to the same endpoint and with the same model,
+thinking configuration, system string, dialect, and canonical tool definitions
+as the request that produced the calls. Model/thinking may change after the
+assistant finishes that turn; system/tools/dialect remain fixed. Parallel
 results may be returned in any order, but correlation is strictly by the public
 ID. Never infer correlation from tool name, arguments, or position.
 
@@ -142,55 +148,25 @@ the gateway does not guess their tool IDs. Anthropic system text-block arrays
 and ephemeral content-block cache hints are accepted for stock Pi compatibility.
 Hints are advisory and do not control backend caching.
 
-### Pi configuration (text)
+### Pi configuration, thinking, and compaction
 
-Add this provider to `~/.pi/agent/models.json`:
+Merge the [canonical Pi provider entries](../../README.md#configure-pi) into
+`~/.pi/agent/models.json`; they cover Sonnet and Opus in both API dialects,
+image inputs, and the verified thinking-level maps. This reference deliberately
+links to one maintained configuration rather than duplicating it.
 
-```json
-{
-  "providers": {
-    "claude-subscription-local": {
-      "baseUrl": "http://127.0.0.1:8317/v1",
-      "api": "openai-completions",
-      "apiKey": "local-placeholder",
-      "compat": {
-        "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
-        "supportsStore": true,
-        "supportsUsageInStreaming": true,
-        "supportsStrictMode": false,
-        "maxTokensField": "max_tokens"
-      },
-      "models": [
-        {
-          "id": "sonnet",
-          "name": "Claude subscription (local)",
-          "reasoning": false,
-          "input": ["text"],
-          "contextWindow": 200000,
-          "maxTokens": 16384,
-          "cost": {
-            "input": 0,
-            "output": 0,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          }
-        }
-      ]
-    }
-  }
-}
-```
-
-Start a new Pi session with its ordinary tool set enabled:
+Start the two-model proxy in one terminal (stop any existing server on that port
+first), then start Pi in another terminal with its ordinary tool set enabled:
 
 ```bash
+uv run claude-proxy --model sonnet --model opus
 pi --provider claude-subscription-local --model sonnet
 ```
 
 The dummy API key is deliberately non-secret; the gateway ignores it and uses
 the operator's local Claude login. Pi's ordinary native tool definitions and
-loop are supported; do not configure sampling or reasoning options. The Pi
+loop are supported. Use `/model` within the same provider and `/thinking` between
+completed assistant turns; do not configure unsupported sampling options. The Pi
 provider's normal `store: false` and streaming-usage fields are accepted, as is
 the advisory `max_tokens` field added by Pi's ordinary `streamSimple` path.
 
@@ -242,12 +218,19 @@ old idle lineage remains eligible for normal least-recently-used eviction.
   rejected.
 - Advisory only: `max_tokens` and `max_completion_tokens`; the Agent SDK does
   not provide exact output-token enforcement through this path.
+- Thinking: normalized OpenAI `reasoning_effort` and Anthropic `thinking` plus
+  `output_config.effort`; omitted controls disable thinking. See the
+  [model-dependent control reference](../../README.md#model-and-thinking-controls)
+  for levels, legacy budget mode, display, and native versus public replay.
+  Model/thinking changes are supported at completed assistant turns while
+  fixed configuration and pending-tool identity remain guarded.
 - Unsupported: rebasing a busy session or an unresolved tool boundary,
   concurrent branches/forks under one explicit session ID, mixed text and
   tool-result blocks in one user turn, non-text/image tool results, exact sampling/stop
-  controls, reasoning controls, public or multi-user service, and recovery of
-  live conversations after the gateway restarts. A restart loses every
-  suspended tool call, retained transcript, and replay entry.
+  controls, and public or multi-user service. A restart loses every live SDK
+  session, suspended tool call, retained transcript, and replay entry. Clients
+  can recover by resending a structurally complete transcript, including all
+  already-executed tool results; the gateway cannot reconstruct missing history.
 - Limits: at most 128 tool definitions; each name is 1–64 ASCII letters,
   digits, `_`, or `-`; each UTF-8 description is at most 8 KiB; each canonical
   JSON Schema is at most 64 KiB and all schemas together at most 512 KiB; each
@@ -274,6 +257,16 @@ old idle lineage remains eligible for normal least-recently-used eviction.
   `content_filter`, and `length`, respectively. Chat Completions has no distinct
   context-window reason, so context exhaustion deliberately uses its truncation
   signal.
+- Empty native refusals are retained terminal responses with authoritative
+  usage, not backend errors or synthetic answers. Anthropic JSON/SSE yields
+  empty assistant content (`[]`); OpenAI yields empty answer text. An exact retry
+  replays without generation, and the returned assistant may be replayed unchanged
+  before a new user turn, including when tools are configured. Empty-assistant
+  input is a narrow structural allowance, not proof of a native refusal; empty
+  users and malformed or incomplete boundaries remain invalid.
+
+For request IDs, safe session rejection reasons, and `--log`/`--log-json`, see
+[troubleshooting and diagnostics](../../README.md#troubleshooting).
 
 For a tool session, the proxy creates one in-process MCP server named
 `caller_tools_v1`, exposes only the tools from the request, and lets the Agent

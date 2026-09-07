@@ -7,8 +7,14 @@ Date: 2026-09-03
 > current SDK research later the same day. See the
 > [fresh reassessment](../research/2026-09-03-subscription-proxy-reassessment.md).
 > This file is retained as the historical checkpoint that led to the new work.
+>
+> **Current usage:** The September 4 text-only checkpoint below is also historical.
+> The gateway now supports caller tools, transcript import/rebasing, Pi compaction,
+> images, and Sonnet/Opus thinking controls. Do not disable compaction based on
+> this report. Use the [root README](../../README.md) and
+> [current verification record](../research/2026-09-06-model-thinking-verification.md).
 
-## Current text-gateway result (2026-09-04)
+## Historical text-gateway result (2026-09-04)
 
 The narrow Agent SDK path from the reassessment is now implemented. The
 production backend keeps one persistent `ClaudeSDKClient` per fresh, linear
