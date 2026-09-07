@@ -611,6 +611,9 @@ class RawSdkMessageValidator:
             fail_protocol()
         self._require_keys(event, {"type", "delta", "usage", "context_management"})
         delta = event.get("delta")
+        if discarded and event.get("context_management") is None:
+            self._bundled_fallback_close(event)
+            return
         if (
             not isinstance(delta, Mapping)
             or set(delta) != {"stop_reason", "stop_sequence", "stop_details"}
@@ -643,6 +646,56 @@ class RawSdkMessageValidator:
             or (not discarded and usage["output_tokens"] != 0)
         ):
             fail_protocol()
+        self._reconcile_usage(usage)
+        self.stop_reason = "refusal"
+        self.output_tokens = usage["output_tokens"]
+        self._phase = "message_stop"
+
+    def _bundled_fallback_close(self, event: Mapping[str, Any]) -> None:
+        # Claude Code 2.1.259 Qs/Xs closes a retracted partial stream after the
+        # validated fallback banner. This is not the no-fallback API refusal.
+        if event.get("delta") != {
+            "container": None,
+            "stop_details": None,
+            "stop_reason": "refusal",
+            "stop_sequence": None,
+        }:
+            fail_protocol()
+        raw_usage = event.get("usage")
+        ancillary = {"output_tokens_details", "iterations", "server_tool_use"}
+        if (
+            not isinstance(raw_usage, Mapping)
+            or set(raw_usage) != set(USAGE_FIELDS) | ancillary
+            or raw_usage["iterations"] not in (None, [])
+        ):
+            fail_protocol()
+        # Source-correlated live shapes only; nonempty iterations are unobserved.
+        for field, keys in (
+            ("output_tokens_details", {"thinking_tokens"}),
+            ("server_tool_use", {"web_search_requests", "web_fetch_requests"}),
+        ):
+            details = raw_usage[field]
+            if details is None:
+                continue
+            if (
+                not isinstance(details, Mapping)
+                or set(details) != keys
+                or any(
+                    type(value) is not int or value < 0 for value in details.values()
+                )
+            ):
+                fail_protocol()
+        # Only Xs's nullable input/cache counters may be absent semantically.
+        # Output remains required; known counters retain normal reconciliation.
+        usage = normalize_usage(
+            {
+                field: raw_usage[field]
+                for field in USAGE_FIELDS
+                if field == "output_tokens" or raw_usage[field] is not None
+            },
+            USAGE_FIELDS,
+        )
+        assert usage is not None
         self._reconcile_usage(usage)
         self.stop_reason = "refusal"
         self.output_tokens = usage["output_tokens"]

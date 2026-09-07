@@ -12,7 +12,11 @@ from tests.gateway.asgi_client import (
     post_json_then_disconnect,
 )
 from tests.gateway.fakes import FakeSdkClient, FixedTemporaryDirectory, raw_text_events
-from tests.gateway.test_sdk_fallback import fallback_notice, pinned_response
+from tests.gateway.test_sdk_fallback import (
+    bundled_fallback_delta,
+    fallback_notice,
+    pinned_response,
+)
 from tests.gateway.test_sdk_refusal import _raw_delta, _raw_stop
 
 
@@ -49,11 +53,23 @@ def switched_response():
 @pytest.mark.anyio
 @pytest.mark.parametrize("path", ["/v1/messages", "/v1/chat/completions"])
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("switched", [False, True])
+@pytest.mark.parametrize("switched", [False, True, "bundled"])
 async def test_native_auto_publishes_accepted_identity_and_replays(
     tmp_path, path, stream, switched
 ):
     messages = switched_response() if switched else pinned_response("claude-opus-5")
+    if switched == "bundled":
+        # Preserve partial discarded output, but use the installed adapter's close.
+        messages = (
+            *messages[:5],
+            bundled_fallback_delta(
+                input_tokens=2,
+                output_tokens_details={"thinking_tokens": 2},
+                server_tool_use={"web_fetch_requests": 0, "web_search_requests": 0},
+                iterations=[],
+            ),
+            *messages[6:],
+        )
     client = FakeSdkClient((messages,))
     app = native_app(tmp_path, client, policy="auto")
     body = {

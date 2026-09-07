@@ -203,3 +203,44 @@ fallback disabled. Sonnet 5, Opus 5, and Opus 4.8 each emitted an exact raw
 `message_start.model` before text, a matching typed assistant model, and a
 successful `end_turn` result. This reconfirmed account access without exercising
 the private refusal reproduction or expanding the capability claims above.
+
+## Bundled close compatibility fix and reauthorized verification
+
+After the controller approved the exact correlated synthetic close and the user
+authorized further bounded verification, the validator gained a discarded-leg-only
+compatibility path. The no-fallback refusal validator remains unchanged. The path
+requires the validated allowlisted banner, existing session/phase correlation,
+the exact `Qs` delta and null context, and the exact seven `Xs` usage keys.
+Nullable input/cache counters are treated as unavailable, never invented as zero;
+present counters still reconcile against the raw start. Output tokens must remain
+a nonnegative integer. Accepted public usage still comes only from the replacement.
+
+Static inspection of `Xs` immediately following `Qs` shows `?? null` for
+`output_tokens_details`, the three input/cache counters, `iterations`, and
+`server_tool_use`; `output_tokens` is passed directly. A bounded structural-only
+live diagnostic additionally observed `output_tokens_details` with integer
+`thinking_tokens`, `server_tool_use` with integer `web_fetch_requests` and
+`web_search_requests`, and empty `iterations`. Embedded source around offset
+166307077 independently constructs those nested counters. The validator accepts
+only null or these exact nonnegative-integer nested counter shapes, and null or
+empty iterations. Unknown keys, malformed counters, and nonempty iterations fail
+closed; no general iteration schema is claimed.
+
+Three additional private-request transmissions occurred during this authorized
+fix verification, all through the production application in isolated sessions:
+
+1. The initial null-only ancillary validator failed safely with HTTP 502.
+2. A metadata-only diagnostic reproduced that failure and recorded usage
+   structure/types only, establishing the nested shapes above.
+3. After the source-correlated fix, request
+   `req_db9dd7b5bd8f44b0bfd756e8ba24d2df` returned HTTP 200 with requested model
+   `opus-5`, actual/response model `opus-4.8`, fallback header `true`, finish reason
+   `tool_calls`, and one returned tool call.
+
+No generated tool was executed and no tool result was fabricated. The successful
+probe stopped at the response boundary and closed the isolated session, producing
+the previously known `SDK tool bridge closed` teardown traceback. This establishes
+live replacement publication/provenance for the production OpenAI JSON path at
+that boundary, not live post-result continuation or live Anthropic/SSE coverage.
+Both dialects, JSON/SSE, replay, and strict refusal remain covered offline. The
+running proxy was not restarted, and no Pi configuration was changed by this fix.

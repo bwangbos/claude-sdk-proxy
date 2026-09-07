@@ -437,6 +437,174 @@ def fallback_notice(**changes: object) -> SystemMessage:
     )
 
 
+def bundled_fallback_delta(**usage_changes: object) -> StreamEvent:
+    """Claude Code 2.1.259 Qs/Xs refusal-banner close, not an API delta."""
+    return StreamEvent(
+        "bundled-close",
+        "sdk-1",
+        {
+            "type": "message_delta",
+            "context_management": None,
+            "delta": {
+                "container": None,
+                "stop_details": None,
+                "stop_reason": "refusal",
+                "stop_sequence": None,
+            },
+            "usage": {
+                "output_tokens_details": None,
+                "cache_creation_input_tokens": None,
+                "cache_read_input_tokens": None,
+                "input_tokens": None,
+                "iterations": None,
+                "output_tokens": 7,
+                "server_tool_use": None,
+                **usage_changes,
+            },
+        },
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("known_inputs", [False, True])
+@pytest.mark.parametrize("nested_counters", [False, True])
+async def test_bundled_fallback_close_discards_usage(
+    tmp_path, known_inputs, nested_counters
+):
+    delta = bundled_fallback_delta(
+        **(
+            {
+                "input_tokens": 24,
+                "cache_creation_input_tokens": 43,
+                "cache_read_input_tokens": 948,
+            }
+            if known_inputs
+            else {}
+        )
+    )
+    if nested_counters:
+        delta.event["usage"].update(
+            output_tokens_details={"thinking_tokens": 2},
+            server_tool_use={"web_fetch_requests": 0, "web_search_requests": 0},
+            iterations=[],
+        )
+    events = await collect(
+        tmp_path,
+        (
+            _raw_start(),
+            fallback_notice(),
+            delta,
+            _raw_stop(),
+            *pinned_response(),
+        ),
+    )
+    assert events[0] == ResponseIdentity("opus-5", "opus-4.8", True)
+    assert events[-1] == Completed("end_turn", {"input_tokens": 2, "output_tokens": 1})
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no-banner",
+        "strict-banner",
+        "strict-refusal",
+        "auto-refusal",
+        "wrong-session",
+        "wrong-stop",
+        "details",
+        "container",
+        "context",
+        "extra-key",
+        "missing-key",
+        "null-output",
+        "bool-output",
+        "negative-output",
+        "bad-input",
+        "conflicting-input",
+        "extra-usage",
+        "missing-usage",
+        "output-details",
+        "iterations",
+        "server-tool-use",
+        "duplicate-close",
+        "bool-thinking",
+        "negative-thinking",
+        "extra-thinking",
+        "bool-server",
+        "negative-server",
+        "extra-server",
+        "nonempty-iterations",
+    ],
+)
+async def test_bundled_close_rejects_unrelated_or_malformed_transaction(tmp_path, case):
+    from tests.gateway.test_sdk_refusal import _diagnostic
+
+    delta = bundled_fallback_delta()
+    messages = [_raw_start(), fallback_notice(), delta, _raw_stop(), *pinned_response()]
+    policy = "off" if case.startswith("strict-") else "auto"
+    if case == "no-banner":
+        messages.pop(1)
+    elif case in {"strict-refusal", "auto-refusal"}:
+        messages[1:2] = [_notice(), _diagnostic()]
+    elif case == "wrong-session":
+        messages[2] = replace(delta, session_id="unrelated")
+    elif case == "wrong-stop":
+        delta.event["delta"]["stop_reason"] = "end_turn"
+    elif case in {"details", "container"}:
+        delta.event["delta"]["stop_details" if case == "details" else case] = {}
+    elif case == "context":
+        delta.event["context_management"] = {"applied_edits": []}
+    elif case == "extra-key":
+        delta.event["delta"]["extra"] = None
+    elif case == "missing-key":
+        del delta.event["delta"]["container"]
+    elif case in {"null-output", "bool-output", "negative-output"}:
+        delta.event["usage"]["output_tokens"] = {
+            "null-output": None,
+            "bool-output": True,
+            "negative-output": -1,
+        }[case]
+    elif case in {"bad-input", "conflicting-input"}:
+        delta.event["usage"]["input_tokens"] = "24" if case == "bad-input" else 25
+    elif case == "extra-usage":
+        delta.event["usage"]["unknown"] = None
+    elif case == "missing-usage":
+        del delta.event["usage"]["input_tokens"]
+    elif case in {"output-details", "iterations", "server-tool-use"}:
+        key = {
+            "output-details": "output_tokens_details",
+            "iterations": "iterations",
+            "server-tool-use": "server_tool_use",
+        }[case]
+        delta.event["usage"][key] = {}
+    elif case == "duplicate-close":
+        messages.insert(3, bundled_fallback_delta())
+    elif case in {"bool-thinking", "negative-thinking", "extra-thinking"}:
+        delta.event["usage"]["output_tokens_details"] = {"thinking_tokens": 2}
+        if case == "extra-thinking":
+            delta.event["usage"]["output_tokens_details"]["unknown"] = 0
+        else:
+            delta.event["usage"]["output_tokens_details"]["thinking_tokens"] = (
+                True if case == "bool-thinking" else -1
+            )
+    elif case in {"bool-server", "negative-server", "extra-server"}:
+        delta.event["usage"]["server_tool_use"] = {
+            "web_fetch_requests": 0,
+            "web_search_requests": 0,
+        }
+        if case == "extra-server":
+            delta.event["usage"]["server_tool_use"]["unknown"] = 0
+        else:
+            delta.event["usage"]["server_tool_use"]["web_fetch_requests"] = (
+                True if case == "bool-server" else -1
+            )
+    elif case == "nonempty-iterations":
+        delta.event["usage"]["iterations"] = [{}]
+    with pytest.raises(BackendFailure):
+        await collect(tmp_path, tuple(messages), policy)
+
+
 def pinned_response(model: str = "claude-opus-4-8") -> tuple[object, ...]:
     events = list(sdk_response("accepted", "sdk-1"))
     start = events[0]
