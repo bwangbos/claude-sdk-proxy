@@ -50,18 +50,35 @@ identifying the rejecting code path, not a substitute for a complete SDK trace.
   and request correlation for first requests and tool continuations (both runner
   and watcher failures). Terminal error-result and missing-result diagnostics are
   covered as well.
-- Final offline checks: 676 unit, 222 Darwin lifecycle, 848 gateway, and 32
-  integration tests passed (1,778 total). Tracked Python lint and mypy passed.
+- Offline checks: 676 unit and 222 Darwin lifecycle tests passed for the base
+  fix; after the live follow-up, all 853 gateway and 32 integration tests passed
+  again (1,783 tests across those suites). Tracked Python lint and mypy passed.
   The final gateway/integration rerun required loopback socket permission; the
   sandboxed attempt could not bind the integration servers. No live requests
   were involved in those suites. No orphaned lifecycle helpers were found.
 - Independent review found two diagnostics gaps (stale continuation request IDs
   and unlogged terminal SDK failures); both were reproduced, fixed, and approved
   on re-review.
-- The installed runtime's control was inspected, but the private eight-message
-  live replay was blocked by the approval system because it would transmit the
-  transcript to Anthropic. It requires explicit user permission before running.
-- Consequently, end-to-end elimination of the harness's specific failure is not
-  yet verified. No benchmark score or successful live rerun is claimed.
+- The private replay was initially blocked pending permission to transmit the
+  transcript to Anthropic. The user subsequently explicitly approved it.
+- Live replay exposed two additional schema gaps: `stop_details` can omit
+  `fallback_has_prefill_claim`, and a validated `RateLimitEvent` can appear after
+  the raw refusal stop but before `ResultMessage`. Both were reproduced in RED
+  tests, fixed, and independently reviewed. A present prefill field must still
+  be literal false; ordinary metadata validation/session correlation still apply.
+- Two consecutive final replays of the exact eight-message transcript through
+  the OpenAI endpoint returned HTTP 200, model alias `opus`, and
+  `finish_reason: content_filter`. SDK metadata reported
+  `model_refusal_no_fallback`, original model `claude-opus-5`, category `cyber`.
+  Request IDs: `req_e8571129305441dfb58a86689e53f513` and
+  `req_fa26396107624ecca2bc4215d1651050`.
+- Classifier outcomes varied: an earlier replay returned legitimate tool calls.
+  No generated tool was executed or given a result; closing that suspended probe
+  produced the expected bridge-closed cleanup traceback. An earlier pre-fix
+  replay also hit the refusal-order guard; its precise ordering was not captured
+  and it did not recur in the final two replays. These checks do not establish
+  support for arbitrary mid-stream retractions or every upstream event ordering.
+- The running proxy was not restarted. This verifies the supplied continuation
+  in an imported isolated session, not a complete benchmark run or its score.
 
 Reference: [Anthropic refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback).

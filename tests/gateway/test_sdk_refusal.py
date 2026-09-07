@@ -239,9 +239,11 @@ async def test_sdk_session_disables_automatic_refusal_downgrade(tmp_path: Path) 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("category", ["cyber", "bio", "frontier_llm", "general_harms"])
+@pytest.mark.parametrize("prefill_field", [False, True])
 async def test_sdk_session_returns_classifier_refusal_without_downgrade(
     tmp_path: Path,
     category: str,
+    prefill_field: bool,
 ) -> None:
     messages = list(refusal_response())
     messages[2] = _notice(api_refusal_category=category)
@@ -250,7 +252,7 @@ async def test_sdk_session_returns_classifier_refusal_without_downgrade(
             "type": "refusal",
             "category": category,
             "explanation": "private classifier explanation",
-            "fallback_has_prefill_claim": False,
+            **({"fallback_has_prefill_claim": False} if prefill_field else {}),
         }
     )
     assert await _collect_sdk_refusal(tmp_path, tuple(messages)) == [
@@ -594,6 +596,20 @@ async def test_terminal_sdk_failure_is_logged_before_redaction(
         and r.msg.get("reason") == reason
         for r in caplog.records
     )
+
+
+@pytest.mark.anyio
+async def test_refusal_accepts_valid_rate_limit_metadata_before_result(
+    tmp_path: Path,
+) -> None:
+    from tests.gateway.test_sdk_session import live_rate_limit
+
+    messages = list(refusal_response())
+    messages.insert(-1, live_rate_limit())
+    assert await _collect_sdk_refusal(tmp_path, tuple(messages)) == [
+        InputUsage(24, 948, 43),
+        Completed("refusal", RAW_USAGE),
+    ]
 
 
 class _HttpRefusalFactory:

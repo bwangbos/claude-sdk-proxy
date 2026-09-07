@@ -468,7 +468,7 @@ class SdkSession:
                         )
                     )
                 elif isinstance(message, RateLimitEvent):
-                    if self._awaiting_submit or refusal_category is not None:
+                    if self._awaiting_submit:
                         self._fail_protocol()
                     self._observe_session_id(validate_rate_limit_event(message))
                 elif type(message) is UserMessage:

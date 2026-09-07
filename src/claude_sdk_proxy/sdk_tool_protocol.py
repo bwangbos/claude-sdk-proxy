@@ -568,9 +568,7 @@ class RawSdkMessageValidator:
         self.output_tokens = usage["output_tokens"]
         self._phase = "message_stop"
 
-    def _refusal_message_delta(
-        self, event: Mapping[str, Any], category: str
-    ) -> None:
+    def _refusal_message_delta(self, event: Mapping[str, Any], category: str) -> None:
         if self._phase != "block_start" or self._blocks or self._current is not None:
             fail_protocol()
         self._require_keys(event, {"type", "delta", "usage", "context_management"})
@@ -586,12 +584,15 @@ class RawSdkMessageValidator:
         if (
             not isinstance(details, Mapping)
             or set(details)
-            != {"type", "category", "explanation", "fallback_has_prefill_claim"}
+            not in (
+                {"type", "category", "explanation"},
+                {"type", "category", "explanation", "fallback_has_prefill_claim"},
+            )
             or details.get("type") != "refusal"
             or details.get("category") != category
             or not isinstance(details.get("explanation"), str)
             or not details["explanation"]
-            or details.get("fallback_has_prefill_claim") is not False
+            or details.get("fallback_has_prefill_claim", False) is not False
         ):
             fail_protocol()
         context = event.get("context_management")
