@@ -61,9 +61,7 @@ class FailingSession(FakeConversationSession):
         super().__init__("unused")
         self.after_delta = after_delta
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         if self.after_delta:
             yield TextDelta("partial")
@@ -82,9 +80,7 @@ class BlockingStreamSession(FakeConversationSession):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta("first")
         self.entered.set()
@@ -93,9 +89,7 @@ class BlockingStreamSession(FakeConversationSession):
 
 
 class SlowAfterDeltaSession(FakeConversationSession):
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta("partial")
         await asyncio.Event().wait()
@@ -153,18 +147,14 @@ class SequentialSession(FakeConversationSession):
         super().__init__("unused")
         self._outputs = iter(outputs)
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta(next(self._outputs))
         yield Completed("end_turn", {"output_tokens": 1})
 
 
 class InputUsageSession(FakeConversationSession):
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         from claude_sdk_proxy.domain import InputUsage
 
         self.prompts.append(prompt)
@@ -174,9 +164,7 @@ class InputUsageSession(FakeConversationSession):
 
 
 class EmptyTextSession(FakeConversationSession):
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield Completed("end_turn", {"input_tokens": 1, "output_tokens": 0})
 
@@ -188,8 +176,9 @@ def one_session_factory(session: FakeConversationSession):
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        **kwargs: object,
     ) -> FakeConversationSession:
-        del model, system, tools, dialect
+        del model, system, tools, dialect, kwargs
         return session
 
     return factory
@@ -226,6 +215,7 @@ def sdk_app(tmp_path, client: FakeSdkClient):
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        **kwargs: object,
     ) -> SdkSession:
         del tools, dialect
         return SdkSession(
@@ -233,6 +223,7 @@ def sdk_app(tmp_path, client: FakeSdkClient):
             system,
             directory_factory=lambda: FixedTemporaryDirectory(tmp_path),
             client_factory=lambda options: client.capture_options(options),
+            **kwargs,
         )
 
     return create_app(models=("sonnet",), session_factory=factory)
@@ -326,8 +317,18 @@ async def test_health_and_models_report_only_configured_models() -> None:
     assert models.json == {
         "object": "list",
         "data": [
-            {"id": "sonnet", "object": "model", "created": 0, "owned_by": "anthropic"},
-            {"id": "opus", "object": "model", "created": 0, "owned_by": "anthropic"},
+            {
+                "id": "sonnet-5",
+                "object": "model",
+                "created": 0,
+                "owned_by": "anthropic",
+            },
+            {
+                "id": "opus-5",
+                "object": "model",
+                "created": 0,
+                "owned_by": "anthropic",
+            },
         ],
     }
 
@@ -557,9 +558,7 @@ async def test_midstream_timeout_survives_failing_backend_close() -> None:
         turn_timeout_seconds=0.01,
     )
     async with lifespan_app(app):
-        response = await post_json(
-            app, "/v1/messages", anthropic_body(stream=True)
-        )
+        response = await post_json(app, "/v1/messages", anthropic_body(stream=True))
 
     assert response.status == 200
     assert b'"type":"backend_timeout"' in response.body
@@ -658,9 +657,7 @@ async def test_terminal_send_failure_preserves_committed_replay_and_backend() ->
                 openai_body(stream=True),
                 fail_send_after=3,
             )
-        replay = await post_json(
-            app, "/v1/chat/completions", openai_body(stream=True)
-        )
+        replay = await post_json(app, "/v1/chat/completions", openai_body(stream=True))
         assert factory.sessions[0].close_count == 0
 
     assert replay.status == 200

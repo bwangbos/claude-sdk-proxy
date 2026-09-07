@@ -50,9 +50,7 @@ class FakeSdkClient:
         *,
         start_tool_callbacks: bool = True,
         wait_for_tool_callbacks_before_user: bool = True,
-        user_message_barrier: tuple[
-            asyncio.Event, asyncio.Event, asyncio.Event
-        ]
+        user_message_barrier: tuple[asyncio.Event, asyncio.Event, asyncio.Event]
         | None = None,
         message_barriers: Mapping[int, tuple[asyncio.Event, asyncio.Event]]
         | None = None,
@@ -159,6 +157,7 @@ class FakeSdkClient:
             arguments=cast(dict[str, object], arguments),
             meta={"claudecode/toolUseId": internal_id},
         )
+
         async def invoke_handler() -> CallToolResult:
             if entry_barrier is not None:
                 await entry_barrier.wait()
@@ -394,9 +393,7 @@ class FakeConversationSession:
     async def start(self) -> None:
         self.start_count += 1
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta(self._text)
         yield Completed("end_turn", {"output_tokens": 1})
@@ -426,8 +423,21 @@ class FakeSessionFactory:
         dialect: Dialect = "anthropic",
         history: tuple[CanonicalMessage, ...] = (),
         thinking: ThinkingOptions = ThinkingOptions(),
+        refusal_fallback: str = "off",
+        allowed_backend_models: tuple[str, ...] = (),
+        active_backend_model: str | None = None,
+        fallback_provenance: bool = False,
     ) -> FakeConversationSession:
-        del model, system, tools, dialect
+        del (
+            model,
+            system,
+            tools,
+            dialect,
+            refusal_fallback,
+            allowed_backend_models,
+            active_backend_model,
+            fallback_provenance,
+        )
         self.histories.append(history)
         self.thinking_options.append(thinking)
         session = FakeConversationSession(next(self._outputs))

@@ -224,6 +224,13 @@ class Completed:
             object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
 
 
+@dataclass(frozen=True, slots=True)
+class ResponseIdentity:
+    requested_model: str
+    actual_model: str
+    fallback: bool
+
+
 type BackendEvent = TextDelta | ToolCall | Completed
 
 
@@ -238,6 +245,7 @@ class TextRequest:
     dialect: Dialect = "anthropic"
     tools: tuple[ToolDefinition, ...] = ()
     thinking: ThinkingOptions = ThinkingOptions()
+    refusal_fallback: Literal["off", "auto"] = "off"
 
     def __post_init__(self) -> None:
         from claude_sdk_proxy.tool_contract import (
@@ -252,6 +260,8 @@ class TextRequest:
             raise ValueError("max_tokens must be positive")
         if self.dialect not in {"anthropic", "openai"}:
             raise RequestValidationError("messages", "dialect is invalid")
+        if self.refusal_fallback not in {"off", "auto"}:
+            raise RequestValidationError("refusal_fallback", "policy is invalid")
         if not self.messages:
             raise ValueError("messages must not be empty")
 
@@ -379,7 +389,13 @@ def _valid_public_id(value: object) -> bool:
 
 
 type ConversationEvent = (
-    InputUsage | TextDelta | ThinkingDelta | ThinkingCompleted | ToolCall | Completed
+    InputUsage
+    | ResponseIdentity
+    | TextDelta
+    | ThinkingDelta
+    | ThinkingCompleted
+    | ToolCall
+    | Completed
 )
 
 
@@ -401,6 +417,10 @@ class SdkSessionFactory(Protocol):
         dialect: Dialect = "anthropic",
         history: tuple[CanonicalMessage, ...] = (),
         thinking: ThinkingOptions = ThinkingOptions(),
+        refusal_fallback: Literal["off", "auto"] = "off",
+        allowed_backend_models: tuple[str, ...] = (),
+        active_backend_model: str | None = None,
+        fallback_provenance: bool = False,
     ) -> SdkSessionProtocol: ...
 
 

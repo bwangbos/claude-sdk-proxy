@@ -19,6 +19,7 @@ from claude_sdk_proxy.domain import (
     ThinkingDelta,
     ToolCall,
 )
+from claude_sdk_proxy.model_catalog import canonical_model
 from claude_sdk_proxy.openai_tools import (
     parse_openai_messages,
     parse_openai_tools,
@@ -80,8 +81,8 @@ def parse_openai_request(
     user = body.get("user")
     if user is not None and not isinstance(user, str):
         raise RequestValidationError("user", "must be a string or null")
-    model = required_string(body, "model")
-    if model not in allowed_models:
+    model = canonical_model(required_string(body, "model"))
+    if model not in {canonical_model(value) for value in allowed_models}:
         raise RequestValidationError("model", "model is not configured")
     thinking = parse_openai_thinking(body, model)
     stream = boolean(body, "stream")

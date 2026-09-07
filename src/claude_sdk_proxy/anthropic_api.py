@@ -26,6 +26,7 @@ from claude_sdk_proxy.domain import (
     ToolCall,
     ToolDefinition,
 )
+from claude_sdk_proxy.model_catalog import canonical_model
 from claude_sdk_proxy.text_api import (
     boolean,
     reject_fields,
@@ -67,8 +68,8 @@ def parse_anthropic_request(
     body: Mapping[str, object], allowed_models: frozenset[str]
 ) -> TextRequest:
     reject_fields(body, _SUPPORTED_FIELDS, _UNSUPPORTED_FIELDS)
-    model = required_string(body, "model")
-    if model not in allowed_models:
+    model = canonical_model(required_string(body, "model"))
+    if model not in {canonical_model(value) for value in allowed_models}:
         raise RequestValidationError("model", "model is not configured")
     thinking = parse_anthropic_thinking(body, model)
     system = ""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,8 +109,18 @@ class SdkSession:
         dialect: Dialect = "anthropic",
         history: Iterable[CanonicalMessage] = (),
         thinking: ThinkingOptions = ThinkingOptions(),
+        refusal_fallback: Literal["off", "auto"] = "off",
+        allowed_backend_models: tuple[str, ...] = (),
+        active_backend_model: str | None = None,
+        fallback_provenance: bool = False,
     ) -> None:
-        self._model = model
+        from claude_sdk_proxy.model_catalog import backend_model
+
+        self._model = active_backend_model or backend_model(model)
+        self._requested_model = model
+        self._refusal_fallback = refusal_fallback
+        self._allowed_backend_models = allowed_backend_models or (self._model,)
+        self._fallback_provenance = fallback_provenance
         self._system = system
         self._directory_factory = directory_factory or self._new_directory
         self._client_factory = client_factory
@@ -213,6 +224,10 @@ class SdkSession:
             allowed_tools=list(self._expected_sdk_tools),
             skills=[],
             setting_sources=[],
+            settings=json.dumps(
+                {"availableModels": list(self._allowed_backend_models)},
+                separators=(",", ":"),
+            ),
             mcp_servers=(
                 {SDK_MCP_SERVER_NAME: self._bridge.mcp_server}
                 if self._bridge is not None
@@ -233,7 +248,9 @@ class SdkSession:
                 "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
                 # Refusals must not silently change the requested model.
                 # fallback_model controls overload, not classifier fallback.
-                "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
+                "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": (
+                    "1" if self._refusal_fallback == "off" else "0"
+                ),
             },
             extra_args={
                 "restricted": None,

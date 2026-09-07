@@ -28,10 +28,12 @@ def test_cli_accepts_repeatable_models(monkeypatch: pytest.MonkeyPatch) -> None:
         models: tuple[str, ...],
         max_sessions: int,
         tool_result_timeout_seconds: float,
+        refusal_fallback: str,
     ) -> object:
         captured["models"] = models
         captured["max_sessions"] = max_sessions
         captured["tool_result_timeout_seconds"] = tool_result_timeout_seconds
+        captured["refusal_fallback"] = refusal_fallback
         return object()
 
     monkeypatch.setattr(cli, "create_app", create_app)
@@ -40,6 +42,7 @@ def test_cli_accepts_repeatable_models(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["models"] == ("sonnet", "opus")
     assert captured["max_sessions"] == 8
     assert captured["tool_result_timeout_seconds"] == 300.0
+    assert captured["refusal_fallback"] == "off"
 
 
 def test_cli_threads_configured_max_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -50,11 +53,13 @@ def test_cli_threads_configured_max_sessions(monkeypatch: pytest.MonkeyPatch) ->
         models: tuple[str, ...],
         max_sessions: int,
         tool_result_timeout_seconds: float,
+        refusal_fallback: str,
     ) -> object:
         captured.update(
             models=models,
             max_sessions=max_sessions,
             tool_result_timeout_seconds=tool_result_timeout_seconds,
+            refusal_fallback=refusal_fallback,
         )
         return object()
 
@@ -63,9 +68,10 @@ def test_cli_threads_configured_max_sessions(monkeypatch: pytest.MonkeyPatch) ->
 
     assert cli.main(["--max-sessions", "3"]) == 0
     assert captured == {
-        "models": ("sonnet",),
+        "models": ("sonnet-5",),
         "max_sessions": 3,
         "tool_result_timeout_seconds": 300.0,
+        "refusal_fallback": "off",
     }
 
 
@@ -79,11 +85,13 @@ def test_cli_threads_configured_tool_result_timeout(
         models: tuple[str, ...],
         max_sessions: int,
         tool_result_timeout_seconds: float,
+        refusal_fallback: str,
     ) -> object:
         captured.update(
             models=models,
             max_sessions=max_sessions,
             tool_result_timeout_seconds=tool_result_timeout_seconds,
+            refusal_fallback=refusal_fallback,
         )
         return object()
 
@@ -92,6 +100,19 @@ def test_cli_threads_configured_tool_result_timeout(
 
     assert cli.main(["--tool-result-timeout", "12.5"]) == 0
     assert captured["tool_result_timeout_seconds"] == 12.5
+
+
+def test_cli_threads_refusal_fallback_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def create_app(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli, "create_app", create_app)
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+    assert cli.main(["--refusal-fallback", "off"]) == 0
+    assert captured["refusal_fallback"] == "off"
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])

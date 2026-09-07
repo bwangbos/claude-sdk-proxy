@@ -40,9 +40,7 @@ from tests.gateway.fakes import (
 
 
 class ToolBoundarySession:
-    def __init__(
-        self, boundary: tuple[ConversationEvent, ...] | None = None
-    ) -> None:
+    def __init__(self, boundary: tuple[ConversationEvent, ...] | None = None) -> None:
         self.prompts: list[str] = []
         self.close_count = 0
         self.closed = asyncio.Event()
@@ -55,16 +53,12 @@ class ToolBoundarySession:
     async def start(self) -> None:
         pass
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         for event in self.boundary:
             yield event
 
-    async def submit_tool_results(
-        self, results: Iterable[ToolResultBlock]
-    ) -> None:
+    async def submit_tool_results(self, results: Iterable[ToolResultBlock]) -> None:
         raise AssertionError(f"unexpected results: {tuple(results)!r}")
 
     async def wait_failure(self) -> None:
@@ -76,18 +70,14 @@ class ToolBoundarySession:
 
 
 class RepeatedRoundSession(ToolBoundarySession):
-    def __init__(
-        self, boundaries: tuple[tuple[ConversationEvent, ...], ...]
-    ) -> None:
+    def __init__(self, boundaries: tuple[tuple[ConversationEvent, ...], ...]) -> None:
         super().__init__(())
         self.boundaries = boundaries
         self.results: list[tuple[ToolResultBlock, ...]] = []
         self.handler_count = 0
         self._resume = asyncio.Event()
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         for index, boundary in enumerate(self.boundaries):
             if index:
@@ -96,9 +86,7 @@ class RepeatedRoundSession(ToolBoundarySession):
             for event in boundary:
                 yield event
 
-    async def submit_tool_results(
-        self, results: Iterable[ToolResultBlock]
-    ) -> None:
+    async def submit_tool_results(self, results: Iterable[ToolResultBlock]) -> None:
         self.handler_count += 1
         self.results.append(tuple(results))
         self._resume.set()
@@ -116,9 +104,7 @@ class BlockingToolSession(ToolBoundarySession):
             self.entered.set()
             await self.release.wait()
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         if self.after_delta:
             yield InputUsage(13)
@@ -131,7 +117,7 @@ class BlockingToolSession(ToolBoundarySession):
 
 def tool_body(dialect: str, *, stream: bool = False) -> dict[str, object]:
     common: dict[str, object] = {
-        "model": "sonnet",
+        "model": "sonnet-5",
         "messages": [{"role": "user", "content": "go"}],
         "max_tokens": 128,
         "stream": stream,
@@ -260,9 +246,7 @@ def _assistant_call_message(
                 "type": "function",
                 "function": {
                     "name": "echo",
-                    "arguments": json.dumps(
-                        {"value": value}, separators=(",", ":")
-                    ),
+                    "arguments": json.dumps({"value": value}, separators=(",", ":")),
                 },
             }
             for identifier, value in calls
@@ -315,10 +299,14 @@ def _public_boundary(
         message = choice["message"]
         calls = tuple(call["id"] for call in message.get("tool_calls", []))
         usage = response_json["usage"]
-        return calls, (
-            usage["prompt_tokens"],
-            usage["completion_tokens"],
-        ), message["content"] or ""
+        return (
+            calls,
+            (
+                usage["prompt_tokens"],
+                usage["completion_tokens"],
+            ),
+            message["content"] or "",
+        )
     records = [
         json.loads(line.removeprefix(b"data: "))
         for line in response_body.splitlines()
@@ -361,7 +349,7 @@ def _sdk_tool_body(
     stream: bool,
 ) -> dict[str, object]:
     body: dict[str, object] = {
-        "model": "sonnet",
+        "model": "sonnet-5",
         "messages": messages or [{"role": "user", "content": "go"}],
         "max_tokens": 128,
         "stream": stream,
@@ -461,9 +449,7 @@ def _tool_payloads(dialect: str, response_body: bytes, response_json: object):
         (
             item["choices"][0]["delta"]["tool_calls"][0]["id"],
             json.loads(
-                item["choices"][0]["delta"]["tool_calls"][0]["function"][
-                    "arguments"
-                ]
+                item["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
             ),
         )
         for _, item in records
@@ -630,7 +616,7 @@ def _assert_exact_tool_sse(
                         "id": "<response>",
                         "type": "message",
                         "role": "assistant",
-                        "model": "sonnet",
+                        "model": "sonnet-5",
                         "content": [],
                         "stop_reason": None,
                         "stop_sequence": None,
@@ -699,7 +685,7 @@ def _assert_exact_tool_sse(
         "id": "<response>",
         "object": "chat.completion.chunk",
         "created": created,
-        "model": "sonnet",
+        "model": "sonnet-5",
         "choices": [
             {
                 "index": 0,
@@ -765,7 +751,7 @@ def _assert_exact_tool_sse(
                     "id": "<response>",
                     "object": "chat.completion.chunk",
                     "created": created,
-                    "model": "sonnet",
+                    "model": "sonnet-5",
                     "choices": [],
                     "usage": {
                         "prompt_tokens": usage[0],
@@ -792,7 +778,7 @@ def _assert_exact_final_sse(dialect: str, body: bytes) -> None:
                         "id": "<response>",
                         "type": "message",
                         "role": "assistant",
-                        "model": "sonnet",
+                        "model": "sonnet-5",
                         "content": [],
                         "stop_reason": None,
                         "stop_sequence": None,
@@ -837,7 +823,7 @@ def _assert_exact_final_sse(dialect: str, body: bytes) -> None:
         "id": "<response>",
         "object": "chat.completion.chunk",
         "created": created,
-        "model": "sonnet",
+        "model": "sonnet-5",
     }
     assert records == [
         [
@@ -1005,9 +991,7 @@ async def test_stream_tool_boundary_uses_one_response_local_index_state(
             for line in response.body.splitlines()
             if line.startswith(b"data: ")
         ]
-        starts = [
-            item for item in records if item["type"] == "content_block_start"
-        ]
+        starts = [item for item in records if item["type"] == "content_block_start"]
         assert starts == [
             {
                 "type": "content_block_start",
@@ -1047,8 +1031,7 @@ async def test_stream_tool_boundary_uses_one_response_local_index_state(
         calls = [
             item["choices"][0]["delta"]["tool_calls"][0]
             for item in records
-            if item["choices"]
-            and "tool_calls" in item["choices"][0]["delta"]
+            if item["choices"] and "tool_calls" in item["choices"][0]["delta"]
         ]
         assert calls == [
             {
@@ -1138,9 +1121,7 @@ async def test_expired_tool_result_submission_is_http_504() -> None:
         *_result_messages("anthropic", (("toolu_one", "late"),)),
     ]
     async with lifespan_app(app):
-        boundary = await post_json(
-            app, "/v1/messages", tool_body("anthropic"), headers
-        )
+        boundary = await post_json(app, "/v1/messages", tool_body("anthropic"), headers)
         registry = _LIFESPAN_STATES[app]["registry"]
         actor = registry._explicit["expired-results"]
         actor._wait_deadline = asyncio.get_running_loop().time() - 1
@@ -1231,9 +1212,7 @@ async def test_http_repeated_tool_rounds_reverse_parallel_results_and_replay(
             headers,
         )
         messages.append(_assistant_call_message(dialect, second_calls))
-        messages.extend(
-            _result_messages(dialect, ((second_calls[0][0], "round-two"),))
-        )
+        messages.extend(_result_messages(dialect, ((second_calls[0][0], "round-two"),)))
         final_body = _body_with_messages(dialect, messages, stream=stream)
         final = await post_json(app, path, final_body, headers)
         handler_count = session.handler_count
@@ -1254,17 +1233,16 @@ async def test_http_repeated_tool_rounds_reverse_parallel_results_and_replay(
         (7, 3),
         "",
     )
-    final_public = _public_boundary(
-        dialect, final.body, final_json, stream=stream
-    )
+    final_public = _public_boundary(dialect, final.body, final_json, stream=stream)
     assert final_public == (
         (),
         (11, 4),
         "left-result/right-result/final",
     )
-    assert _public_boundary(
-        dialect, replay.body, replay_json, stream=stream
-    ) == final_public
+    assert (
+        _public_boundary(dialect, replay.body, replay_json, stream=stream)
+        == final_public
+    )
     assert session.results == [
         (
             ToolResultBlock(first_calls[0][0], ("left-result",), False),
@@ -1355,9 +1333,7 @@ async def test_real_sdk_http_boundaries_usage_bridge_replay_and_wire(
         transcript.extend(
             [
                 _assistant_sdk_message(dialect, second_calls),
-                *_sdk_result_messages(
-                    dialect, ((second_calls[0][0], "round-two"),)
-                ),
+                *_sdk_result_messages(dialect, ((second_calls[0][0], "round-two"),)),
             ]
         )
         final = await post_json(
@@ -1455,9 +1431,11 @@ async def test_real_sdk_anthropic_accepts_empty_and_multiblock_tool_results(
         final_json = {} if stream else final.json
 
     assert first.status == final.status == 200
-    assert _public_boundary(
-        "anthropic", final.body, final_json, stream=stream
-    ) == ((), (11, 4), "real-sdk-final")
+    assert _public_boundary("anthropic", final.body, final_json, stream=stream) == (
+        (),
+        (11, 4),
+        "real-sdk-final",
+    )
     assert tuple(block.text for block in client.tool_results[0].content) == tuple(
         block["text"] for block in result_content
     )
@@ -1622,9 +1600,10 @@ async def test_real_sdk_oversized_raw_tool_arguments_are_redacted_http_errors(
         assert b"backend_error" in response.body
     else:
         assert response.status == 502
-        assert response.json["error"][
-            "type" if dialect == "anthropic" else "code"
-        ] == "backend_error"
+        assert (
+            response.json["error"]["type" if dialect == "anthropic" else "code"]
+            == "backend_error"
+        )
     assert b"oversized-model-secret" not in response.body
     assert b"sdk-internal-oversized" not in response.body
     assert b"sdk-session-secret" not in response.body
@@ -1693,9 +1672,11 @@ async def test_http_single_tool_round_completes_in_each_mode(
     assert boundary.status == final.status == 200
     boundary_json = {} if stream else boundary.json
     final_json = {} if stream else final.json
-    assert _public_boundary(
-        dialect, boundary.body, boundary_json, stream=stream
-    ) == ((identifier,), (2, 1), "")
+    assert _public_boundary(dialect, boundary.body, boundary_json, stream=stream) == (
+        (identifier,),
+        (2, 1),
+        "",
+    )
     assert _public_boundary(dialect, final.body, final_json, stream=stream) == (
         (),
         (6, 2),
@@ -1715,7 +1696,7 @@ async def test_http_single_tool_round_completes_in_each_mode(
     ],
 )
 async def test_invalid_caller_results_are_400_and_corrected_retry_still_works(
-    bad_results: tuple[tuple[str, str], ...]
+    bad_results: tuple[tuple[str, str], ...],
 ) -> None:
     calls = (("toolu_left", "same"), ("toolu_right", "same"))
     session = RepeatedRoundSession(
@@ -1806,9 +1787,7 @@ async def test_http_tool_session_freezes_schema_and_dialect_as_409() -> None:
         changed_schema["tools"][0]["input_schema"]["properties"]["extra"] = {  # type: ignore[index]
             "type": "boolean"
         }
-        schema = await post_json(
-            app, "/v1/messages", changed_schema, headers
-        )
+        schema = await post_json(app, "/v1/messages", changed_schema, headers)
         dialect = await post_json(
             app, "/v1/chat/completions", tool_body("openai"), headers
         )
@@ -2063,9 +2042,7 @@ async def test_disconnect_after_result_commit_finishes_for_identical_replay() ->
 
     assert first.status == replay.status == 200
     assert disconnected is None
-    assert replay.json["content"] == [
-        {"type": "text", "text": "background-final"}
-    ]
+    assert replay.json["content"] == [{"type": "text", "text": "background-final"}]
     assert replay.json["usage"] == {"input_tokens": 8, "output_tokens": 2}
     assert handler_count == session.handler_count == 1
     assert session.prompts == ["go"]
@@ -2108,6 +2085,7 @@ async def test_oversized_caller_result_is_redacted() -> None:
             ),
         )
     )
+
     def factory(
         model: str,
         system: str,

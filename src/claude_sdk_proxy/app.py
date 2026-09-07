@@ -5,6 +5,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import cast
 
 from starlette.applications import Starlette
@@ -44,7 +45,13 @@ from claude_sdk_proxy.domain import (
     ThinkingCompleted,
     ToolCall,
 )
+from claude_sdk_proxy.fallback_policy import (
+    RefusalFallback,
+    native_allowlist,
+    resolve_fallback,
+)
 from claude_sdk_proxy.http_errors import error_detail, error_response
+from claude_sdk_proxy.model_catalog import canonical_models
 from claude_sdk_proxy.openai_api import (
     OpenAIStreamState,
     encode_openai_error,
@@ -66,6 +73,7 @@ def create_app(
     tool_result_timeout_seconds: float = 300.0,
     teardown_timeout_seconds: float = 5.0,
     max_sessions: int = 8,
+    refusal_fallback: RefusalFallback = "off",
 ) -> Starlette:
     if max_sessions <= 0:
         raise ValueError("max sessions must be positive")
@@ -75,7 +83,14 @@ def create_app(
         or len(set(models)) != len(models)
     ):
         raise ValueError("models must be non-empty and unique")
-    allowed_models = frozenset(models)
+    if refusal_fallback == "auto":
+        raise ValueError(
+            "automatic refusal fallback is not available until buffering is integrated"
+        )
+    if refusal_fallback not in {"off", "auto"}:
+        raise ValueError("refusal fallback must be off or auto")
+    model_order = canonical_models(models)
+    allowed_models = frozenset(model_order)
 
     @asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[dict[str, SessionRegistry]]:
@@ -85,6 +100,7 @@ def create_app(
             tool_result_timeout_seconds=tool_result_timeout_seconds,
             teardown_timeout_seconds=teardown_timeout_seconds,
             max_sessions=max_sessions,
+            configured_models=model_order,
         )
         try:
             yield {"registry": registry}
@@ -102,7 +118,8 @@ def create_app(
     )
     app.add_middleware(DiagnosticContextMiddleware)
     app.state.allowed_models = allowed_models
-    app.state.model_order = models
+    app.state.model_order = model_order
+    app.state.refusal_fallback = refusal_fallback
     return app
 
 
@@ -145,6 +162,12 @@ async def _handle(request: Request, *, dialect: str) -> Response:
             parse_openai_request if dialect == "openai" else parse_anthropic_request
         )
         parsed = parser(cast(Mapping[str, object], body), allowed)
+        policy = resolve_fallback(
+            request.headers.getlist("x-claude-proxy-refusal-fallback"),
+            cast(RefusalFallback, request.app.state.refusal_fallback),
+        )
+        native_allowlist(parsed.model, request.app.state.model_order, policy)
+        parsed = replace(parsed, refusal_fallback=policy)
         monitor = DisconnectMonitor(request.receive)
         await monitor.start()
         registry = cast(SessionRegistry, request.state.registry)

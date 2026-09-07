@@ -54,9 +54,12 @@ def test_explicit_openai_completion_timestamp_is_consistent_across_outputs() -> 
     created = 1_799_000_123
     completed = Completed("end_turn", {"input_tokens": 2, "output_tokens": 1})
 
-    assert _openai_payload(
-        encode_openai_start("chatcmpl_test", "sonnet", created=created)[0]
-    )["created"] == created
+    assert (
+        _openai_payload(
+            encode_openai_start("chatcmpl_test", "sonnet", created=created)[0]
+        )["created"]
+        == created
+    )
     chunks = encode_openai_event(
         "chatcmpl_test",
         "sonnet",
@@ -68,14 +71,18 @@ def test_explicit_openai_completion_timestamp_is_consistent_across_outputs() -> 
         created,
         created,
     ]
-    assert render_openai_response(
-        "chatcmpl_test", "sonnet", "done", completed, created=created
-    )["created"] == created
+    assert (
+        render_openai_response(
+            "chatcmpl_test", "sonnet", "done", completed, created=created
+        )["created"]
+        == created
+    )
 
     # Existing callers that do not pass request context retain their old contract.
-    assert _openai_payload(encode_openai_start("chatcmpl_test", "sonnet")[0])[
-        "created"
-    ] == 0
+    assert (
+        _openai_payload(encode_openai_start("chatcmpl_test", "sonnet")[0])["created"]
+        == 0
+    )
 
 
 @pytest.mark.parametrize("user", ["advisory-user", None])
@@ -95,7 +102,7 @@ def test_openai_user_and_known_null_optionals_are_advisory(user: str | None) -> 
         frozenset({"sonnet"}),
     )
 
-    assert request.model == "sonnet"
+    assert request.model == "sonnet-5"
     assert request.max_tokens is None
     assert request.tools == ()
     assert request == parse_openai_request(
@@ -211,9 +218,9 @@ def test_cache_usage_maps_without_fabricating_absent_optional_fields() -> None:
         "cache_read_input_tokens": 700,
         "cache_creation_input_tokens": 11,
     }
-    openai_usage = render_openai_response(
-        "chatcmpl_test", "sonnet", "ok", completed
-    )["usage"]
+    openai_usage = render_openai_response("chatcmpl_test", "sonnet", "ok", completed)[
+        "usage"
+    ]
     assert openai_usage == {
         "prompt_tokens": 716,
         "completion_tokens": 2,
@@ -229,12 +236,14 @@ def test_cache_usage_maps_without_fabricating_absent_optional_fields() -> None:
     assert typed_usage.prompt_tokens_details.cache_write_tokens == 11
 
     absent = Completed("end_turn", {"input_tokens": 5, "output_tokens": 2})
-    assert "prompt_tokens_details" not in render_openai_response(
-        "chatcmpl_test", "sonnet", "ok", absent
-    )["usage"]
-    assert render_anthropic_response("msg_test", "sonnet", "ok", absent)[
-        "usage"
-    ] == {"input_tokens": 5, "output_tokens": 2}
+    assert (
+        "prompt_tokens_details"
+        not in render_openai_response("chatcmpl_test", "sonnet", "ok", absent)["usage"]
+    )
+    assert render_anthropic_response("msg_test", "sonnet", "ok", absent)["usage"] == {
+        "input_tokens": 5,
+        "output_tokens": 2,
+    }
 
 
 @pytest.mark.anyio
@@ -246,9 +255,7 @@ async def test_sdk_boundary_preserves_cache_snapshot_and_checks_repetitions(
         "cache_read_input_tokens": 700,
         "cache_creation_input_tokens": 11,
     }
-    raw = list(
-        raw_text_events("done", "sdk-1", input_tokens=5, output_tokens=2)
-    )
+    raw = list(raw_text_events("done", "sdk-1", input_tokens=5, output_tokens=2))
     raw[0].event["message"]["usage"] = {**cache_usage, "output_tokens": 0}
     raw[3:3] = [
         AssistantMessage(
@@ -410,9 +417,7 @@ async def test_asgi_repeated_tools_preserve_each_raw_boundary_usage(
     )
     final_raw = list(
         _attach_boundary_usage(
-            raw_text_events(
-                "done", "sdk-real", input_tokens=2, output_tokens=4
-            ),
+            raw_text_events("done", "sdk-real", input_tokens=2, output_tokens=4),
             final_usage,
         )
     )
@@ -514,9 +519,10 @@ async def test_asgi_repeated_tools_preserve_each_raw_boundary_usage(
     assert first.status == final.status == 200
     assert len(calls) == 2
     assert _public_usage(dialect, stream, first.body, first_payload) == expected_tool
-    assert _public_usage(
-        dialect, stream, final.body, {} if stream else final.json
-    ) == expected_final
+    assert (
+        _public_usage(dialect, stream, final.body, {} if stream else final.json)
+        == expected_final
+    )
 
 
 @pytest.mark.anyio
@@ -627,6 +633,7 @@ async def test_text_boundary_rejects_output_snapshot_regression(
             tmp_path,
             (*raw, result_message(usage={"input_tokens": 5, "output_tokens": 32})),
         )
+
 
 def test_tool_boundary_accepts_increasing_interim_output_snapshots() -> None:
     sdk_name = "mcp__caller_tools__echo"

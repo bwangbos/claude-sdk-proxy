@@ -23,6 +23,10 @@ _LATEST_ADAPTIVE_EFFORTS: dict[str, frozenset[str]] = {
         "claude-opus-5",
         "claude-opus-5[1m]",
         "claude-sonnet-5",
+        "opus-5",
+        "sonnet-5",
+        "opus-4.8",
+        "claude-opus-4-8",
     )
 }
 _FOUR_SIX_EFFORTS = frozenset({"low", "medium", "high", "max"})
@@ -48,9 +52,7 @@ class ThinkingOptions:
     display: ThinkingDisplay | None = None
 
 
-def parse_openai_thinking(
-    body: Mapping[str, object], model: str
-) -> ThinkingOptions:
+def parse_openai_thinking(body: Mapping[str, object], model: str) -> ThinkingOptions:
     value = body.get("reasoning_effort")
     if value is None or value == "none":
         return ThinkingOptions()
@@ -64,9 +66,7 @@ def parse_openai_thinking(
     return ThinkingOptions(mode="adaptive", effort=effort)
 
 
-def parse_anthropic_thinking(
-    body: Mapping[str, object], model: str
-) -> ThinkingOptions:
+def parse_anthropic_thinking(body: Mapping[str, object], model: str) -> ThinkingOptions:
     output = body.get("output_config")
     effort: ThinkingEffort | None = None
     if output is not None:

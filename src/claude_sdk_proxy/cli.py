@@ -37,6 +37,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=_port, default=8317)
     parser.add_argument("--model", action="append")
+    parser.add_argument("--refusal-fallback", choices=("off", "auto"), default="off")
     parser.add_argument("--max-sessions", type=_positive, default=8)
     parser.add_argument(
         "--log", metavar="PATH", help="Append redacted diagnostics to a file"
@@ -64,12 +65,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--host must be a loopback IP address")
     if not host.is_loopback:
         parser.error("--host must be a loopback IP address")
-    models = tuple(args.model or ("sonnet",))
+    models = tuple(args.model or ("sonnet-5",))
     try:
         app = create_app(
             models=models,
             max_sessions=args.max_sessions,
             tool_result_timeout_seconds=args.tool_result_timeout,
+            refusal_fallback=args.refusal_fallback,
         )
     except ValueError as error:
         parser.error(str(error))

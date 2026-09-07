@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import uuid
 from dataclasses import replace
@@ -10,8 +11,11 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     ConversationEvent,
     SdkSessionFactory,
+    SdkSessionProtocol,
     TextRequest,
 )
+from claude_sdk_proxy.fallback_policy import native_allowlist
+from claude_sdk_proxy.model_catalog import backend_model
 from claude_sdk_proxy.session_identity import (
     messages_equal,
     replay_messages_equal,
@@ -40,6 +44,7 @@ class SessionRegistry:
         teardown_timeout_seconds: float = 5.0,
         max_sessions: int = 8,
         tool_result_timeout_seconds: float = 300.0,
+        configured_models: tuple[str, ...] = (),
     ) -> None:
         if turn_timeout_seconds <= 0:
             raise ValueError("turn timeout must be positive")
@@ -57,6 +62,7 @@ class SessionRegistry:
         self._explicit: dict[str, SessionEntry] = {}
         self._implicit: dict[str, SessionEntry] = {}
         self._closed = False
+        self._configured_models = configured_models
 
     async def open_turn(
         self, request: TextRequest, explicit_id: str | None
@@ -188,9 +194,7 @@ class SessionRegistry:
     def _settings_replacement(
         self, entry: SessionEntry, request: TextRequest
     ) -> SessionEntry:
-        seeded = replace(
-            request, messages=entry.transcript + request.messages[-1:]
-        )
+        seeded = replace(request, messages=entry.transcript + request.messages[-1:])
         return self._new_entry(seeded, entry.external_id, entry.explicit)
 
     def _can_rebase(self, entry: SessionEntry, request: TextRequest) -> bool:
@@ -249,6 +253,18 @@ class SessionRegistry:
         backend_history = (
             request.messages if isinstance(request.next_input, tuple) else history
         )
+        active_backend = backend_model(request.model)
+        allowed_backend_models = native_allowlist(
+            request.model,
+            self._configured_models or (request.model,),
+            request.refusal_fallback,
+        )
+        common = {
+            "refusal_fallback": request.refusal_fallback,
+            "allowed_backend_models": allowed_backend_models,
+            "active_backend_model": active_backend,
+            "fallback_provenance": False,
+        }
         record(
             "session_created",
             mode="import" if history else "fresh",
@@ -256,36 +272,40 @@ class SessionRegistry:
             messages=len(request.messages),
         )
         if history and request.thinking == ThinkingOptions():
-            backend = self._session_factory(
+            backend = self._create_backend(
                 request.model,
                 request.system,
                 tools=request.tools,
                 dialect=request.dialect,
                 history=backend_history,
+                **common,
             )
         elif history:
-            backend = self._session_factory(
+            backend = self._create_backend(
                 request.model,
                 request.system,
                 tools=request.tools,
                 dialect=request.dialect,
                 history=backend_history,
                 thinking=request.thinking,
+                **common,
             )
         elif request.thinking == ThinkingOptions():
-            backend = self._session_factory(
+            backend = self._create_backend(
                 request.model,
                 request.system,
                 tools=request.tools,
                 dialect=request.dialect,
+                **common,
             )
         else:
-            backend = self._session_factory(
+            backend = self._create_backend(
                 request.model,
                 request.system,
                 tools=request.tools,
                 dialect=request.dialect,
                 thinking=request.thinking,
+                **common,
             )
         if not request.tools:
             entry: SessionEntry = Conversation(
@@ -314,6 +334,19 @@ class SessionRegistry:
                 transcript=history,
             )
         return entry
+
+    def _create_backend(
+        self, model: str, system: str, **kwargs: object
+    ) -> SdkSessionProtocol:
+        """Call legacy injectable factories without withholding policy from SDK ones."""
+        parameters = inspect.signature(self._session_factory).parameters.values()
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
+        )
+        if not accepts_kwargs:
+            accepted = {parameter.name for parameter in parameters}
+            kwargs = {key: value for key, value in kwargs.items() if key in accepted}
+        return self._session_factory(model, system, **kwargs)  # type: ignore[arg-type]
 
     async def _install_rebase(
         self,
@@ -473,9 +506,7 @@ class SessionRegistry:
     def _config_matches(entry: SessionEntry, request: TextRequest) -> bool:
         return entry.matches_config(request)
 
-    def _validate_fixed_config(
-        self, entry: SessionEntry, request: TextRequest
-    ) -> None:
+    def _validate_fixed_config(self, entry: SessionEntry, request: TextRequest) -> None:
         if request.system != entry.system:
             raise SessionMismatch("session system does not match")
         if request.dialect != entry.dialect:

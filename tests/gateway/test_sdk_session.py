@@ -946,7 +946,9 @@ async def test_tool_session_exposes_only_generated_caller_tools(
         assert client.options.system_prompt == caller_system
         assert client.options.cwd == tmp_path
         assert client.options.include_partial_messages is True
-        assert client.options.settings is None
+        assert json.loads(client.options.settings or "") == {
+            "availableModels": ["claude-sonnet-5"]
+        }
         assert client.options.env == {
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
             "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
@@ -1497,9 +1499,7 @@ async def test_stream_generation_supports_two_native_tool_rounds(
     tmp_path: Path,
 ) -> None:
     messages = (
-        *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
-        ),
+        *raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"),
         UserMessage([SdkToolResultBlock("sdk-a", "first", False)]),
         *raw_tool_events(
             (("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),),
@@ -1720,13 +1720,9 @@ async def test_callback_after_seal_cannot_join_the_next_tool_epoch(
     tmp_path: Path,
 ) -> None:
     messages = (
-        *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
-        ),
+        *raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"),
         UserMessage([SdkToolResultBlock("sdk-a", "first", False)]),
-        *raw_tool_events(
-            (("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),), "sdk-1"
-        ),
+        *raw_tool_events((("sdk-b", "mcp__caller_tools__echo", '{"v":2}'),), "sdk-1"),
     )
     session, client = make_tool_session(tmp_path, messages)
     await session.start()
@@ -2148,9 +2144,7 @@ async def test_user_message_while_awaiting_submit_fails_closed(
     tmp_path: Path,
 ) -> None:
     messages = (
-        *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
-        ),
+        *raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"),
         UserMessage([SdkToolResultBlock("sdk-a", "secret", False)]),
     )
     session, _ = make_tool_session(
@@ -2172,9 +2166,7 @@ async def test_user_message_after_complete_result_echo_fails_closed(
     tmp_path: Path,
 ) -> None:
     messages = (
-        *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
-        ),
+        *raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"),
         UserMessage([SdkToolResultBlock("sdk-a", "one", False)]),
         UserMessage([SdkToolResultBlock("sdk-a", "secret-extra", False)]),
     )
@@ -2200,9 +2192,7 @@ async def test_prefetched_user_message_keeps_awaiting_submit_phase(
     release = asyncio.Event()
     delivered = asyncio.Event()
     messages = (
-        *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
-        ),
+        *raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"),
         UserMessage([SdkToolResultBlock("sdk-a", "one", False)]),
         *raw_text_events("done", "sdk-1"),
         result_message(),
@@ -2239,9 +2229,7 @@ async def test_prefetched_user_message_received_after_submit_is_accepted(
     release = asyncio.Event()
     delivered = asyncio.Event()
     messages = (
-        *raw_tool_events(
-            (("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"
-        ),
+        *raw_tool_events((("sdk-a", "mcp__caller_tools__echo", '{"v":1}'),), "sdk-1"),
         UserMessage([SdkToolResultBlock("sdk-a", "one", False)]),
         *raw_text_events("done", "sdk-1"),
         result_message(),
