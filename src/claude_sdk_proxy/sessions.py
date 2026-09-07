@@ -201,7 +201,15 @@ class SessionRegistry:
         self, entry: SessionEntry, request: TextRequest
     ) -> SessionEntry:
         seeded = replace(request, messages=entry.transcript + request.messages[-1:])
-        return self._new_entry(seeded, entry.external_id, entry.explicit)
+        recovery = (
+            entry
+            if request.model == entry.model
+            and request.refusal_fallback == entry.refusal_fallback
+            else None
+        )
+        return self._new_entry(
+            seeded, entry.external_id, entry.explicit, recovery=recovery
+        )
 
     def _can_rebase(self, entry: SessionEntry, request: TextRequest) -> bool:
         if self._evictable(entry):

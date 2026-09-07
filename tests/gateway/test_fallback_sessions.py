@@ -13,6 +13,7 @@ from claude_sdk_proxy.domain import (
 )
 from claude_sdk_proxy.session_identity import request_fingerprint
 from claude_sdk_proxy.sessions import SessionMismatch, SessionRegistry
+from claude_sdk_proxy.thinking import ThinkingOptions
 from tests.gateway.test_tool_sessions import (
     ToolSession,
     collect,
@@ -96,6 +97,39 @@ async def test_known_rebase_preserves_only_validated_active_model(downgraded):
             "claude-opus-4-8" if downgraded else "claude-opus-5"
         )
         assert factory.options[1]["fallback_provenance"] is downgraded
+    finally:
+        await reg.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("explicit", [None, "known"])
+async def test_thinking_only_replacement_preserves_validated_downgrade(explicit):
+    factory = Factory()
+    reg = registry(factory)
+    request = initial()
+    try:
+        await collect((await reg.open_turn(request, explicit)).stream())
+        changed = replace(
+            request,
+            thinking=ThinkingOptions(mode="adaptive", effort="low"),
+            messages=(
+                *request.messages,
+                CanonicalMessage.assistant_text("done"),
+                CanonicalMessage.user_text("next"),
+            ),
+        )
+        events = await collect((await reg.open_turn(changed, explicit)).stream())
+        assert factory.options[1]["active_backend_model"] == "claude-opus-4-8"
+        assert factory.options[1]["fallback_provenance"] is True
+        assert factory.options[1]["refusal_fallback"] == "auto"
+        assert factory.options[1]["thinking"] == ThinkingOptions(
+            mode="adaptive", effort="low"
+        )
+        assert events[0] == ResponseIdentity("opus-5", "opus-4.8", True)
+        assert (
+            await collect((await reg.open_turn(changed, explicit)).stream()) == events
+        )
+        assert len(factory.sessions) == 2
     finally:
         await reg.close()
 
