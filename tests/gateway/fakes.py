@@ -190,7 +190,7 @@ def raw_text_events(
                 "type": "message_start",
                 "message": {
                     "model": model,
-                    "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
                 },
             },
         ),
@@ -260,7 +260,7 @@ def raw_tool_events(
                 "type": "message_start",
                 "message": {
                     "model": model,
-                    "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
                 },
             },
         )
@@ -390,6 +390,9 @@ def sdk_response(
 class FakeConversationSession:
     def __init__(self, text: str) -> None:
         self._text = text
+        from claude_sdk_proxy.domain import ResponseIdentity
+
+        self.identity = ResponseIdentity("sonnet-5", "sonnet-5", False)
         self.start_count = 0
         self.close_count = 0
         self.prompts: list[str] = []
@@ -399,6 +402,7 @@ class FakeConversationSession:
 
     async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
+        yield self.identity
         yield TextDelta(self._text)
         yield Completed("end_turn", {"output_tokens": 1})
 
@@ -433,7 +437,6 @@ class FakeSessionFactory:
         fallback_provenance: bool = False,
     ) -> FakeConversationSession:
         del (
-            model,
             system,
             tools,
             dialect,
@@ -445,5 +448,11 @@ class FakeSessionFactory:
         self.histories.append(history)
         self.thinking_options.append(thinking)
         session = FakeConversationSession(next(self._outputs))
+        from claude_sdk_proxy.domain import ResponseIdentity
+        from claude_sdk_proxy.model_catalog import canonical_model
+
+        session.identity = ResponseIdentity(
+            canonical_model(model), canonical_model(model), False
+        )
         self.sessions.append(session)
         return session

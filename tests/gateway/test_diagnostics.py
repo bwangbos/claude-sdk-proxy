@@ -17,13 +17,14 @@ async def test_tool_continuation_backend_logs_use_current_request_id(caplog, wat
     import asyncio
 
     from claude_sdk_proxy.diagnostics import record
-    from claude_sdk_proxy.domain import ModelFallbackDisabled
+    from claude_sdk_proxy.domain import ModelFallbackDisabled, ResponseIdentity
     from tests.gateway.test_tool_http import RepeatedRoundSession, tool_body
 
     caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
 
     class FailingContinuation(RepeatedRoundSession):
         async def stream_generation(self, prompt):
+            yield ResponseIdentity("sonnet-5", "sonnet-5", False)
             for event in self.boundary:
                 yield event
             await self._resume.wait()

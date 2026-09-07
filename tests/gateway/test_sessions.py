@@ -10,6 +10,7 @@ from claude_sdk_proxy.domain import (
     Completed,
     ConversationEvent,
     Dialect,
+    ResponseIdentity,
     TextDelta,
     TextRequest,
     ToolDefinition,
@@ -71,7 +72,15 @@ def completed_events(text: str) -> list[ConversationEvent]:
 
 
 async def collect(events: AsyncIterator[ConversationEvent]) -> list[ConversationEvent]:
-    return [event async for event in events]
+    # These lifecycle tests compare content; fallback tests assert metadata itself.
+    return [event async for event in events if not isinstance(event, ResponseIdentity)]
+
+
+async def next_content(events: AsyncIterator[ConversationEvent]) -> ConversationEvent:
+    event = await anext(events)
+    if isinstance(event, ResponseIdentity):
+        event = await anext(events)
+    return event
 
 
 class BlockingConversationSession(FakeConversationSession):
@@ -82,9 +91,7 @@ class BlockingConversationSession(FakeConversationSession):
         self._started = started
         self._release = release
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         self._started.set()
         await self._release.wait()
@@ -129,9 +136,7 @@ class BlockingStartSession(FakeConversationSession):
 
 
 class IncompleteSession(FakeConversationSession):
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         yield TextDelta(self._text)
 
@@ -225,7 +230,7 @@ async def test_second_duplicate_is_rejected_while_replay_is_paused() -> None:
     await collect(original.stream())
     replay = await registry.open_turn(request, explicit_id=None)
     replay_stream = replay.stream()
-    assert await anext(replay_stream) == TextDelta("answer")
+    assert await next_content(replay_stream) == TextDelta("answer")
 
     with pytest.raises(SessionConflict, match="in flight"):
         await registry.open_turn(request, explicit_id=None)
@@ -241,7 +246,7 @@ async def test_continuation_is_rejected_while_replay_is_paused() -> None:
     await collect(original.stream())
     replay = await registry.open_turn(request, explicit_id=None)
     replay_stream = replay.stream()
-    assert await anext(replay_stream) == TextDelta("answer")
+    assert await next_content(replay_stream) == TextDelta("answer")
 
     with pytest.raises(SessionConflict, match="conversation is busy"):
         await registry.open_turn(
@@ -281,7 +286,7 @@ async def test_premature_replay_release_preserves_healthy_session(
     replay_stream = replay.stream()
 
     if release == "close":
-        assert await anext(replay_stream) == TextDelta("answer")
+        assert await next_content(replay_stream) == TextDelta("answer")
         await replay_stream.aclose()
     else:
         await replay.abort()
@@ -345,9 +350,7 @@ async def test_replay_identity_ignores_rendering_and_advisory_fields() -> None:
     factory = FakeSessionFactory(outputs=("answer",))
     registry = SessionRegistry(factory)
     original = first_request("hello")
-    duplicate = first_request(
-        "hello", max_tokens=7, stream=False, include_usage=True
-    )
+    duplicate = first_request("hello", max_tokens=7, stream=False, include_usage=True)
 
     first = await registry.open_turn(original, explicit_id=None)
     await collect(first.stream())
@@ -648,7 +651,7 @@ async def test_generator_close_before_completion_invalidates_session() -> None:
     lease = await registry.open_turn(first_request("hello"), explicit_id="lineage")
     stream = lease.stream()
 
-    assert await anext(stream) == TextDelta("partial")
+    assert await next_content(stream) == TextDelta("partial")
     await stream.aclose()
     retry = await registry.open_turn(first_request("hello"), explicit_id="lineage")
 
@@ -733,8 +736,8 @@ async def test_commit_happens_before_terminal_event_is_exposed() -> None:
     first = await registry.open_turn(request, explicit_id=None)
     stream = first.stream()
 
-    assert await anext(stream) == TextDelta("answer")
-    assert await anext(stream) == Completed("end_turn", {"output_tokens": 1})
+    assert await next_content(stream) == TextDelta("answer")
+    assert await next_content(stream) == Completed("end_turn", {"output_tokens": 1})
     duplicate = await registry.open_turn(request, explicit_id=None)
 
     assert await collect(duplicate.stream()) == completed_events("answer")
@@ -750,8 +753,8 @@ async def test_abort_after_commit_preserves_replay_and_backend() -> None:
     lease = await registry.open_turn(request, explicit_id="lineage")
     stream = lease.stream()
 
-    assert await anext(stream) == TextDelta("answer")
-    assert await anext(stream) == Completed("end_turn", {"output_tokens": 1})
+    assert await next_content(stream) == TextDelta("answer")
+    assert await next_content(stream) == Completed("end_turn", {"output_tokens": 1})
     await lease.abort()
     duplicate = await registry.open_turn(request, explicit_id="lineage")
 
@@ -787,7 +790,7 @@ async def test_commit_and_abort_serialize_at_completed_boundary() -> None:
     request = first_request("hello")
     lease = await registry.open_turn(request, explicit_id="lineage")
     stream = lease.stream()
-    assert await anext(stream) == TextDelta("answer")
+    assert await next_content(stream) == TextDelta("answer")
 
     await registry._lock.acquire()
     try:
@@ -896,9 +899,7 @@ async def test_only_current_completed_head_remains_replayable() -> None:
     first = await registry.open_turn(first_request_head, explicit_id="lineage")
     await collect(first.stream())
     current_request_head = continuation_request("first", "one", "second")
-    continuation = await registry.open_turn(
-        current_request_head, explicit_id="lineage"
-    )
+    continuation = await registry.open_turn(current_request_head, explicit_id="lineage")
     expected = await collect(continuation.stream())
 
     with pytest.raises(SessionMismatch, match="transcript"):

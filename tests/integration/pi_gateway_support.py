@@ -31,9 +31,7 @@ from tests.gateway.fakes import FakeConversationSession
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_text_client.mjs"
 TOOL_FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_tool_client.mjs"
 THINKING_FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_thinking_client.mjs"
-INSTALL_PI = (
-    "install pi with: npm install -g @earendil-works/pi-coding-agent@0.85.1"
-)
+INSTALL_PI = "install pi with: npm install -g @earendil-works/pi-coding-agent@0.85.1"
 
 
 class IntegrationSession(FakeConversationSession):
@@ -42,10 +40,9 @@ class IntegrationSession(FakeConversationSession):
         self._outputs = iter(outputs)
         self._stall = stall
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
+        yield self.identity
         yield TextDelta(next(self._outputs))
         if self._stall:
             await asyncio.Event().wait()
@@ -90,9 +87,7 @@ class PiToolSession(FakeConversationSession):
         self._resume = asyncio.Event()
         self._failure = asyncio.Event()
 
-    async def stream_generation(
-        self, prompt: str
-    ) -> AsyncIterator[ConversationEvent]:
+    async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         boundaries: tuple[tuple[ConversationEvent, ...], ...] = (
             (
@@ -115,18 +110,16 @@ class PiToolSession(FakeConversationSession):
             if index:
                 await self._resume.wait()
                 self._resume.clear()
+            yield self.identity
             for event in boundary:
                 yield event
 
-    async def submit_tool_results(
-        self, results: Iterable[ToolResultBlock]
-    ) -> None:
+    async def submit_tool_results(self, results: Iterable[ToolResultBlock]) -> None:
         normalized = tuple(results)
         self.handler_count += 1
         self.results.append(
             tuple(
-                (result.tool_call_id, "".join(result.content))
-                for result in normalized
+                (result.tool_call_id, "".join(result.content)) for result in normalized
             )
         )
         self._resume.set()
@@ -162,9 +155,7 @@ def _pi_module(package_name: str, relative_module: Path) -> Path:
         module = package / relative_module
         if package.joinpath("package.json").is_file() and module.is_file():
             return module
-    pytest.fail(
-        f"installed pi is missing @earendil-works/{package_name}; {INSTALL_PI}"
-    )
+    pytest.fail(f"installed pi is missing @earendil-works/{package_name}; {INSTALL_PI}")
 
 
 @asynccontextmanager
@@ -174,9 +165,7 @@ async def serve(app: Any) -> AsyncIterator[str]:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", 0))
         host, port = sock.getsockname()
-        server = uvicorn.Server(
-            uvicorn.Config(app, log_level="error", lifespan="on")
-        )
+        server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="on"))
         task = asyncio.create_task(server.serve(sockets=[sock]))
         try:
             async with asyncio.timeout(2):
@@ -244,9 +233,9 @@ async def run_pi_thinking(
     dialect: str,
     *,
     scenario: str = "flow",
-    first_model: str = "sonnet",
+    first_model: str = "sonnet-5",
     first_reasoning: str = "high",
-    second_model: str = "opus",
+    second_model: str = "opus-5",
     second_reasoning: str = "low",
     timeout_seconds: float = 5,
 ) -> dict[str, Any]:
@@ -268,9 +257,7 @@ async def run_pi_thinking(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await communicate_or_reap(
-        process, timeout_seconds=timeout_seconds
-    )
+    stdout, stderr = await communicate_or_reap(process, timeout_seconds=timeout_seconds)
     if process.returncode != 0:
         pytest.fail(
             f"Pi thinking fixture failed ({process.returncode}): "

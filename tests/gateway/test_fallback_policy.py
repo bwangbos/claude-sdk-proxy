@@ -53,15 +53,6 @@ def test_auto_does_not_add_a_route_for_direct_non_opus_request() -> None:
     )
 
 
-def test_application_gates_auto_until_buffering_is_integrated() -> None:
-    with pytest.raises(ValueError, match="not available"):
-        create_app(
-            models=("opus-5", "opus-4.8"),
-            refusal_fallback="auto",
-            session_factory=FakeSessionFactory(()),
-        )
-
-
 @pytest.mark.anyio
 async def test_sdk_options_pin_model_and_override_ambient_aliases(tmp_path) -> None:
     client = FakeSdkClient(())
@@ -129,16 +120,18 @@ async def test_invalid_policy_value_is_400_in_both_dialects(path, body) -> None:
         ),
     ],
 )
-async def test_auto_header_is_gated_before_factory_launch(path, body) -> None:
+async def test_auto_without_allowed_target_is_rejected_before_factory_launch(
+    path, body
+) -> None:
     launches = 0
 
     def factory(*args, **kwargs):
         nonlocal launches
         launches += 1
-        raise AssertionError("gated auto policy reached the session factory")
+        raise AssertionError("unconfigured fallback reached the session factory")
 
     app = create_app(
-        models=("opus-5", "opus-4.8"),
+        models=("opus-5",),
         session_factory=factory,
     )
     async with lifespan_app(app):

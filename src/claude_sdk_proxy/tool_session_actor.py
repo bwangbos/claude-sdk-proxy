@@ -29,6 +29,8 @@ from claude_sdk_proxy.domain import (
     ToolCallBlock,
     ToolDefinition,
 )
+from claude_sdk_proxy.fallback_policy import RefusalFallback
+from claude_sdk_proxy.model_catalog import backend_model
 from claude_sdk_proxy.session_identity import fixed_config_matches
 from claude_sdk_proxy.session_turn import (
     SessionConflict,
@@ -81,6 +83,9 @@ class ToolSessionActor:
     in_flight_fingerprint: str | None = None
     replay: dict[str, tuple[ConversationEvent, ...]] = field(default_factory=dict)
     last_used: int = 0
+    refusal_fallback: RefusalFallback = "off"
+    active_backend_model: str = ""
+    fallback_provenance: bool = False
     state: ToolSessionState = ToolSessionState.READY
     pending_call_ids: frozenset[str] = frozenset()
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -104,7 +109,11 @@ class ToolSessionActor:
         )
 
     def matches_generation_config(self, request: TextRequest) -> bool:
-        return request.model == self.model and request.thinking == self.thinking
+        return (
+            request.model == self.model
+            and request.thinking == self.thinking
+            and request.refusal_fallback == self.refusal_fallback
+        )
 
     def matches_config(self, request: TextRequest) -> bool:
         return self.matches_fixed_config(request) and self.matches_generation_config(
@@ -206,6 +215,9 @@ class ToolSessionActor:
                     bind_task_request_id(self._current.request_id)
                 event = await self._next_event(stream)
                 events.append(event)
+                if isinstance(event, ResponseIdentity):
+                    self.active_backend_model = backend_model(event.actual_model)
+                    self.fallback_provenance = event.fallback
                 response = self._current
                 if response is None:
                     raise RuntimeError("tool generation has no response sink")
@@ -453,6 +465,12 @@ def _redact_backend(error: BaseException) -> BaseException:
         return error
     if isinstance(error, SessionTimeout):
         return error
+    if isinstance(error, BackendFailure) and str(error).partition(":")[0] in {
+        "backend_model_mismatch",
+        "fallback_buffer_limit",
+        "fallback_tool_rollback_unsupported",
+    }:
+        return BackendFailure(str(error).partition(":")[0])
     return BackendFailure("Agent SDK query failed")
 
 

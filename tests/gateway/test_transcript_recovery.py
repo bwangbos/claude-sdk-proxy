@@ -7,7 +7,12 @@ from dataclasses import replace
 import pytest
 
 from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import BackendFailure, CanonicalMessage, ToolResultBlock
+from claude_sdk_proxy.domain import (
+    BackendFailure,
+    CanonicalMessage,
+    ResponseIdentity,
+    ToolResultBlock,
+)
 from claude_sdk_proxy.sessions import SessionCapacity, SessionConflict, SessionRegistry
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.test_tool_http import tool_body
@@ -209,7 +214,7 @@ def completed_result_tail():
 @pytest.mark.anyio
 @pytest.mark.parametrize("explicit", [False, True])
 async def test_complete_tool_results_can_import_without_a_live_session(explicit):
-    backend = ToolSession((final_boundary("recovered"),))
+    backend = http_session((final_boundary("recovered"),))
     factory = ToolFactory((backend,))
     app = create_app(models=("sonnet",), session_factory=factory)
     headers = {"x-claude-proxy-session": "recovered"} if explicit else {}
@@ -228,8 +233,8 @@ async def test_complete_tool_results_can_import_without_a_live_session(explicit)
 @pytest.mark.anyio
 @pytest.mark.parametrize("explicit", [False, True])
 async def test_complete_rewritten_result_tail_replaces_suspended_session(explicit):
-    old = ToolSession((call_boundary("call_one"), final_boundary("original")))
-    replacement = ToolSession((final_boundary("recovered"),))
+    old = http_session((call_boundary("call_one"), final_boundary("original")))
+    replacement = http_session((final_boundary("recovered"),))
     factory = ToolFactory((old, replacement))
     app = create_app(models=("sonnet",), session_factory=factory)
     headers = {"x-claude-proxy-session": "recovered"} if explicit else {}
@@ -253,7 +258,7 @@ async def test_complete_rewritten_result_tail_replaces_suspended_session(explici
 
 @pytest.mark.anyio
 async def test_wrong_pending_ids_do_not_replace_an_identified_session():
-    old = ToolSession((call_boundary("call_one"), final_boundary("original")))
+    old = http_session((call_boundary("call_one"), final_boundary("original")))
     factory = ToolFactory((old,))
     app = create_app(models=("sonnet",), session_factory=factory)
     headers = {"x-claude-proxy-session": "stable"}
@@ -271,3 +276,12 @@ async def test_wrong_pending_ids_do_not_replace_an_identified_session():
         good = await post_json(app, "/v1/chat/completions", body, headers=headers)
         assert good.status == 200
         assert len(factory.sessions) == 1
+
+
+def http_session(boundaries):
+    return ToolSession(
+        tuple(
+            (ResponseIdentity("sonnet-5", "sonnet-5", False), *boundary)
+            for boundary in boundaries
+        )
+    )

@@ -64,6 +64,7 @@ class FailingSession(FakeConversationSession):
     async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
         if self.after_delta:
+            yield self.identity
             yield TextDelta("partial")
         raise BackendFailure("credential=/Users/alice/secret-token")
         yield  # pragma: no cover
@@ -82,6 +83,7 @@ class BlockingStreamSession(FakeConversationSession):
 
     async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
+        yield self.identity
         yield TextDelta("first")
         self.entered.set()
         await self.release.wait()
@@ -91,6 +93,7 @@ class BlockingStreamSession(FakeConversationSession):
 class SlowAfterDeltaSession(FakeConversationSession):
     async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
+        yield self.identity
         yield TextDelta("partial")
         await asyncio.Event().wait()
         yield Completed("end_turn", None)  # pragma: no cover
@@ -149,6 +152,7 @@ class SequentialSession(FakeConversationSession):
 
     async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
+        yield self.identity
         yield TextDelta(next(self._outputs))
         yield Completed("end_turn", {"output_tokens": 1})
 
@@ -158,6 +162,7 @@ class InputUsageSession(FakeConversationSession):
         from claude_sdk_proxy.domain import InputUsage
 
         self.prompts.append(prompt)
+        yield self.identity
         yield InputUsage(7)
         yield TextDelta(self._text)
         yield Completed("end_turn", {"input_tokens": 7, "output_tokens": 1})
@@ -166,6 +171,7 @@ class InputUsageSession(FakeConversationSession):
 class EmptyTextSession(FakeConversationSession):
     async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
+        yield self.identity
         yield Completed("end_turn", {"input_tokens": 1, "output_tokens": 0})
 
 
@@ -521,12 +527,12 @@ async def test_midstream_backend_failure_is_redacted_openai_sse_error() -> None:
     ]
     assert response.status == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert json.loads(records[-2])["error"] == {
+    assert json.loads(records[-1])["error"] == {
         "message": "Backend request failed",
         "type": "backend_error",
         "code": "backend_error",
     }
-    assert records[-1] == b"[DONE]"
+    assert b"[DONE]" not in records
     assert b"secret-token" not in response.body
     assert session.close_count == 1
 
@@ -1126,7 +1132,7 @@ async def test_unknown_raw_event_after_text_is_redacted_sse_error(tmp_path) -> N
 
     assert response.status == 200
     assert b'"type":"backend_error"' in response.body
-    assert response.body.endswith(b"data: [DONE]\n\n")
+    assert b"data: [DONE]" not in response.body
     assert b"secret" not in response.body
 
 

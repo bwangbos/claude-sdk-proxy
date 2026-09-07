@@ -84,6 +84,7 @@ def request_fingerprint(request: TextRequest) -> str:
     identity = {
         "dialect": request.dialect,
         "model": request.model,
+        "refusal_fallback": request.refusal_fallback,
         "system": request.system,
         "thinking": {
             "mode": request.thinking.mode,
@@ -173,9 +174,7 @@ def _pi_cross_model_message(
         )
     else:
         blocks = tuple(
-            TextBlock(block.thinking)
-            if isinstance(block, ThinkingBlock)
-            else block
+            TextBlock(block.thinking) if isinstance(block, ThinkingBlock) else block
             for block in message.blocks
             if not isinstance(block, RedactedThinkingBlock)
             and not (isinstance(block, ThinkingBlock) and not block.thinking.strip())

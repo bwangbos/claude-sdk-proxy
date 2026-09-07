@@ -136,7 +136,9 @@ class SessionRegistry:
                 if not self._can_rebase(entry, request):
                     raise SessionMismatch("conversation has pending tools") from None
                 return (
-                    self._new_entry(request, entry.external_id, entry.explicit),
+                    self._new_entry(
+                        request, entry.external_id, entry.explicit, recovery=entry
+                    ),
                     None,
                     entry,
                 )
@@ -188,7 +190,11 @@ class SessionRegistry:
                 self._reject_busy(entry, fingerprint)
                 if not self._can_rebase(entry, request):
                     raise SessionMismatch("conversation has pending tools")
-                return self._new_entry(request, entry.external_id, False), None, entry
+                return (
+                    self._new_entry(request, entry.external_id, False, recovery=entry),
+                    None,
+                    entry,
+                )
         return self._fresh(request, uuid.uuid4().hex, False), None, None
 
     def _settings_replacement(
@@ -245,7 +251,12 @@ class SessionRegistry:
         return entry
 
     def _new_entry(
-        self, request: TextRequest, sid: str, explicit: bool
+        self,
+        request: TextRequest,
+        sid: str,
+        explicit: bool,
+        *,
+        recovery: SessionEntry | None = None,
     ) -> SessionEntry:
         history = request.messages[:-1]
         # The native resume loader discards trailing unresolved calls. Import
@@ -253,7 +264,10 @@ class SessionRegistry:
         backend_history = (
             request.messages if isinstance(request.next_input, tuple) else history
         )
-        active_backend = backend_model(request.model)
+        active_backend = (
+            recovery.active_backend_model if recovery else backend_model(request.model)
+        )
+        provenance = recovery.fallback_provenance if recovery else False
         allowed_backend_models = native_allowlist(
             request.model,
             self._configured_models or (request.model,),
@@ -263,7 +277,7 @@ class SessionRegistry:
             "refusal_fallback": request.refusal_fallback,
             "allowed_backend_models": allowed_backend_models,
             "active_backend_model": active_backend,
-            "fallback_provenance": False,
+            "fallback_provenance": provenance,
         }
         record(
             "session_created",
@@ -333,6 +347,9 @@ class SessionRegistry:
                 self._remove_tool,
                 transcript=history,
             )
+        entry.refusal_fallback = request.refusal_fallback
+        entry.active_backend_model = active_backend
+        entry.fallback_provenance = provenance
         return entry
 
     def _create_backend(

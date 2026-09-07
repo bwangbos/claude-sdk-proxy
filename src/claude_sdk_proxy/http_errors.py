@@ -9,6 +9,7 @@ from starlette.responses import JSONResponse
 
 from claude_sdk_proxy.diagnostics import record
 from claude_sdk_proxy.domain import (
+    BackendFailure,
     ModelFallbackDisabled,
     RequestValidationError,
     UnsupportedFeature,
@@ -109,6 +110,20 @@ def _session_error(error: SessionMismatch | SessionConflict) -> ErrorDetail:
 
 
 def error_detail(error: Exception) -> ErrorDetail:
+    if isinstance(error, BackendFailure):
+        reason = str(error).partition(":")[0]
+        messages = {
+            "backend_model_mismatch": "Backend model identity validation failed.",
+            "fallback_buffer_limit": (
+                "Automatic fallback response exceeded its buffer limit."
+            ),
+            "fallback_tool_rollback_unsupported": (
+                "Fallback cannot retract native tool activity."
+            ),
+        }
+        if reason in messages:
+            record("request_rejected", code="backend_error", reason=reason, status=502)
+            return ErrorDetail(502, "backend_error", messages[reason], "model", reason)
     if isinstance(error, ModelFallbackDisabled):
         return ErrorDetail(
             502, "backend_error", str(error), "model", "model_fallback_disabled"

@@ -238,10 +238,7 @@ def encode_openai_event(
 
 
 def encode_openai_error(code: str, message: str) -> tuple[bytes, ...]:
-    return (
-        _sse({"error": {"message": message, "type": code, "code": code}}),
-        b"data: [DONE]\n\n",
-    )
+    return (_sse({"error": {"message": message, "type": code, "code": code}}),)
 
 
 def _openai_max_tokens(body: Mapping[str, object]) -> int | None:

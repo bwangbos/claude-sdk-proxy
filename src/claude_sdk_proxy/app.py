@@ -84,10 +84,6 @@ def create_app(
         or len(set(models)) != len(models)
     ):
         raise ValueError("models must be non-empty and unique")
-    if refusal_fallback == "auto":
-        raise ValueError(
-            "automatic refusal fallback is not available until buffering is integrated"
-        )
     if refusal_fallback not in {"off", "auto"}:
         raise ValueError("refusal fallback must be off or auto")
     model_order = canonical_models(models)
@@ -167,12 +163,6 @@ async def _handle(request: Request, *, dialect: str) -> Response:
             request.headers.getlist("x-claude-proxy-refusal-fallback"),
             cast(RefusalFallback, request.app.state.refusal_fallback),
         )
-        if policy == "auto":
-            raise RequestValidationError(
-                "X-Claude-Proxy-Refusal-Fallback",
-                "automatic refusal fallback is not available until buffering "
-                "is integrated",
-            )
         native_allowlist(parsed.model, request.app.state.model_order, policy)
         parsed = replace(parsed, refusal_fallback=policy)
         monitor = DisconnectMonitor(request.receive)
@@ -215,11 +205,11 @@ async def _stream_response(
 ) -> Response:
     stream = cast(ClosableEventStream, lease.stream())
     try:
+        identity = await anext(stream)
+        if not isinstance(identity, ResponseIdentity):
+            raise BackendFailure("backend_model_mismatch")
+        _identity_headers(lease, identity)
         first = await anext(stream)
-        # Identity is transport metadata, not content; preserve initial usage
-        # framing while consuming that metadata separately.
-        if isinstance(first, ResponseIdentity):
-            first = await anext(stream)
     except asyncio.CancelledError:
         await cleanup_best_effort(lease, stream)
         if monitor.consume_disconnect_cancellation():
@@ -238,10 +228,10 @@ async def _stream_response(
             lease,
             stream,
             first,
-            encode_openai_start(request_id, request.model, created=created),
+            encode_openai_start(request_id, identity.actual_model, created=created),
             lambda event: encode_openai_event(
                 request_id,
-                request.model,
+                identity.actual_model,
                 event,
                 request.include_usage,
                 openai_state,
@@ -259,13 +249,13 @@ async def _stream_response(
         first,
         encode_anthropic_start(
             request_id,
-            request.model,
+            identity.actual_model,
             first if isinstance(first, InputUsage) else 0,
             request.tools,
             anthropic_state,
         ),
         lambda event: encode_anthropic_event(
-            request_id, request.model, event, state=anthropic_state
+            request_id, identity.actual_model, event, state=anthropic_state
         ),
         lambda error: encode_anthropic_error(
             error_detail(error).code, error_detail(error).message
@@ -285,8 +275,14 @@ async def _nonstream_response(
     stream = cast(ClosableEventStream, lease.stream())
     blocks: list[TextBlock | ToolCall | ThinkingBlock | RedactedThinkingBlock] = []
     completed: Completed | None = None
+    identity: ResponseIdentity | None = None
     try:
         async for event in stream:
+            if identity is None:
+                if not isinstance(event, ResponseIdentity):
+                    raise BackendFailure("backend_model_mismatch")
+                identity = event
+                continue
             if isinstance(event, TextDelta):
                 if blocks and isinstance(blocks[-1], TextBlock):
                     blocks[-1] = TextBlock(blocks[-1].text + event.text)
@@ -312,7 +308,7 @@ async def _nonstream_response(
         return cast(Response, monitor.wrap(response))
     finally:
         await close_best_effort(stream)
-    if completed is None:
+    if completed is None or identity is None:
         await abort_best_effort(lease)
         response = error_response(dialect, BackendFailure("missing completion"))
         return cast(Response, monitor.wrap(response))
@@ -324,13 +320,23 @@ async def _nonstream_response(
     payload = (
         render_openai_response(
             request_id,
-            request.model,
+            identity.actual_model,
             rendered,
             completed,
             created=created,
         )
         if dialect == "openai"
-        else render_anthropic_response(request_id, request.model, rendered, completed)
+        else render_anthropic_response(
+            request_id, identity.actual_model, rendered, completed
+        )
     )
+    _identity_headers(lease, identity)
     response = JSONResponse(payload, headers=lease.response_headers)
     return cast(Response, monitor.wrap(response))
+
+
+def _identity_headers(lease: TurnLeaseProtocol, identity: ResponseIdentity) -> None:
+    lease.response_headers["X-Claude-Proxy-Requested-Model"] = identity.requested_model
+    lease.response_headers["X-Claude-Proxy-Actual-Model"] = identity.actual_model
+    if identity.fallback:
+        lease.response_headers["X-Claude-Proxy-Fallback"] = "true"

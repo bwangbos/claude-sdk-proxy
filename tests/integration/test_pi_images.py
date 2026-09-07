@@ -20,11 +20,13 @@ async def test_stock_pi_read_returns_image_to_original_tool_call(tmp_path):
             self.results = ()
 
         async def stream_generation(self, prompt):
+            yield self.identity
             yield ToolCall(
                 "toolu_screenshot", "read", {"path": str(tmp_path / "color.png")}
             )
             yield Completed("tool_use", {"input_tokens": 1, "output_tokens": 1})
             await self.ready.wait()
+            yield self.identity
             yield TextDelta("red")
             yield Completed("end_turn", {"input_tokens": 1, "output_tokens": 1})
 

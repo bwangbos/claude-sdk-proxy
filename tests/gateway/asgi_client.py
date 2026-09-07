@@ -74,6 +74,7 @@ async def request(
     allow_no_response: bool = False,
     block_body_after_start: bool = False,
     body_send_entered: asyncio.Event | None = None,
+    response_start_entered: asyncio.Event | None = None,
     body_send_release: asyncio.Event | None = None,
     disconnect_after_body_contains: bytes | None = None,
     external_cancel_with_disconnect: bool = False,
@@ -108,6 +109,8 @@ async def request(
         nonlocal body_sends
         if message["type"] == "http.response.start":
             response_started.set()
+            if response_start_entered is not None:
+                response_start_entered.set()
         elif message["type"] == "http.response.body":
             body_sends += 1
             if body_send_entered is not None:
@@ -172,6 +175,7 @@ async def post_json(
     disconnect_after_start: bool = False,
     block_body_after_start: bool = False,
     body_send_entered: asyncio.Event | None = None,
+    response_start_entered: asyncio.Event | None = None,
     body_send_release: asyncio.Event | None = None,
     disconnect_after_body_contains: bytes | None = None,
 ) -> AsgiResponse:
@@ -187,6 +191,7 @@ async def post_json(
         disconnect_after_start=disconnect_after_start,
         block_body_after_start=block_body_after_start,
         body_send_entered=body_send_entered,
+        response_start_entered=response_start_entered,
         body_send_release=body_send_release,
         disconnect_after_body_contains=disconnect_after_body_contains,
     )

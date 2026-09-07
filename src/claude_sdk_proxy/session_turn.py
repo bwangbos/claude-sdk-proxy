@@ -10,12 +10,15 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
     ConversationEvent,
+    ResponseIdentity,
     SdkSessionProtocol,
     TextBlock,
     TextDelta,
     TextRequest,
     ThinkingCompleted,
 )
+from claude_sdk_proxy.fallback_policy import RefusalFallback
+from claude_sdk_proxy.model_catalog import backend_model
 from claude_sdk_proxy.replay_stream import ReplayStream
 from claude_sdk_proxy.session_identity import fixed_config_matches
 from claude_sdk_proxy.thinking import ThinkingOptions
@@ -60,6 +63,9 @@ class Conversation:
     in_flight_fingerprint: str | None = None
     replay: dict[str, tuple[ConversationEvent, ...]] = field(default_factory=dict)
     last_used: int = 0
+    refusal_fallback: RefusalFallback = "off"
+    active_backend_model: str = ""
+    fallback_provenance: bool = False
 
     def matches_fixed_config(self, request: TextRequest) -> bool:
         return fixed_config_matches(
@@ -67,7 +73,11 @@ class Conversation:
         )
 
     def matches_generation_config(self, request: TextRequest) -> bool:
-        return request.model == self.model and request.thinking == self.thinking
+        return (
+            request.model == self.model
+            and request.thinking == self.thinking
+            and request.refusal_fallback == self.refusal_fallback
+        )
 
     def matches_config(self, request: TextRequest) -> bool:
         return self.matches_fixed_config(request) and self.matches_generation_config(
@@ -125,6 +135,11 @@ class TurnLease:
                 if self._aborted:
                     raise RuntimeError("turn was aborted")
                 events.append(event)
+                if isinstance(event, ResponseIdentity):
+                    self._conversation.active_backend_model = backend_model(
+                        event.actual_model
+                    )
+                    self._conversation.fallback_provenance = event.fallback
                 if isinstance(event, TextDelta):
                     if assistant_blocks and isinstance(assistant_blocks[-1], TextBlock):
                         assistant_blocks[-1] = TextBlock(

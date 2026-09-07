@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
+from claude_agent_sdk import AssistantMessage, StreamEvent, UserMessage
 from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
-from claude_agent_sdk import UserMessage
 
 from claude_sdk_proxy.app import create_app
 from claude_sdk_proxy.domain import ThinkingBlock
@@ -18,6 +19,17 @@ from tests.gateway.test_thinking_streams import (
     thinking_response,
 )
 from tests.integration.pi_gateway_support import run_pi_thinking, serve
+
+
+def opus_response(events):
+    result = []
+    for event in events:
+        if isinstance(event, StreamEvent) and event.event["type"] == "message_start":
+            event.event["message"]["model"] = "claude-opus-5"
+        if isinstance(event, AssistantMessage):
+            event = replace(event, model="claude-opus-5")
+        result.append(event)
+    return tuple(result)
 
 
 class PiThinkingSessionFactory:
@@ -36,8 +48,8 @@ class PiThinkingSessionFactory:
             FakeSdkClient((first_response,)),
             FakeSdkClient(
                 (
-                    thinking_response(),
-                    sdk_response("PI_STILL_OPUS_DONE", "sdk-thinking"),
+                    opus_response(thinking_response()),
+                    opus_response(sdk_response("PI_STILL_OPUS_DONE", "sdk-thinking")),
                 )
             ),
             FakeSdkClient((sdk_response("PI_SWITCH_BACK_DONE", "sdk-back"),)),
@@ -81,7 +93,7 @@ async def test_real_pi_preserves_thinking_through_tool_replay_and_switches_setti
 ) -> None:
     """Catch Pi payload drift or a header-dependent replay/switch implementation."""
     factory = PiThinkingSessionFactory(tmp_path)
-    app = create_app(models=("sonnet", "opus"), session_factory=factory)
+    app = create_app(models=("sonnet-5", "opus-5"), session_factory=factory)
 
     async with serve(app) as base_url:
         result = await run_pi_thinking(base_url, dialect)
@@ -89,7 +101,7 @@ async def test_real_pi_preserves_thinking_through_tool_replay_and_switches_setti
     assert result["customSessionHeaders"] == []
     assert result["models"] == [
         {
-            "id": "sonnet",
+            "id": "sonnet-5",
             "api": f"{dialect}-messages"
             if dialect == "anthropic"
             else "openai-completions",
@@ -106,7 +118,7 @@ async def test_real_pi_preserves_thinking_through_tool_replay_and_switches_setti
             },
         },
         {
-            "id": "opus",
+            "id": "opus-5",
             "api": f"{dialect}-messages"
             if dialect == "anthropic"
             else "openai-completions",
@@ -151,7 +163,7 @@ async def test_real_pi_preserves_thinking_through_tool_replay_and_switches_setti
         {"name": "echo", "content": "second"},
     ]
 
-    assert factory.models == ["sonnet", "opus", "sonnet"]
+    assert factory.models == ["sonnet-5", "opus-5", "sonnet-5"]
     assert factory.thinking == [
         ThinkingOptions(mode="adaptive", effort="high", display="summarized")
         if dialect == "anthropic"
@@ -169,9 +181,9 @@ async def test_real_pi_preserves_thinking_through_tool_replay_and_switches_setti
         for block in message.blocks
     ), factory.histories
     assert [client.options.model for client in factory.clients] == [
-        "sonnet",
-        "opus",
-        "sonnet",
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
     ]
     assert [client.options.effort for client in factory.clients] == [
         "high",
@@ -182,11 +194,11 @@ async def test_real_pi_preserves_thinking_through_tool_replay_and_switches_setti
 
     payloads = result["requestPayloads"]
     assert [payload["model"] for payload in payloads] == [
-        "sonnet",
-        "sonnet",
-        "opus",
-        "opus",
-        "sonnet",
+        "sonnet-5",
+        "sonnet-5",
+        "opus-5",
+        "opus-5",
+        "sonnet-5",
     ]
     if dialect == "openai":
         assert [payload["reasoningEffort"] for payload in payloads] == [
@@ -229,7 +241,7 @@ async def test_real_pi_roundtrips_model_and_thinking_settings_without_header(
 ) -> None:
     """Isolate the bidirectional switch from a second unchanged Opus turn."""
     factory = PiThinkingSessionFactory(tmp_path)
-    app = create_app(models=("sonnet", "opus"), session_factory=factory)
+    app = create_app(models=("sonnet-5", "opus-5"), session_factory=factory)
 
     async with serve(app) as base_url:
         result = await run_pi_thinking(base_url, dialect, scenario="roundtrip")
@@ -248,7 +260,7 @@ async def test_real_pi_roundtrips_model_and_thinking_settings_without_header(
         {"name": "echo", "content": "first"},
         {"name": "echo", "content": "second"},
     ]
-    assert factory.models == ["sonnet", "opus", "sonnet"]
+    assert factory.models == ["sonnet-5", "opus-5", "sonnet-5"]
     assert [client.options.effort for client in factory.clients] == [
         "high",
         "low",
@@ -256,8 +268,8 @@ async def test_real_pi_roundtrips_model_and_thinking_settings_without_header(
     ]
     assert [client.disconnect_count for client in factory.clients] == [1, 1, 1]
     assert [payload["model"] for payload in result["requestPayloads"]] == [
-        "sonnet",
-        "sonnet",
-        "opus",
-        "sonnet",
+        "sonnet-5",
+        "sonnet-5",
+        "opus-5",
+        "sonnet-5",
     ]

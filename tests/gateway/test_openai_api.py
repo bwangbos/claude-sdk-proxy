@@ -779,4 +779,4 @@ def test_openai_error_ends_the_stream() -> None:
             "code": "backend_error",
         }
     }
-    assert chunks[1] == b"data: [DONE]\n\n"
+    assert len(chunks) == 1

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from anthropic import AsyncAnthropic, BadRequestError
-from claude_agent_sdk import ResultMessage, UserMessage
+from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, UserMessage
 from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
 from openai import AsyncOpenAI
 
@@ -19,6 +21,8 @@ from tests.gateway.fakes import (
     raw_text_events,
     raw_tool_events,
 )
+from tests.gateway.test_sdk_fallback import fallback_notice
+from tests.gateway.test_sdk_refusal import _raw_delta, _raw_stop
 from tests.integration.pi_gateway_support import serve
 
 _SCHEMA = {
@@ -42,13 +46,14 @@ def _result_message() -> ResultMessage:
     )
 
 
-def _tool_app(tmp_path: Path, client: FakeSdkClient):
+def _tool_app(tmp_path: Path, client: FakeSdkClient, *, fallback=False):
     def factory(
         model: str,
         system: str,
         *,
         tools: tuple[ToolDefinition, ...] = (),
         dialect: Dialect = "anthropic",
+        **kwargs,
     ) -> SdkSession:
         return SdkSession(
             model,
@@ -57,9 +62,14 @@ def _tool_app(tmp_path: Path, client: FakeSdkClient):
             client_factory=lambda options: client.capture_options(options),
             tools=tools,
             dialect=dialect,
+            **kwargs,
         )
 
-    return create_app(models=("sonnet",), session_factory=factory)
+    return create_app(
+        models=("opus-5", "opus-4.8") if fallback else ("sonnet",),
+        session_factory=factory,
+        refusal_fallback="auto" if fallback else "off",
+    )
 
 
 def _sdk_messages(rounds: int) -> tuple[Any, ...]:
@@ -90,9 +100,7 @@ def _sdk_messages(rounds: int) -> tuple[Any, ...]:
                     input_tokens=7,
                     output_tokens=3,
                 ),
-                UserMessage(
-                    [SdkToolResultBlock("sdk-again", "round-two", False)]
-                ),
+                UserMessage([SdkToolResultBlock("sdk-again", "round-two", False)]),
             ]
         )
     messages.extend(
@@ -114,9 +122,10 @@ async def _anthropic_create(
     messages: list[dict[str, Any]],
     *,
     stream: bool,
+    model: str = "sonnet",
 ):
     request = {
-        "model": "sonnet",
+        "model": model,
         "messages": messages,
         "max_tokens": 128,
         "tools": [
@@ -128,11 +137,15 @@ async def _anthropic_create(
         ],
     }
     if not stream:
-        return await client.messages.create(**request)
+        result = await client.messages.create(**request)
+        assert result.model == ("opus-4.8" if model == "opus-5" else "sonnet-5")
+        return result
     async with client.messages.stream(**request) as response:
         async for _ in response:
             pass
-        return await response.get_final_message()
+        result = await response.get_final_message()
+        assert result.model == ("opus-4.8" if model == "opus-5" else "sonnet-5")
+        return result
 
 
 def _anthropic_history(message: Any) -> dict[str, Any]:
@@ -153,9 +166,10 @@ async def _openai_create(
     messages: list[dict[str, Any]],
     *,
     stream: bool,
+    model: str = "sonnet",
 ) -> dict[str, Any]:
     request = {
-        "model": "sonnet",
+        "model": model,
         "messages": messages,
         "max_tokens": 128,
         "tools": [
@@ -173,6 +187,7 @@ async def _openai_create(
         request["stream_options"] = {"include_usage": True}
     response = await client.chat.completions.create(**request, stream=stream)
     if not stream:
+        assert response.model == ("opus-4.8" if model == "opus-5" else "sonnet-5")
         dumped = response.model_dump()
         message = dumped["choices"][0]["message"]
         return {
@@ -186,6 +201,7 @@ async def _openai_create(
     usage: dict[str, int] | None = None
     finish_reason: str | None = None
     async for chunk in response:
+        assert chunk.model == ("opus-4.8" if model == "opus-5" else "sonnet-5")
         dumped = chunk.model_dump(exclude_none=True)
         if dumped.get("usage") is not None:
             usage = dumped["usage"]
@@ -206,9 +222,7 @@ async def _openai_create(
                 target["id"] += raw_call.get("id", "")
                 function = raw_call.get("function", {})
                 target["function"]["name"] += function.get("name", "")
-                target["function"]["arguments"] += function.get(
-                    "arguments", ""
-                )
+                target["function"]["arguments"] += function.get("arguments", "")
     message: dict[str, Any] = {
         "role": "assistant",
         "content": "".join(content) or None,
@@ -227,26 +241,64 @@ async def _openai_create(
 @pytest.mark.parametrize("dialect", ["anthropic", "openai"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("rounds", [1, 2])
+@pytest.mark.parametrize("fallback", [False, True])
 async def test_official_clients_complete_tool_rounds_over_real_http(
-    tmp_path: Path, dialect: str, stream: bool, rounds: int
+    tmp_path: Path, dialect: str, stream: bool, rounds: int, fallback: bool
 ) -> None:
-    sdk_client = FakeSdkClient(responses=(_sdk_messages(rounds),))
-    app = _tool_app(tmp_path, sdk_client)
+    native = list(_sdk_messages(rounds))
+    if fallback:
+        for index, event in enumerate(native):
+            if (
+                isinstance(event, StreamEvent)
+                and event.event["type"] == "message_start"
+            ):
+                event.event["message"]["model"] = "claude-opus-4-8"
+            if isinstance(event, AssistantMessage):
+                native[index] = replace(event, model="claude-opus-4-8")
+        native[:0] = [
+            *raw_text_events(
+                "discarded original output", "sdk-official", model="claude-opus-5"
+            )[:4],
+            fallback_notice(session_id="sdk-official"),
+            _raw_delta(
+                session_id="sdk-official", usage={"input_tokens": 2, "output_tokens": 0}
+            ),
+            replace(_raw_stop(), session_id="sdk-official"),
+        ]
+    sdk_client = FakeSdkClient(responses=(tuple(native),))
+    app = _tool_app(tmp_path, sdk_client, fallback=fallback)
+    model = "opus-5" if fallback else "sonnet"
+
+    async def verify_headers(response):
+        assert response.headers["x-claude-proxy-requested-model"] == (
+            "opus-5" if fallback else "sonnet-5"
+        )
+        assert response.headers["x-claude-proxy-actual-model"] == (
+            "opus-4.8" if fallback else "sonnet-5"
+        )
+        assert response.headers.get("x-claude-proxy-fallback") == (
+            "true" if fallback else None
+        )
 
     async with serve(app) as base_url:
         if dialect == "anthropic":
             async with AsyncAnthropic(
                 base_url=base_url,
+                http_client=httpx.AsyncClient(
+                    event_hooks={"response": [verify_headers]}
+                ),
                 api_key="local-placeholder",
                 max_retries=0,
                 timeout=5,
             ) as client:
-                messages: list[dict[str, Any]] = [
-                    {"role": "user", "content": "go"}
-                ]
+                messages: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
                 first = await _anthropic_create(
-                    client, messages, stream=stream
+                    client, messages, stream=stream, model=model
                 )
+                replay = await _anthropic_create(
+                    client, messages, stream=stream, model=model
+                )
+                assert replay.content == first.content
                 calls = [block for block in first.content if block.type == "tool_use"]
                 assert len(calls) == 2
                 assert calls[0].id != calls[1].id
@@ -277,12 +329,10 @@ async def test_official_clients_complete_tool_rounds_over_real_http(
                 )
                 if rounds == 2:
                     second = await _anthropic_create(
-                        client, messages, stream=stream
+                        client, messages, stream=stream, model=model
                     )
                     second_call = next(
-                        block
-                        for block in second.content
-                        if block.type == "tool_use"
+                        block for block in second.content if block.type == "tool_use"
                     )
                     assert second_call.input == {"v": 2}
                     assert (
@@ -305,12 +355,14 @@ async def test_official_clients_complete_tool_rounds_over_real_http(
                         ]
                     )
                 final = await _anthropic_create(
-                    client, messages, stream=stream
+                    client, messages, stream=stream, model=model
                 )
+                replay = await _anthropic_create(
+                    client, messages, stream=stream, model=model
+                )
+                assert replay.content == final.content
                 assert final.stop_reason == "end_turn"
-                assert [block.text for block in final.content] == [
-                    "left/right/final"
-                ]
+                assert [block.text for block in final.content] == ["left/right/final"]
                 assert (
                     final.usage.input_tokens,
                     final.usage.output_tokens,
@@ -318,20 +370,26 @@ async def test_official_clients_complete_tool_rounds_over_real_http(
         else:
             async with AsyncOpenAI(
                 base_url=f"{base_url}/v1",
+                http_client=httpx.AsyncClient(
+                    event_hooks={"response": [verify_headers]}
+                ),
                 api_key="local-placeholder",
                 max_retries=0,
                 timeout=5,
             ) as client:
                 messages = [{"role": "user", "content": "go"}]
                 first_openai = await _openai_create(
-                    client, messages, stream=stream
+                    client, messages, stream=stream, model=model
+                )
+                assert (
+                    await _openai_create(client, messages, stream=stream, model=model)
+                    == first_openai
                 )
                 calls = first_openai["message"]["tool_calls"]
                 assert len(calls) == 2
                 assert calls[0]["id"] != calls[1]["id"]
                 assert [
-                    json.loads(call["function"]["arguments"])
-                    for call in calls
+                    json.loads(call["function"]["arguments"]) for call in calls
                 ] == [{"v": 1}, {"v": 1}]
                 assert first_openai["finish_reason"] == "tool_calls"
                 assert first_openai["usage"] == {
@@ -356,12 +414,10 @@ async def test_official_clients_complete_tool_rounds_over_real_http(
                 )
                 if rounds == 2:
                     second_openai = await _openai_create(
-                        client, messages, stream=stream
+                        client, messages, stream=stream, model=model
                     )
                     second_call = second_openai["message"]["tool_calls"][0]
-                    assert json.loads(
-                        second_call["function"]["arguments"]
-                    ) == {"v": 2}
+                    assert json.loads(second_call["function"]["arguments"]) == {"v": 2}
                     assert second_openai["usage"] == {
                         "prompt_tokens": 7,
                         "completion_tokens": 3,
@@ -378,7 +434,11 @@ async def test_official_clients_complete_tool_rounds_over_real_http(
                         ]
                     )
                 final_openai = await _openai_create(
-                    client, messages, stream=stream
+                    client, messages, stream=stream, model=model
+                )
+                assert (
+                    await _openai_create(client, messages, stream=stream, model=model)
+                    == final_openai
                 )
                 assert final_openai["finish_reason"] == "stop"
                 assert final_openai["message"]["content"] == "left/right/final"
@@ -424,13 +484,9 @@ async def test_anthropic_client_preserves_nonempty_explicit_tool_error(
             max_retries=0,
             timeout=5,
         ) as client:
-            history: list[dict[str, Any]] = [
-                {"role": "user", "content": "go"}
-            ]
+            history: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
             first = await _anthropic_create(client, history, stream=False)
-            call = next(
-                block for block in first.content if block.type == "tool_use"
-            )
+            call = next(block for block in first.content if block.type == "tool_use")
             history.extend(
                 [
                     _anthropic_history(first),
@@ -482,13 +538,9 @@ async def test_anthropic_client_rejects_empty_error_before_sdk_resume(
             max_retries=0,
             timeout=5,
         ) as client:
-            history: list[dict[str, Any]] = [
-                {"role": "user", "content": "go"}
-            ]
+            history: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
             first = await _anthropic_create(client, history, stream=False)
-            call = next(
-                block for block in first.content if block.type == "tool_use"
-            )
+            call = next(block for block in first.content if block.type == "tool_use")
             history.append(_anthropic_history(first))
             with pytest.raises(BadRequestError) as rejected:
                 await _anthropic_create(
@@ -527,8 +579,6 @@ async def test_anthropic_client_rejects_empty_error_before_sdk_resume(
             )
             final = await _anthropic_create(client, history, stream=False)
 
-    assert [block.text for block in final.content] == [
-        "corrected result accepted"
-    ]
+    assert [block.text for block in final.content] == ["corrected result accepted"]
     assert sdk_client.tool_handler_count == 1
     assert sdk_client.tool_results[0].is_error is True

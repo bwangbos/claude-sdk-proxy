@@ -18,6 +18,7 @@ from claude_sdk_proxy.domain import (
     Dialect,
     InputUsage,
     RequestValidationError,
+    ResponseIdentity,
     TextDelta,
     ToolCall,
     ToolDefinition,
@@ -55,6 +56,7 @@ class ToolBoundarySession:
 
     async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
+        yield ResponseIdentity("sonnet-5", "sonnet-5", False)
         for event in self.boundary:
             yield event
 
@@ -83,6 +85,7 @@ class RepeatedRoundSession(ToolBoundarySession):
             if index:
                 await self._resume.wait()
                 self._resume.clear()
+            yield ResponseIdentity("sonnet-5", "sonnet-5", False)
             for event in boundary:
                 yield event
 
@@ -106,6 +109,7 @@ class BlockingToolSession(ToolBoundarySession):
 
     async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
         self.prompts.append(prompt)
+        yield ResponseIdentity("sonnet-5", "sonnet-5", False)
         if self.after_delta:
             yield InputUsage(13)
             yield TextDelta("partial")
@@ -2001,12 +2005,10 @@ async def test_disconnect_after_result_commit_finishes_for_identical_replay() ->
     original_stream = session.stream_generation
 
     async def blocked_stream(prompt: str) -> AsyncIterator[ConversationEvent]:
-        index = 0
         async for event in original_stream(prompt):
-            if index == 2:
+            if isinstance(event, TextDelta):
                 generation_entered.set()
                 await generation_release.wait()
-            index += 1
             yield event
 
     session.stream_generation = blocked_stream  # type: ignore[method-assign]
