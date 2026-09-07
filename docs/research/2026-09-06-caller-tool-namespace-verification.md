@@ -45,3 +45,16 @@ The complete result-submission path is covered deterministically through the
 real adapter and MCP callback handler. Successful live admission of the captured
 request does not guarantee that a model will never invent a different tool name.
 No running server, Pi settings, or user research files were changed by this fix.
+
+## Final offline gate
+
+A fresh tracked snapshot of `41ef985` rebuilt the native helpers and passed
+`make release-offline`: 676 unit, 222 Darwin lifecycle, 829 gateway, and 32
+integration tests (**1,759 total**), with strict markers, skips forbidden, and
+warnings treated as errors. Full-snapshot Ruff and mypy (45 source files) passed.
+No live model calls were part of that deterministic gate.
+
+Independent read-only review approved the correction with no findings. A
+post-verification process check found no orphaned proxy anchor, supervisor, or
+probe-child helpers. The running proxy was left untouched; restart it to load
+the corrected namespace after choosing how to integrate this branch.
