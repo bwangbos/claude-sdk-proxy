@@ -120,6 +120,7 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
+    { name = "httpx" },
     { name = "jsonschema" },
     { name = "mcp" },
     { name = "referencing" },
@@ -140,6 +141,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", specifier = "==0.2.152" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "mcp", specifier = "==2.1.1" },
     { name = "referencing", specifier = "==0.37.0" },
