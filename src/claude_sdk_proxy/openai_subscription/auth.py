@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import math
 import secrets
 import time
 import urllib.parse
@@ -119,6 +120,8 @@ class OAuthLogin:
                 data["refresh_token"],
                 data["expires_in"],
             )
+            expires_seconds = float(expires_in)
+            expires_at = self._clock() + expires_seconds
             if (
                 not isinstance(access, str)
                 or not access
@@ -127,16 +130,22 @@ class OAuthLogin:
                 or not isinstance(expires_in, (int, float))
                 or isinstance(expires_in, bool)
                 or expires_in <= 0
+                or not math.isfinite(expires_seconds)
+                or not math.isfinite(expires_at)
             ):
                 raise ValueError
             account_id = _extract_account_id(access)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        except (
+            KeyError,
+            OverflowError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
             raise AuthenticationError(
                 f"OpenAI {operation} returned an invalid token response"
             ) from error
-        return Credentials(
-            access, refresh, self._clock() + float(expires_in), account_id
-        )
+        return Credentials(access, refresh, expires_at, account_id)
 
     async def run(self, *, open_browser: BrowserOpener, timeout: float) -> Credentials:
         pkce, state = create_pkce(), secrets.token_hex(16)
@@ -253,13 +262,13 @@ class CredentialManager:
     async def login(
         self, *, open_browser: BrowserOpener, timeout: float = 300.0
     ) -> Credentials:
+        generation = await self.store.snapshot_generation()
         credentials = await OAuthLogin(
             client=await self._get_client(), clock=self._clock
         ).run(open_browser=open_browser, timeout=timeout)
-        current = await self.store.load()
         try:
-            return await self.store.save(
-                credentials, expected_revision=current.revision if current else None
+            return await self.store.save_if_generation(
+                credentials, expected_generation=generation
             )
         except CredentialRevisionError as error:
             raise AuthenticationError(

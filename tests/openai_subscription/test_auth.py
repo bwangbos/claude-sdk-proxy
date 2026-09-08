@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import socket
 import urllib.parse
 from pathlib import Path
@@ -257,6 +258,18 @@ async def test_token_exchange_rejects_malformed_response_without_leaking_body(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("expires_in", [math.inf, -math.inf, math.nan])
+async def test_token_exchange_rejects_nonfinite_expiry(expires_in: float) -> None:
+    body = _token_response()
+    body["expires_in"] = expires_in
+    raw = json.dumps(body, allow_nan=True).encode()
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=raw))
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(AuthenticationError, match="invalid token response"):
+            await OAuthLogin(client=client).exchange_code("code", "verifier")
+
+
+@pytest.mark.anyio
 async def test_refresh_is_shared_across_store_instances(tmp_path: Path) -> None:
     store1 = CredentialStore(tmp_path)
     store2 = CredentialStore(tmp_path)
@@ -355,6 +368,66 @@ async def test_logout_wins_race_with_inflight_refresh(tmp_path: Path) -> None:
             await refresh_task
 
     assert await store.load() is None
+
+
+@pytest.mark.anyio
+async def test_logout_while_absent_invalidates_pending_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_login(self: OAuthLogin, **kwargs: Any) -> Credentials:
+        entered.set()
+        await release.wait()
+        return Credentials(_jwt(), "refresh", 2_000.0, "acct-test")
+
+    monkeypatch.setattr(OAuthLogin, "run", delayed_login)
+    manager = CredentialManager(CredentialStore(tmp_path), clock=lambda: 1_000.0)
+    pending = asyncio.create_task(manager.login(open_browser=lambda url: None))
+    await entered.wait()
+    assert not await manager.logout()
+    release.set()
+
+    with pytest.raises(AuthenticationError, match="changed during login"):
+        await pending
+    assert await manager.store.load() is None
+
+
+@pytest.mark.anyio
+async def test_newer_login_invalidates_older_pending_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    async def ordered_login(self: OAuthLogin, **kwargs: Any) -> Credentials:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_entered.set()
+            await release_first.wait()
+            account_id = "older"
+        else:
+            account_id = "newer"
+        return Credentials(
+            _jwt(account_id), f"refresh-{account_id}", 2_000.0, account_id
+        )
+
+    monkeypatch.setattr(OAuthLogin, "run", ordered_login)
+    store = CredentialStore(tmp_path)
+    manager = CredentialManager(store, clock=lambda: 1_000.0)
+    older = asyncio.create_task(manager.login(open_browser=lambda url: None))
+    await first_entered.wait()
+    newer = await manager.login(open_browser=lambda url: None)
+    release_first.set()
+
+    with pytest.raises(AuthenticationError, match="changed during login"):
+        await older
+    current = await store.load()
+    assert current is not None
+    assert current.account_id == newer.account_id == "newer"
 
 
 @pytest.mark.anyio
