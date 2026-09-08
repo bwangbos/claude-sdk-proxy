@@ -6,6 +6,7 @@ import math
 import os
 import stat
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -164,3 +165,69 @@ async def test_cancelled_refresh_lock_waiter_does_not_leak_lock(
     await asyncio.sleep(0.05)
     async with follower.refresh_lock():
         pass
+
+
+@pytest.mark.anyio
+async def test_repeated_cancellation_cannot_abandon_acquired_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waiter = CredentialStore(tmp_path, lock_timeout=0.5)
+    follower = CredentialStore(tmp_path, lock_timeout=0.1)
+    worker_started = threading.Event()
+    allow_acquisition = threading.Event()
+    original = waiter._acquire_lock_sync
+
+    def controlled_acquisition(cancelled: threading.Event | None = None) -> int | None:
+        worker_started.set()
+        allow_acquisition.wait(timeout=1)
+        return original(None)
+
+    monkeypatch.setattr(waiter, "_acquire_lock_sync", controlled_acquisition)
+    waiter_context = waiter.refresh_lock()
+    waiting = asyncio.create_task(waiter_context.__aenter__())
+    await asyncio.to_thread(worker_started.wait, 1)
+    waiting.cancel()
+    await asyncio.sleep(0)
+    waiting.cancel()
+    allow_acquisition.set()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    await asyncio.sleep(0.03)
+
+    async with follower.refresh_lock():
+        pass
+
+
+@pytest.mark.anyio
+async def test_generation_write_failure_precedes_credential_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = CredentialStore(tmp_path)
+    original = await store.save(_credentials(), expected_revision=None)
+
+    def fail_generation(value: str) -> None:
+        raise OSError("synthetic generation write failure")
+
+    monkeypatch.setattr(store, "_write_generation_locked", fail_generation)
+    replacement = Credentials("new-access", "new-refresh", 2345.0, "account-1")
+    with pytest.raises(OSError, match="synthetic"):
+        await store.save(replacement, expected_revision=original.revision)
+
+    assert await store.load() == original
+
+
+@pytest.mark.anyio
+async def test_generation_write_failure_precedes_logout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = CredentialStore(tmp_path)
+    original = await store.save(_credentials(), expected_revision=None)
+
+    def fail_generation(value: str) -> None:
+        raise OSError("synthetic generation write failure")
+
+    monkeypatch.setattr(store, "_write_generation_locked", fail_generation)
+    with pytest.raises(OSError, match="synthetic"):
+        await store.delete(expected_revision=original.revision)
+
+    assert await store.load() == original

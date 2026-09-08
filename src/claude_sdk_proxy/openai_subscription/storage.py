@@ -122,9 +122,13 @@ class CredentialStore:
         lock_fd = self._acquire_named_lock_sync(self.state_lock_path)
         assert lock_fd is not None
         try:
-            stored = self._save_locked_sync(credentials, expected_revision)
+            if not math.isfinite(credentials.expires_at):
+                raise UnsafeCredentialStorageError("Credential expiry is invalid")
+            current = self._load_sync()
+            if (current.revision if current else None) != expected_revision:
+                raise CredentialRevisionError("Credentials changed during operation")
             self._write_generation_locked(secrets.token_hex(16))
-            return stored
+            return self._save_locked_sync(credentials, expected_revision)
         finally:
             self._release_lock_sync(lock_fd)
 
@@ -198,11 +202,12 @@ class CredentialStore:
             if self._load_or_create_generation_locked() != expected_generation:
                 raise CredentialRevisionError("Credentials changed during operation")
             current = self._load_sync()
-            stored = self._save_locked_sync(
+            if not math.isfinite(credentials.expires_at):
+                raise UnsafeCredentialStorageError("Credential expiry is invalid")
+            self._write_generation_locked(secrets.token_hex(16))
+            return self._save_locked_sync(
                 credentials, current.revision if current is not None else None
             )
-            self._write_generation_locked(secrets.token_hex(16))
-            return stored
         finally:
             self._release_lock_sync(lock_fd)
 
@@ -264,8 +269,8 @@ class CredentialStore:
                 return False
             if expected_revision is not None and current.revision != expected_revision:
                 raise CredentialRevisionError("Credentials changed during operation")
-            self.path.unlink()
             self._write_generation_locked(secrets.token_hex(16))
+            self.path.unlink()
             return True
         finally:
             self._release_lock_sync(lock_fd)
@@ -313,16 +318,23 @@ class CredentialStore:
             fd = await asyncio.shield(acquisition)
         except asyncio.CancelledError as cancellation:
             cancelled.set()
-            task = asyncio.current_task()
-            if task is not None:
-                while task.uncancel():
-                    pass
-            try:
-                acquired_fd = await acquisition
-            except TimeoutError:
-                acquired_fd = None
-            if acquired_fd is not None:
-                await asyncio.to_thread(self._release_lock_sync, acquired_fd)
+            self._clear_cancellation()
+
+            async def finish_acquisition() -> None:
+                try:
+                    acquired_fd = await acquisition
+                except TimeoutError:
+                    return
+                if acquired_fd is not None:
+                    await asyncio.to_thread(self._release_lock_sync, acquired_fd)
+
+            cleanup = asyncio.create_task(finish_acquisition())
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    self._clear_cancellation()
+            cleanup.result()
             raise cancellation
         if fd is None:
             raise RuntimeError("Unexpected cancelled lock acquisition")
@@ -330,3 +342,10 @@ class CredentialStore:
             yield
         finally:
             await asyncio.to_thread(self._release_lock_sync, fd)
+
+    @staticmethod
+    def _clear_cancellation() -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            while task.uncancel():
+                pass
