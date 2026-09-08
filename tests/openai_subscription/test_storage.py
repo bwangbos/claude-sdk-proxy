@@ -231,3 +231,23 @@ async def test_generation_write_failure_precedes_logout(
         await store.delete(expected_revision=original.revision)
 
     assert await store.load() == original
+
+
+@pytest.mark.anyio
+async def test_logout_fsyncs_directory_after_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = CredentialStore(tmp_path)
+    original = await store.save(_credentials(), expected_revision=None)
+    real_fsync = os.fsync
+
+    def fail_at_post_unlink_barrier(fd: int) -> None:
+        if not store.path.exists():
+            raise OSError("synthetic post-unlink fsync")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_at_post_unlink_barrier)
+    with pytest.raises(OSError, match="post-unlink"):
+        await store.delete(expected_revision=original.revision)
+
+    assert not store.path.exists()

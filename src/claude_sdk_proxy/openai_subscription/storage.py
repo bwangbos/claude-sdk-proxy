@@ -271,6 +271,11 @@ class CredentialStore:
                 raise CredentialRevisionError("Credentials changed during operation")
             self._write_generation_locked(secrets.token_hex(16))
             self.path.unlink()
+            dir_fd = os.open(self.root, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
             return True
         finally:
             self._release_lock_sync(lock_fd)
