@@ -156,6 +156,7 @@ class EventTranslator:
         self.account = account
         self.request = request
         self.items: dict[int, dict[str, Any]] = {}
+        self.done_items: set[int] = set()
         self.text: dict[int, str] = {}
         self.summaries: dict[int, str] = {}
         self.arguments: dict[int, str] = {}
@@ -250,6 +251,7 @@ class EventTranslator:
             ):
                 item["encrypted_content"] = previous["encrypted_content"]
             self.items[index] = item
+            self.done_items.add(index)
             if self.items[index]["type"] == "function_call":
                 return self._call(index, self.items[index])
         elif kind in {
@@ -296,7 +298,17 @@ class EventTranslator:
             raise SubscriptionFailure("upstream_error")
         result: list[ConversationEvent] = []
         reasoning: list[tuple[int, str, dict[str, Any]]] = []
-        output = [self._item(item) for item in response["output"]]
+        terminal_output = response["output"]
+        if not terminal_output and self.items:
+            boundaries = set(range(len(self.items)))
+            if (
+                status != "completed"
+                or set(self.items) != boundaries
+                or self.done_items != boundaries
+            ):
+                raise SubscriptionFailure("invalid_response")
+            terminal_output = [self.items[index] for index in range(len(self.items))]
+        output = [self._item(item) for item in terminal_output]
         for index, item in enumerate(output):
             existing = self.items.get(index)
             if existing is not None and (

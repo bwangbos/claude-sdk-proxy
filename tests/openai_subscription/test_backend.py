@@ -8,11 +8,15 @@ import pytest
 from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
+    RedactedThinkingBlock,
     ResponseIdentity,
+    TextBlock,
     TextDelta,
     ThinkingCompleted,
     ThinkingDelta,
     ToolCall,
+    ToolCallBlock,
+    ToolResultBlock,
 )
 from claude_sdk_proxy.openai_subscription.backend import Backend, SubscriptionFailure
 from claude_sdk_proxy.openai_subscription.replay import decode_reasoning
@@ -249,6 +253,174 @@ async def test_fragmented_multiple_tool_arguments_preserve_distinct_native_ids()
         ("call_B", {}),
     ]
     assert events[-1].stop_reason == "tool_use"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("dialect", ["anthropic", "openai"])
+async def test_sparse_terminal_replays_completed_done_items_in_both_dialects(dialect):
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_native",
+        "summary": [{"type": "summary_text", "text": "brief"}],
+        "encrypted_content": "opaque",
+        "status": "completed",
+    }
+    message = {
+        **text_item("hello"),
+        "id": "msg_native",
+        "phase": "final_answer",
+        "status": "completed",
+    }
+    call = {
+        "type": "function_call",
+        "id": "fc_native",
+        "call_id": "call_native",
+        "name": "lookup",
+        "arguments": '{"a":1}',
+        "status": "completed",
+    }
+    output = [reasoning, message, call]
+    usage = {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "input_tokens_details": {"cached_tokens": 3},
+        "output_tokens_details": {"reasoning_tokens": 2},
+    }
+    first = sse(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {**reasoning, "summary": []},
+        },
+        {
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "delta": "brief",
+        },
+        {"type": "response.output_item.done", "output_index": 0, "item": reasoning},
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {**message, "content": []},
+        },
+        {"type": "response.output_text.delta", "output_index": 1, "delta": "hello"},
+        {"type": "response.output_item.done", "output_index": 1, "item": message},
+        {
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {**call, "arguments": ""},
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "output_index": 2,
+            "delta": '{"a":1}',
+        },
+        {"type": "response.output_item.done", "output_index": 2, "item": call},
+        terminal([], usage=usage),
+    )
+    captured = []
+    responses = iter([first, sse(terminal([text_item("next")]))])
+
+    def handler(r):
+        captured.append(json.loads(r.content))
+        return httpx.Response(200, stream=Bytes(next(responses)))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        backend = Backend(Auth(), client=client)
+        req = request(dialect=dialect)
+        lease = await backend.open_turn(req)
+        events = [event async for event in lease.stream()]
+        assert [e.text for e in events if isinstance(e, TextDelta)] == ["hello"]
+        assert [e.text for e in events if isinstance(e, ThinkingDelta)] == ["brief"]
+        calls = [
+            (e.id, e.name, dict(e.arguments))
+            for e in events
+            if isinstance(e, ToolCall)
+        ]
+        assert calls == [("call_native", "lookup", {"a": 1})]
+        assert dict(events[-1].usage) == {
+            "input_tokens": 8,
+            "cache_read_input_tokens": 3,
+            "output_tokens": 7,
+            "reasoning_tokens": 2,
+        }
+
+        completed = next(
+            e.block
+            for e in events
+            if isinstance(e, ThinkingCompleted)
+            and not isinstance(e.block, RedactedThinkingBlock)
+        )
+        blocks = (
+            completed,
+            TextBlock("hello"),
+            ToolCallBlock("call_native", "lookup", {"a": 1}),
+        )
+        carrier = next(
+            (
+                e.block
+                for e in events
+                if isinstance(e, ThinkingCompleted)
+                and isinstance(e.block, RedactedThinkingBlock)
+            ),
+            None,
+        )
+        assistant = CanonicalMessage(
+            "assistant", blocks + ((carrier,) if carrier is not None else ())
+        )
+        continued = replace(
+            req,
+            messages=req.messages
+            + (
+                assistant,
+                CanonicalMessage(
+                    "user", (ToolResultBlock("call_native", ("ok",), False),)
+                ),
+            ),
+        )
+        lease = await backend.open_turn(continued)
+        _ = [event async for event in lease.stream()]
+        assert captured[1]["input"][1:4] == output
+        await backend.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {**text_item(""), "content": []},
+            }
+        ],
+        [
+            {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": text_item(),
+            }
+        ],
+        [
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": text_item(),
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": {**text_item(), "id": "msg_2"},
+            },
+        ],
+    ],
+    ids=["added-only", "missing-zero-boundary", "noncontiguous-boundary"],
+)
+async def test_sparse_terminal_rejects_unfinished_or_noncontiguous_items(events):
+    with pytest.raises(SubscriptionFailure) as failure:
+        await collect(sse(*events, terminal([])))
+    assert failure.value.category == "invalid_response"
 
 
 @pytest.mark.anyio
