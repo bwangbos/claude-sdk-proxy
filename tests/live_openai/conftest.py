@@ -7,14 +7,19 @@ import pytest
 
 
 @pytest.fixture(scope="session")
-def openai_live_base_url() -> str:
+def openai_live_opt_in() -> None:
     if os.environ.get("OPENAI_SUBSCRIPTION_LIVE") != "1":
         pytest.fail(
             "set OPENAI_SUBSCRIPTION_LIVE=1 only after completing "
             "`uv run claude-proxy login openai`"
         )
+
+
+@pytest.fixture(scope="session")
+def openai_live_base_url(openai_live_opt_in: None) -> str:
+    del openai_live_opt_in
     return os.environ.get(
-        "OPENAI_SUBSCRIPTION_TEST_BASE_URL", "http://127.0.0.1:8317"
+        "OPENAI_SUBSCRIPTION_TEST_BASE_URL", "http://127.0.0.1:8318"
     ).rstrip("/")
 
 

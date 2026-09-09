@@ -88,16 +88,27 @@ tool arguments/results, upstream error bodies, or raw provider identifiers.
 The deterministic suite uses mock transport and proves translation, replay,
 cancellation, accounting shapes, client compatibility, and credential/header
 isolation. It does not prove current endpoint access or account authorization.
-After completing the new proxy login, start the proxy with both exact models in
-one terminal and run the bounded live battery in another:
+After completing the new proxy login, start a separate test-owned proxy on an
+alternate loopback port with both exact models in one terminal and run the
+bounded live battery in another:
 
 ```bash
-OPENAI_SUBSCRIPTION_LIVE=1 make live-openai
+# Terminal 1
+uv run claude-proxy --port 8318 --model gpt-6-astra --model gpt-5.6-sol
+
+# Terminal 2
+OPENAI_SUBSCRIPTION_LIVE=1 \
+  OPENAI_SUBSCRIPTION_TEST_BASE_URL=http://127.0.0.1:8318 \
+  make live-openai
 ```
 
-To test another loopback port, also set
-`OPENAI_SUBSCRIPTION_TEST_BASE_URL=http://127.0.0.1:PORT`. The battery has
-two-minute HTTP deadlines, covers both models, effort, usage, tool/image
-continuation, compacted history, cancellation, and a stock Pi smoke using only
-a temporary `PI_CODING_AGENT_DIR`. It does not edit `~/.pi`, activate a service,
+Use another unused loopback port if 8318 is occupied, and set both the server's
+`--port` and `OPENAI_SUBSCRIPTION_TEST_BASE_URL` consistently. The battery has
+two-minute HTTP deadlines, checks requested routing plus observed upstream model
+identity, both models, effort, usage, tool/image continuation, compacted-history
+answers, client disconnect, and a stock Pi smoke using only a temporary
+`PI_CODING_AGENT_DIR`. A test-owned local probe verifies that disconnect closes
+the upstream HTTP stream, releases the active lease, and creates no replay entry.
+Provider-side billing cessation after cancellation is not observable from this
+proxy and is not claimed. The battery does not edit `~/.pi`, activate a service,
 or make performance claims.

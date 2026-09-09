@@ -15,8 +15,11 @@ claims. It does not replace the usage and limitation contract in the
   serialization (`exclude_unset=True`, `mode="json"`, `by_alias=True`) was
   submitted as a continuation; the next native input preserved the reasoning
   ciphertext plus message ID and phase.
-- The mock-backed stock Pi image/tool smoke passed with a temporary
-  `PI_CODING_AGENT_DIR`; the user's Pi configuration was not edited.
+- The unchanged `tests/integration/test_pi_images.py` regression passed. It uses
+  a `sonnet-5` `FakeConversationSession` and temporary `PI_CODING_AGENT_DIR`, so
+  it verifies preservation of the existing Claude/Pi harness only. It is not
+  direct-ChatGPT or Astra/Sol harness evidence, and the user's Pi configuration
+  was not edited.
 - Ruff, strict mypy, and whitespace checks passed.
 - The final full non-live run produced 2,226 passes, 76 live deselections, and
   the one supplied reset/domain alternation baseline failure. Its 44 macOS fork
@@ -31,20 +34,24 @@ Evidence is preserved in
 No Task 4 direct-ChatGPT live test was run. In particular, this checkpoint does
 not establish current authorization for the unofficial endpoint, model access,
 included-plan accounting or credit behavior, actual tool/image/reasoning output,
-live compaction, or live cancellation behavior. No latency or performance claim
-is made.
+live compaction, provider-side cancellation/billing cessation, or real OpenAI
+stock-Pi compatibility. The local cancellation scaffold can observe proxy-owned
+HTTP/task cleanup only. No latency or performance claim is made.
 
 After the operator explicitly completes `uv run claude-proxy login openai`, the
 reproduction commands are:
 
 ```bash
 # Terminal 1
-uv run claude-proxy --model gpt-6-astra --model gpt-5.6-sol
+uv run claude-proxy --port 8318 --model gpt-6-astra --model gpt-5.6-sol
 
 # Terminal 2
-OPENAI_SUBSCRIPTION_LIVE=1 make live-openai
+OPENAI_SUBSCRIPTION_LIVE=1 \
+  OPENAI_SUBSCRIPTION_TEST_BASE_URL=http://127.0.0.1:8318 \
+  make live-openai
 ```
 
 The target is isolated from the existing Claude live targets and has two-minute
-HTTP deadlines. A result from another date/account is new evidence and should be
-recorded separately rather than rewriting this checkpoint.
+HTTP deadlines. Its live stock-Pi check is still unverified at this checkpoint.
+A result from another date/account is new evidence and should be recorded
+separately rather than rewriting this checkpoint.
