@@ -150,7 +150,21 @@ async def test_real_upstream_disconnect_closes_connection_and_releases_turn(
         async with serve(app) as base_url:
             async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
                 async with client.stream(
-                    "POST", "/v1/chat/completions", json=body(stream=True)
+                    "POST",
+                    "/v1/chat/completions",
+                    json=body(
+                        stream=True,
+                        max_tokens=8192,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Write the integers 1 through 10000, one per "
+                                    "line, with no omissions or commentary."
+                                ),
+                            }
+                        ],
+                    ),
                 ) as response:
                     assert response.status_code == 200
                     async for line in response.aiter_lines():
@@ -159,6 +173,8 @@ async def test_real_upstream_disconnect_closes_connection_and_releases_turn(
                         frame = json.loads(line[6:])
                         choices = frame.get("choices") or []
                         if choices and choices[0].get("delta", {}).get("content"):
+                            assert transport.active == 1
+                            assert not transport.terminal_seen
                             break
                     else:
                         pytest.fail("upstream completed before visible content")

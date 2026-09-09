@@ -111,6 +111,10 @@ answers, client disconnect, and a stock Pi smoke using only a temporary
 uses the proxy-owned login and real fixed upstream endpoint; an instrumented
 `httpx.AsyncHTTPTransport` observes that disconnect closes the actual local
 upstream connection, releases the active lease, and creates no replay entry.
+The probe requests deliberately long output and disconnects after the first
+visible content only if the observer has not seen a completed, incomplete,
+failed, or error terminal SSE event; a naturally completed response fails the
+cancellation gate.
 Provider-side compute or billing cessation after connection close is not
 observable from this proxy and is not claimed. The battery does not edit
 `~/.pi`, activate a service, or make performance claims.

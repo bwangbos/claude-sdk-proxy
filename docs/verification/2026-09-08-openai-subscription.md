@@ -37,8 +37,10 @@ included-plan accounting or credit behavior, actual tool/image/reasoning output,
 live compaction, provider-side cancellation/billing cessation, or real OpenAI
 stock-Pi compatibility. When later run with explicit opt-in, the cancellation
 probe can observe closure of the real local upstream HTTP connection and
-proxy-owned task cleanup, but not provider-side compute or billing. No latency
-or performance claim is made.
+proxy-owned task cleanup. It requires a still-active, non-terminal upstream
+stream when the first visible downstream content is disconnected; it cannot
+pass on natural completion. It still cannot observe provider-side compute or
+billing. No latency or performance claim is made.
 
 After the operator explicitly completes `uv run claude-proxy login openai`, the
 reproduction commands are:
