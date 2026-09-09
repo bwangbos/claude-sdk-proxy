@@ -184,8 +184,17 @@ async def test_late_reasoning_ciphertext_backfilled_after_immediate_summary_delt
         i for i, e in enumerate(events) if isinstance(e, TextDelta)
     )
     completed = next(e for e in events if isinstance(e, ThinkingCompleted))
+    from claude_sdk_proxy.domain import TextBlock
+    from claude_sdk_proxy.openai_subscription.replay import envelope_scope
+
+    scope = envelope_scope(
+        request(),
+        "acct",
+        request().messages
+        + (CanonicalMessage("assistant", (completed.block, TextBlock("hello"))),),
+    )
     assert (
-        decode_reasoning(completed.block.signature, "acct", "gpt-6-astra")[
+        decode_reasoning(completed.block.signature, "acct", "gpt-6-astra", scope=scope)[
             "encrypted_content"
         ]
         == "CIPHERTEXT"
@@ -416,3 +425,127 @@ async def test_completed_replay_preserves_metadata_and_compaction_drops_it():
             {"role": "user", "content": [{"type": "input_text", "text": "compacted"}]}
         ]
         await backend.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "change",
+    ["prefix", "system", "tools", "compaction", "answer", "summary", "missing-binding"],
+)
+async def test_emitted_envelope_cannot_restore_changed_context(change):
+    import base64
+
+    from claude_sdk_proxy.domain import TextBlock, ThinkingBlock, ToolDefinition
+    from claude_sdk_proxy.openai_subscription.replay import PREFIX
+    from claude_sdk_proxy.openai_subscription.translation import build_body
+
+    req = replace(
+        request(),
+        messages=(
+            CanonicalMessage.user_text("old context"),
+            CanonicalMessage.assistant_text("old answer"),
+            CanonicalMessage.user_text("hi"),
+        ),
+    )
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "brief"}],
+        "encrypted_content": "old opaque state",
+    }
+    events, _ = await collect(sse(terminal([reasoning, text_item()])), req=req)
+    block = next(e.block for e in events if isinstance(e, ThinkingCompleted))
+    assistant = CanonicalMessage("assistant", (block, TextBlock("hello")))
+    continued = replace(
+        req, messages=req.messages + (assistant, CanonicalMessage.user_text("next"))
+    )
+    assert any(
+        i.get("encrypted_content") == "old opaque state"
+        for i in build_body(continued, "acct")["input"]
+    )
+    if change == "prefix":
+        continued = replace(
+            continued,
+            messages=(CanonicalMessage.user_text("rewritten"),)
+            + continued.messages[1:],
+        )
+    elif change == "system":
+        continued = replace(continued, system="new system")
+    elif change == "tools":
+        continued = replace(
+            continued, tools=(ToolDefinition("new_tool", "new", {"type": "object"}),)
+        )
+    elif change == "compaction":
+        continued = replace(continued, messages=continued.messages[2:])
+    elif change in {"answer", "summary"}:
+        edited = CanonicalMessage(
+            "assistant",
+            (
+                ThinkingBlock(
+                    "changed" if change == "summary" else block.thinking,
+                    block.signature,
+                ),
+                TextBlock("changed" if change == "answer" else "hello"),
+            ),
+        )
+        continued = replace(
+            continued,
+            messages=continued.messages[:-2] + (edited, continued.messages[-1]),
+        )
+    else:
+        envelope = json.loads(base64.urlsafe_b64decode(block.signature[len(PREFIX) :]))
+        envelope.pop("scope", None)
+        signature = (
+            PREFIX + base64.urlsafe_b64encode(json.dumps(envelope).encode()).decode()
+        )
+        edited = CanonicalMessage(
+            "assistant", (ThinkingBlock(block.thinking, signature), TextBlock("hello"))
+        )
+        continued = replace(
+            continued,
+            messages=continued.messages[:-2] + (edited, continued.messages[-1]),
+        )
+    assert not any(
+        i.get("type") == "reasoning" for i in build_body(continued, "acct")["input"]
+    )
+
+
+@pytest.mark.anyio
+async def test_added_ciphertext_survives_done_and_terminal_omission():
+    from claude_sdk_proxy.domain import TextBlock
+    from claude_sdk_proxy.openai_subscription.translation import build_body
+
+    item = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "encrypted_content": "opaque",
+    }
+    omitted = {k: v for k, v in item.items() if k != "encrypted_content"}
+    events, _ = await collect(
+        sse(
+            {"type": "response.output_item.added", "output_index": 0, "item": item},
+            {"type": "response.output_item.done", "output_index": 0, "item": omitted},
+            terminal([omitted]),
+        )
+    )
+    block = next(e.block for e in events if isinstance(e, ThinkingCompleted))
+    req = request()
+    continued = replace(
+        req,
+        messages=req.messages
+        + (
+            CanonicalMessage("assistant", (block, TextBlock(""))),
+            CanonicalMessage.user_text("next"),
+        ),
+    )
+    assert build_body(continued, "acct")["input"][1]["encrypted_content"] == "opaque"
+
+
+@pytest.mark.anyio
+async def test_terminal_frame_with_final_bare_cr_is_completed():
+    data = b"data: " + json.dumps(terminal([text_item()])).encode() + b"\r\r"
+    events, stream = await collect(data, fragmented=True)
+    assert isinstance(events[-1], Completed)
+    assert events[-1].stop_reason == "end_turn"
+    assert stream.closed

@@ -112,14 +112,21 @@ def test_reasoning_envelope_is_scoped_and_preserves_ciphertext():
         "summary": [{"type": "summary_text", "text": "brief"}],
         "encrypted_content": "opaque-not-decoded",
     }
-    signature = encode_reasoning(item, "acct", "gpt-6-astra")
+    signature = encode_reasoning(item, "acct", "gpt-6-astra", scope="0" * 64)
     assert signature.startswith("openai-subscription:v1:")
-    assert decode_reasoning(signature, "acct", "gpt-6-astra") == item
-    assert decode_reasoning(signature, "different", "gpt-6-astra") is None
-    assert decode_reasoning(signature, "acct", "gpt-5.6-sol") is None
-    assert decode_reasoning("claude-signature", "acct", "gpt-6-astra") is None
+    assert decode_reasoning(signature, "acct", "gpt-6-astra", scope="0" * 64) == item
+    assert (
+        decode_reasoning(signature, "different", "gpt-6-astra", scope="0" * 64) is None
+    )
+    assert decode_reasoning(signature, "acct", "gpt-5.6-sol", scope="0" * 64) is None
+    assert (
+        decode_reasoning("claude-signature", "acct", "gpt-6-astra", scope="0" * 64)
+        is None
+    )
     with pytest.raises(RequestValidationError):
-        decode_reasoning("openai-subscription:v1:not-base64", "acct", "gpt-6-astra")
+        decode_reasoning(
+            "openai-subscription:v1:not-base64", "acct", "gpt-6-astra", scope="0" * 64
+        )
 
 
 def test_foreign_reasoning_degrades_and_matching_reasoning_replays():
@@ -136,13 +143,29 @@ def test_foreign_reasoning_degrades_and_matching_reasoning_replays():
             CanonicalMessage(
                 "assistant",
                 (
-                    ThinkingBlock(
-                        "brief", encode_reasoning(item, "acct", "gpt-6-astra")
-                    ),
+                    ThinkingBlock("brief", "unbound-placeholder"),
                     TextBlock("answer"),
                 ),
             ),
             CanonicalMessage.user_text("next"),
+        ),
+    )
+    from claude_sdk_proxy.openai_subscription.replay import envelope_scope
+
+    signature = encode_reasoning(
+        item,
+        "acct",
+        "gpt-6-astra",
+        scope=envelope_scope(req, "acct", req.messages[:-1]),
+    )
+    req = replace(
+        req,
+        messages=(
+            req.messages[0],
+            CanonicalMessage(
+                "assistant", (ThinkingBlock("brief", signature), TextBlock("answer"))
+            ),
+            req.messages[-1],
         ),
     )
     assert tr.build_body(req, "acct")["input"][1] == item

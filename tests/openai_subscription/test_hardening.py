@@ -79,14 +79,17 @@ def test_images_and_image_tool_results_stay_in_caller_order():
 )
 def test_envelope_shape_rejects_wrong_version_provider_item_and_extra_fields(changes):
     signature = encode_reasoning(
-        {"type": "reasoning", "id": "rs_1", "summary": []}, "acct", "gpt-6-astra"
+        {"type": "reasoning", "id": "rs_1", "summary": []},
+        "acct",
+        "gpt-6-astra",
+        scope="0" * 64,
     )
     prefix = "openai-subscription:v1:"
     raw = json.loads(base64.urlsafe_b64decode(signature[len(prefix) :]))
     raw.update(changes)
     bad = prefix + base64.urlsafe_b64encode(json.dumps(raw).encode()).decode()
     with pytest.raises(RequestValidationError):
-        decode_reasoning(bad, "acct", "gpt-6-astra")
+        decode_reasoning(bad, "acct", "gpt-6-astra", scope="0" * 64)
 
 
 @pytest.mark.anyio

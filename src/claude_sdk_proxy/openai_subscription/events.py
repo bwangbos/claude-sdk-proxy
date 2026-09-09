@@ -16,6 +16,7 @@ from claude_sdk_proxy.domain import (
     RefusalDelta,
     TextBlock,
     TextDelta,
+    TextRequest,
     ThinkingBlock,
     ThinkingCompleted,
     ThinkingDelta,
@@ -23,7 +24,7 @@ from claude_sdk_proxy.domain import (
     ToolCallBlock,
 )
 
-from .replay import encode_reasoning, valid_reasoning
+from .replay import encode_reasoning, envelope_scope, valid_reasoning
 
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_TURN_BYTES = 16 * 1024 * 1024
@@ -73,15 +74,20 @@ async def parse_sse(chunks: AsyncIterator[bytes]) -> AsyncIterator[dict[str, Any
     data: list[str] = []
     frame_size = total = 0
     try:
-        async for chunk in chunks:
-            total += len(chunk)
+        source = aiter(chunks)
+        while True:
+            chunk = await anext(source, None)
+            eof = chunk is None
+            total += len(chunk) if chunk is not None else 0
             if total > MAX_TURN_BYTES:
                 raise SubscriptionFailure("buffer_limit")
-            buffer += decoder.decode(chunk)
+            buffer += decoder.decode(chunk or b"", final=eof)
             while True:
                 match = re.search(r"[\r\n]", buffer)
                 if match is None or (
-                    buffer[match.start()] == "\r" and match.end() == len(buffer)
+                    not eof
+                    and buffer[match.start()] == "\r"
+                    and match.end() == len(buffer)
                 ):
                     break
                 i = match.start()
@@ -108,7 +114,8 @@ async def parse_sse(chunks: AsyncIterator[bytes]) -> AsyncIterator[dict[str, Any
                     data.append(line[5:].removeprefix(" "))
             if frame_size + len(buffer.encode("utf-8")) > MAX_FRAME_BYTES:
                 raise SubscriptionFailure("buffer_limit")
-        decoder.decode(b"", final=True)
+            if eof:
+                break
         if buffer.strip() or data:
             raise SubscriptionFailure("invalid_response")
     except UnicodeError, ValueError, RecursionError:
@@ -140,9 +147,9 @@ def usage_from_response(value: Any) -> dict[str, int] | None:
 
 
 class EventTranslator:
-    def __init__(self, account: str, model: str):
+    def __init__(self, account: str, request: TextRequest):
         self.account = account
-        self.model = model
+        self.request = request
         self.items: dict[int, dict[str, Any]] = {}
         self.text: dict[int, str] = {}
         self.summaries: dict[int, str] = {}
@@ -230,6 +237,13 @@ class EventTranslator:
                 "arguments"
             ):
                 raise SubscriptionFailure("invalid_response")
+            if (
+                item["type"] == "reasoning"
+                and previous
+                and not item.get("encrypted_content")
+                and previous.get("encrypted_content")
+            ):
+                item["encrypted_content"] = previous["encrypted_content"]
             self.items[index] = item
             if self.items[index]["type"] == "function_call":
                 return self._call(index, self.items[index])
@@ -276,6 +290,7 @@ class EventTranslator:
         if status not in {"completed", "incomplete"}:
             raise SubscriptionFailure("upstream_error")
         result: list[ConversationEvent] = []
+        reasoning: list[tuple[int, str, dict[str, Any]]] = []
         output = [self._item(item) for item in response["output"]]
         for index, item in enumerate(output):
             existing = self.items.get(index)
@@ -307,13 +322,7 @@ class EventTranslator:
                     raise SubscriptionFailure("invalid_response")
                 if summary[len(prior) :]:
                     result.append(ThinkingDelta(index, summary[len(prior) :]))
-                try:
-                    signature = encode_reasoning(item, self.account, self.model)
-                except ValueError:
-                    raise SubscriptionFailure("buffer_limit") from None
-                result.append(
-                    ThinkingCompleted(index, ThinkingBlock(summary, signature))
-                )
+                reasoning.append((index, summary, item))
             else:
                 content = item.get("content")
                 if not isinstance(content, list):
@@ -347,6 +356,19 @@ class EventTranslator:
         if set(self.items) - set(range(len(output))):
             raise SubscriptionFailure("invalid_response")
         self.output = output
+        scope = envelope_scope(
+            self.request,
+            self.account,
+            self.request.messages + (self.assistant_message(include_reasoning=True),),
+        )
+        for index, summary, item in reasoning:
+            try:
+                signature = encode_reasoning(
+                    item, self.account, self.request.model, scope=scope
+                )
+            except ValueError:
+                raise SubscriptionFailure("buffer_limit") from None
+            result.append(ThinkingCompleted(index, ThinkingBlock(summary, signature)))
         self.finished = True
         self.cacheable = status == "completed"
         reason = "end_turn"
@@ -373,8 +395,8 @@ class EventTranslator:
         )
         return result
 
-    def assistant_message(self) -> CanonicalMessage:
-        blocks: list[TextBlock | ToolCallBlock] = []
+    def assistant_message(self, *, include_reasoning: bool = False) -> CanonicalMessage:
+        blocks: list[TextBlock | ToolCallBlock | ThinkingBlock] = []
         for item in self.output:
             if item["type"] == "message":
                 blocks.extend(
@@ -386,6 +408,12 @@ class EventTranslator:
                 blocks.append(
                     ToolCallBlock(
                         item["call_id"], item["name"], json.loads(item["arguments"])
+                    )
+                )
+            elif item["type"] == "reasoning" and include_reasoning:
+                blocks.append(
+                    ThinkingBlock(
+                        "".join(s["text"] for s in item["summary"]), "scope-placeholder"
                     )
                 )
         if self.refusal:

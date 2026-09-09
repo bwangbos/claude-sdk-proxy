@@ -150,7 +150,7 @@ class TurnLease:
                     self.request.model, self.request.model, False, verified=False
                 )
             self.diagnostics.pop("upstream_request_id", None)
-            translator = EventTranslator(credential.account_id, self.request.model)
+            translator = EventTranslator(credential.account_id, self.request)
             replay = self.backend.cache.get(self.request, credential.account_id)
             body = build_body(self.request, credential.account_id, replay)
             headers = {

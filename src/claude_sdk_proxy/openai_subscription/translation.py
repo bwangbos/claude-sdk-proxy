@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from claude_sdk_proxy.domain import (
-    CanonicalMessage,
     ImageBlock,
     RedactedThinkingBlock,
     RequestValidationError,
@@ -16,7 +15,7 @@ from claude_sdk_proxy.domain import (
     ToolResultBlock,
 )
 
-from .replay import decode_reasoning, packed, plain
+from .replay import decode_reasoning, envelope_scope, packed, plain
 
 MODELS = ("gpt-6-astra", "gpt-5.6-sol")
 EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -53,10 +52,12 @@ def image_part(block: ImageBlock) -> dict[str, str]:
 
 
 def translate_messages(
-    messages: tuple[CanonicalMessage, ...], account: str, model: str
+    request: TextRequest, account: str, *, only_last: bool = False
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    for message in messages:
+    for index, message in enumerate(request.messages):
+        if only_last and index != len(request.messages) - 1:
+            continue
         parts: list[dict[str, Any]] = []
 
         def flush() -> None:
@@ -106,7 +107,14 @@ def translate_messages(
                     }
                 )
             elif isinstance(block, ThinkingBlock):
-                item = decode_reasoning(block.signature, account, model)
+                item = decode_reasoning(
+                    block.signature,
+                    account,
+                    request.model,
+                    scope=envelope_scope(
+                        request, account, request.messages[: index + 1]
+                    ),
+                )
                 if item is not None:
                     flush()
                     result.append(item)
@@ -125,9 +133,9 @@ def build_body(
         "instructions": request.system,
         "store": False,
         "stream": True,
-        "input": translate_messages(request.messages, account, request.model)
+        "input": translate_messages(request, account)
         if replay is None
-        else replay + translate_messages(request.messages[-1:], account, request.model),
+        else replay + translate_messages(request, account, only_last=True),
         "include": ["reasoning.encrypted_content"],
         "tool_choice": "auto",
         "parallel_tool_calls": True,

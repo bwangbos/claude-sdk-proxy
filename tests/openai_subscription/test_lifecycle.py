@@ -273,6 +273,7 @@ def test_oversize_envelope_is_rejected_without_exposing_ciphertext():
             },
             "acct",
             "gpt-6-astra",
+            scope="0" * 64,
         )
     assert "SECRET" not in str(error.value)
 
@@ -367,8 +368,15 @@ async def test_terminal_omission_does_not_erase_already_received_ciphertext():
         )
     )
     completed = next(e for e in events if isinstance(e, ThinkingCompleted))
+    from claude_sdk_proxy.openai_subscription.replay import envelope_scope
+
+    scope = envelope_scope(
+        request(),
+        "acct",
+        request().messages + (CanonicalMessage("assistant", (completed.block,)),),
+    )
     assert (
-        decode_reasoning(completed.block.signature, "acct", "gpt-6-astra")[
+        decode_reasoning(completed.block.signature, "acct", "gpt-6-astra", scope=scope)[
             "encrypted_content"
         ]
         == "opaque"

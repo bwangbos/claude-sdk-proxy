@@ -77,7 +77,9 @@ def valid_reasoning(item: Any) -> bool:
     )
 
 
-def encode_reasoning(item: dict[str, Any], account: str, model: str) -> str:
+def encode_reasoning(
+    item: dict[str, Any], account: str, model: str, *, scope: str
+) -> str:
     if not valid_reasoning(item):
         raise RequestValidationError("messages", "invalid OpenAI reasoning envelope")
     raw = packed(
@@ -86,6 +88,7 @@ def encode_reasoning(item: dict[str, Any], account: str, model: str) -> str:
             "provider": "openai-subscription",
             "account": account_scope(account),
             "model": model,
+            "scope": scope,
             "item": item,
         }
     )
@@ -97,7 +100,9 @@ def encode_reasoning(item: dict[str, Any], account: str, model: str) -> str:
     return signature
 
 
-def decode_reasoning(signature: str, account: str, model: str) -> dict[str, Any] | None:
+def decode_reasoning(
+    signature: str, account: str, model: str, *, scope: str
+) -> dict[str, Any] | None:
     if not signature.startswith(PREFIX):
         return None
     try:
@@ -106,13 +111,18 @@ def decode_reasoning(signature: str, account: str, model: str) -> dict[str, Any]
         envelope = json.loads(
             base64.b64decode(signature[len(PREFIX) :], altchars=b"-_", validate=True)
         )
-        if not isinstance(envelope, dict) or set(envelope) != {
+        required = {
             "v",
             "provider",
             "account",
             "model",
             "item",
-        }:
+        }
+        if (
+            not isinstance(envelope, dict)
+            or not required <= set(envelope)
+            or set(envelope) - required - {"scope"}
+        ):
             raise ValueError
         if (
             type(envelope["v"]) is not int
@@ -127,6 +137,8 @@ def decode_reasoning(signature: str, account: str, model: str) -> dict[str, Any]
             raise ValueError
         if envelope["account"] != account_scope(account) or envelope["model"] != model:
             return None
+        if envelope.get("scope") != scope:
+            return None
         return dict(envelope["item"])
     except ValueError, TypeError, RecursionError:
         raise RequestValidationError(
@@ -135,11 +147,15 @@ def decode_reasoning(signature: str, account: str, model: str) -> dict[str, Any]
 
 
 def _key(
-    request: TextRequest, account: str, messages: tuple[CanonicalMessage, ...]
+    request: TextRequest,
+    account: str,
+    messages: tuple[CanonicalMessage, ...],
+    *,
+    include_summaries: bool = False,
 ) -> bytes:
     # Chat has no signature channel. Normalize adjacent text blocks because
     # downstream Chat aggregates them into one assistant content string.
-    visible = []
+    visible: list[dict[str, Any]] = []
     for message in messages:
         if message.role == "user":
             visible.append({"role": "user", "blocks": message.blocks})
@@ -153,7 +169,16 @@ def _key(
 
         text = "".join(b.text for b in blocks if isinstance(b, TextBlock))
         calls = [b for b in blocks if not isinstance(b, TextBlock)]
-        visible.append({"role": message.role, "text": text, "blocks": calls})
+        normalized: dict[str, Any] = {
+            "role": message.role,
+            "text": text,
+            "blocks": calls,
+        }
+        if include_summaries:
+            normalized["summaries"] = [
+                b.thinking for b in message.blocks if isinstance(b, ThinkingBlock)
+            ]
+        visible.append(normalized)
     return hashlib.sha256(
         packed(
             [
@@ -165,6 +190,17 @@ def _key(
             ]
         )
     ).digest()
+
+
+def envelope_scope(
+    request: TextRequest, account: str, messages: tuple[CanonicalMessage, ...]
+) -> str:
+    """Full visible boundary, independent of terminal signature block placement.
+
+    Preserve user block order strictly; normalize assistant text, calls and
+    ordered summaries into separate channels. Never include opaque signatures.
+    """
+    return _key(request, account, messages, include_summaries=True).hex()
 
 
 class ReplayCache:
