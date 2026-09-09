@@ -13,18 +13,23 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     Completed,
     ConversationEvent,
+    RedactedThinkingBlock,
     RefusalDelta,
-    TextBlock,
     TextDelta,
     TextRequest,
     ThinkingBlock,
     ThinkingCompleted,
     ThinkingDelta,
     ToolCall,
-    ToolCallBlock,
 )
 
-from .replay import encode_reasoning, envelope_scope, valid_reasoning
+from .replay import (
+    encode_assistant,
+    encode_reasoning,
+    envelope_scope,
+    native_assistant,
+    valid_reasoning,
+)
 
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_TURN_BYTES = 16 * 1024 * 1024
@@ -369,6 +374,14 @@ class EventTranslator:
             except ValueError:
                 raise SubscriptionFailure("buffer_limit") from None
             result.append(ThinkingCompleted(index, ThinkingBlock(summary, signature)))
+        if status == "completed" and self.request.dialect == "anthropic":
+            carrier = encode_assistant(
+                output, self.account, self.request.model, scope=scope
+            )
+            if carrier is not None:
+                result.append(
+                    ThinkingCompleted(len(output), RedactedThinkingBlock(carrier))
+                )
         self.finished = True
         self.cacheable = status == "completed"
         reason = "end_turn"
@@ -396,26 +409,4 @@ class EventTranslator:
         return result
 
     def assistant_message(self, *, include_reasoning: bool = False) -> CanonicalMessage:
-        blocks: list[TextBlock | ToolCallBlock | ThinkingBlock] = []
-        for item in self.output:
-            if item["type"] == "message":
-                blocks.extend(
-                    TextBlock(p["text"])
-                    for p in item["content"]
-                    if p["type"] == "output_text"
-                )
-            elif item["type"] == "function_call":
-                blocks.append(
-                    ToolCallBlock(
-                        item["call_id"], item["name"], json.loads(item["arguments"])
-                    )
-                )
-            elif item["type"] == "reasoning" and include_reasoning:
-                blocks.append(
-                    ThinkingBlock(
-                        "".join(s["text"] for s in item["summary"]), "scope-placeholder"
-                    )
-                )
-        if self.refusal:
-            blocks.append(TextBlock(self.refusal))
-        return CanonicalMessage("assistant", tuple(blocks) or (TextBlock(""),))
+        return native_assistant(self.output, include_reasoning=include_reasoning)

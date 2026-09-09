@@ -151,7 +151,11 @@ class TurnLease:
                 )
             self.diagnostics.pop("upstream_request_id", None)
             translator = EventTranslator(credential.account_id, self.request)
-            replay = self.backend.cache.get(self.request, credential.account_id)
+            replay = (
+                self.backend.cache.get(self.request, credential.account_id)
+                if self.request.dialect == "openai"
+                else None
+            )
             body = build_body(self.request, credential.account_id, replay)
             headers = {
                 "Authorization": f"Bearer {credential.access_token}",
@@ -212,7 +216,11 @@ class TurnLease:
                         self.diagnostics["category"] = (
                             "completed" if translator.cacheable else "incomplete"
                         )
-                        if translator.cacheable and not self._aborted:
+                        if (
+                            translator.cacheable
+                            and not self._aborted
+                            and self.request.dialect == "openai"
+                        ):
                             self.backend.cache.put(
                                 self.request,
                                 credential.account_id,

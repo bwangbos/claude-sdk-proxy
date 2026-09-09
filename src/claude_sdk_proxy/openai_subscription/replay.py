@@ -18,11 +18,14 @@ from claude_sdk_proxy.domain import (
     CanonicalMessage,
     RedactedThinkingBlock,
     RequestValidationError,
+    TextBlock,
     TextRequest,
     ThinkingBlock,
+    ToolCallBlock,
 )
 
 PREFIX = "openai-subscription:v1:"
+ASSISTANT_PREFIX = "openai-subscription:assistant:v1:"
 MAX_SIGNATURE_BYTES = 1024 * 1024
 MAX_CACHE_BYTES = 64 * 1024 * 1024
 
@@ -201,6 +204,140 @@ def envelope_scope(
     ordered summaries into separate channels. Never include opaque signatures.
     """
     return _key(request, account, messages, include_summaries=True).hex()
+
+
+def native_assistant(
+    output: list[dict[str, Any]], *, include_reasoning: bool = False
+) -> CanonicalMessage:
+    """Visible projection shared by the producer and portable replay validator."""
+    blocks: list[TextBlock | ToolCallBlock | ThinkingBlock] = []
+    refusals: list[str] = []
+    for item in output:
+        if item["type"] == "message":
+            for part in item["content"]:
+                if part["type"] == "output_text":
+                    blocks.append(TextBlock(part["text"]))
+                elif part["type"] == "refusal":
+                    refusals.append(part["refusal"])
+        elif item["type"] == "function_call":
+            blocks.append(
+                ToolCallBlock(
+                    item["call_id"], item["name"], json.loads(item["arguments"])
+                )
+            )
+        elif item["type"] == "reasoning" and include_reasoning:
+            blocks.append(
+                ThinkingBlock(
+                    "".join(s["text"] for s in item["summary"]), "scope-placeholder"
+                )
+            )
+    if refusals:
+        blocks.append(TextBlock("".join(refusals)))
+    return CanonicalMessage("assistant", tuple(blocks) or (TextBlock(""),))
+
+
+def encode_assistant(
+    output: list[dict[str, Any]], account: str, model: str, *, scope: str
+) -> str | None:
+    """One bounded portable carrier, not a copy in every thinking signature."""
+    raw = packed(
+        {
+            "v": 1,
+            "provider": "openai-subscription",
+            "account": account_scope(account),
+            "model": model,
+            "scope": scope,
+            "output": output,
+        }
+    )
+    if len(raw) * 4 // 3 + len(ASSISTANT_PREFIX) + 4 > MAX_SIGNATURE_BYTES:
+        return None
+    return ASSISTANT_PREFIX + base64.urlsafe_b64encode(raw).decode()
+
+
+def decode_assistant(
+    signature: str,
+    request: TextRequest,
+    account: str,
+    boundary: tuple[CanonicalMessage, ...],
+) -> list[dict[str, Any]] | None:
+    """Malformed, obsolete and incompatible carriers all fail open to visibility."""
+    if (
+        not signature.startswith(ASSISTANT_PREFIX)
+        or len(signature) > MAX_SIGNATURE_BYTES
+    ):
+        return None
+    try:
+        value = json.loads(
+            base64.b64decode(
+                signature[len(ASSISTANT_PREFIX) :], altchars=b"-_", validate=True
+            )
+        )
+        if not isinstance(value, dict) or set(value) != {
+            "v",
+            "provider",
+            "account",
+            "model",
+            "scope",
+            "output",
+        }:
+            return None
+        expected = envelope_scope(request, account, boundary)
+        if (
+            type(value["v"]) is not int
+            or value["v"] != 1
+            or value["provider"] != "openai-subscription"
+            or value["account"] != account_scope(account)
+            or value["model"] != request.model
+            or value["scope"] != expected
+        ):
+            return None
+        output = value["output"]
+        if not isinstance(output, list) or len(output) > 1024:
+            return None
+        for item in output:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                return None
+            kind = item.get("type")
+            if kind == "reasoning":
+                if not valid_reasoning(item):
+                    return None
+            elif kind == "message":
+                if (
+                    item.get("role") != "assistant"
+                    or item.get("phase") not in {None, "commentary", "final_answer"}
+                    or not isinstance(item.get("content"), list)
+                ):
+                    return None
+                for part in item["content"]:
+                    if not isinstance(part, dict) or not (
+                        (
+                            part.get("type") == "output_text"
+                            and isinstance(part.get("text"), str)
+                        )
+                        or (
+                            part.get("type") == "refusal"
+                            and isinstance(part.get("refusal"), str)
+                        )
+                    ):
+                        return None
+            elif kind == "function_call":
+                if (
+                    not isinstance(item.get("call_id"), str)
+                    or not isinstance(item.get("name"), str)
+                    or not isinstance(item.get("arguments"), str)
+                    or not isinstance(json.loads(item["arguments"]), dict)
+                ):
+                    return None
+            else:
+                return None
+        # Even a caller-edited carrier may not override visible text/calls.
+        projected = boundary[:-1] + (native_assistant(output, include_reasoning=True),)
+        return (
+            output if envelope_scope(request, account, projected) == expected else None
+        )
+    except ValueError, TypeError, KeyError, RecursionError:
+        return None
 
 
 class ReplayCache:

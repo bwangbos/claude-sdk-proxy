@@ -15,7 +15,14 @@ from claude_sdk_proxy.domain import (
     ToolResultBlock,
 )
 
-from .replay import decode_reasoning, envelope_scope, packed, plain
+from .replay import (
+    ASSISTANT_PREFIX,
+    decode_assistant,
+    decode_reasoning,
+    envelope_scope,
+    packed,
+    plain,
+)
 
 MODELS = ("gpt-6-astra", "gpt-5.6-sol")
 EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -58,6 +65,19 @@ def translate_messages(
     for index, message in enumerate(request.messages):
         if only_last and index != len(request.messages) - 1:
             continue
+        carriers = [
+            b.data
+            for b in message.blocks
+            if isinstance(b, RedactedThinkingBlock)
+            and b.data.startswith(ASSISTANT_PREFIX)
+        ]
+        if message.role == "assistant" and len(carriers) == 1:
+            native = decode_assistant(
+                carriers[0], request, account, request.messages[: index + 1]
+            )
+            if native is not None:
+                result.extend(native)
+                continue
         parts: list[dict[str, Any]] = []
 
         def flush() -> None:
