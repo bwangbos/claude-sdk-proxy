@@ -883,9 +883,10 @@ uv run pytest -q -m 'not live'
 ```
 
 The [rename verification record](docs/verification/2026-09-09-quaylet-rename.md)
-discloses the existing reset/domain test failure and fork warnings in that
-broader inventory; do not interpret the narrower Make targets as proof that
-every collected test passes.
+records an earlier stale reset/domain test failure, since corrected to accept
+consecutive user messages, and existing fork warnings in that broader inventory.
+Do not interpret the narrower Make targets as proof that every collected test
+passes.
 
 Claude live subscription tests remain separate and explicit:
 

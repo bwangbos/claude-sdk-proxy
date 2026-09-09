@@ -88,14 +88,31 @@ def test_canonical_request_rejects_an_invalid_tool_name() -> None:
     assert str(error.value) == "tool name is invalid"
 
 
-def test_text_request_requires_alternating_messages_ending_in_user() -> None:
-    with pytest.raises(ValueError, match="alternate"):
+def test_text_request_preserves_consecutive_user_messages() -> None:
+    request = TextRequest(
+        model="sonnet",
+        system="",
+        messages=(
+            CanonicalMessage.user_text("one"),
+            CanonicalMessage.user_text("two"),
+        ),
+        max_tokens=1024,
+        stream=False,
+        include_usage=False,
+    )
+
+    assert [message.require_text() for message in request.messages] == ["one", "two"]
+    assert request.next_prompt == "two"
+
+
+def test_text_request_requires_history_to_end_with_user() -> None:
+    with pytest.raises(ValueError, match="must end with a user message"):
         TextRequest(
             model="sonnet",
             system="",
             messages=(
-                CanonicalMessage("user", "one"),
-                CanonicalMessage("user", "two"),
+                CanonicalMessage.user_text("one"),
+                CanonicalMessage.assistant_text("two"),
             ),
             max_tokens=1024,
             stream=False,
