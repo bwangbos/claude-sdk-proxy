@@ -1,4 +1,4 @@
-# Claude Agent SDK gateway and historical probes
+# Quaylet Claude gateway reference and historical probes
 
 This package ships a single-user localhost text/image-and-caller-tool gateway
 and retains the earlier trusted-local feasibility probes as historical comparator
@@ -28,7 +28,7 @@ Install the locked dependencies and launch the default model on loopback:
 
 ```bash
 uv sync --dev
-uv run claude-proxy --model sonnet-5
+uv run quaylet --model sonnet-5
 ```
 
 The server listens at `http://127.0.0.1:8317`. It exposes
@@ -53,7 +53,7 @@ turn with:
 ```bash
 curl http://127.0.0.1:8317/v1/messages \
   -H 'Content-Type: application/json' \
-  -H 'X-Claude-Proxy-Session: example-anthropic' \
+  -H 'X-Quaylet-Session: example-anthropic' \
   -d '{
     "model":"sonnet-5",
     "max_tokens":256,
@@ -83,7 +83,7 @@ For OpenAI Chat Completions, the equivalent first request is:
 ```bash
 curl http://127.0.0.1:8317/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-Claude-Proxy-Session: example-openai' \
+  -H 'X-Quaylet-Session: example-openai' \
   -d '{
     "model":"sonnet-5",
     "messages":[{"role":"user","content":"Use lookup once for Boston."}],
@@ -168,7 +168,7 @@ Start the three-model proxy in one terminal (stop any existing server on that po
 first), then start Pi in another terminal with its ordinary tool set enabled:
 
 ```bash
-uv run claude-proxy --model sonnet-5 --model opus-5 --model opus-4.8
+uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8
 pi --provider claude-subscription-local --model sonnet-5
 ```
 
@@ -195,7 +195,7 @@ limits, request IDs, and opt-in diagnostic logging.
 
 Most clients can use transcript matching without a custom header. A client that
 can set per-conversation headers may send a unique
-`X-Claude-Proxy-Session: <id>` to distinguish independent conversations that
+`X-Quaylet-Session: <id>` to distinguish independent conversations that
 begin with identical text. Never configure one static value globally: that
 would collapse all conversations into one lineage.
 
@@ -204,7 +204,7 @@ would collapse all conversations into one lineage.
 Strict fidelity is the default (`--refusal-fallback off`). To opt in to the
 native Opus 5 → Opus 4.8 classifier fallback, configure both models and use
 `--refusal-fallback auto`, or override one request with
-`X-Claude-Proxy-Refusal-Fallback: auto`. The header accepts exactly `off` or
+`X-Quaylet-Refusal-Fallback: auto`. The header accepts exactly `off` or
 `auto`, once; invalid/repeated values or an unavailable target reject the request
 before generation. This is not overload retry or an arbitrary model router.
 
@@ -214,8 +214,8 @@ at most 64 MiB of normalized payload per response, not a total process-memory
 bound. Strict mode streams incrementally after validated model identity.
 
 Successful JSON/SSE uses the canonical actual model. Responses include
-`X-Claude-Proxy-Requested-Model` and `X-Claude-Proxy-Actual-Model`, plus
-`X-Claude-Proxy-Fallback: true` after a validated downgrade. Exact retained
+`X-Quaylet-Requested-Model` and `X-Quaylet-Actual-Model`, plus
+`X-Quaylet-Fallback: true` after a validated downgrade. Exact retained
 replays keep their original metadata. Known-session rebasing or thinking-only
 changes preserve the active model when the requested model/policy are unchanged;
 completed model/policy changes clear that provenance. Fresh imports after
@@ -331,7 +331,7 @@ app, the installed Agent SDK, and a stock Pi agent. It never inspects
 credentials. Run it from the normal authenticated host context:
 
 ```bash
-CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet-5 \
+QUAYLET_LIVE=1 QUAYLET_LIVE_MODEL=sonnet-5 \
   .venv/bin/pytest -q --strict-markers --forbid-skips -W error \
   tests/live/test_gateway_text.py tests/live/test_gateway_tools.py \
   tests/live/test_gateway_images.py
@@ -356,7 +356,8 @@ its Agent SDK 0.2.148 pin, and its negative Phase 0 verdict. It is retained for
 audit history and is not the launch or verification contract for the current
 Agent SDK 0.2.152 gateway above. In particular,
 `RUN_LIVE_CLAUDE_TESTS=1` is the legacy probe opt-in; current gateway live tests
-use `CLAUDE_PROXY_LIVE=1` plus `CLAUDE_PROXY_LIVE_MODEL`.
+use `QUAYLET_LIVE=1` plus `QUAYLET_LIVE_MODEL`. The archived commands below
+retain their historical names and apply only to their original revision.
 
 Legacy live subscription checks are opt-in and require
 `RUN_LIVE_CLAUDE_TESTS=1`. They must stop if the legacy policy evidence is

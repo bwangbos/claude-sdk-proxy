@@ -1,12 +1,15 @@
-# Documentation
+# Quaylet documentation
 
 ## Current usage and verification
 
 - [Opt-in direct ChatGPT backend](openai-subscription.md): login, exact models,
   fixed endpoint and billing boundary, replay/reasoning limitations, usage,
   diagnostics, and the explicitly gated live battery.
-- [Direct ChatGPT verification checkpoint](verification/2026-09-08-openai-subscription.md):
-  deterministic evidence and explicitly unverified live gates.
+- [Direct ChatGPT live follow-up](verification/2026-09-08-openai-live.md):
+  bounded Astra/Sol, tools, image-bearing results, compaction, cancellation,
+  accounting, and stock Pi evidence, with explicit limitations.
+- [Earlier direct ChatGPT checkpoint](verification/2026-09-08-openai-subscription.md):
+  deterministic evidence before the live follow-up.
 
 - [Opus 4.8 vision verification](research/2026-09-07-opus-4-8-vision-verification.md):
   direct images and image tool results through both APIs, image-history rebasing,
@@ -52,3 +55,5 @@ future Claude behavior or model availability.
 Historical observations and failed probes are retained rather than rewritten
 as successes. For current behavior, use the root README, gateway reference,
 and the implementation/tests at the revision you are running.
+Historical documents also retain the pre-Quaylet project, command, and header
+names. Those are not aliases in the current clean-cut rename.

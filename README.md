@@ -1,4 +1,6 @@
-# Claude SDK Proxy
+# Quaylet
+
+**Your subscriptions. Your harness.**
 
 An MIT-licensed, local HTTP compatibility gateway for OpenAI- and
 Anthropic-compatible agent harnesses. The default backend uses the Claude login
@@ -10,11 +12,11 @@ configured provider backend, and returns standard streaming or non-streaming
 responses. The calling harness remains responsible for executing its own tools.
 
 > [!IMPORTANT]
-> This is an experimental, single-user local tool. It is not an Anthropic
+> This is an experimental, single-user local tool. It is not an Anthropic or OpenAI
 > product, not a drop-in implementation of every OpenAI or Anthropic feature,
 > and not intended to be exposed as a public or multi-user service. Use it in a
-> way that complies with the terms governing your Claude account and the Agent
-> SDK.
+> way that complies with the terms governing your accounts and the runtimes or
+> transports you use. Supporting an integration is not provider endorsement.
 
 ## What works
 
@@ -43,7 +45,7 @@ Pi or another agent harness
         │
         │ OpenAI Chat Completions or Anthropic Messages
         ▼
-Claude SDK Proxy on 127.0.0.1
+Quaylet on 127.0.0.1
         ├── default: Claude Agent SDK → existing Claude login
         └── opt-in: fixed ChatGPT subscription SSE endpoint → proxy-owned login
 ```
@@ -80,8 +82,8 @@ CLI version. Keep the locked SDK dependency when reproducing runtime behavior.
 
 For the separate direct ChatGPT backend, read the
 [opt-in guide](docs/openai-subscription.md). Its new login, exact model IDs,
-fixed unofficial endpoint, account-limit/credit boundary, and unverified live
-gates do not change or replace this default Claude setup.
+fixed unofficial endpoint, account-limit/credit boundary, and bounded live
+verification do not change or replace this default Claude setup.
 
 ## Quick start
 
@@ -89,10 +91,10 @@ Clone the repository, install the locked dependencies, and start the default
 `sonnet-5` model:
 
 ```bash
-git clone https://github.com/bwangbos/claude-sdk-proxy.git
-cd claude-sdk-proxy
+git clone https://github.com/bwangbos/quaylet.git
+cd quaylet
 uv sync --dev
-uv run claude-proxy --model sonnet-5
+uv run quaylet --model sonnet-5
 ```
 
 The server listens on `http://127.0.0.1:8317` by default. In another terminal:
@@ -107,6 +109,26 @@ Expected health response:
 ```json
 {"status":"ok"}
 ```
+
+## Renamed from Claude SDK Proxy
+
+Quaylet is a clean-cut rename: the Python package and command are `quaylet`,
+and custom HTTP headers use `X-Quaylet-*`. The old commands, Python imports,
+and custom header names are not compatibility aliases. The standard
+`/v1/chat/completions`, `/v1/messages`, `/v1/models`, and `/health` routes,
+port 8317, and model IDs are unchanged.
+
+Existing clones can keep their directory name. Update the remote and install
+the revision you intend to run with `uv sync --dev`:
+
+```bash
+git remote set-url origin https://github.com/bwangbos/quaylet.git
+```
+
+Update any launch scripts and custom headers you maintain. Claude continues
+to use its existing managed login. ChatGPT credentials now live under
+`~/.config/quaylet/`; see the [login guide](docs/openai-subscription.md#login-and-startup).
+Historical reports retain the names and commands used at their recorded revision.
 
 ## Configure Pi
 
@@ -301,7 +323,7 @@ Start the proxy with the three advertised pinned models, then start Pi with its
 ordinary tools:
 
 ```bash
-uv run claude-proxy --model sonnet-5 --model opus-5 --model opus-4.8
+uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8
 pi --provider claude-subscription-local --model sonnet-5
 ```
 
@@ -331,7 +353,7 @@ OpenAI's default display mode may omit one.
 
 Model and effort can change only after a completed assistant answer. Keep the
 API dialect, system prompt, and tool definitions fixed, and never switch while
-tool results are still pending. Pi needs no fixed `X-Claude-Proxy-Session`
+tool results are still pending. Pi needs no fixed `X-Quaylet-Session`
 header; the proxy recognizes its exact replay shape while retaining native
 signed history. The deterministic integration suite verifies Sonnet/high to
 Opus/low, another unchanged Opus turn, and a switch back to Sonnet/high through
@@ -495,7 +517,7 @@ lists canonical configured names once, not every model available to the account.
 Classifier-refusal fallback is off by default. Enable the observed, bounded
 Opus 5 to Opus 4.8 native route with `--refusal-fallback auto`; both models must
 be in the server allowlist. A request can override the server setting with
-`X-Claude-Proxy-Refusal-Fallback: off` or `auto`. An invalid or repeated header
+`X-Quaylet-Refusal-Fallback: off` or `auto`. An invalid or repeated header
 is HTTP 400. This control is transport metadata and is never added to prompts.
 The feature is separate from overload fallback, which remains unconfigured.
 Keep the requested model and policy unchanged when submitting tool results,
@@ -505,7 +527,7 @@ Sonnet 5 or Opus 4.8 requests, `auto` still buffers but adds no fallback route.
 ```bash
 curl http://127.0.0.1:8317/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H 'X-Claude-Proxy-Refusal-Fallback: auto' \
+  -H 'X-Quaylet-Refusal-Fallback: auto' \
   -d '{"model":"opus-5","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
@@ -518,9 +540,9 @@ payload is limited to 64 MiB per response; exceeding it fails with
 `fallback_buffer_limit`, publishes no buffered output, and closes the session.
 This is a payload ceiling, not a bound on total process memory.
 
-Successful responses include `X-Claude-Proxy-Requested-Model` and
-`X-Claude-Proxy-Actual-Model`; responses served after a validated switch also
-include `X-Claude-Proxy-Fallback: true`. Body and SSE `model` fields name the
+Successful responses include `X-Quaylet-Requested-Model` and
+`X-Quaylet-Actual-Model`; responses served after a validated switch also
+include `X-Quaylet-Fallback: true`. Body and SSE `model` fields name the
 canonical actual model. These fields and headers are retained on exact replay
 and on later responses recovered from the same live downgraded session. Replay
 is bounded to the existing in-memory live-session cache; it is not durable and
@@ -630,7 +652,7 @@ transcript matching without custom headers. If a client supports a unique
 per-conversation header, it may send:
 
 ```http
-X-Claude-Proxy-Session: conversation-specific-id
+X-Quaylet-Session: conversation-specific-id
 ```
 
 The proxy returns this header on admitted responses, and clients may send the
@@ -662,7 +684,7 @@ history or missing results on its own.
 ## Server options
 
 ```text
-uv run claude-proxy \
+uv run quaylet \
   [--host 127.0.0.1] \
   [--port 8317] \
   [--model MODEL]... \
@@ -687,7 +709,7 @@ uv run claude-proxy \
 Example with all pinned models and opt-in fallback:
 
 ```bash
-uv run claude-proxy --model sonnet-5 --model opus-5 --model opus-4.8 \
+uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8 \
   --refusal-fallback auto --max-sessions 16
 ```
 
@@ -699,7 +721,7 @@ The provider entry does not start the gateway. Run the following in a separate
 terminal and confirm `/health` responds:
 
 ```bash
-uv run claude-proxy --model sonnet-5 --model opus-5 --model opus-4.8
+uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8
 ```
 
 ### Pi returns `param: "tools"`
@@ -732,7 +754,7 @@ session header when the requests actually belong to different conversations.
 Every HTTP response includes an `X-Request-ID`. For opt-in diagnostics:
 
 ```bash
-uv run claude-proxy --model sonnet-5 --log proxy.jsonl --log-json
+uv run quaylet --model sonnet-5 --log proxy.jsonl --log-json
 ```
 
 `--log PATH` appends readable metadata by default; add `--log-json` for JSON lines.
@@ -797,7 +819,7 @@ make check
 Claude live subscription tests remain separate and explicit:
 
 ```bash
-CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet-5 \
+QUAYLET_LIVE=1 QUAYLET_LIVE_MODEL=sonnet-5 \
   .venv/bin/pytest -q --strict-markers --forbid-skips -W error \
   tests/live/test_gateway_text.py tests/live/test_gateway_tools.py
 ```

@@ -17,23 +17,31 @@ enforce the account's subscription or credit policy.
 
 ## Login and startup
 
+Quaylet stores its own OAuth credentials in `~/.config/quaylet/`, with a private
+directory and owner-only credential file. It does not read Pi or Codex credentials.
+The earlier `~/.config/claude-sdk-proxy/` location is no longer consulted.
+If upgrading, stop any process using the old credential store before moving
+that directory to the new name; never overwrite an existing destination or
+copy refresh tokens into two active stores. Alternatively, log in explicitly
+at the new location. The proxy does not perform automatic migration.
+
 Create a proxy-owned login explicitly; serving never opens a browser:
 
 ```bash
-uv run claude-proxy login openai
-uv run claude-proxy auth-status openai
+uv run quaylet login openai
+uv run quaylet auth-status openai
 ```
 
 Status output contains no access or refresh token. Logout is likewise explicit:
 
 ```bash
-uv run claude-proxy logout openai
+uv run quaylet logout openai
 ```
 
 After login, expose one or both exact model IDs:
 
 ```bash
-uv run claude-proxy --model gpt-6-astra --model gpt-5.6-sol
+uv run quaylet --model gpt-6-astra --model gpt-5.6-sol
 ```
 
 They use the existing Chat Completions and Anthropic Messages frontend paths.
@@ -79,7 +87,7 @@ reported separately and is not added twice.
 Use the existing redacted diagnostics controls, for example:
 
 ```bash
-uv run claude-proxy --model gpt-6-astra --log proxy.jsonl --log-json
+uv run quaylet --model gpt-6-astra --log proxy.jsonl --log-json
 ```
 
 Logs include safe categories and request IDs, never credential values, prompts,
@@ -97,7 +105,7 @@ bounded live battery in another:
 
 ```bash
 # Terminal 1
-uv run claude-proxy --port 8318 --model gpt-6-astra --model gpt-5.6-sol
+uv run quaylet --port 8318 --model gpt-6-astra --model gpt-5.6-sol
 
 # Terminal 2
 OPENAI_SUBSCRIPTION_LIVE=1 \
