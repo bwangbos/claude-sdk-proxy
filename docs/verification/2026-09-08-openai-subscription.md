@@ -35,8 +35,10 @@ No Task 4 direct-ChatGPT live test was run. In particular, this checkpoint does
 not establish current authorization for the unofficial endpoint, model access,
 included-plan accounting or credit behavior, actual tool/image/reasoning output,
 live compaction, provider-side cancellation/billing cessation, or real OpenAI
-stock-Pi compatibility. The local cancellation scaffold can observe proxy-owned
-HTTP/task cleanup only. No latency or performance claim is made.
+stock-Pi compatibility. When later run with explicit opt-in, the cancellation
+probe can observe closure of the real local upstream HTTP connection and
+proxy-owned task cleanup, but not provider-side compute or billing. No latency
+or performance claim is made.
 
 After the operator explicitly completes `uv run claude-proxy login openai`, the
 reproduction commands are:

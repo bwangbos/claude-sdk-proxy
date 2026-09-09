@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 
 import httpx
@@ -125,56 +126,26 @@ def test_tool_round_image_and_compacted_continuation(
     assert compacted_answer.strip().lower() == "red|unknown"
 
 
-@pytest.mark.parametrize("model", MODELS)
-def test_external_client_disconnect_keeps_server_responsive(
-    openai_live_client: httpx.Client, model: str
-):
-    with openai_live_client.stream(
-        "POST",
-        "/v1/chat/completions",
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": "Count slowly to 1000."}],
-            "max_tokens": 2048,
-            "stream": True,
-        },
-    ) as response:
-        assert response.status_code == 200, response.read().decode()
-        first_data = next(
-            line for line in response.iter_lines() if line.startswith("data:")
-        )
-        assert first_data
-    health = openai_live_client.get("/health")
-    assert health.status_code == 200
-
-
 @pytest.mark.anyio
-async def test_client_disconnect_closes_local_upstream_and_releases_turn(
+async def test_real_upstream_disconnect_closes_connection_and_releases_turn(
     openai_live_opt_in: None,
 ):
     del openai_live_opt_in
     from claude_sdk_proxy.openai_subscription.backend import Backend
     from tests.integration.pi_gateway_support import serve
-    from tests.openai_subscription.test_backend import Auth, Bytes, sse, text_item
+    from tests.live_openai.transport_observer import ObservedAsyncTransport
     from tests.openai_subscription.test_http import body, create_app
 
-    upstream = Bytes(
-        sse(
-            {
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {**text_item(), "content": []},
-            },
-            {"type": "response.output_text.delta", "output_index": 0, "delta": "hi"},
-        ),
-        hang=True,
+    transport = ObservedAsyncTransport(
+        httpx.AsyncHTTPTransport(), observed_host="chatgpt.com"
     )
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, stream=upstream)
-        )
-    ) as upstream_client:
-        backend = Backend(Auth(), client=upstream_client)
+    upstream_client = httpx.AsyncClient(
+        transport=transport,
+        timeout=httpx.Timeout(120.0, connect=15.0),
+        follow_redirects=False,
+    )
+    backend = Backend(client=upstream_client, timeout=120.0)
+    try:
         app = create_app(models=("gpt-6-astra",), subscription_backend=backend)
         async with serve(app) as base_url:
             async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
@@ -183,12 +154,23 @@ async def test_client_disconnect_closes_local_upstream_and_releases_turn(
                 ) as response:
                     assert response.status_code == 200
                     async for line in response.aiter_lines():
-                        if line.startswith("data:") and "hi" in line:
+                        if not line.startswith("data: {"):
+                            continue
+                        frame = json.loads(line[6:])
+                        choices = frame.get("choices") or []
+                        if choices and choices[0].get("delta", {}).get("content"):
                             break
-            async with asyncio.timeout(2):
-                while not upstream.closed or backend._leases:
+                    else:
+                        pytest.fail("upstream completed before visible content")
+            async with asyncio.timeout(5):
+                while not transport.closed.is_set() or backend._leases:
                     await asyncio.sleep(0.01)
             assert backend.cache.bytes_used == 0
+            assert transport.opened.is_set()
+            assert transport.active == 0
+    finally:
+        await backend.close()
+        await upstream_client.aclose()
 
 
 def test_stock_pi_anthropic_smoke(openai_live_base_url: str, tmp_path):

@@ -107,8 +107,10 @@ Use another unused loopback port if 8318 is occupied, and set both the server's
 two-minute HTTP deadlines, checks requested routing plus observed upstream model
 identity, both models, effort, usage, tool/image continuation, compacted-history
 answers, client disconnect, and a stock Pi smoke using only a temporary
-`PI_CODING_AGENT_DIR`. A test-owned local probe verifies that disconnect closes
-the upstream HTTP stream, releases the active lease, and creates no replay entry.
-Provider-side billing cessation after cancellation is not observable from this
-proxy and is not claimed. The battery does not edit `~/.pi`, activate a service,
-or make performance claims.
+`PI_CODING_AGENT_DIR`. After explicit opt-in, a test-owned ephemeral loopback app
+uses the proxy-owned login and real fixed upstream endpoint; an instrumented
+`httpx.AsyncHTTPTransport` observes that disconnect closes the actual local
+upstream connection, releases the active lease, and creates no replay entry.
+Provider-side compute or billing cessation after connection close is not
+observable from this proxy and is not claimed. The battery does not edit
+`~/.pi`, activate a service, or make performance claims.
