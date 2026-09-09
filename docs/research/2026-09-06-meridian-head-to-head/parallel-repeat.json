@@ -1,0 +1,674 @@
+[
+  {
+    "project": "ours",
+    "case": "parallel_tools",
+    "passed": true,
+    "parallel": true,
+    "status": 200,
+    "seconds": 3.52,
+    "response": {
+      "id": "chatcmpl_791b40e29d9047fcaaa5c20f6188a055",
+      "object": "chat.completion",
+      "created": 0,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_mI7bHE4YB_FqMhK_fbgPUhyH",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"alpha\"}"
+                }
+              },
+              {
+                "id": "call_pfd-8IxwIoTyymXTpn1R8FaQ",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"beta\"}"
+                }
+              }
+            ]
+          },
+          "logprobs": null,
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 789,
+        "completion_tokens": 120,
+        "total_tokens": 909
+      }
+    },
+    "continuation_status": 200,
+    "continuation": {
+      "id": "chatcmpl_fe169af320e34b47b8c6c36d194bd278",
+      "object": "chat.completion",
+      "created": 0,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "alpha=A-bb455096;beta=B-1aae1da4"
+          },
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 2,
+        "completion_tokens": 24,
+        "total_tokens": 26
+      }
+    },
+    "submitted_messages": [
+      {
+        "role": "user",
+        "content": "Call lookup for alpha and beta in parallel in this response. Do not guess their values. After receiving both results, output alpha=value;beta=value. Run H2H-a53c21ba63"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_mI7bHE4YB_FqMhK_fbgPUhyH",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"alpha\"}"
+            }
+          },
+          {
+            "id": "call_pfd-8IxwIoTyymXTpn1R8FaQ",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"beta\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_pfd-8IxwIoTyymXTpn1R8FaQ",
+        "content": "B-1aae1da4"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_mI7bHE4YB_FqMhK_fbgPUhyH",
+        "content": "A-bb455096"
+      }
+    ]
+  },
+  {
+    "project": "ours",
+    "case": "parallel_tools",
+    "passed": true,
+    "parallel": true,
+    "status": 200,
+    "seconds": 4.248,
+    "response": {
+      "id": "chatcmpl_64c76388ca4e4317a1ea09afcb373bc0",
+      "object": "chat.completion",
+      "created": 0,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_7KQPla6L2vb_K8rLk_QGyb6Z",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"alpha\"}"
+                }
+              },
+              {
+                "id": "call_if1SVJ4n1hWCo6EwbqLrsfrs",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"beta\"}"
+                }
+              }
+            ]
+          },
+          "logprobs": null,
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 788,
+        "completion_tokens": 120,
+        "total_tokens": 908
+      }
+    },
+    "continuation_status": 200,
+    "continuation": {
+      "id": "chatcmpl_a78591aba58e44689e8b6518edc1f832",
+      "object": "chat.completion",
+      "created": 0,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "alpha=A-6421d77e;beta=B-1ca07534"
+          },
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 2,
+        "completion_tokens": 24,
+        "total_tokens": 26
+      }
+    },
+    "submitted_messages": [
+      {
+        "role": "user",
+        "content": "Call lookup for alpha and beta in parallel in this response. Do not guess their values. After receiving both results, output alpha=value;beta=value. Run H2H-f7828029d3"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_7KQPla6L2vb_K8rLk_QGyb6Z",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"alpha\"}"
+            }
+          },
+          {
+            "id": "call_if1SVJ4n1hWCo6EwbqLrsfrs",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"beta\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_if1SVJ4n1hWCo6EwbqLrsfrs",
+        "content": "B-1ca07534"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_7KQPla6L2vb_K8rLk_QGyb6Z",
+        "content": "A-6421d77e"
+      }
+    ]
+  },
+  {
+    "project": "ours",
+    "case": "parallel_tools",
+    "passed": true,
+    "parallel": true,
+    "status": 200,
+    "seconds": 3.859,
+    "response": {
+      "id": "chatcmpl_af69e98758204969a263d7d5d14a40f9",
+      "object": "chat.completion",
+      "created": 0,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_RuvQffXKsE_v9AOGIMaITRMq",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"alpha\"}"
+                }
+              },
+              {
+                "id": "call_LMYXxu6VYnYgPnmQwaAkWKFx",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"beta\"}"
+                }
+              }
+            ]
+          },
+          "logprobs": null,
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 789,
+        "completion_tokens": 120,
+        "total_tokens": 909
+      }
+    },
+    "continuation_status": 200,
+    "continuation": {
+      "id": "chatcmpl_30d5ee24f3e64e00ab949907efb8baea",
+      "object": "chat.completion",
+      "created": 0,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "alpha=A-0e343129;beta=B-f2cead84"
+          },
+          "logprobs": null,
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 2,
+        "completion_tokens": 23,
+        "total_tokens": 25
+      }
+    },
+    "submitted_messages": [
+      {
+        "role": "user",
+        "content": "Call lookup for alpha and beta in parallel in this response. Do not guess their values. After receiving both results, output alpha=value;beta=value. Run H2H-356fca5e8f"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_RuvQffXKsE_v9AOGIMaITRMq",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"alpha\"}"
+            }
+          },
+          {
+            "id": "call_LMYXxu6VYnYgPnmQwaAkWKFx",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"beta\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_LMYXxu6VYnYgPnmQwaAkWKFx",
+        "content": "B-f2cead84"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_RuvQffXKsE_v9AOGIMaITRMq",
+        "content": "A-0e343129"
+      }
+    ]
+  },
+  {
+    "project": "meridian",
+    "case": "parallel_tools",
+    "passed": false,
+    "parallel": true,
+    "status": 200,
+    "seconds": 5.9879999999999995,
+    "response": {
+      "id": "chatcmpl-7e879257-4f71-47b3-ae40-76179acc06e8",
+      "object": "chat.completion",
+      "created": 1788672637,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "type": "function",
+                "id": "toolu_01GozCdLbi1bNywULCMRa4Qp",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"alpha\"}"
+                }
+              },
+              {
+                "type": "function",
+                "id": "toolu_01N43v6tb4GLeEcBkNJYruy2",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"beta\"}"
+                }
+              }
+            ]
+          },
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 990,
+        "completion_tokens": 122,
+        "total_tokens": 1112,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      }
+    },
+    "continuation_status": 200,
+    "continuation": {
+      "id": "chatcmpl-103aee52-f0d8-401f-9995-fc12303de4bf",
+      "object": "chat.completion",
+      "created": 1788672640,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "alpha=B-d081942a;beta=A-281858c2"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1179,
+        "completion_tokens": 106,
+        "total_tokens": 1285,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 1177
+        }
+      }
+    },
+    "submitted_messages": [
+      {
+        "role": "user",
+        "content": "Call lookup for alpha and beta in parallel in this response. Do not guess their values. After receiving both results, output alpha=value;beta=value. Run H2H-497d0d21c2"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "type": "function",
+            "id": "toolu_01GozCdLbi1bNywULCMRa4Qp",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"alpha\"}"
+            }
+          },
+          {
+            "type": "function",
+            "id": "toolu_01N43v6tb4GLeEcBkNJYruy2",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"beta\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_01N43v6tb4GLeEcBkNJYruy2",
+        "content": "B-d081942a"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_01GozCdLbi1bNywULCMRa4Qp",
+        "content": "A-281858c2"
+      }
+    ]
+  },
+  {
+    "project": "meridian",
+    "case": "parallel_tools",
+    "passed": false,
+    "parallel": true,
+    "status": 200,
+    "seconds": 11.058,
+    "response": {
+      "id": "chatcmpl-95fa3719-ffbd-4082-aba5-5209d1669e75",
+      "object": "chat.completion",
+      "created": 1788672642,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "type": "function",
+                "id": "toolu_013NJAsLHHkBCEkuFm4Ky7i6",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"alpha\"}"
+                }
+              },
+              {
+                "type": "function",
+                "id": "toolu_01U6gAui9MgzjsesnUq9RPGC",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"beta\"}"
+                }
+              }
+            ]
+          },
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 989,
+        "completion_tokens": 121,
+        "total_tokens": 1110,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      }
+    },
+    "continuation_status": 200,
+    "continuation": {
+      "id": "chatcmpl-a0b9f734-8dd0-4318-95c2-1022b01badc0",
+      "object": "chat.completion",
+      "created": 1788672651,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "alpha=B-8daf459b;beta=A-c4240394"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1181,
+        "completion_tokens": 533,
+        "total_tokens": 1714,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 1179
+        }
+      }
+    },
+    "submitted_messages": [
+      {
+        "role": "user",
+        "content": "Call lookup for alpha and beta in parallel in this response. Do not guess their values. After receiving both results, output alpha=value;beta=value. Run H2H-216d5970a7"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "type": "function",
+            "id": "toolu_013NJAsLHHkBCEkuFm4Ky7i6",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"alpha\"}"
+            }
+          },
+          {
+            "type": "function",
+            "id": "toolu_01U6gAui9MgzjsesnUq9RPGC",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"beta\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_01U6gAui9MgzjsesnUq9RPGC",
+        "content": "B-8daf459b"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_013NJAsLHHkBCEkuFm4Ky7i6",
+        "content": "A-c4240394"
+      }
+    ]
+  },
+  {
+    "project": "meridian",
+    "case": "parallel_tools",
+    "passed": false,
+    "parallel": true,
+    "status": 200,
+    "seconds": 5.172,
+    "response": {
+      "id": "chatcmpl-d9b91f39-ae4a-4ad3-927b-377ac5a3e63f",
+      "object": "chat.completion",
+      "created": 1788672653,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "type": "function",
+                "id": "toolu_01FGjVqDofF87T6v6qGxtuJm",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"alpha\"}"
+                }
+              },
+              {
+                "type": "function",
+                "id": "toolu_01LPym66WHQwz3NYvesyDQ1S",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\":\"beta\"}"
+                }
+              }
+            ]
+          },
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 991,
+        "completion_tokens": 108,
+        "total_tokens": 1099,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      }
+    },
+    "continuation_status": 200,
+    "continuation": {
+      "id": "chatcmpl-967e882e-a6ef-49e1-979a-5a86770957ad",
+      "object": "chat.completion",
+      "created": 1788672656,
+      "model": "sonnet",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "alpha=B-6415330e;beta=A-595cba91"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1180,
+        "completion_tokens": 122,
+        "total_tokens": 1302,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 1178
+        }
+      }
+    },
+    "submitted_messages": [
+      {
+        "role": "user",
+        "content": "Call lookup for alpha and beta in parallel in this response. Do not guess their values. After receiving both results, output alpha=value;beta=value. Run H2H-d4d62a4d64"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "type": "function",
+            "id": "toolu_01FGjVqDofF87T6v6qGxtuJm",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"alpha\"}"
+            }
+          },
+          {
+            "type": "function",
+            "id": "toolu_01LPym66WHQwz3NYvesyDQ1S",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"beta\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_01LPym66WHQwz3NYvesyDQ1S",
+        "content": "B-6415330e"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_01FGjVqDofF87T6v6qGxtuJm",
+        "content": "A-595cba91"
+      }
+    ]
+  }
+]

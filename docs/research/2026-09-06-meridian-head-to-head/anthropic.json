@@ -1,0 +1,476 @@
+[
+  {
+    "project": "ours",
+    "case": "import",
+    "passed": true,
+    "status": 200,
+    "seconds": 1.723,
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "H2H-0a47aa87d3"
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_e1926e2565ce4dac869d1f88d9852b4e",
+        "type": "message",
+        "role": "assistant",
+        "model": "sonnet",
+        "content": [
+          {
+            "type": "text",
+            "text": "H2H-0a47aa87d3"
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 309,
+          "output_tokens": 14
+        }
+      }
+    }
+  },
+  {
+    "project": "ours",
+    "case": "parallel_tools",
+    "passed": true,
+    "parallel": true,
+    "status": 200,
+    "seconds": 3.253,
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "toolu_wx3BjMAIq1BsV4eMwr94bsv1",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\": \"alpha\"}"
+                }
+              },
+              {
+                "id": "toolu_A7B0HZYRz8junpF-scsE0Kyx",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\": \"beta\"}"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_f85368d06bd24b8497566aab17b84820",
+        "type": "message",
+        "role": "assistant",
+        "model": "sonnet",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_wx3BjMAIq1BsV4eMwr94bsv1",
+            "name": "lookup",
+            "input": {
+              "key": "alpha"
+            }
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_A7B0HZYRz8junpF-scsE0Kyx",
+            "name": "lookup",
+            "input": {
+              "key": "beta"
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 789,
+          "output_tokens": 120
+        }
+      }
+    },
+    "continuation_status": 200,
+    "continuation": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "alpha=A-6a257a38;beta=B-3c913b33"
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_15b780ca43b64bcf90cf711df0e221ce",
+        "type": "message",
+        "role": "assistant",
+        "model": "sonnet",
+        "content": [
+          {
+            "type": "text",
+            "text": "alpha=A-6a257a38;beta=B-3c913b33"
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 2,
+          "output_tokens": 24
+        }
+      }
+    },
+    "submitted_messages": [
+      {
+        "role": "user",
+        "content": "Call lookup for alpha and beta in parallel in this response. Do not guess their values. After receiving both results, output alpha=value;beta=value. Run H2H-acd4c961d6"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "toolu_wx3BjMAIq1BsV4eMwr94bsv1",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\": \"alpha\"}"
+            }
+          },
+          {
+            "id": "toolu_A7B0HZYRz8junpF-scsE0Kyx",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\": \"beta\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_A7B0HZYRz8junpF-scsE0Kyx",
+        "content": "B-3c913b33"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_wx3BjMAIq1BsV4eMwr94bsv1",
+        "content": "A-6a257a38"
+      }
+    ]
+  },
+  {
+    "project": "ours",
+    "case": "replay",
+    "passed": true,
+    "status": 200,
+    "seconds": 1.562,
+    "replay_seconds": 0.001,
+    "exact_response": false,
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "H2H-a53b6f5c72"
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_43078f86451247dfbcfb56a64e11867a",
+        "type": "message",
+        "role": "assistant",
+        "model": "sonnet",
+        "content": [
+          {
+            "type": "text",
+            "text": "H2H-a53b6f5c72"
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 284,
+          "output_tokens": 14
+        }
+      }
+    },
+    "replay": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "H2H-a53b6f5c72"
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_5b36ea71eef84fe0952ed40d21a0a99d",
+        "type": "message",
+        "role": "assistant",
+        "model": "sonnet",
+        "content": [
+          {
+            "type": "text",
+            "text": "H2H-a53b6f5c72"
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 284,
+          "output_tokens": 14
+        }
+      }
+    }
+  },
+  {
+    "project": "meridian",
+    "case": "import",
+    "passed": true,
+    "status": 200,
+    "seconds": 2.951,
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "H2H-ab4c4ae956"
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_1788672682938",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "H2H-ab4c4ae956"
+          }
+        ],
+        "model": "sonnet",
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 623,
+          "output_tokens": 14,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0
+        }
+      }
+    }
+  },
+  {
+    "project": "meridian",
+    "case": "parallel_tools",
+    "passed": true,
+    "parallel": true,
+    "status": 200,
+    "seconds": 4.807,
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "toolu_01Xjb9w9Tfu9CXq63DXviUPy",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\": \"alpha\"}"
+                }
+              },
+              {
+                "id": "toolu_01V2Eyyecfg8FC7Ru7VQQ2gW",
+                "type": "function",
+                "function": {
+                  "name": "lookup",
+                  "arguments": "{\"key\": \"beta\"}"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_1788672685132",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_01Xjb9w9Tfu9CXq63DXviUPy",
+            "name": "lookup",
+            "input": {
+              "key": "alpha"
+            },
+            "caller": {
+              "type": "direct"
+            }
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_01V2Eyyecfg8FC7Ru7VQQ2gW",
+            "name": "lookup",
+            "input": {
+              "key": "beta"
+            }
+          }
+        ],
+        "model": "sonnet",
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 990,
+          "output_tokens": 121,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0
+        }
+      }
+    },
+    "continuation_status": 200,
+    "continuation": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "alpha=A-b43a5e1f;beta=B-c97555cd"
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_1788672687732",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "alpha=A-b43a5e1f;beta=B-c97555cd"
+          }
+        ],
+        "model": "sonnet",
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 2,
+          "output_tokens": 26,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 1235
+        }
+      }
+    },
+    "submitted_messages": [
+      {
+        "role": "user",
+        "content": "Call lookup for alpha and beta in parallel in this response. Do not guess their values. After receiving both results, output alpha=value;beta=value. Run H2H-16ed15f70a"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "toolu_01Xjb9w9Tfu9CXq63DXviUPy",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\": \"alpha\"}"
+            }
+          },
+          {
+            "id": "toolu_01V2Eyyecfg8FC7Ru7VQQ2gW",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\": \"beta\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_01V2Eyyecfg8FC7Ru7VQQ2gW",
+        "content": "B-c97555cd"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "toolu_01Xjb9w9Tfu9CXq63DXviUPy",
+        "content": "A-b43a5e1f"
+      }
+    ]
+  },
+  {
+    "project": "meridian",
+    "case": "replay",
+    "passed": true,
+    "status": 200,
+    "seconds": 2.313,
+    "replay_seconds": 2.744,
+    "exact_response": false,
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "H2H-441b32703c"
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_1788672690062",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "H2H-441b32703c"
+          }
+        ],
+        "model": "sonnet",
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 474,
+          "output_tokens": 11,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0
+        }
+      }
+    },
+    "replay": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "H2H-441b32703c"
+          }
+        }
+      ],
+      "raw_anthropic": {
+        "id": "msg_1788672692806",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "H2H-441b32703c"
+          }
+        ],
+        "model": "sonnet",
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 474,
+          "output_tokens": 11,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0
+        }
+      }
+    }
+  }
+]
