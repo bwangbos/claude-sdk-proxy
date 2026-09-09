@@ -262,6 +262,7 @@ async def test_sparse_terminal_replays_completed_done_items_in_both_dialects(dia
         "type": "reasoning",
         "id": "rs_native",
         "summary": [{"type": "summary_text", "text": "brief"}],
+        "content": [{"type": "reasoning_text", "text": "private trace"}],
         "encrypted_content": "opaque",
         "status": "completed",
     }

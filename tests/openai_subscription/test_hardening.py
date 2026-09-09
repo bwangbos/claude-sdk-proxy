@@ -19,6 +19,7 @@ from claude_sdk_proxy.openai_subscription.replay import (
     ReplayCache,
     decode_reasoning,
     encode_reasoning,
+    valid_reasoning,
 )
 from claude_sdk_proxy.openai_subscription.translation import build_body
 from tests.fixtures.image_data import solid_png
@@ -90,6 +91,42 @@ def test_envelope_shape_rejects_wrong_version_provider_item_and_extra_fields(cha
     bad = prefix + base64.urlsafe_b64encode(json.dumps(raw).encode()).decode()
     with pytest.raises(RequestValidationError):
         decode_reasoning(bad, "acct", "gpt-6-astra", scope="0" * 64)
+
+
+@pytest.mark.parametrize(
+    "optional",
+    [
+        {"content": None},
+        {"content": [{"type": "reasoning_text", "text": "private trace"}]},
+        {"encrypted_content": None, "status": None},
+    ],
+    ids=["null-content", "reasoning-content", "nullable-fields"],
+)
+def test_reasoning_envelope_preserves_official_optional_fields(optional):
+    item = {"type": "reasoning", "id": "rs_1", "summary": [], **optional}
+    signature = encode_reasoning(item, "acct", "gpt-6-astra", scope="0" * 64)
+    assert decode_reasoning(signature, "acct", "gpt-6-astra", scope="0" * 64) == item
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {},
+        [None],
+        [{"type": "summary_text", "text": "wrong kind"}],
+        [{"type": "reasoning_text"}],
+        [{"type": "reasoning_text", "text": 1}],
+        [{"type": "reasoning_text", "text": "ok", "extra": True}],
+    ],
+)
+def test_reasoning_item_rejects_malformed_content(content):
+    item = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "content": content,
+    }
+    assert not valid_reasoning(item)
 
 
 @pytest.mark.anyio

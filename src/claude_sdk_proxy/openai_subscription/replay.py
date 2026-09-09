@@ -61,7 +61,8 @@ def account_scope(account: str) -> str:
 def valid_reasoning(item: Any) -> bool:
     return (
         isinstance(item, dict)
-        and not set(item) - {"type", "id", "summary", "encrypted_content", "status"}
+        and not set(item)
+        - {"type", "id", "summary", "content", "encrypted_content", "status"}
         and item.get("type") == "reasoning"
         and isinstance(item.get("id"), str)
         and 0 < len(item["id"]) <= 256
@@ -74,11 +75,26 @@ def valid_reasoning(item: Any) -> bool:
             for s in item["summary"]
         )
         and (
+            item.get("content") is None
+            or (
+                isinstance(item["content"], list)
+                and all(
+                    isinstance(content, dict)
+                    and set(content) == {"type", "text"}
+                    and content["type"] == "reasoning_text"
+                    and isinstance(content["text"], str)
+                    for content in item["content"]
+                )
+            )
+        )
+        and (
             "encrypted_content" not in item
+            or item["encrypted_content"] is None
             or isinstance(item["encrypted_content"], str)
         )
         and (
             "status" not in item
+            or item["status"] is None
             or item["status"] in ("in_progress", "completed", "incomplete")
         )
     )
