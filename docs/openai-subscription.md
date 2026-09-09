@@ -159,12 +159,12 @@ The bounded 2026-09-08 execution and its explicit limitations are recorded in
 the [live verification follow-up](verification/2026-09-08-openai-live.md);
 results from that account and date do not establish future or general access.
 After completing the new proxy login, start a separate test-owned proxy on an
-alternate loopback port with both exact models in one terminal and run the
+alternate loopback port with Astra and Sol in one terminal and run the
 bounded live battery in another:
 
 ```bash
 # Terminal 1
-uv run quaylet --port 8318 --model gpt-6-astra --model gpt-5.6-sol
+uv run quaylet --port 8318 --model gpt-6-astra gpt-5.6-sol
 
 # Terminal 2
 OPENAI_SUBSCRIPTION_LIVE=1 \
@@ -175,7 +175,7 @@ OPENAI_SUBSCRIPTION_LIVE=1 \
 Use another unused loopback port if 8318 is occupied, and set both the server's
 `--port` and `OPENAI_SUBSCRIPTION_TEST_BASE_URL` consistently. The battery has
 two-minute HTTP deadlines, checks requested routing plus observed upstream model
-identity, both models, effort, usage, tool/image continuation, compacted-history
+identity, Astra/Sol, effort, usage, tool/image continuation, compacted-history
 answers, client disconnect, and a stock Pi smoke using only a temporary
 `PI_CODING_AGENT_DIR`. After explicit opt-in, a test-owned ephemeral loopback app
 uses the proxy-owned login and real fixed upstream endpoint; an instrumented
@@ -188,3 +188,16 @@ cancellation gate.
 Provider-side compute or billing cessation after connection close is not
 observable from this proxy and is not claimed. The battery does not edit
 `~/.pi`, activate a service, or make performance claims.
+
+`make live-openai` also includes the added-model catalog tests. They create
+in-process Quaylet applications for Terra, Luna, GPT-5.5, and Spark, independently
+of the server on port 8318. They check one tool round, model identity, and usage;
+the three vision models also receive image tool results. To run only these
+four checks, without starting a server:
+
+```bash
+OPENAI_SUBSCRIPTION_LIVE=1 uv run pytest tests/live_openai/test_catalog.py -q
+```
+
+The [catalog evidence](models.md#scope-and-evidence) records their successful
+September 9 run and the distinct Claude quota-related verification gap.

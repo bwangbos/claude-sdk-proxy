@@ -2,7 +2,7 @@
 
 This reference's SDK session, fallback, and parked-tool rules are specific to
 Claude-backed models. For Quaylet's direct ChatGPT backend, use its
-[provider guide](../openai-subscription.md) for Astra/Sol authentication,
+[provider guide](../openai-subscription.md) for ChatGPT authentication,
 reasoning, stateless tool continuation, accounting, and replay behavior.
 
 This package ships a single-user localhost text/image-and-caller-tool gateway
@@ -38,12 +38,15 @@ uv run quaylet --model sonnet-5
 
 The server listens at `http://127.0.0.1:8317`. It exposes
 `POST /v1/chat/completions`, `POST /v1/messages`, `GET /v1/models`, and
-`GET /health`. `--host` accepts loopback IP addresses only. Repeat `--model`
-to expose more than one pinned model. The canonical choices are `sonnet-5`,
-`opus-5`, and `opus-4.8`; legacy `sonnet`/`opus` inputs normalize to version 5.
-There is no default model: server startup requires at least one `--model`.
-`/v1/models` lists only configured canonical names, not the account's full model
-catalog. `--max-sessions` sets the positive retained-session limit and defaults
+`GET /health`. `--host` accepts loopback IP addresses only. Use
+`--model sonnet-5 opus-5 opus-4.8` for a subset, or `--all-models` for the entire
+bundled Claude/ChatGPT catalog. Repeated `--model` flags still work. There is no
+default model: startup requires one of these selection modes.
+`uv run quaylet models` lists all selectable catalog IDs and capabilities offline,
+without login or a server. See the [catalog](../models.md) for per-model thinking,
+image support, and live-verification limits. `/v1/models` instead lists only
+configured canonical names, not the account's full model catalog.
+`--max-sessions` sets the positive retained-session limit and defaults
 to 8.
 `--tool-result-timeout` sets the positive finite number of seconds a suspended
 tool operation can wait for caller results and defaults to `300.0`. Both POST
@@ -174,7 +177,7 @@ Start the three-model proxy in one terminal (stop any existing server on that po
 first), then start Pi in another terminal with its ordinary tool set enabled:
 
 ```bash
-uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8
+uv run quaylet --model sonnet-5 opus-5 opus-4.8
 pi --provider claude-subscription-local --model sonnet-5
 ```
 

@@ -61,6 +61,14 @@ disabled/manual thinking. Other Claude defaults are unchanged. ChatGPT omission
 retains the upstream reasoning default; `none` and `ultra` remain unsupported.
 Codex's `ultra` includes automatic delegation, which Quaylet does not implement.
 
+Pi custom-provider entries must match these capabilities; listing a model in
+Quaylet does not configure Pi. For Fable, use adaptive thinking and map `off`
+and `minimal` to `null` (unavailable), with the five supported efforts mapped
+to themselves. Haiku must not use `forceAdaptiveThinking`; use Anthropic
+Messages for manual-budget thinking. Older Claude 4.6 entries do not accept
+`xhigh`. For ChatGPT mappings and Spark's text-only profile, see the
+[provider guide](openai-subscription.md#pi-and-other-harnesses).
+
 The only verified automatic Claude fallback route remains Opus 5 → Opus 4.8.
 Adding a model does not authorize arbitrary fallback destinations. For model
 validation, use the default `--refusal-fallback off`.
@@ -129,7 +137,9 @@ No running service or Pi configuration was changed by this catalog update.
 
 Offline verification: 2,291 tests passed, 75 live tests deselected, with 44
 existing fork deprecation warnings (75.60 seconds). Ruff and mypy also passed.
-The added live battery increases the live-test count by four. A fresh read-only
-source review found no actionable correctness issues.
+After adding the offline `models` command, the merged `a7a559c` revision passed
+**2,293 offline tests**, with 79 live tests deselected and 44 existing warnings
+(70.21 seconds). Lint and type checks passed. Fresh read-only reviews of the
+catalog and listing command found no actionable correctness issues.
 Formatting passes for all changed Python files; a whole-tree formatting check
 still reports 48 unchanged files. No unrelated formatting was applied.

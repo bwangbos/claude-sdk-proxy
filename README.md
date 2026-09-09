@@ -371,11 +371,11 @@ models support text and image input. Opus 4.8 image inputs, image tool results,
 and the stock Pi Anthropic image workflow are
 [live-verified](docs/research/2026-09-07-opus-4-8-vision-verification.md).
 
-Start the proxy with the three advertised pinned models, then start Pi with its
-ordinary tools:
+Start the proxy with the three pinned models in this Pi example, then start Pi
+with its ordinary tools:
 
 ```bash
-uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8
+uv run quaylet --model sonnet-5 opus-5 opus-4.8
 pi --provider claude-subscription-local --model sonnet-5
 ```
 
@@ -396,12 +396,20 @@ Keep `supportsStrictMode: false` in the provider configuration; Pi otherwise
 adds a tool-definition field outside the
 proxy's supported subset.
 
-Pi's reasoning selector exposes `off`, `low`, `medium`, `high`, `xhigh`, and
-`max`. `off` maps to the OpenAI value `none`; Pi's unsupported `minimal` slot is
+For these Sonnet/Opus entries, Pi's reasoning selector exposes `off`, `low`,
+`medium`, `high`, `xhigh`, and `max`. `off` maps to the OpenAI value `none`;
+Pi's unsupported `minimal` slot is
 hidden by mapping it to `null`. If controls are omitted from an API request,
 thinking remains disabled. An accepted effort does not guarantee a visible
 thinking summary: the backend may return no summary for a simple prompt, and
-OpenAI's default display mode may omit one.
+the OpenAI-compatible frontend may omit one.
+
+These Pi examples are a subset of the full catalog, not the full model list.
+Run `uv run quaylet models` to see other choices. Add their canonical IDs to
+Pi's custom-provider configuration as well as the server selection; `--all-models`
+does not update Pi's picker. Do not copy the Sonnet/Opus thinking map unchanged
+to Fable, Haiku, or ChatGPT models: see [per-model guidance](docs/models.md)
+and the [ChatGPT provider guide](docs/openai-subscription.md#pi-and-other-harnesses).
 
 Model and effort can change only after a completed assistant answer. Keep the
 API dialect, system prompt, and tool definitions fixed, and never switch while
@@ -612,20 +620,26 @@ fails with `fallback_tool_rollback_unsupported`, publishes no buffered output,
 and closes/drains the native session. The proxy never executes generated tools,
 fabricates results, or moves abandoned callback IDs into the replacement leg.
 
+The following table applies to **Sonnet 5, Opus 5, and Opus 4.8**. Fable requires
+adaptive thinking even when controls are omitted, Haiku uses manual budgets,
+and ChatGPT omission retains the provider default. See the
+[full capability table](docs/models.md#bundled-catalog-2026-09-09).
+
 | Setting | OpenAI Chat Completions | Anthropic Messages |
 | --- | --- | --- |
 | Thinking off | Omit `reasoning_effort`, use `null`, or use `"none"` | Omit `thinking`, use `null`, or use `{"type":"disabled"}`; omit effort |
 | Adaptive effort | `reasoning_effort: "low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` | `thinking: {"type":"adaptive"}` with `output_config: {"effort":"high"}` (same five effort values for current aliases) |
 | Thinking display | No separate display request control | Add `display: "summarized"` or `"omitted"` inside active `thinking` |
 
-All three canonical models support the listed adaptive levels in the recorded
+These three models support the listed adaptive levels in the recorded
 live checks. All three models have verified text/image profiles; use Pi's
 Anthropic provider for image-returning tools, including on Opus 4.8.
 Pinned older model IDs have different capability rules; the proxy rejects
 unsupported model/control combinations with HTTP 400, without a silent
 downgrade. The legacy Anthropic `thinking: {"type":"enabled","budget_tokens":N}`
-form is accepted only for configured supported 4.5 IDs, with a positive integer
-budget below `max_tokens`; it is not the mode for the current aliases. These
+form is accepted only for configured supported 4.5 IDs (including `haiku-4.5`),
+with a positive integer budget below `max_tokens`; it is not the mode for
+Sonnet 5 or Opus 5/4.8. These
 older-ID rules are parser-tested, not part of the Sonnet/Opus live matrix.
 
 Anthropic returns native `thinking`/`redacted_thinking` blocks, including signature
@@ -793,10 +807,10 @@ per-request `X-Quaylet-Refusal-Fallback: auto` is rejected for ChatGPT; there is
 no model fallback. The server's default refusal-fallback setting applies only
 to Claude requests.
 
-Example with all pinned models and opt-in fallback:
+Example with the Sonnet/Opus subset and opt-in fallback:
 
 ```bash
-uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8 \
+uv run quaylet --model sonnet-5 opus-5 opus-4.8 \
   --refusal-fallback auto --max-sessions 16
 ```
 
@@ -808,7 +822,7 @@ The provider entry does not start the gateway. Run the following in a separate
 terminal and confirm `/health` responds:
 
 ```bash
-uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8
+uv run quaylet --model sonnet-5 opus-5 opus-4.8
 ```
 
 ### Pi returns `param: "tools"`
@@ -862,14 +876,19 @@ diagnostic lines when reporting a failure.
 The server does not hot-reload. Stop it with `Ctrl+C` and start it again after
 updating the checkout.
 
-### Opus is missing or thinking controls are rejected
+### A model is missing or thinking controls are rejected
 
-Check `/v1/models` for the canonical choices, restart the server with
-`--model sonnet-5 --model opus-5 --model opus-4.8`, and use the current Pi
-configuration above.
+Run `uv run quaylet models` for the bundled catalog, then check `/v1/models`
+for the running server's selected models. Restart with `--all-models` or a subset
+such as `--model sonnet-5 opus-5 opus-4.8`. Add the same canonical IDs to Pi's
+custom-provider configuration; the server does not populate Pi's model picker.
 Pi needs `reasoning: true`, the model-level `thinkingLevelMap`, and the matching
 provider compatibility flags. Restart Pi after changing provider configuration.
 Changing `models.json` alone does not update a running proxy's allowlist or code.
+Effort and image support are model-specific: for example, Spark is text-only,
+GPT-5.5/Spark reject `max`, and Fable rejects disabled thinking. Catalog membership
+does not guarantee subscription access or remaining quota; see
+[model verification limits](docs/models.md#scope-and-evidence).
 
 ### Fallback fails or the first streaming event is delayed
 
