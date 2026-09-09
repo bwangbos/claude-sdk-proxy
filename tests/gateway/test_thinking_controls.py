@@ -3,18 +3,18 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.anthropic_api import parse_anthropic_request
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import (
+from quaylet.anthropic_api import parse_anthropic_request
+from quaylet.app import create_app
+from quaylet.domain import (
     CanonicalMessage,
     RequestValidationError,
     TextRequest,
 )
-from claude_sdk_proxy.openai_api import parse_openai_request
-from claude_sdk_proxy.sdk_session import SdkSession
-from claude_sdk_proxy.session_identity import request_fingerprint
-from claude_sdk_proxy.sessions import SessionConflict, SessionRegistry
-from claude_sdk_proxy.thinking import ThinkingOptions
+from quaylet.openai_api import parse_openai_request
+from quaylet.sdk_session import SdkSession
+from quaylet.session_identity import request_fingerprint
+from quaylet.sessions import SessionConflict, SessionRegistry
+from quaylet.thinking import ThinkingOptions
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.fakes import (
     FakeSdkClient,

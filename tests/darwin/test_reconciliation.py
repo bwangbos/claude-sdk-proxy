@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy import supervisor_probe
-from claude_sdk_proxy.supervisor_probe import run_lifecycle_scenario
+from quaylet import supervisor_probe
+from quaylet.supervisor_probe import run_lifecycle_scenario
 
 
 class _InjectedPythonFailure(RuntimeError):

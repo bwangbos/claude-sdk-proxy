@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.journal import (
+from quaylet.journal import (
     CertifiedDone,
     Journal,
     JournalCreateReceipt,
@@ -18,7 +18,7 @@ from claude_sdk_proxy.journal import (
     UnconfirmedReason,
     UnreleasedPartialCreate,
 )
-from claude_sdk_proxy.lifecycle import (
+from quaylet.lifecycle import (
     BatchDescriptor,
     BatchDescriptorKind,
     Record,
@@ -74,7 +74,7 @@ def make_journal(
             **keywords,
             library_path=(
                 Path(__file__).resolve().parents[2]
-                / "build/lib/libclaude_proxy_lifecycle_fault.dylib"
+                / "build/lib/libquaylet_lifecycle_fault.dylib"
             ),
         )
     else:
@@ -539,7 +539,7 @@ def test_corrupt_partial_create_cannot_mint_deletion_authority(
     os.close(fd)
     fault_library = (
         Path(__file__).resolve().parents[2]
-        / "build/lib/libclaude_proxy_lifecycle_fault.dylib"
+        / "build/lib/libquaylet_lifecycle_fault.dylib"
     )
     journal = Journal._open_at_for_test(
         parent_dirfd,
@@ -571,7 +571,7 @@ def test_header_payload_mismatch_is_never_canonical(
 ) -> None:
     fault_library = (
         Path(__file__).resolve().parents[2]
-        / "build/lib/libclaude_proxy_lifecycle_fault.dylib"
+        / "build/lib/libquaylet_lifecycle_fault.dylib"
     )
     os.chmod(tmp_path, 0o700)
     parent_dirfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -886,7 +886,7 @@ def test_atfork_registration_failure_fails_handle_construction(
     _make_lock_files(parent_dirfd, "allocation.journal")
     fault_library = (
         Path(__file__).resolve().parents[2]
-        / "build/lib/libclaude_proxy_lifecycle_fault.dylib"
+        / "build/lib/libquaylet_lifecycle_fault.dylib"
     )
     Journal.force_atfork_registration_failure_for_test(fault_library, True)
     try:

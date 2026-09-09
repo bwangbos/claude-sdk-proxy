@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from claude_sdk_proxy.anthropic_api import (
+from quaylet.anthropic_api import (
     AnthropicStreamState,
     encode_anthropic_error,
     encode_anthropic_event,
@@ -12,7 +12,7 @@ from claude_sdk_proxy.anthropic_api import (
     parse_anthropic_request,
     render_anthropic_response,
 )
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     Completed,
     RequestValidationError,

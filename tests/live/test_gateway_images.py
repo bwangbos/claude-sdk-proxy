@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from claude_sdk_proxy.app import create_app
+from quaylet.app import create_app
 from tests.fixtures.image_data import solid_png
 from tests.gateway.asgi_client import lifespan_app, post_json
 
@@ -15,8 +15,8 @@ async def test_live_stock_pi_image_tool(tmp_path):
     from tests.integration.pi_gateway_support import serve
     from tests.integration.pi_image_support import run_pi_image
 
-    assert os.environ.get("CLAUDE_PROXY_LIVE") == "1"
-    assert os.environ["CLAUDE_PROXY_LIVE_MODEL"] == "sonnet"
+    assert os.environ.get("QUAYLET_LIVE") == "1"
+    assert os.environ["QUAYLET_LIVE_MODEL"] == "sonnet"
     async with serve(create_app(models=("sonnet",))) as url:
         output = await run_pi_image(url, tmp_path)
     assert output.strip().lower().strip(".") == "red", output
@@ -25,8 +25,8 @@ async def test_live_stock_pi_image_tool(tmp_path):
 @pytest.mark.parametrize("dialect", ["anthropic", "openai"])
 @pytest.mark.parametrize("tool", [False, True])
 async def test_live_image_understanding(dialect: str, tool: bool) -> None:
-    assert os.environ.get("CLAUDE_PROXY_LIVE") == "1"
-    model = os.environ["CLAUDE_PROXY_LIVE_MODEL"]
+    assert os.environ.get("QUAYLET_LIVE") == "1"
+    model = os.environ["QUAYLET_LIVE_MODEL"]
     image = (
         {
             "type": "image",
@@ -144,7 +144,7 @@ async def test_live_image_understanding(dialect: str, tool: bool) -> None:
             }
         )
         rebased = await post_json(
-            app, path, body, headers={"x-claude-proxy-session": "image-import"}
+            app, path, body, headers={"x-quaylet-session": "image-import"}
         )
         assert rebased.status == 200, rebased.json
         text = (

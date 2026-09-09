@@ -7,9 +7,9 @@ from typing import Literal, cast
 
 import pytest
 
-from claude_sdk_proxy.attestation import current_attestation_availability
-from claude_sdk_proxy.probes import run_tool_bridge_probe
-from claude_sdk_proxy.usage_evidence import (
+from quaylet.attestation import current_attestation_availability
+from quaylet.probes import run_tool_bridge_probe
+from quaylet.usage_evidence import (
     UsageEvidenceSchema,
     UsageOperationClass,
     UsageTupleKey,
@@ -23,9 +23,9 @@ def _exact_model() -> str:
         pytest.fail("set RUN_LIVE_CLAUDE_TESTS=1 for the mandatory live matrix")
     if not current_attestation_availability().core_gate_available:
         pytest.fail("SDK tools unavailable because the Task 6 core gate is false")
-    model_id = os.environ.get("CLAUDE_PROXY_TEST_MODEL_ID")
+    model_id = os.environ.get("QUAYLET_TEST_MODEL_ID")
     if model_id is None:
-        pytest.fail("CLAUDE_PROXY_TEST_MODEL_ID must be configured")
+        pytest.fail("QUAYLET_TEST_MODEL_ID must be configured")
     return model_id
 
 

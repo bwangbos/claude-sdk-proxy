@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy import supervisor_probe
-from claude_sdk_proxy.supervisor_probe import run_lifecycle_scenario
+from quaylet import supervisor_probe
+from quaylet.supervisor_probe import run_lifecycle_scenario
 
 
 def test_supervisorless_running_anchor_stays_unconfirmed() -> None:
@@ -133,7 +133,7 @@ def test_anchor_group_exits_when_its_last_controller_is_killed(
     identity_path = tmp_path / "anchor-identity"
     controller = (
         "import os, signal, sys\n"
-        "from claude_sdk_proxy import supervisor_probe as probe\n"
+        "from quaylet import supervisor_probe as probe\n"
         "def checkpoint(flow, point):\n"
         "    if flow == 'actor_loss' and point == 'actor_loss_observed':\n"
         "        key = probe._retained_actor_chain_keys()[0]\n"

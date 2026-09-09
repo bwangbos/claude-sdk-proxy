@@ -7,8 +7,8 @@ from typing import Any
 import pytest
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, SystemMessage
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.app import create_app
+from quaylet.sdk_session import SdkSession
 from tests.integration.pi_gateway_support import run_pi_thinking, serve
 
 pytestmark = [pytest.mark.live, pytest.mark.anyio]
@@ -71,8 +71,8 @@ class LiveSdkFactory:
 
 
 def _require_live() -> None:
-    if os.environ.get("CLAUDE_PROXY_LIVE") != "1":
-        pytest.fail("live thinking tests require CLAUDE_PROXY_LIVE=1")
+    if os.environ.get("QUAYLET_LIVE") != "1":
+        pytest.fail("live thinking tests require QUAYLET_LIVE=1")
 
 
 ROWS = [

@@ -9,10 +9,10 @@ import pytest
 from claude_agent_sdk import AssistantMessage, StreamEvent, UserMessage
 from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import ThinkingBlock
-from claude_sdk_proxy.sdk_session import SdkSession
-from claude_sdk_proxy.thinking import ThinkingOptions
+from quaylet.app import create_app
+from quaylet.domain import ThinkingBlock
+from quaylet.sdk_session import SdkSession
+from quaylet.thinking import ThinkingOptions
 from tests.gateway.fakes import FakeSdkClient, FixedTemporaryDirectory, sdk_response
 from tests.gateway.test_thinking_streams import (
     interleaved_tool_response,

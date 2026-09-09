@@ -6,15 +6,15 @@ from pathlib import Path
 import pytest
 from claude_agent_sdk import project_key_for_directory
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     TextBlock,
     ToolCallBlock,
     ToolResultBlock,
     ToolResultPrompt,
 )
-from claude_sdk_proxy.sdk_history import seed_history
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.sdk_history import seed_history
+from quaylet.sdk_session import SdkSession
 from tests.gateway.fakes import FakeSdkClient, FixedTemporaryDirectory, sdk_response
 
 

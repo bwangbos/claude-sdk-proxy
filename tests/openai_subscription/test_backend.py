@@ -5,7 +5,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     Completed,
     RedactedThinkingBlock,
@@ -18,9 +18,9 @@ from claude_sdk_proxy.domain import (
     ToolCallBlock,
     ToolResultBlock,
 )
-from claude_sdk_proxy.openai_subscription.backend import Backend, SubscriptionFailure
-from claude_sdk_proxy.openai_subscription.replay import decode_reasoning
-from claude_sdk_proxy.openai_subscription.storage import Credentials
+from quaylet.openai_subscription.backend import Backend, SubscriptionFailure
+from quaylet.openai_subscription.replay import decode_reasoning
+from quaylet.openai_subscription.storage import Credentials
 
 from .test_translation import request
 
@@ -188,8 +188,8 @@ async def test_late_reasoning_ciphertext_backfilled_after_immediate_summary_delt
         i for i, e in enumerate(events) if isinstance(e, TextDelta)
     )
     completed = next(e for e in events if isinstance(e, ThinkingCompleted))
-    from claude_sdk_proxy.domain import TextBlock
-    from claude_sdk_proxy.openai_subscription.replay import envelope_scope
+    from quaylet.domain import TextBlock
+    from quaylet.openai_subscription.replay import envelope_scope
 
     scope = envelope_scope(
         request(),
@@ -480,8 +480,8 @@ async def test_auth_and_transient_retries_before_content_only_and_fixed_headers(
         )
         assert captured[-1].headers["Authorization"] == "Bearer new-access"
         assert captured[-1].headers["chatgpt-account-id"] == "acct"
-        assert captured[-1].headers["User-Agent"].startswith("claude-sdk-proxy")
-        assert captured[-1].headers["originator"] == "claude-sdk-proxy"
+        assert captured[-1].headers["User-Agent"].startswith("quaylet")
+        assert captured[-1].headers["originator"] == "quaylet"
         assert json.loads(captured[-1].content)["instructions"] == ""
         assert all(s.closed for s in streams)
         await backend.close()
@@ -608,9 +608,9 @@ async def test_completed_replay_preserves_metadata_and_compaction_drops_it():
 async def test_emitted_envelope_cannot_restore_changed_context(change):
     import base64
 
-    from claude_sdk_proxy.domain import TextBlock, ThinkingBlock, ToolDefinition
-    from claude_sdk_proxy.openai_subscription.replay import PREFIX
-    from claude_sdk_proxy.openai_subscription.translation import build_body
+    from quaylet.domain import TextBlock, ThinkingBlock, ToolDefinition
+    from quaylet.openai_subscription.replay import PREFIX
+    from quaylet.openai_subscription.translation import build_body
 
     req = replace(
         request(),
@@ -685,8 +685,8 @@ async def test_emitted_envelope_cannot_restore_changed_context(change):
 
 @pytest.mark.anyio
 async def test_added_ciphertext_survives_done_and_terminal_omission():
-    from claude_sdk_proxy.domain import TextBlock
-    from claude_sdk_proxy.openai_subscription.translation import build_body
+    from quaylet.domain import TextBlock
+    from quaylet.openai_subscription.translation import build_body
 
     item = {
         "type": "reasoning",

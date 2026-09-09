@@ -4,8 +4,8 @@ import os
 
 import pytest
 
-from claude_sdk_proxy.attestation import current_attestation_availability
-from claude_sdk_proxy.probes import run_compaction_probe
+from quaylet.attestation import current_attestation_availability
+from quaylet.probes import run_compaction_probe
 
 pytestmark = pytest.mark.live
 

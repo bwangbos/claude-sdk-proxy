@@ -17,7 +17,7 @@ from claude_agent_sdk import (
 from mcp.server import Server
 from mcp.types import CallToolRequestParams, CallToolResult
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     Completed,
     ConversationEvent,
@@ -25,7 +25,7 @@ from claude_sdk_proxy.domain import (
     TextDelta,
     ToolDefinition,
 )
-from claude_sdk_proxy.thinking import ThinkingOptions
+from quaylet.thinking import ThinkingOptions
 
 
 class FixedTemporaryDirectory:
@@ -392,7 +392,7 @@ def sdk_response(
 class FakeConversationSession:
     def __init__(self, text: str) -> None:
         self._text = text
-        from claude_sdk_proxy.domain import ResponseIdentity
+        from quaylet.domain import ResponseIdentity
 
         self.identity = ResponseIdentity("sonnet-5", "sonnet-5", False)
         self.start_count = 0
@@ -450,8 +450,8 @@ class FakeSessionFactory:
         self.histories.append(history)
         self.thinking_options.append(thinking)
         session = FakeConversationSession(next(self._outputs))
-        from claude_sdk_proxy.domain import ResponseIdentity
-        from claude_sdk_proxy.model_catalog import canonical_model
+        from quaylet.domain import ResponseIdentity
+        from quaylet.model_catalog import canonical_model
 
         session.identity = ResponseIdentity(
             canonical_model(model), canonical_model(model), False

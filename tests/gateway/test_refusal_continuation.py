@@ -13,9 +13,9 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
 
-from claude_sdk_proxy.anthropic_api import parse_anthropic_request
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import (
+from quaylet.anthropic_api import parse_anthropic_request
+from quaylet.app import create_app
+from quaylet.domain import (
     BackendFailure,
     CanonicalMessage,
     Completed,
@@ -25,9 +25,9 @@ from claude_sdk_proxy.domain import (
     ThinkingBlock,
     ThinkingDelta,
 )
-from claude_sdk_proxy.sdk_session import SdkSession
-from claude_sdk_proxy.sessions import SessionRegistry
-from claude_sdk_proxy.tool_session_actor import ToolSessionState
+from quaylet.sdk_session import SdkSession
+from quaylet.sessions import SessionRegistry
+from quaylet.tool_session_actor import ToolSessionState
 from tests.gateway.asgi_client import _LIFESPAN_STATES, lifespan_app, post_json
 from tests.gateway.fakes import (
     FakeSdkClient,
@@ -120,7 +120,7 @@ class RefusalFactory:
         self.directories = []
 
     def __call__(self, model, system, *, history=(), **kwargs):
-        from claude_sdk_proxy.model_catalog import backend_model
+        from quaylet.model_catalog import backend_model
 
         pinned = backend_model(model)
         responses = []
@@ -201,8 +201,8 @@ async def test_http_empty_refusal_continues_native_history(
     async with lifespan_app(app):
         first = await post_json(app, path, _body(dialect, messages, tools=tools))
         assert first.status == 200, first.body
-        sid = first.headers["x-claude-proxy-session"]
-        headers = {"x-claude-proxy-session": sid} if explicit else {}
+        sid = first.headers["x-quaylet-session"]
+        headers = {"x-quaylet-session": sid} if explicit else {}
         messages += [
             _assistant(first, dialect, False),
             {"role": "user", "content": "refuse"},
@@ -240,7 +240,7 @@ async def test_http_empty_refusal_continues_native_history(
         continued = await post_json(app, path, body, headers)
         assert continued.status == 200, continued.body
         assert "continued" in continued.body.decode()
-        assert continued.headers["x-claude-proxy-session"] == sid
+        assert continued.headers["x-quaylet-session"] == sid
         assert registry._implicit[sid].transcript[: len(native)] == native
         assert SYNTHETIC_DIAGNOSTIC not in repr(registry._implicit[sid].transcript)
         if switch:
@@ -307,8 +307,8 @@ async def test_http_refusal_after_completed_tool_result_boundary(
             call_id = assistant["tool_calls"][0]["id"]
             result = {"role": "tool", "tool_call_id": call_id, "content": "one"}
         messages += [assistant, result]
-        sid = first.headers["x-claude-proxy-session"]
-        headers = {"x-claude-proxy-session": sid}
+        sid = first.headers["x-quaylet-session"]
+        headers = {"x-quaylet-session": sid}
         body = _body(dialect, messages, stream, True)
         refused = await post_json(app, path, body, headers)
         _assert_http_refusal(dialect, stream, refused)

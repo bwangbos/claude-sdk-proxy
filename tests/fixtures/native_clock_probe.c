@@ -26,9 +26,9 @@ static int simulated_clock_gettime(clockid_t clock, struct timespec *value) {
 #if defined(TEST_LIFECYCLE)
 #include "../../native/lifecycle.c"
 #elif defined(TEST_SUPERVISOR)
-#include "../../native/claude_supervisor.c"
+#include "../../native/quaylet_supervisor.c"
 #elif defined(TEST_ANCHOR)
-#include "../../native/claude_anchor.c"
+#include "../../native/quaylet_anchor.c"
 #else
 #error Select a native component
 #endif

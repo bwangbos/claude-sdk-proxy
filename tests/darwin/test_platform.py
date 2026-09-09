@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.platform import (
+from quaylet.platform import (
     MountIdentity,
     PlatformProbeError,
     PlatformUnsupported,

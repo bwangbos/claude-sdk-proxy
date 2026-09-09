@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     Completed,
     ConversationEvent,
@@ -15,7 +15,7 @@ from claude_sdk_proxy.domain import (
     TextRequest,
     ToolDefinition,
 )
-from claude_sdk_proxy.sessions import (
+from quaylet.sessions import (
     SessionCapacity,
     SessionConflict,
     SessionMismatch,
@@ -23,7 +23,7 @@ from claude_sdk_proxy.sessions import (
     SessionTimeout,
     TurnLease,
 )
-from claude_sdk_proxy.thinking import ThinkingOptions
+from quaylet.thinking import ThinkingOptions
 from tests.gateway.fakes import FakeConversationSession, FakeSessionFactory
 
 
@@ -421,8 +421,8 @@ async def test_explicit_ids_keep_identical_conversations_independent() -> None:
     await collect(two.stream())
 
     assert factory.created == 2
-    assert one.response_headers == {"X-Claude-Proxy-Session": "client-one"}
-    assert two.response_headers == {"X-Claude-Proxy-Session": "client-two"}
+    assert one.response_headers == {"X-Quaylet-Session": "client-one"}
+    assert two.response_headers == {"X-Quaylet-Session": "client-two"}
 
 
 @pytest.mark.anyio

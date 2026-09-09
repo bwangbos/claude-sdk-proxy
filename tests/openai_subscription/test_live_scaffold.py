@@ -11,19 +11,19 @@ def test_live_identity_requires_proxy_route_and_matching_observed_body():
     response = httpx.Response(
         200,
         headers={
-            "x-claude-proxy-requested-model": "gpt-6-astra",
-            "x-claude-proxy-actual-model": "gpt-6-astra-2026-09-08",
+            "x-quaylet-requested-model": "gpt-6-astra",
+            "x-quaylet-actual-model": "gpt-6-astra-2026-09-08",
         },
         json={"model": "gpt-6-astra-2026-09-08"},
     )
     assert_response_identity(response, "gpt-6-astra")
 
     for headers, model in (
-        ({"x-claude-proxy-actual-model": "dated"}, "dated"),
+        ({"x-quaylet-actual-model": "dated"}, "dated"),
         (
             {
-                "x-claude-proxy-requested-model": "gpt-6-astra",
-                "x-claude-proxy-actual-model": "dated",
+                "x-quaylet-requested-model": "gpt-6-astra",
+                "x-quaylet-actual-model": "dated",
             },
             "different",
         ),

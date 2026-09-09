@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_sdk_proxy.supervisor_probe import run_lifecycle_scenario
+from quaylet.supervisor_probe import run_lifecycle_scenario
 
 
 @pytest.mark.parametrize(

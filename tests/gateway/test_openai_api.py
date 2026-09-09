@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     Completed,
     RequestValidationError,
@@ -15,7 +15,7 @@ from claude_sdk_proxy.domain import (
     ToolResultBlock,
     UnsupportedFeature,
 )
-from claude_sdk_proxy.openai_api import (
+from quaylet.openai_api import (
     encode_openai_error,
     encode_openai_event,
     encode_openai_start,
@@ -463,7 +463,7 @@ def test_openai_parser_maps_argument_decoder_recursion_to_messages(
         del value
         raise RecursionError
 
-    monkeypatch.setattr("claude_sdk_proxy.openai_tools.json.loads", fail_decode)
+    monkeypatch.setattr("quaylet.openai_tools.json.loads", fail_decode)
     body = {
         "model": "sonnet",
         "tools": [openai_echo_tool()],
@@ -533,7 +533,7 @@ def test_openai_parser_rejects_unknown_fields_and_nonboolean_stream(
 
 
 def test_openai_start_and_delta_use_literal_chunk_order() -> None:
-    from claude_sdk_proxy.domain import InputUsage
+    from quaylet.domain import InputUsage
 
     start = encode_openai_start("chatcmpl_test", "sonnet")
     delta = encode_openai_event(
@@ -680,7 +680,7 @@ def test_openai_nonstream_call_only_response_uses_null_content() -> None:
 
 
 def test_openai_stream_renders_two_identical_calls_with_distinct_ids() -> None:
-    from claude_sdk_proxy.openai_api import OpenAIStreamState
+    from quaylet.openai_api import OpenAIStreamState
 
     state = OpenAIStreamState()
     first = payload(

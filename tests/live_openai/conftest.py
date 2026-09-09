@@ -11,7 +11,7 @@ def openai_live_opt_in() -> None:
     if os.environ.get("OPENAI_SUBSCRIPTION_LIVE") != "1":
         pytest.fail(
             "set OPENAI_SUBSCRIPTION_LIVE=1 only after completing "
-            "`uv run claude-proxy login openai`"
+            "`uv run quaylet login openai`"
         )
 
 

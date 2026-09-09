@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import claude_sdk_proxy.path_policy as path_policy_impl
-from claude_sdk_proxy.path_policy import (
+import quaylet.path_policy as path_policy_impl
+from quaylet.path_policy import (
     PathClass,
     PathPolicy,
     PathPolicyError,
@@ -427,10 +427,10 @@ def test_every_owned_resource_close_is_one_shot_and_owner_scoped(
                     raise KeyboardInterrupt("AMBIGUOUS-RESOURCE-CLOSE")
 
         monkeypatch.setattr(
-            "claude_sdk_proxy.path_policy.os.close", effect_then_raise_close
+            "quaylet.path_policy.os.close", effect_then_raise_close
         )
         monkeypatch.setattr(
-            "claude_sdk_proxy.path_policy.os.scandir", EffectThenRaiseScandir
+            "quaylet.path_policy.os.scandir", EffectThenRaiseScandir
         )
         verified = False
         try:
@@ -519,7 +519,7 @@ def test_classify_never_succeeds_after_missing_path_cleanup_becomes_ambiguous(
             original_close(descriptor)
 
         monkeypatch.setattr(
-            "claude_sdk_proxy.path_policy.os.close", effect_then_raise_missing
+            "quaylet.path_policy.os.close", effect_then_raise_missing
         )
         failed_closed = False
         try:
@@ -609,7 +609,7 @@ def test_cleanup_failure_after_acquisition_never_orphans_the_new_owner(
             original_close(descriptor)
 
         monkeypatch.setattr(
-            "claude_sdk_proxy.path_policy.os.close",
+            "quaylet.path_policy.os.close",
             effect_then_raise_after_acquisition,
         )
         failed_closed = False
@@ -717,7 +717,7 @@ def test_acquisition_preregistration_rejects_same_owner_reentrancy(
                 reentry_rejected = True
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.open", inspecting_open)
+    monkeypatch.setattr("quaylet.path_policy.os.open", inspecting_open)
 
     policy.metadata("settings.json")
 
@@ -747,7 +747,7 @@ def test_forked_pending_resource_becomes_nonactionable_in_child(
             original_close(value)
 
         monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setattr("claude_sdk_proxy.path_policy.os.close", tracking_close)
+        monkeypatch.setattr("quaylet.path_policy.os.close", tracking_close)
         verified = False
         try:
             with pytest.raises(PathPolicyError, match="ownership is ambiguous"):
@@ -799,7 +799,7 @@ def test_fork_inside_close_cannot_certify_inherited_obligation_closed(
             return
         original_close(value)
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.close", forking_close)
+    monkeypatch.setattr("quaylet.path_policy.os.close", forking_close)
 
     try:
         path_policy_impl._close_fd(owner, descriptor)
@@ -868,7 +868,7 @@ def test_concurrent_operation_waits_for_close_disposition_then_fails_closed(
             original_close(descriptor)
 
         monkeypatch.setattr(
-            "claude_sdk_proxy.path_policy.os.close", effect_then_raise_close
+            "quaylet.path_policy.os.close", effect_then_raise_close
         )
 
         def first_operation() -> None:
@@ -934,7 +934,7 @@ def test_ambiguous_fd_close_poison_is_retained_without_numeric_retry(
             if close_calls == 1:
                 raise KeyboardInterrupt("AMBIGUOUS-FD-CLOSE")
 
-        monkeypatch.setattr("claude_sdk_proxy.path_policy.os.close", effect_then_raise)
+        monkeypatch.setattr("quaylet.path_policy.os.close", effect_then_raise)
         poisoned = False
         try:
             with pytest.raises(KeyboardInterrupt, match="AMBIGUOUS-FD-CLOSE"):
@@ -997,7 +997,7 @@ def test_ambiguous_scandir_close_poison_is_retained_without_retry(
                     raise KeyboardInterrupt("AMBIGUOUS-SCANDIR-CLOSE")
 
         monkeypatch.setattr(
-            "claude_sdk_proxy.path_policy.os.scandir", EffectThenRaiseScandir
+            "quaylet.path_policy.os.scandir", EffectThenRaiseScandir
         )
         poisoned = False
         try:
@@ -1044,7 +1044,7 @@ def test_snapshot_rejects_leaf_replacement_before_admitting_metadata(
                 target.write_bytes(b"SECOND-LONGER")
         return original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.stat", swapping_stat)
+    monkeypatch.setattr("quaylet.path_policy.os.stat", swapping_stat)
 
     with pytest.raises(PathPolicyError, match="identity changed"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
@@ -1074,7 +1074,7 @@ def test_snapshot_binds_complete_opened_directory_metadata(
             os.utime(directory, ns=(current + 1_000_000, current + 1_000_000))
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.open", changing_open)
+    monkeypatch.setattr("quaylet.path_policy.os.open", changing_open)
 
     with pytest.raises(PathPolicyError, match="identity changed"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
@@ -1116,7 +1116,7 @@ def test_snapshot_certifies_root_across_descendant_scan_churn(
                 target.rename(roots[0] / "settings.local.json")
         return original_scandir(path)
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", churning_scandir)
+    monkeypatch.setattr("quaylet.path_policy.os.scandir", churning_scandir)
 
     with pytest.raises(PathPolicyError, match="changed during snapshot"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
@@ -1155,7 +1155,7 @@ def test_snapshot_root_sentinel_detects_transient_root_create_delete(
                 )
         return original_scandir(path)
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", churning_scandir)
+    monkeypatch.setattr("quaylet.path_policy.os.scandir", churning_scandir)
 
     with pytest.raises(PathPolicyError, match="changed during snapshot"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
@@ -1187,7 +1187,7 @@ def test_snapshot_certifies_each_nested_directory_across_its_descendants(
             (parent / "hooks").mkdir(mode=0o700)
         return original_scandir(path)
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", churning_scandir)
+    monkeypatch.setattr("quaylet.path_policy.os.scandir", churning_scandir)
 
     with pytest.raises(PathPolicyError, match="changed during snapshot"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
@@ -1225,7 +1225,7 @@ def test_snapshot_recertifies_earlier_entries_after_later_descendants(
             )
         return original_scandir(path)
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", churning_scandir)
+    monkeypatch.setattr("quaylet.path_policy.os.scandir", churning_scandir)
 
     with pytest.raises(PathPolicyError, match="changed during snapshot"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
@@ -1328,10 +1328,10 @@ def test_snapshot_unwind_closes_every_opened_authority(
             raise KeyboardInterrupt("SCANDIR-UNWIND")
         return original_scandir(path)
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.open", tracking_open)
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.close", tracking_close)
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.stat", failing_stat)
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.scandir", failing_scandir)
+    monkeypatch.setattr("quaylet.path_policy.os.open", tracking_open)
+    monkeypatch.setattr("quaylet.path_policy.os.close", tracking_close)
+    monkeypatch.setattr("quaylet.path_policy.os.stat", failing_stat)
+    monkeypatch.setattr("quaylet.path_policy.os.scandir", failing_scandir)
 
     with pytest.raises(KeyboardInterrupt, match="UNWIND"):
         policy.snapshot(root=RootKind.REAL_LOGIN)
@@ -1375,9 +1375,9 @@ def test_snapshot_effect_then_raise_close_unwinds_remaining_authority(
             injected = True
             raise KeyboardInterrupt("CLOSE-UNWIND")
 
-    monkeypatch.setattr("claude_sdk_proxy.path_policy.os.open", tracking_open)
+    monkeypatch.setattr("quaylet.path_policy.os.open", tracking_open)
     monkeypatch.setattr(
-        "claude_sdk_proxy.path_policy.os.close", effect_then_raise_close
+        "quaylet.path_policy.os.close", effect_then_raise_close
     )
 
     with pytest.raises(KeyboardInterrupt, match="CLOSE-UNWIND"):

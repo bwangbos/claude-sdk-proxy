@@ -12,8 +12,8 @@ from claude_agent_sdk import (
     TaskStartedMessage,
 )
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import (
+from quaylet.app import create_app
+from quaylet.domain import (
     BackendFailure,
     CanonicalMessage,
     Completed,
@@ -22,7 +22,7 @@ from claude_sdk_proxy.domain import (
     TextDelta,
     ToolDefinition,
 )
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.sdk_session import SdkSession
 from tests.gateway.asgi_client import (
     lifespan_app,
     post_json,
@@ -159,7 +159,7 @@ class SequentialSession(FakeConversationSession):
 
 class InputUsageSession(FakeConversationSession):
     async def stream_generation(self, prompt: str) -> AsyncIterator[ConversationEvent]:
-        from claude_sdk_proxy.domain import InputUsage
+        from quaylet.domain import InputUsage
 
         self.prompts.append(prompt)
         yield self.identity
@@ -244,7 +244,7 @@ async def test_openai_nonstream_conversation_continues_through_one_sdk_session()
 
     async with lifespan_app(app):
         first = await post_json(app, "/v1/chat/completions", openai_body("first"))
-        session_id = first.headers["x-claude-proxy-session"]
+        session_id = first.headers["x-quaylet-session"]
         second = await post_json(
             app,
             "/v1/chat/completions",
@@ -262,7 +262,7 @@ async def test_openai_nonstream_conversation_continues_through_one_sdk_session()
     assert first.status == 200
     assert first.json["choices"][0]["message"]["content"] == "first answer"
     assert second.json["choices"][0]["message"]["content"] == "second answer"
-    assert second.headers["x-claude-proxy-session"] == session_id
+    assert second.headers["x-quaylet-session"] == session_id
     assert session.prompts == ["first", "second"]
     assert session.start_count == 2
     assert session.close_count == 1
@@ -279,11 +279,11 @@ async def test_anthropic_nonstream_uses_anthropic_envelope_and_echoes_explicit_i
             app,
             "/v1/messages",
             anthropic_body(),
-            {"X-Claude-Proxy-Session": "client-one"},
+            {"X-Quaylet-Session": "client-one"},
         )
 
     assert response.status == 200
-    assert response.headers["x-claude-proxy-session"] == "client-one"
+    assert response.headers["x-quaylet-session"] == "client-one"
     assert response.json["type"] == "message"
     assert response.json["content"] == [{"type": "text", "text": "answer"}]
 
@@ -381,7 +381,7 @@ async def test_anthropic_session_mismatch_uses_anthropic_error_envelope() -> Non
             app,
             "/v1/messages",
             anthropic_body(),
-            {"X-Claude-Proxy-Session": "lineage"},
+            {"X-Quaylet-Session": "lineage"},
         )
         mismatch = await post_json(
             app,
@@ -396,7 +396,7 @@ async def test_anthropic_session_mismatch_uses_anthropic_error_envelope() -> Non
                 ],
                 "max_tokens": 128,
             },
-            {"X-Claude-Proxy-Session": "lineage"},
+            {"X-Quaylet-Session": "lineage"},
         )
 
     assert first.status == 200
@@ -406,7 +406,7 @@ async def test_anthropic_session_mismatch_uses_anthropic_error_envelope() -> Non
         "error": {
             "type": "session_mismatch",
             "message": "Session system prompt changed. "
-            "Use a unique X-Claude-Proxy-Session per conversation; "
+            "Use a unique X-Quaylet-Session per conversation; "
             "retry only after active work completes.",
             "reason": "system_changed",
         },
@@ -443,10 +443,10 @@ async def test_explicit_session_rebases_rewritten_text_history(
 
     async with lifespan_app(app):
         first = await post_json(
-            app, path, first_body, {"X-Claude-Proxy-Session": "lineage"}
+            app, path, first_body, {"X-Quaylet-Session": "lineage"}
         )
         rebased = await post_json(
-            app, path, rewritten, {"X-Claude-Proxy-Session": "lineage"}
+            app, path, rewritten, {"X-Quaylet-Session": "lineage"}
         )
 
     assert first.status == 200
@@ -472,7 +472,7 @@ async def test_preheader_backend_failure_is_redacted_http_502() -> None:
     assert response.status == 502
     assert response.json["error"]["code"] == "backend_error"
     assert response.json["error"]["message"] == "Backend request failed"
-    assert "x-claude-proxy-session" in response.headers
+    assert "x-quaylet-session" in response.headers
     assert b"secret-token" not in response.body
     assert session.close_count == 1
 
@@ -1186,12 +1186,12 @@ async def test_all_busy_capacity_is_stable_redacted_503(
                 app,
                 "/v1/chat/completions",
                 openai_body("first", stream=True),
-                {"X-Claude-Proxy-Session": "busy"},
+                {"X-Quaylet-Session": "busy"},
             )
         )
         await session.entered.wait()
         response = await post_json(
-            app, path, body, {"X-Claude-Proxy-Session": "second"}
+            app, path, body, {"X-Quaylet-Session": "second"}
         )
         session.release.set()
         await active

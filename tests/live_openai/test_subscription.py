@@ -14,8 +14,8 @@ MODELS = ("gpt-6-astra", "gpt-5.6-sol")
 
 
 def assert_response_identity(response: httpx.Response, requested: str) -> None:
-    assert response.headers.get("x-claude-proxy-requested-model") == requested
-    actual = response.headers.get("x-claude-proxy-actual-model")
+    assert response.headers.get("x-quaylet-requested-model") == requested
+    actual = response.headers.get("x-quaylet-actual-model")
     assert actual
     assert response.json()["model"] == actual
 
@@ -131,7 +131,7 @@ async def test_real_upstream_disconnect_closes_connection_and_releases_turn(
     openai_live_opt_in: None,
 ):
     del openai_live_opt_in
-    from claude_sdk_proxy.openai_subscription.backend import Backend
+    from quaylet.openai_subscription.backend import Backend
     from tests.integration.pi_gateway_support import serve
     from tests.live_openai.transport_observer import ObservedAsyncTransport
     from tests.openai_subscription.test_http import body, create_app

@@ -12,9 +12,9 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent, UserM
 from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
 from openai import AsyncOpenAI
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import Dialect, ToolDefinition
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.app import create_app
+from quaylet.domain import Dialect, ToolDefinition
+from quaylet.sdk_session import SdkSession
 from tests.gateway.fakes import (
     FakeSdkClient,
     FixedTemporaryDirectory,
@@ -270,13 +270,13 @@ async def test_official_clients_complete_tool_rounds_over_real_http(
     model = "opus-5" if fallback else "sonnet"
 
     async def verify_headers(response):
-        assert response.headers["x-claude-proxy-requested-model"] == (
+        assert response.headers["x-quaylet-requested-model"] == (
             "opus-5" if fallback else "sonnet-5"
         )
-        assert response.headers["x-claude-proxy-actual-model"] == (
+        assert response.headers["x-quaylet-actual-model"] == (
             "opus-4.8" if fallback else "sonnet-5"
         )
-        assert response.headers.get("x-claude-proxy-fallback") == (
+        assert response.headers.get("x-quaylet-fallback") == (
             "true" if fallback else None
         )
 

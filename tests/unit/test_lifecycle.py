@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from claude_sdk_proxy.lifecycle import (
+from quaylet.lifecycle import (
     ALL_COMPLETED_STEPS,
     BatchDescriptor,
     BatchDescriptorKind,

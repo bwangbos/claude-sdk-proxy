@@ -7,8 +7,8 @@ from typing import Protocol
 
 import pytest
 
-from claude_sdk_proxy import capability_cli
-from claude_sdk_proxy.domain import (
+from quaylet import capability_cli
+from quaylet.domain import (
     BackendEvent,
     BackendFailure,
     CanonicalMessage,
@@ -97,7 +97,7 @@ def test_all_json_reports_literal_structural_capabilities_in_backend_order(
 def test_live_gate_exits_two_before_backend_construction(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("CLAUDE_PROXY_LIVE", raising=False)
+    monkeypatch.delenv("QUAYLET_LIVE", raising=False)
 
     def forbidden_factory(name: str, path: Path) -> FakeBackend:
         del name, path
@@ -111,7 +111,7 @@ def test_live_gate_exits_two_before_backend_construction(
 
     assert error.value.code == 2
     message = capsys.readouterr().err
-    assert "CLAUDE_PROXY_LIVE=1" in message
+    assert "QUAYLET_LIVE=1" in message
     assert "--model" in message
 
 
@@ -123,7 +123,7 @@ def test_live_gate_rejects_missing_or_blank_model_before_backend_construction(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CLAUDE_PROXY_LIVE", "1")
+    monkeypatch.setenv("QUAYLET_LIVE", "1")
 
     def forbidden_factory(name: str, path: Path) -> FakeBackend:
         del name, path
@@ -142,7 +142,7 @@ def test_live_gate_rejects_missing_or_blank_model_before_backend_construction(
 def test_live_success_updates_only_observed_statuses_and_metrics(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CLAUDE_PROXY_LIVE", "1")
+    monkeypatch.setenv("QUAYLET_LIVE", "1")
     observed_request: CanonicalRequest | None = None
 
     class SuccessfulBackend:
@@ -212,7 +212,7 @@ def test_live_success_updates_only_observed_statuses_and_metrics(
 def test_live_typed_failure_serializes_only_exception_class(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CLAUDE_PROXY_LIVE", "1")
+    monkeypatch.setenv("QUAYLET_LIVE", "1")
     secret = "sensitive-backend-error"
 
     class FailingBackend:
@@ -262,7 +262,7 @@ def test_live_typed_failure_serializes_only_exception_class(
 def test_live_ordinary_exception_is_redacted_without_stderr(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CLAUDE_PROXY_LIVE", "1")
+    monkeypatch.setenv("QUAYLET_LIVE", "1")
     secret = "process-launch-secret"
 
     class FailingBackend:
@@ -296,7 +296,7 @@ def test_live_setup_exception_becomes_stable_fail_closed_json(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CLAUDE_PROXY_LIVE", "1")
+    monkeypatch.setenv("QUAYLET_LIVE", "1")
     secret = "setup-secret"
 
     class FailingReportBackend:

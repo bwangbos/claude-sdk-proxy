@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-import claude_sdk_proxy.probe_cli as probe_cli
-import claude_sdk_proxy.validated as validated
-from claude_sdk_proxy.usage_evidence import UsageEvidenceSchema
-from claude_sdk_proxy.validated import (
+import quaylet.probe_cli as probe_cli
+import quaylet.validated as validated
+from quaylet.usage_evidence import UsageEvidenceSchema
+from quaylet.validated import (
     REQUIRED_SDK_TOOL_GATES,
     ManifestError,
     Phase0PrerequisiteDigestResolver,
@@ -249,7 +249,7 @@ def _manifest_document(
     model_map = dict(models or {"sonnet": _MODEL})
     core_gates = {gate: all_core_gates for gate in CORE_GATES}
     accepted_shape: dict[str, object] | None = {
-        "schema": "claude_sdk_proxy.public_child_attestation",
+        "schema": "quaylet.public_child_attestation",
         "version": 1,
         "fields": [
             "auth_source",
@@ -395,7 +395,7 @@ def _manifest_document(
             "fingerprint_algorithm": "sha256_sorted_name_nul_value_nul_v1",
         },
         "auth_evidence": {
-            "schema": "claude_sdk_proxy.child_attestation_manifest",
+            "schema": "quaylet.child_attestation_manifest",
             "version": 1,
             "accepted_public_shape": accepted_shape,
             "provider": "anthropic",
@@ -467,19 +467,22 @@ def _enable_synthetic_all(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_committed_manifest_has_every_core_domain_and_honest_false_verdict() -> None:
-    manifest = load_manifest(Path("docs/feasibility/validated-environment.json"))
+def test_historical_manifest_records_every_core_domain_and_false_verdict() -> None:
+    document = json.loads(
+        Path("docs/feasibility/validated-environment.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    gates = document["core_gates"]
 
-    assert set(manifest.core_gates) == CORE_GATES
-    assert manifest.core_gates["personal_subscription_policy"] is False
-    assert manifest.core_gates["exact_runtime_tuple"] is False
-    assert manifest.core_gates["per_child_auth_attestation"] is False
-    assert manifest.core_gates["exact_usage_schema"] is False
-    assert not all(manifest.core_gates.values())
-    with pytest.raises(ManifestError, match="false core gates"):
-        require_core_gates(manifest)
-    assert load_usage_evidence(manifest).rows
-    assert load_sdk_tool_evidence(manifest).records == ()
+    assert set(gates) == CORE_GATES
+    assert gates["personal_subscription_policy"] is False
+    assert gates["exact_runtime_tuple"] is False
+    assert gates["per_child_auth_attestation"] is False
+    assert gates["exact_usage_schema"] is False
+    assert not all(gates.values())
+    assert document["usage_evidence"]["rows"]
+    assert document["sdk_tool_evidence"]["records"] == []
 
 
 def test_synthetic_complete_manifest_passes_every_core_gate(tmp_path: Path) -> None:
@@ -783,7 +786,7 @@ def test_sdk_tool_digest_matches_the_exact_v1_projection(tmp_path: Path) -> None
         },
     }
     expected = hashlib.sha256(
-        b"claude-sdk-proxy:sdk-tool-record:v1\0" + canonical_evidence_json(projection)
+        b"quaylet:sdk-tool-record:v1\0" + canonical_evidence_json(projection)
     ).hexdigest()
 
     assert sdk_tool_record_digest(record) == expected
@@ -1818,10 +1821,11 @@ def test_manifest_model_map_rejects_moving_alias_backend_ids(tmp_path: Path) -> 
         _load_document(tmp_path, document)
 
 
-def test_committed_manifest_is_canonical_json_with_one_trailing_newline() -> None:
+def test_historical_manifest_is_canonical_json_with_one_trailing_newline() -> None:
     path = Path("docs/feasibility/validated-environment.json")
-    manifest = load_manifest(path)
-    assert path.read_bytes() == canonical_evidence_json(manifest.to_json()) + b"\n"
+    encoded = path.read_bytes()
+    document = json.loads(encoded)
+    assert encoded == canonical_evidence_json(document) + b"\n"
 
 
 def test_atomic_writer_refuses_nonexact_path_and_document_types(
@@ -2176,22 +2180,28 @@ def test_manifest_rejects_mapping_subclass_directly_in_canonical_encoder() -> No
         canonical_evidence_json(SafeLookingMapping(a=1))
 
 
-def test_committed_manifest_loader_and_gate_rejection_are_deterministic() -> None:
-    first = load_manifest(Path("docs/feasibility/validated-environment.json"))
-    second = load_manifest(Path("docs/feasibility/validated-environment.json"))
+def test_historical_manifest_schema_is_rejected_by_current_loader() -> None:
+    path = Path("docs/feasibility/validated-environment.json")
+    for _ in range(2):
+        with pytest.raises(ManifestError) as error:
+            load_manifest(path)
+        assert str(error.value) == "auth evidence schema is unsupported"
+
+
+def test_current_manifest_loader_and_gate_rejection_are_deterministic(
+    tmp_path: Path,
+) -> None:
+    document = _manifest_document(all_core_gates=False)
+    first = _load_document(tmp_path, document)
+    second = _load_document(tmp_path, document)
     assert first == second
+    expected = "Phase 0 manifest has false core gates: " + ", ".join(
+        sorted(CORE_GATES)
+    )
     for manifest in (first, second):
         with pytest.raises(ManifestError) as error:
             require_core_gates(manifest)
-        assert str(error.value) == (
-            "Phase 0 manifest has false core gates: "
-            "attribution_absent_observable, auth_source_lifetime, "
-            "compaction_disabled, exact_backend_model, exact_runtime_tuple, "
-            "exact_usage_schema, native_session_continuity, "
-            "path_safe_persistence, per_child_auth_attestation, "
-            "personal_subscription_policy, preinput_network_gate, "
-            "prompt_isolation, streaming_event_contract"
-        )
+        assert str(error.value) == expected
 
 
 def test_atomic_writer_does_not_leave_temp_file_on_open_failure(
@@ -2557,30 +2567,48 @@ def test_optional_tool_gate_uses_no_public_dialect_admission(
     assert sdk_tool_gate_passed(manifest, _MODEL)
 
 
-def test_committed_optional_tool_gate_is_false() -> None:
-    manifest = load_manifest(Path("docs/feasibility/validated-environment.json"))
-    for model in manifest.model_map.values():
-        assert sdk_tool_gate_passed(manifest, model) is False
+def test_historical_manifest_records_no_optional_tool_evidence() -> None:
+    document = json.loads(
+        Path("docs/feasibility/validated-environment.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert document["sdk_tool_evidence"]["records"] == []
 
 
-def test_committed_manifest_records_installed_cli_mismatch() -> None:
-    manifest = load_manifest(Path("docs/feasibility/validated-environment.json"))
-    assert manifest.cli_version == "2.1.251"
-    assert manifest.observed_cli_version == "2.1.252"
-    assert manifest.core_gates["exact_runtime_tuple"] is False
+def test_historical_manifest_records_installed_cli_mismatch() -> None:
+    document = json.loads(
+        Path("docs/feasibility/validated-environment.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    runtime = document["runtime_evidence"]
+    assert runtime["cli_version"] == "2.1.251"
+    assert runtime["observed_cli_version"] == "2.1.252"
+    assert document["core_gates"]["exact_runtime_tuple"] is False
 
 
-def test_committed_manifest_records_current_policy_digests() -> None:
-    manifest = load_manifest(Path("docs/feasibility/validated-environment.json"))
-    assert {source["sha256"] for source in manifest.policy_sources} == {
+def test_historical_manifest_records_policy_digests() -> None:
+    document = json.loads(
+        Path("docs/feasibility/validated-environment.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {
+        source["sha256"] for source in document["policy_evidence"]["sources"]
+    } == {
         "2830a3e2b3623aa731e55bede28cf7ba652c524195b3082fce3f56f4aabc75e5",
         "19ee9ebf0bbed7f2b6ec9562e730303269f97c232b3db04506a5c6f7c6d379ca",
     }
 
 
-def test_manifest_evidence_never_contains_os_environment_values() -> None:
-    manifest = load_manifest(Path("docs/feasibility/validated-environment.json"))
-    encoded = canonical_evidence_json(manifest.to_json())
+def test_historical_manifest_never_contains_os_environment_values() -> None:
+    document = json.loads(
+        Path("docs/feasibility/validated-environment.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    encoded = canonical_evidence_json(document)
     sensitive_terms = ("TOKEN", "KEY", "SECRET", "PASSWORD", "COOKIE")
     for name, value in os.environ.items():
         if (

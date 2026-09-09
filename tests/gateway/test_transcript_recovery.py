@@ -6,14 +6,14 @@ from dataclasses import replace
 
 import pytest
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import (
+from quaylet.app import create_app
+from quaylet.domain import (
     BackendFailure,
     CanonicalMessage,
     ResponseIdentity,
     ToolResultBlock,
 )
-from claude_sdk_proxy.sessions import SessionCapacity, SessionConflict, SessionRegistry
+from quaylet.sessions import SessionCapacity, SessionConflict, SessionRegistry
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.test_tool_http import tool_body
 from tests.gateway.test_tool_sessions import (
@@ -53,7 +53,7 @@ async def test_expired_rebase_respects_new_owner_and_capacity(same_key, cancel_c
     first = first_request(tools=(echo_tool(),))
     try:
         lease = await registry.open_turn(first, None)
-        sid = lease.response_headers["X-Claude-Proxy-Session"]
+        sid = lease.response_headers["X-Quaylet-Session"]
         await collect(lease.stream())
         correct = continuation(
             first,
@@ -84,7 +84,7 @@ async def test_expired_rebase_respects_new_owner_and_capacity(same_key, cancel_c
                 await task
         await asyncio.wait_for(candidate.closed.wait(), 2)
         assert not newer.closed.is_set()
-        assert newer_lease.response_headers["X-Claude-Proxy-Session"] == (
+        assert newer_lease.response_headers["X-Quaylet-Session"] == (
             sid if same_key else "different"
         )
     finally:
@@ -217,7 +217,7 @@ async def test_complete_tool_results_can_import_without_a_live_session(explicit)
     backend = http_session((final_boundary("recovered"),))
     factory = ToolFactory((backend,))
     app = create_app(models=("sonnet",), session_factory=factory)
-    headers = {"x-claude-proxy-session": "recovered"} if explicit else {}
+    headers = {"x-quaylet-session": "recovered"} if explicit else {}
     async with lifespan_app(app):
         result = await post_json(
             app, "/v1/chat/completions", completed_result_tail(), headers=headers
@@ -237,7 +237,7 @@ async def test_complete_rewritten_result_tail_replaces_suspended_session(explici
     replacement = http_session((final_boundary("recovered"),))
     factory = ToolFactory((old, replacement))
     app = create_app(models=("sonnet",), session_factory=factory)
-    headers = {"x-claude-proxy-session": "recovered"} if explicit else {}
+    headers = {"x-quaylet-session": "recovered"} if explicit else {}
     async with lifespan_app(app):
         first = await post_json(
             app, "/v1/chat/completions", tool_body("openai"), headers=headers
@@ -249,8 +249,8 @@ async def test_complete_rewritten_result_tail_replaces_suspended_session(explici
         assert result.status == 200, result.json
         assert result.json["choices"][0]["message"]["content"] == "recovered"
         assert (
-            result.headers["x-claude-proxy-session"]
-            == first.headers["x-claude-proxy-session"]
+            result.headers["x-quaylet-session"]
+            == first.headers["x-quaylet-session"]
         )
         await old.closed.wait()
         assert old.results == []
@@ -261,7 +261,7 @@ async def test_wrong_pending_ids_do_not_replace_an_identified_session():
     old = http_session((call_boundary("call_one"), final_boundary("original")))
     factory = ToolFactory((old,))
     app = create_app(models=("sonnet",), session_factory=factory)
-    headers = {"x-claude-proxy-session": "stable"}
+    headers = {"x-quaylet-session": "stable"}
     async with lifespan_app(app):
         first = await post_json(
             app, "/v1/chat/completions", tool_body("openai"), headers=headers

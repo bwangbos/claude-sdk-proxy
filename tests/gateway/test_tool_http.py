@@ -10,9 +10,9 @@ import pytest
 from claude_agent_sdk import ResultMessage, UserMessage
 from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
 
-from claude_sdk_proxy.anthropic_api import parse_anthropic_request
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import (
+from quaylet.anthropic_api import parse_anthropic_request
+from quaylet.app import create_app
+from quaylet.domain import (
     Completed,
     ConversationEvent,
     Dialect,
@@ -24,8 +24,8 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
-from claude_sdk_proxy.openai_api import parse_openai_request
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.openai_api import parse_openai_request
+from quaylet.sdk_session import SdkSession
 from tests.gateway.asgi_client import (
     _LIFESPAN_STATES,
     lifespan_app,
@@ -1118,7 +1118,7 @@ async def test_expired_tool_result_submission_is_http_504() -> None:
         return session
 
     app = create_app(models=("sonnet",), session_factory=factory)
-    headers = {"X-Claude-Proxy-Session": "expired-results"}
+    headers = {"X-Quaylet-Session": "expired-results"}
     messages = [
         {"role": "user", "content": "go"},
         _assistant_call_message("anthropic", (("toolu_one", "same"),)),
@@ -1190,7 +1190,7 @@ async def test_http_repeated_tool_rounds_reverse_parallel_results_and_replay(
         return session
 
     app = create_app(models=("sonnet",), session_factory=factory)
-    headers = {"X-Claude-Proxy-Session": f"rounds-{dialect}-{stream}"}
+    headers = {"X-Quaylet-Session": f"rounds-{dialect}-{stream}"}
     messages: list[dict[str, object]] = [{"role": "user", "content": "go"}]
     async with lifespan_app(app):
         first = await post_json(
@@ -1728,7 +1728,7 @@ async def test_invalid_caller_results_are_400_and_corrected_retry_still_works(
         return session
 
     app = create_app(models=("sonnet",), session_factory=factory)
-    headers = {"X-Claude-Proxy-Session": "invalid-results"}
+    headers = {"X-Quaylet-Session": "invalid-results"}
     messages: list[dict[str, object]] = [{"role": "user", "content": "go"}]
     async with lifespan_app(app):
         first = await post_json(
@@ -1784,7 +1784,7 @@ async def test_http_tool_session_freezes_schema_and_dialect_as_409() -> None:
         return session
 
     app = create_app(models=("sonnet",), session_factory=factory)
-    headers = {"X-Claude-Proxy-Session": "frozen-config"}
+    headers = {"X-Quaylet-Session": "frozen-config"}
     async with lifespan_app(app):
         first = await post_json(app, "/v1/messages", tool_body("anthropic"), headers)
         changed_schema = tool_body("anthropic")
@@ -1819,7 +1819,7 @@ async def test_duplicate_http_tool_request_is_409_while_generation_is_active() -
         return session
 
     app = create_app(models=("sonnet",), session_factory=factory)
-    headers = {"X-Claude-Proxy-Session": "busy-tools"}
+    headers = {"X-Quaylet-Session": "busy-tools"}
     async with lifespan_app(app):
         active_task = asyncio.create_task(
             post_json(app, "/v1/messages", tool_body("anthropic"), headers)
@@ -1856,13 +1856,13 @@ async def test_waiting_http_tool_session_makes_all_busy_capacity_503() -> None:
             app,
             "/v1/messages",
             tool_body("anthropic"),
-            {"X-Claude-Proxy-Session": "waiting"},
+            {"X-Quaylet-Session": "waiting"},
         )
         other = await post_json(
             app,
             "/v1/messages",
             tool_body("anthropic"),
-            {"X-Claude-Proxy-Session": "other"},
+            {"X-Quaylet-Session": "other"},
         )
 
     assert waiting.status == 200
@@ -2110,13 +2110,13 @@ async def test_oversized_caller_result_is_redacted() -> None:
             app,
             "/v1/messages",
             tool_body("anthropic"),
-            {"X-Claude-Proxy-Session": "caller-secret-session"},
+            {"X-Quaylet-Session": "caller-secret-session"},
         )
         caller = await post_json(
             app,
             "/v1/messages",
             _body_with_messages("anthropic", messages, stream=False),
-            {"X-Claude-Proxy-Session": "caller-secret-session"},
+            {"X-Quaylet-Session": "caller-secret-session"},
         )
 
     assert boundary.status == 200

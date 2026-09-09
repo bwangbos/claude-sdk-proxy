@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from claude_sdk_proxy.app import create_app
+from quaylet.app import create_app
 from tests.gateway.asgi_client import AsgiResponse
 from tests.gateway.fakes import sdk_response
 from tests.gateway.test_refusal_continuation import RefusalFactory, _assistant, _body
@@ -47,8 +47,8 @@ async def test_empty_refusal_replay_and_continuation_over_real_http(
         assert continued.status_code == 200, continued.text
         assert "continued" in continued.text
         assert (
-            continued.headers["x-claude-proxy-session"]
-            == refused.headers["x-claude-proxy-session"]
+            continued.headers["x-quaylet-session"]
+            == refused.headers["x-quaylet-session"]
         )
         assert factory.clients[0].prompts == ["refuse", "continue"]
         assert len(factory.clients) == 1

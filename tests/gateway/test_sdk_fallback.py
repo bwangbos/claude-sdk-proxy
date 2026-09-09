@@ -7,13 +7,13 @@ from pathlib import Path
 import pytest
 from claude_agent_sdk import AssistantMessage, StreamEvent, SystemMessage
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     BackendFailure,
     Completed,
     ResponseIdentity,
     TextDelta,
 )
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.sdk_session import SdkSession
 from tests.gateway.fakes import (
     FakeSdkClient,
     FixedTemporaryDirectory,
@@ -51,8 +51,8 @@ class _NoPrefixCopy(str):
 
 
 def test_buffer_fragment_accumulation_does_not_copy_prefix() -> None:
-    from claude_sdk_proxy.domain import ThinkingDelta
-    from claude_sdk_proxy.sdk_fallback import FallbackBuffer
+    from quaylet.domain import ThinkingDelta
+    from quaylet.sdk_fallback import FallbackBuffer
 
     buffer = FallbackBuffer(limit_bytes=12)
     for event_type in (TextDelta, lambda text: ThinkingDelta(0, text)):
@@ -63,7 +63,7 @@ def test_buffer_fragment_accumulation_does_not_copy_prefix() -> None:
 
 @pytest.mark.parametrize("kind", ["text", "thinking", "tool"])
 def test_native_fragment_accumulation_does_not_copy_prefix(kind: str) -> None:
-    from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+    from quaylet.sdk_tool_protocol import RawSdkMessageValidator
     from tests.gateway.test_thinking_streams import thinking_response
 
     messages = (
@@ -102,7 +102,7 @@ def test_native_fragment_accumulation_does_not_copy_prefix(kind: str) -> None:
 async def test_synthetic_closed_thinking_discard_keeps_replacement_signed_history(
     tmp_path: Path,
 ) -> None:
-    from claude_sdk_proxy.domain import ThinkingBlock, ThinkingCompleted, ThinkingDelta
+    from quaylet.domain import ThinkingBlock, ThinkingCompleted, ThinkingDelta
 
     original = pinned_thinking("claude-opus-5")[:7]
     events = await collect(
@@ -129,7 +129,7 @@ async def test_synthetic_closed_thinking_discard_keeps_replacement_signed_histor
 async def test_auto_no_fallback_refusal_is_committed_only_after_result(
     tmp_path: Path,
 ) -> None:
-    from claude_sdk_proxy.domain import InputUsage
+    from quaylet.domain import InputUsage
     from tests.gateway.test_sdk_refusal import RAW_USAGE, refusal_response
 
     assert await collect(tmp_path, refusal_response()) == [
@@ -197,7 +197,7 @@ async def test_invalid_native_transition_never_releases_identity(
     "payload", [{"signature": "éé"}, {"data": "éé"}, {"partial_json": "éé"}]
 )
 def test_native_payload_limit_precedes_validator_retention(payload: dict) -> None:
-    from claude_sdk_proxy.sdk_fallback import FallbackBuffer
+    from quaylet.sdk_fallback import FallbackBuffer
 
     buffer = FallbackBuffer(limit_bytes=3)
     with pytest.raises(BackendFailure, match="fallback_buffer_limit"):
@@ -210,8 +210,8 @@ def test_tool_suffix_retains_coalesced_thinking_not_per_delta_events(
 ) -> None:
     from claude_agent_sdk import ThinkingBlock as SdkThinkingBlock
 
-    from claude_sdk_proxy.domain import ThinkingDelta, ToolDefinition
-    from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+    from quaylet.domain import ThinkingDelta, ToolDefinition
+    from quaylet.sdk_tool_protocol import RawSdkMessageValidator
     from tests.gateway.test_thinking_streams import interleaved_tool_response
 
     raw = RawSdkMessageValidator((ToolDefinition("echo", "", {"type": "object"}),))
@@ -342,7 +342,7 @@ async def test_identity_is_live_only_in_strict_mode(
 async def test_auto_failure_discards_buffer_and_closes_client(
     tmp_path: Path, monkeypatch, failure: str
 ) -> None:
-    from claude_sdk_proxy.sdk_fallback import FallbackBuffer
+    from quaylet.sdk_fallback import FallbackBuffer
 
     reached, release = asyncio.Event(), asyncio.Event()
     client = FakeSdkClient(
@@ -351,7 +351,7 @@ async def test_auto_failure_discards_buffer_and_closes_client(
     )
     if failure == "overflow":
         monkeypatch.setattr(
-            "claude_sdk_proxy.sdk_session.FallbackBuffer",
+            "quaylet.sdk_session.FallbackBuffer",
             lambda: FallbackBuffer(limit_bytes=3),
         )
     session = SdkSession(
@@ -470,7 +470,7 @@ async def test_replacement_tool_boundary_has_one_identity_and_new_call(
 
 
 def test_discard_removes_original_leg() -> None:
-    from claude_sdk_proxy.sdk_fallback import FallbackBuffer
+    from quaylet.sdk_fallback import FallbackBuffer
 
     buffer = FallbackBuffer(limit_bytes=32)
     buffer.append(TextDelta("discard me"))
@@ -480,7 +480,7 @@ def test_discard_removes_original_leg() -> None:
 
 
 def test_buffer_counts_utf8_before_retaining() -> None:
-    from claude_sdk_proxy.sdk_fallback import FallbackBuffer
+    from quaylet.sdk_fallback import FallbackBuffer
 
     buffer = FallbackBuffer(limit_bytes=3)
     with pytest.raises(BackendFailure, match="fallback_buffer_limit"):
@@ -489,7 +489,7 @@ def test_buffer_counts_utf8_before_retaining() -> None:
 
 
 def test_buffer_coalesces_and_resets_at_response_boundary() -> None:
-    from claude_sdk_proxy.sdk_fallback import FallbackBuffer
+    from quaylet.sdk_fallback import FallbackBuffer
 
     buffer = FallbackBuffer(limit_bytes=4)
     for _ in range(4):

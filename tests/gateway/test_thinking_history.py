@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from claude_sdk_proxy.anthropic_api import parse_anthropic_request
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import CanonicalMessage, TextBlock, ThinkingBlock
-from claude_sdk_proxy.openai_api import parse_openai_request
-from claude_sdk_proxy.sdk_history import seed_history
-from claude_sdk_proxy.sdk_session import SdkSession
-from claude_sdk_proxy.session_identity import (
+from quaylet.anthropic_api import parse_anthropic_request
+from quaylet.app import create_app
+from quaylet.domain import CanonicalMessage, TextBlock, ThinkingBlock
+from quaylet.openai_api import parse_openai_request
+from quaylet.sdk_history import seed_history
+from quaylet.sdk_session import SdkSession
+from quaylet.session_identity import (
     replay_messages_equal,
     request_fingerprint,
 )
@@ -115,7 +115,7 @@ async def test_openai_public_replay_reuses_native_session_and_retains_thinking(
     async with lifespan_app(app):
         first = await post_json(app, "/v1/chat/completions", body)
         assert first.status == 200
-        sid = first.headers["x-claude-proxy-session"]
+        sid = first.headers["x-quaylet-session"]
         registry = _LIFESPAN_STATES[app]["registry"]
         entry = registry._implicit[sid]
         assert entry.transcript[1].blocks == (
@@ -132,7 +132,7 @@ async def test_openai_public_replay_reuses_native_session_and_retains_thinking(
         ]
         second = await post_json(app, "/v1/chat/completions", body)
         assert second.status == 200, second.json
-        assert second.headers["x-claude-proxy-session"] == sid
+        assert second.headers["x-quaylet-session"] == sid
         assert client.connect_count == 1
         assert client.prompts == ["hi", "next"]
         assert registry._implicit[sid].transcript[1].blocks == (
@@ -151,7 +151,7 @@ async def test_openai_public_replay_reuses_native_session_and_retains_thinking(
     ],
 )
 def test_unsigned_or_malformed_native_history_is_rejected(block):
-    from claude_sdk_proxy.domain import RequestValidationError
+    from quaylet.domain import RequestValidationError
 
     with pytest.raises(RequestValidationError):
         parse_anthropic_request(
@@ -199,15 +199,15 @@ async def test_openai_reasoning_only_max_tokens_replays_without_answer_text(tmp_
         second = await post_json(app, "/v1/chat/completions", body)
         assert second.status == 200, second.json
         assert (
-            second.headers["x-claude-proxy-session"]
-            == first.headers["x-claude-proxy-session"]
+            second.headers["x-quaylet-session"]
+            == first.headers["x-quaylet-session"]
         )
         assert client.prompts == ["hi", "next"]
 
 
 @pytest.mark.parametrize("dialect,expected", [("anthropic", False), ("openai", True)])
 def test_native_signed_history_identity_is_dialect_specific(dialect, expected):
-    from claude_sdk_proxy.session_identity import messages_equal
+    from quaylet.session_identity import messages_equal
 
     left = (
         CanonicalMessage(
@@ -298,7 +298,7 @@ async def test_interleaved_thinking_continuation_keeps_order_and_one_result_batc
     async with lifespan_app(app):
         first = await post_json(app, path, body)
         assert first.status == 200
-        sid = first.headers["x-claude-proxy-session"]
+        sid = first.headers["x-quaylet-session"]
         replay = await post_json(app, path, body)
         assert replay.status == 200
         assert client.tool_handler_count == 2
@@ -334,7 +334,7 @@ async def test_interleaved_thinking_continuation_keeps_order_and_one_result_batc
             ]
         final = await post_json(app, path, body)
         assert final.status == 200, final.json
-        assert final.headers["x-claude-proxy-session"] == sid
+        assert final.headers["x-quaylet-session"] == sid
         registry = _LIFESPAN_STATES[app]["registry"]
         transcript = registry._implicit[sid].transcript
         assert [m.role for m in transcript] == [

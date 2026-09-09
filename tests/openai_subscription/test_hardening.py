@@ -6,7 +6,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     ImageBlock,
     RequestValidationError,
@@ -14,14 +14,14 @@ from claude_sdk_proxy.domain import (
     ToolCallBlock,
     ToolResultBlock,
 )
-from claude_sdk_proxy.openai_subscription.backend import Backend, SubscriptionFailure
-from claude_sdk_proxy.openai_subscription.replay import (
+from quaylet.openai_subscription.backend import Backend, SubscriptionFailure
+from quaylet.openai_subscription.replay import (
     ReplayCache,
     decode_reasoning,
     encode_reasoning,
     valid_reasoning,
 )
-from claude_sdk_proxy.openai_subscription.translation import build_body
+from quaylet.openai_subscription.translation import build_body
 from tests.fixtures.image_data import solid_png
 
 from .test_backend import Auth, Bytes, collect, sse, terminal, text_item
@@ -284,7 +284,7 @@ async def test_incomplete_terminal_never_populates_replay_cache():
 
 @pytest.mark.anyio
 async def test_oversize_request_is_rejected_before_auth_or_http(monkeypatch):
-    from claude_sdk_proxy.openai_subscription import translation
+    from quaylet.openai_subscription import translation
 
     monkeypatch.setattr(translation, "MAX_REQUEST_BYTES", 256, raising=False)
 

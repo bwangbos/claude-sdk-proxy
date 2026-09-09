@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.platform import darwin_probe_path
+from quaylet.platform import darwin_probe_path
 
 
 @pytest.fixture

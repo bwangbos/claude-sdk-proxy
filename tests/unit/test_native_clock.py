@@ -25,7 +25,7 @@ def test_native_deadlines_use_python_uptime_after_system_sleep(
             f"-DTEST_{component}",
             str(root / "tests/fixtures/native_clock_probe.c"),
             "-L" + str(root / "build/lib"),
-            "-lclaude_proxy_lifecycle",
+            "-lquaylet_lifecycle",
             "-Wl,-rpath," + str(root / "build/lib"),
             "-lproc",
             "-o",

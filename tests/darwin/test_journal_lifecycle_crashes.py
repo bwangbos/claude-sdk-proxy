@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.journal import (
+from quaylet.journal import (
     Journal,
     JournalDeleteReceipt,
     JournalError,
@@ -16,7 +16,7 @@ from claude_sdk_proxy.journal import (
     RecordClass,
     UnreleasedPartialCreate,
 )
-from claude_sdk_proxy.lifecycle import Record, StateKind
+from quaylet.lifecycle import Record, StateKind
 
 NORMAL_LIMIT = 64 * 1024
 PHYSICAL_RECORD_SIZE = 108 + 1064
@@ -60,7 +60,7 @@ def _future() -> int:
 def _fault_library() -> Path:
     return (
         Path(__file__).resolve().parents[2]
-        / "build/lib/libclaude_proxy_lifecycle_fault.dylib"
+        / "build/lib/libquaylet_lifecycle_fault.dylib"
     )
 
 

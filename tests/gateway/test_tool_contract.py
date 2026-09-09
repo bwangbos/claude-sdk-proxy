@@ -4,7 +4,7 @@ from types import MappingProxyType
 
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     RequestValidationError,
     TextBlock,
@@ -14,7 +14,7 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
-from claude_sdk_proxy.tool_contract import (
+from quaylet.tool_contract import (
     MAX_JSON_CONTAINER_DEPTH,
     canonical_json,
     freeze_json,

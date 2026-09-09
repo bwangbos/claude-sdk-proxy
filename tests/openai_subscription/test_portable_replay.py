@@ -4,7 +4,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     RedactedThinkingBlock,
     TextBlock,
@@ -14,7 +14,7 @@ from claude_sdk_proxy.domain import (
     ToolCallBlock,
     ToolResultBlock,
 )
-from claude_sdk_proxy.openai_subscription.backend import Backend
+from quaylet.openai_subscription.backend import Backend
 
 from .test_backend import Auth, Bytes, sse, terminal, text_item
 from .test_translation import request
@@ -161,7 +161,7 @@ async def test_chat_does_not_emit_portable_metadata_carrier():
 
 @pytest.mark.anyio
 async def test_carrier_is_single_and_bounded_with_multiple_reasoning_items(monkeypatch):
-    from claude_sdk_proxy.openai_subscription import replay
+    from quaylet.openai_subscription import replay
 
     reasoning = [
         {
@@ -223,8 +223,8 @@ async def test_carrier_is_single_and_bounded_with_multiple_reasoning_items(monke
 async def test_carrier_cannot_override_visible_history_or_ambiguity(change):
     import base64
 
-    from claude_sdk_proxy.openai_subscription.replay import ASSISTANT_PREFIX
-    from claude_sdk_proxy.openai_subscription.translation import build_body
+    from quaylet.openai_subscription.replay import ASSISTANT_PREFIX
+    from quaylet.openai_subscription.translation import build_body
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(

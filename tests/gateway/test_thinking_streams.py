@@ -8,8 +8,8 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, StreamEvent
 from claude_agent_sdk import TextBlock as SdkTextBlock
 from claude_agent_sdk import ThinkingBlock as SdkThinkingBlock
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.app import create_app
+from quaylet.sdk_session import SdkSession
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.fakes import FakeSdkClient, FixedTemporaryDirectory
 
@@ -217,8 +217,8 @@ async def test_stream_preserves_thinking_fields_and_block_indices(tmp_path, dial
     ],
 )
 def test_malformed_thinking_is_rejected(mutation):
-    from claude_sdk_proxy.domain import BackendFailure
-    from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+    from quaylet.domain import BackendFailure
+    from quaylet.sdk_tool_protocol import RawSdkMessageValidator
 
     events = list(thinking_response()[:-1])
     if mutation == "signature_type":
@@ -251,12 +251,12 @@ def test_malformed_thinking_is_rejected(mutation):
 def test_empty_display_and_redacted_blocks_keep_native_payload(kind, typed_mode):
     from claude_agent_sdk._internal.message_parser import parse_message
 
-    from claude_sdk_proxy.domain import (
+    from quaylet.domain import (
         RedactedThinkingBlock,
         ThinkingBlock,
         ThinkingCompleted,
     )
-    from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+    from quaylet.sdk_tool_protocol import RawSdkMessageValidator
 
     block = (
         {"type": "thinking", "thinking": "", "signature": ""}
@@ -302,8 +302,8 @@ def test_empty_display_and_redacted_blocks_keep_native_payload(kind, typed_mode)
 
 
 def test_missing_typed_thinking_does_not_pass_as_lossy_redacted_projection():
-    from claude_sdk_proxy.domain import BackendFailure
-    from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+    from quaylet.domain import BackendFailure
+    from quaylet.sdk_tool_protocol import RawSdkMessageValidator
 
     validator = RawSdkMessageValidator(())
     with pytest.raises(BackendFailure):
@@ -573,16 +573,16 @@ async def test_native_empty_display_and_raw_redacted_survive_http(
 
 
 def test_text_thinking_text_interleaving_preserves_signed_order_and_public_text():
-    from claude_sdk_proxy.domain import (
+    from quaylet.domain import (
         CanonicalMessage,
         TextBlock,
         TextDelta,
         ThinkingBlock,
         ThinkingCompleted,
     )
-    from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
-    from claude_sdk_proxy.session_identity import messages_equal
-    from claude_sdk_proxy.tool_session_actor import _assistant_message
+    from quaylet.sdk_tool_protocol import RawSdkMessageValidator
+    from quaylet.session_identity import messages_equal
+    from quaylet.tool_session_actor import _assistant_message
 
     validator = RawSdkMessageValidator(())
     normalized = []
@@ -693,7 +693,7 @@ async def test_live_thinking_token_progress_is_not_output_or_usage(
     ],
 )
 async def test_thinking_progress_remains_strictly_scoped(tmp_path, overrides, index):
-    from claude_sdk_proxy.domain import BackendFailure
+    from quaylet.domain import BackendFailure
 
     raw = thinking_response()
     client = FakeSdkClient(

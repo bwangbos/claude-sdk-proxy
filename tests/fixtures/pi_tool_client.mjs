@@ -71,7 +71,7 @@ const model = {
   id: "sonnet-5",
   name: "Claude subscription proxy",
   api: "openai-completions",
-  provider: "claude-proxy",
+  provider: "quaylet",
   baseUrl,
   reasoning: false,
   input: ["text"],
@@ -116,7 +116,7 @@ async function recordingFetch(input, init) {
   const request = new Request(input, init);
   const headers = Object.fromEntries(request.headers.entries());
   for (const name of Object.keys(headers)) {
-    if (name.toLowerCase() === "x-claude-proxy-session") {
+    if (name.toLowerCase() === "x-quaylet-session") {
       customSessionHeaders.push(name);
     }
   }

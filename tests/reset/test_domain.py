@@ -1,6 +1,6 @@
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     CanonicalRequest,
     CapabilityReport,

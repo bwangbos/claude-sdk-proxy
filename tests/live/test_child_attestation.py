@@ -10,7 +10,7 @@ from importlib.metadata import version
 import pytest
 from claude_agent_sdk import SystemMessage
 
-from claude_sdk_proxy.attestation import (
+from quaylet.attestation import (
     AttestationError,
     current_attestation_availability,
     extract_child_attestation,

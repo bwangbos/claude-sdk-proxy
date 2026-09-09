@@ -5,7 +5,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     Completed,
     ResponseIdentity,
@@ -13,9 +13,9 @@ from claude_sdk_proxy.domain import (
     ToolCallBlock,
     ToolResultBlock,
 )
-from claude_sdk_proxy.openai_subscription.backend import Backend, SubscriptionFailure
-from claude_sdk_proxy.openai_subscription.events import parse_sse
-from claude_sdk_proxy.openai_subscription.replay import ReplayCache, encode_reasoning
+from quaylet.openai_subscription.backend import Backend, SubscriptionFailure
+from quaylet.openai_subscription.events import parse_sse
+from quaylet.openai_subscription.replay import ReplayCache, encode_reasoning
 
 from .test_backend import Auth, Bytes, collect, sse, terminal, text_item
 from .test_translation import request
@@ -280,7 +280,7 @@ def test_oversize_envelope_is_rejected_without_exposing_ciphertext():
 
 @pytest.mark.anyio
 async def test_refusal_delta_streams_distinctly_and_replays_visible_fallback():
-    from claude_sdk_proxy import domain
+    from quaylet import domain
 
     item = {
         "type": "message",
@@ -347,8 +347,8 @@ async def test_refusal_delta_streams_distinctly_and_replays_visible_fallback():
 
 @pytest.mark.anyio
 async def test_terminal_omission_does_not_erase_already_received_ciphertext():
-    from claude_sdk_proxy.domain import ThinkingCompleted
-    from claude_sdk_proxy.openai_subscription.replay import decode_reasoning
+    from quaylet.domain import ThinkingCompleted
+    from quaylet.openai_subscription.replay import decode_reasoning
 
     item = {
         "type": "reasoning",
@@ -368,7 +368,7 @@ async def test_terminal_omission_does_not_erase_already_received_ciphertext():
         )
     )
     completed = next(e for e in events if isinstance(e, ThinkingCompleted))
-    from claude_sdk_proxy.openai_subscription.replay import envelope_scope
+    from quaylet.openai_subscription.replay import envelope_scope
 
     scope = envelope_scope(
         request(),
@@ -385,7 +385,7 @@ async def test_terminal_omission_does_not_erase_already_received_ciphertext():
 
 @pytest.mark.anyio
 async def test_changed_item_id_at_done_is_rejected_before_tool_emission():
-    from claude_sdk_proxy.domain import ToolCall
+    from quaylet.domain import ToolCall
 
     item = {
         "type": "function_call",
@@ -419,7 +419,7 @@ async def test_changed_item_id_at_done_is_rejected_before_tool_emission():
 async def test_failure_diagnostics_record_only_safe_metadata(caplog):
     import logging
 
-    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    caplog.set_level(logging.INFO, logger="quaylet.diagnostics")
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda r: httpx.Response(

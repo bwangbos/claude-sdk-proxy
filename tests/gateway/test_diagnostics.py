@@ -5,8 +5,8 @@ import logging
 
 import pytest
 
-from claude_sdk_proxy import cli
-from claude_sdk_proxy.app import create_app
+from quaylet import cli
+from quaylet.app import create_app
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.fakes import FakeSessionFactory
 
@@ -16,11 +16,11 @@ from tests.gateway.fakes import FakeSessionFactory
 async def test_tool_continuation_backend_logs_use_current_request_id(caplog, watcher):
     import asyncio
 
-    from claude_sdk_proxy.diagnostics import record
-    from claude_sdk_proxy.domain import ModelFallbackDisabled, ResponseIdentity
+    from quaylet.diagnostics import record
+    from quaylet.domain import ModelFallbackDisabled, ResponseIdentity
     from tests.gateway.test_tool_http import RepeatedRoundSession, tool_body
 
-    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    caplog.set_level(logging.INFO, logger="quaylet.diagnostics")
 
     class FailingContinuation(RepeatedRoundSession):
         async def stream_generation(self, prompt):
@@ -96,13 +96,13 @@ async def test_request_ids_cover_validation_errors_and_success(stream):
 
 @pytest.mark.anyio
 async def test_session_errors_explain_reason_and_log_only_safe_metadata(caplog):
-    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    caplog.set_level(logging.INFO, logger="quaylet.diagnostics")
     app = create_app(models=("sonnet",), session_factory=FakeSessionFactory(("hello",)))
     body = {
         "model": "sonnet",
         "messages": [{"role": "user", "content": "SECRET_PROMPT"}],
     }
-    headers = {"x-claude-proxy-session": "SECRET_SESSION"}
+    headers = {"x-quaylet-session": "SECRET_SESSION"}
     async with lifespan_app(app):
         first = await post_json(app, "/v1/chat/completions", body, headers=headers)
         changed = {
@@ -117,7 +117,7 @@ async def test_session_errors_explain_reason_and_log_only_safe_metadata(caplog):
     assert error.status == 409
     assert error.json["error"].get("reason") == "system_changed"
     assert "system" in error.json["error"]["message"].lower()
-    assert "X-Claude-Proxy-Session" in error.json["error"]["message"]
+    assert "X-Quaylet-Session" in error.json["error"]["message"]
     records = [r.msg for r in caplog.records if isinstance(r.msg, dict)]
     assert any(r.get("event") == "session_selected" for r in records)
     assert any(
@@ -129,8 +129,8 @@ async def test_session_errors_explain_reason_and_log_only_safe_metadata(caplog):
 
 
 def test_cli_json_log_file_has_request_diagnostics(monkeypatch, tmp_path):
-    from claude_sdk_proxy.http_errors import error_detail
-    from claude_sdk_proxy.sessions import SessionMismatch
+    from quaylet.http_errors import error_detail
+    from quaylet.sessions import SessionMismatch
 
     path = tmp_path / "proxy.jsonl"
 

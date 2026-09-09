@@ -1,11 +1,11 @@
 import pytest
 
-from claude_sdk_proxy.model_catalog import (
+from quaylet.model_catalog import (
     backend_model,
     canonical_model,
     canonical_models,
 )
-from claude_sdk_proxy.openai_api import parse_openai_request
+from quaylet.openai_api import parse_openai_request
 
 
 @pytest.mark.parametrize(

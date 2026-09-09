@@ -9,14 +9,14 @@ import pytest
 from mcp.server import Server
 from mcp.types import CallToolRequestParams, CallToolResult, ListToolsResult
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     BackendFailure,
     RequestValidationError,
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
 )
-from claude_sdk_proxy.tool_bridge import ToolBridge
+from quaylet.tool_bridge import ToolBridge
 
 
 def echo_definition(

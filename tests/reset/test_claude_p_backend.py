@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.claude_p_backend import ClaudePBackend, _drain_stderr
-from claude_sdk_proxy.domain import (
+from quaylet.claude_p_backend import ClaudePBackend, _drain_stderr
+from quaylet.domain import (
     BackendEvent,
     BackendFailure,
     CanonicalMessage,
@@ -152,7 +152,7 @@ def test_stream_executes_isolated_cli_with_exact_input_and_normalizes_events(
         '{"type":"user","message":{"role":"user","content":"caller-message"},'
         '"parent_tool_use_id":null}\n'
     )
-    assert Path(captured["cwd"]).name.startswith("claude-proxy-")
+    assert Path(captured["cwd"]).name.startswith("quaylet-")
     assert captured["cwd_entries"] == []
     assert not Path(captured["cwd"]).exists()
     assert "FAKE_CLAUDE_CAPTURE" in captured["environment_names"]

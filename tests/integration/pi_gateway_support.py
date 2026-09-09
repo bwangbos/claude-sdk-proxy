@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 import uvicorn
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     Completed,
     ConversationEvent,
@@ -25,7 +25,7 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
-from claude_sdk_proxy.thinking import ThinkingOptions
+from quaylet.thinking import ThinkingOptions
 from tests.gateway.fakes import FakeConversationSession
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "pi_text_client.mjs"
@@ -314,7 +314,7 @@ async def recover_failed_session(base_url: str, scenario: str) -> dict[str, Any]
             body,
             {
                 "Content-Type": "application/json",
-                "X-Claude-Proxy-Session": f"pi-{scenario}",
+                "X-Quaylet-Session": f"pi-{scenario}",
             },
             method="POST",
         )

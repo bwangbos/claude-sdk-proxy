@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     Completed,
     ConversationEvent,
@@ -21,13 +21,13 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
-from claude_sdk_proxy.sessions import (
+from quaylet.sessions import (
     SessionCapacity,
     SessionConflict,
     SessionMismatch,
     SessionRegistry,
 )
-from claude_sdk_proxy.thinking import ThinkingOptions
+from quaylet.thinking import ThinkingOptions
 from tests.gateway.fakes import FakeConversationSession
 from tests.gateway.test_sessions import collect, completed_events, first_request
 from tests.gateway.test_tool_sessions import (
@@ -174,7 +174,7 @@ async def test_completed_explicit_turn_replaces_generation_settings(
         second_lease = await registry.open_turn(changed, explicit_id="lineage")
 
         assert second_lease.response_headers == {
-            "X-Claude-Proxy-Session": "lineage"
+            "X-Quaylet-Session": "lineage"
         }
         assert factory.models == [first_model, next_model]
         assert factory.thinking == [first_thinking, next_thinking]
@@ -435,7 +435,7 @@ async def test_simultaneous_setting_switches_have_one_owner() -> None:
 
         candidate.release.set()
         lease = await switching
-        assert lease.response_headers["X-Claude-Proxy-Session"] == "lineage"
+        assert lease.response_headers["X-Quaylet-Session"] == "lineage"
         await collect(lease.stream())
     finally:
         candidate.release.set()
@@ -715,7 +715,7 @@ async def test_completed_tool_turn_can_switch_model() -> None:
 
         lease = await registry.open_turn(changed, "lineage")
 
-        assert lease.response_headers["X-Claude-Proxy-Session"] == "lineage"
+        assert lease.response_headers["X-Quaylet-Session"] == "lineage"
         assert factory.calls[-1][0] == "opus"
         assert factory.histories[-1] == changed.messages[:-1]
         assert old.close_count == 1
@@ -792,7 +792,7 @@ async def test_invalidated_predecessor_is_not_selected_for_setting_switch() -> N
 
         imported = await registry.open_turn(changed, "lineage")
 
-        assert imported.response_headers["X-Claude-Proxy-Session"] == "lineage"
+        assert imported.response_headers["X-Quaylet-Session"] == "lineage"
         assert factory.histories[-1] == changed.messages[:-1]
         assert old.close_count == 1
         assert await collect(imported.stream()) == completed_events("imported answer")
@@ -835,7 +835,7 @@ async def test_setting_switch_startup_cannot_overwrite_a_new_owner(
         with pytest.raises(SessionConflict if same_id else SessionCapacity):
             await switching
         await asyncio.wait_for(candidate.closed.wait(), 2)
-        assert new_owner.response_headers["X-Claude-Proxy-Session"] == new_id
+        assert new_owner.response_headers["X-Quaylet-Session"] == new_id
         assert newer.close_count == 0
     finally:
         release.set()

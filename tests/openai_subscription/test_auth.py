@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 import pytest
 
-from claude_sdk_proxy.openai_subscription.auth import (
+from quaylet.openai_subscription.auth import (
     AUTHORIZATION_URL,
     CLIENT_ID,
     REDIRECT_URI,
@@ -23,7 +23,7 @@ from claude_sdk_proxy.openai_subscription.auth import (
     _extract_account_id,
     create_pkce,
 )
-from claude_sdk_proxy.openai_subscription.storage import Credentials, CredentialStore
+from quaylet.openai_subscription.storage import Credentials, CredentialStore
 
 
 def _jwt(account_id: str = "acct-test") -> str:

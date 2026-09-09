@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from claude_sdk_proxy import cli
+from quaylet import cli
 
 
 def test_cli_uses_loopback_defaults_and_configured_model(

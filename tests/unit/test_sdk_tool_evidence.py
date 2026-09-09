@@ -7,20 +7,20 @@ from dataclasses import FrozenInstanceError, dataclass, fields
 
 import pytest
 
-import claude_sdk_proxy.probes as probes
-from claude_sdk_proxy.attestation import (
+import quaylet.probes as probes
+from quaylet.attestation import (
     ExactModelAliasMap,
     ModelIdentityError,
     current_attestation_availability,
 )
-from claude_sdk_proxy.platform import MountIdentity
-from claude_sdk_proxy.probes import ProbeUnavailable, run_tool_bridge_probe
-from claude_sdk_proxy.usage_evidence import (
+from quaylet.platform import MountIdentity
+from quaylet.probes import ProbeUnavailable, run_tool_bridge_probe
+from quaylet.usage_evidence import (
     EvidenceSchemaError,
     UsageOperationClass,
     UsageTupleKey,
 )
-from claude_sdk_proxy.validated import (
+from quaylet.validated import (
     REQUIRED_SDK_TOOL_GATES,
     SdkMcpNamingRule,
     SdkToolEvidenceError,

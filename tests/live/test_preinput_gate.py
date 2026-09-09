@@ -9,7 +9,7 @@ from importlib.metadata import version
 
 import pytest
 
-from claude_sdk_proxy.attestation import current_attestation_availability
+from quaylet.attestation import current_attestation_availability
 
 pytestmark = pytest.mark.live
 

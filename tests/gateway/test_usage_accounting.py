@@ -8,12 +8,12 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, UserMes
 from claude_agent_sdk import ToolResultBlock as SdkToolResultBlock
 from openai.types.completion_usage import CompletionUsage
 
-import claude_sdk_proxy.app as app_module
-from claude_sdk_proxy.anthropic_api import (
+import quaylet.app as app_module
+from quaylet.anthropic_api import (
     encode_anthropic_start,
     render_anthropic_response,
 )
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     BackendFailure,
     Completed,
     InputUsage,
@@ -22,13 +22,13 @@ from claude_sdk_proxy.domain import (
     TextDelta,
     ToolDefinition,
 )
-from claude_sdk_proxy.openai_api import (
+from quaylet.openai_api import (
     encode_openai_event,
     encode_openai_start,
     parse_openai_request,
     render_openai_response,
 )
-from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+from quaylet.sdk_tool_protocol import RawSdkMessageValidator
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.fakes import FakeSdkClient, raw_text_events, raw_tool_events
 from tests.gateway.test_sdk_session import collect_sdk_response, result_message

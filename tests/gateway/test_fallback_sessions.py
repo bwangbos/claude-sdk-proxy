@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     Completed,
     ResponseIdentity,
@@ -11,9 +11,9 @@ from claude_sdk_proxy.domain import (
     ToolCall,
     ToolResultBlock,
 )
-from claude_sdk_proxy.session_identity import request_fingerprint
-from claude_sdk_proxy.sessions import SessionMismatch, SessionRegistry
-from claude_sdk_proxy.thinking import ThinkingOptions
+from quaylet.session_identity import request_fingerprint
+from quaylet.sessions import SessionMismatch, SessionRegistry
+from quaylet.thinking import ThinkingOptions
 from tests.gateway.test_tool_sessions import (
     ToolSession,
     collect,

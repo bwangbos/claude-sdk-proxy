@@ -7,11 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.environment import (
+from quaylet.environment import (
     EnvironmentConfig,
     build_child_environment,
 )
-from claude_sdk_proxy.supervisor_probe import (
+from quaylet.supervisor_probe import (
     run_bootstrap_environment,
     run_lifecycle_scenario,
 )

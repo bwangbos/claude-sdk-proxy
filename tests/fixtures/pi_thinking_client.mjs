@@ -88,7 +88,7 @@ const nativeFetch = globalThis.fetch;
 async function recordingFetch(input, init) {
   const request = new Request(input, init);
   for (const name of request.headers.keys()) {
-    if (name.toLowerCase() === "x-claude-proxy-session") {
+    if (name.toLowerCase() === "x-quaylet-session") {
       customSessionHeaders.push(name);
     }
   }

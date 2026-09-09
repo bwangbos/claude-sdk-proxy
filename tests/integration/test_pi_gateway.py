@@ -5,7 +5,7 @@ import socket
 
 import pytest
 
-from claude_sdk_proxy.app import create_app
+from quaylet.app import create_app
 from tests.integration.pi_gateway_support import (
     PiToolSession,
     SequenceSessionFactory,

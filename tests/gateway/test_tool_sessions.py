@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Iterable
 
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     BackendFailure,
     CanonicalMessage,
     Completed,
@@ -19,8 +19,8 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
-from claude_sdk_proxy.session_identity import request_fingerprint
-from claude_sdk_proxy.sessions import (
+from quaylet.session_identity import request_fingerprint
+from quaylet.sessions import (
     SessionCapacity,
     SessionConflict,
     SessionMismatch,
@@ -28,7 +28,7 @@ from claude_sdk_proxy.sessions import (
     SessionTimeout,
     ToolSessionActor,
 )
-from claude_sdk_proxy.thinking import ThinkingOptions
+from quaylet.thinking import ThinkingOptions
 
 
 def echo_tool(*, description: str = "echo") -> ToolDefinition:

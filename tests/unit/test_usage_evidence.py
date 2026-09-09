@@ -8,7 +8,7 @@ from dataclasses import replace
 
 import pytest
 
-from claude_sdk_proxy.usage_evidence import (
+from quaylet.usage_evidence import (
     EvidenceSchemaError,
     UsageDerivedField,
     UsageDialect,

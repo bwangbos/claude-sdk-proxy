@@ -1,5 +1,5 @@
-#ifndef CLAUDE_PROXY_LIFECYCLE_H
-#define CLAUDE_PROXY_LIFECYCLE_H
+#ifndef QUAYLET_LIFECYCLE_H
+#define QUAYLET_LIFECYCLE_H
 
 #include <stdbool.h>
 #include <stdint.h>

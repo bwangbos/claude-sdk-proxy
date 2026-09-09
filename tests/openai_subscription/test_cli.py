@@ -1,16 +1,16 @@
 import pytest
 
-from claude_sdk_proxy import cli
-from claude_sdk_proxy.openai_subscription.auth import AuthenticationError
+from quaylet import cli
+from quaylet.openai_subscription.auth import AuthenticationError
 
 
-def test_help_describes_opt_in_chatgpt_backend(capsys):
+def test_help_names_quaylet_and_supported_subscriptions(capsys):
     with pytest.raises(SystemExit) as raised:
         cli.main(["--help"])
     assert raised.value.code == 0
     help_text = capsys.readouterr().out
-    assert "Claude gateway" in help_text
-    assert "opt-in ChatGPT backend" in help_text
+    assert "Quaylet local API gateway" in help_text
+    assert "Claude and ChatGPT subscriptions" in help_text
 
 
 @pytest.mark.parametrize("command", ["login", "logout", "auth-status"])

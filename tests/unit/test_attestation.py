@@ -26,9 +26,9 @@ import anyio
 import pytest
 from claude_agent_sdk import ClaudeSDKClient, SystemMessage
 
-import claude_sdk_proxy._attestation_v2 as implementation
-import claude_sdk_proxy.attestation as public
-from claude_sdk_proxy.attestation import (
+import quaylet._attestation_v2 as implementation
+import quaylet.attestation as public
+from quaylet.attestation import (
     ATTESTATION_MANIFEST_SCHEMA,
     AttestationAvailability,
     AttestationError,
@@ -45,15 +45,15 @@ from claude_sdk_proxy.attestation import (
     extract_child_attestation,
     prepare_supervisor_launch,
 )
-from claude_sdk_proxy.environment import (
+from quaylet.environment import (
     EnvironmentAmbiguityError,
     EnvironmentConfig,
     build_child_environment,
     environment_fingerprint,
 )
-from claude_sdk_proxy.isolation import IsolationConfig
-from claude_sdk_proxy.journal import Journal, RecordClass
-from claude_sdk_proxy.lifecycle import Record
+from quaylet.isolation import IsolationConfig
+from quaylet.journal import Journal, RecordClass
+from quaylet.lifecycle import Record
 
 pytestmark = pytest.mark.anyio
 
@@ -76,11 +76,11 @@ def _repository_root() -> Path:
 
 
 def _supervisor_path() -> Path:
-    return _repository_root() / "build/bin/claude-proxy-supervisor"
+    return _repository_root() / "build/bin/quaylet-supervisor"
 
 
 def _write_cli(path: Path) -> None:
-    fixture = _repository_root() / "build/bin/claude-proxy-task6-test-cli"
+    fixture = _repository_root() / "build/bin/quaylet-task6-test-cli"
     if not fixture.is_file():
         raise RuntimeError("Task 6 native test CLI is unavailable; run make native")
     shutil.copyfile(fixture, path)

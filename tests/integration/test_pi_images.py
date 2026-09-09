@@ -4,8 +4,8 @@ import asyncio
 
 import pytest
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import Completed, ImageBlock, TextDelta, ToolCall
+from quaylet.app import create_app
+from quaylet.domain import Completed, ImageBlock, TextDelta, ToolCall
 from tests.gateway.fakes import FakeConversationSession
 from tests.integration.pi_gateway_support import serve
 from tests.integration.pi_image_support import run_pi_image

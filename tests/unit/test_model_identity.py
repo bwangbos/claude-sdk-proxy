@@ -6,15 +6,15 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-import claude_sdk_proxy.attestation as attestation
-import claude_sdk_proxy.probes as probes
-from claude_sdk_proxy.attestation import (
+import quaylet.attestation as attestation
+import quaylet.probes as probes
+from quaylet.attestation import (
     CanonicalEvent,
     ModelIdentityError,
     ModelIdentityGate,
     current_attestation_availability,
 )
-from claude_sdk_proxy.probes import (
+from quaylet.probes import (
     ProbeUnavailable,
     run_session_probe,
     run_stream_probe,

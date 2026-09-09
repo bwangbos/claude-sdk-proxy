@@ -8,7 +8,7 @@ from typing import Any, Literal, cast
 
 import pytest
 
-from claude_sdk_proxy.app import create_app
+from quaylet.app import create_app
 from tests.gateway.asgi_client import AsgiResponse, lifespan_app, post_json
 from tests.integration.pi_gateway_support import (
     TOOL_FIXTURE,
@@ -26,11 +26,11 @@ type Dialect = Literal["anthropic", "openai"]
 
 @pytest.fixture
 def live_model() -> str:
-    if os.environ.get("CLAUDE_PROXY_LIVE") != "1":
-        pytest.fail("live tool tests require CLAUDE_PROXY_LIVE=1")
-    model = os.environ.get("CLAUDE_PROXY_LIVE_MODEL", "")
+    if os.environ.get("QUAYLET_LIVE") != "1":
+        pytest.fail("live tool tests require QUAYLET_LIVE=1")
+    model = os.environ.get("QUAYLET_LIVE_MODEL", "")
     if not model.strip():
-        pytest.fail("live tool tests require a non-empty CLAUDE_PROXY_LIVE_MODEL")
+        pytest.fail("live tool tests require a non-empty QUAYLET_LIVE_MODEL")
     return model
 
 
@@ -240,7 +240,7 @@ async def _send(
         app,
         _path(dialect),
         _request(model, dialect, messages, tools),
-        {"X-Claude-Proxy-Session": session},
+        {"X-Quaylet-Session": session},
         **kwargs,
     )
 
@@ -650,7 +650,7 @@ async def test_live_stock_pi_agent_completes_tool_loop_with_provider_config_only
     live_model: str,
 ) -> None:
     if live_model != "sonnet":
-        pytest.fail("the stock Pi live fixture requires CLAUDE_PROXY_LIVE_MODEL=sonnet")
+        pytest.fail("the stock Pi live fixture requires QUAYLET_LIVE_MODEL=sonnet")
     env = {
         **os.environ,
         "PI_AI_MODULE": str(pi_ai_module()),

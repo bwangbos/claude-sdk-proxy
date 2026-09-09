@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.app import create_app
+from quaylet.sdk_session import SdkSession
 from tests.gateway.asgi_client import (
     _LIFESPAN_STATES,
     lifespan_app,
@@ -84,10 +84,10 @@ async def test_native_auto_publishes_accepted_identity_and_replays(
         assert response.status == replay.status == 200
         assert len(client.prompts) == 1
         for result in (response, replay):
-            assert result.headers["x-claude-proxy-requested-model"] == "opus-5"
+            assert result.headers["x-quaylet-requested-model"] == "opus-5"
             actual = "opus-4.8" if switched else "opus-5"
-            assert result.headers["x-claude-proxy-actual-model"] == actual
-            assert result.headers.get("x-claude-proxy-fallback") == (
+            assert result.headers["x-quaylet-actual-model"] == actual
+            assert result.headers.get("x-quaylet-fallback") == (
                 "true" if switched else None
             )
             assert b"discarded original output" not in result.body
@@ -162,7 +162,7 @@ async def test_native_identity_failure_is_safe_and_closes(tmp_path, path, stream
         )
         assert response.status == 502
         assert response.json["error"]["reason"] == "backend_model_mismatch"
-        assert "x-claude-proxy-actual-model" not in response.headers
+        assert "x-quaylet-actual-model" not in response.headers
         await asyncio.wait_for(client.disconnected.wait(), 2)
 
 
@@ -234,7 +234,7 @@ async def test_buffering_failure_keeps_monitor_deadline_capacity_and_cleanup(
                 result = await asyncio.wait_for(task, 2)
                 if failure == "deadline":
                     assert result.status == 504
-                    assert "x-claude-proxy-actual-model" not in result.headers
+                    assert "x-quaylet-actual-model" not in result.headers
                 else:
                     assert result is None
             await asyncio.wait_for(client.disconnected.wait(), 2)
@@ -285,8 +285,8 @@ async def test_strict_later_identity_conflict_never_sends_success_marker(
 async def test_auto_buffer_limit_never_publishes_and_releases_capacity(
     tmp_path, path, monkeypatch
 ):
-    from claude_sdk_proxy import sdk_session
-    from claude_sdk_proxy.sdk_fallback import FallbackBuffer
+    from quaylet import sdk_session
+    from quaylet.sdk_fallback import FallbackBuffer
 
     monkeypatch.setattr(
         sdk_session, "FallbackBuffer", lambda: FallbackBuffer(limit_bytes=3)
@@ -306,7 +306,7 @@ async def test_auto_buffer_limit_never_publishes_and_releases_capacity(
         )
         assert result.status == 502
         assert result.json["error"]["reason"] == "fallback_buffer_limit"
-        assert "x-claude-proxy-actual-model" not in result.headers
+        assert "x-quaylet-actual-model" not in result.headers
         assert b"accepted" not in result.body
         await asyncio.wait_for(client.disconnected.wait(), 2)
         assert not _LIFESPAN_STATES[app]["registry"]._implicit

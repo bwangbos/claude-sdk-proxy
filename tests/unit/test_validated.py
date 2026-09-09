@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.validated import (
+from quaylet.validated import (
     POLICY_URLS,
     CliIdentity,
     PolicyEvidence,

@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from claude_sdk_proxy.app import create_app
+from quaylet.app import create_app
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.integration.pi_gateway_support import run_pi, serve
 
@@ -12,11 +12,11 @@ from tests.integration.pi_gateway_support import run_pi, serve
 @pytest.mark.live
 @pytest.mark.anyio
 async def test_live_gateway_preserves_linear_context() -> None:
-    if os.environ.get("CLAUDE_PROXY_LIVE") != "1":
-        pytest.fail("live test requires CLAUDE_PROXY_LIVE=1")
-    live_model = os.environ.get("CLAUDE_PROXY_LIVE_MODEL", "")
+    if os.environ.get("QUAYLET_LIVE") != "1":
+        pytest.fail("live test requires QUAYLET_LIVE=1")
+    live_model = os.environ.get("QUAYLET_LIVE_MODEL", "")
     if not live_model:
-        pytest.fail("live test requires CLAUDE_PROXY_LIVE_MODEL")
+        pytest.fail("live test requires QUAYLET_LIVE_MODEL")
 
     app = create_app(models=(live_model,))
     marker = "AMBER-731"
@@ -62,11 +62,11 @@ async def test_live_gateway_preserves_linear_context() -> None:
 @pytest.mark.live
 @pytest.mark.anyio
 async def test_live_gateway_rebases_from_imported_history() -> None:
-    if os.environ.get("CLAUDE_PROXY_LIVE") != "1":
-        pytest.fail("live test requires CLAUDE_PROXY_LIVE=1")
-    live_model = os.environ.get("CLAUDE_PROXY_LIVE_MODEL", "")
+    if os.environ.get("QUAYLET_LIVE") != "1":
+        pytest.fail("live test requires QUAYLET_LIVE=1")
+    live_model = os.environ.get("QUAYLET_LIVE_MODEL", "")
     if not live_model:
-        pytest.fail("live test requires CLAUDE_PROXY_LIVE_MODEL")
+        pytest.fail("live test requires QUAYLET_LIVE_MODEL")
 
     marker = "REBASING-CYAN-842"
     app = create_app(models=(live_model,))
@@ -101,11 +101,11 @@ async def test_live_gateway_rebases_from_imported_history() -> None:
 @pytest.mark.live
 @pytest.mark.anyio
 async def test_live_stock_pi_provider_rebases_compacted_transcript() -> None:
-    if os.environ.get("CLAUDE_PROXY_LIVE") != "1":
-        pytest.fail("live test requires CLAUDE_PROXY_LIVE=1")
-    live_model = os.environ.get("CLAUDE_PROXY_LIVE_MODEL", "")
+    if os.environ.get("QUAYLET_LIVE") != "1":
+        pytest.fail("live test requires QUAYLET_LIVE=1")
+    live_model = os.environ.get("QUAYLET_LIVE_MODEL", "")
     if live_model != "sonnet":
-        pytest.fail("the stock Pi live fixture requires CLAUDE_PROXY_LIVE_MODEL=sonnet")
+        pytest.fail("the stock Pi live fixture requires QUAYLET_LIVE_MODEL=sonnet")
 
     app = create_app(models=(live_model,))
     async with serve(app) as base_url:

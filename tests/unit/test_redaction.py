@@ -14,16 +14,16 @@ from pathlib import Path
 
 import pytest
 
-import claude_sdk_proxy.probe_cli as probe_cli
-import claude_sdk_proxy.probes as probes
-from claude_sdk_proxy.attestation import current_attestation_availability
-from claude_sdk_proxy.path_policy import (
+import quaylet.probe_cli as probe_cli
+import quaylet.probes as probes
+from quaylet.attestation import current_attestation_availability
+from quaylet.path_policy import (
     PathPolicy,
     RootKind,
     _consume_safe_canary_receipt,
 )
-from claude_sdk_proxy.probe_cli import main
-from claude_sdk_proxy.probes import (
+from quaylet.probe_cli import main
+from quaylet.probes import (
     MAX_REDACTED_REPORT_BYTES,
     ProbeResult,
     ProbeUnavailable,
@@ -370,7 +370,7 @@ def test_lazy_pid_boundary_invalidates_when_at_fork_handler_is_unavailable(
     )
     simulated_child_pid = os.getpid() + 100_000
     monkeypatch.setattr(
-        "claude_sdk_proxy.path_policy.os.getpid", lambda: simulated_child_pid
+        "quaylet.path_policy.os.getpid", lambda: simulated_child_pid
     )
 
     with pytest.raises(RuntimeError, match="process"):
@@ -582,7 +582,7 @@ def test_probe_cli_redacts_unexpected_exception_messages(
     def fail() -> ProbeResult:
         raise RuntimeError("EXCEPTION-MESSAGE-SECRET")
 
-    monkeypatch.setattr("claude_sdk_proxy.probe_cli.run_prompt_purity_probe", fail)
+    monkeypatch.setattr("quaylet.probe_cli.run_prompt_purity_probe", fail)
 
     status = main(["prompt-purity"])
     captured = capsys.readouterr()

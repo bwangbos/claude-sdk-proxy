@@ -21,7 +21,7 @@ const model = {
   id: "sonnet-5",
   name: "Claude subscription proxy",
   api: "openai-completions",
-  provider: "claude-proxy",
+  provider: "quaylet",
   baseUrl,
   reasoning: false,
   input: ["text"],
@@ -54,7 +54,7 @@ async function runTurn(context, { abortAfterText = false } = {}) {
     headers:
       scenario === "rebase"
         ? undefined
-        : { "X-Claude-Proxy-Session": sessionId },
+        : { "X-Quaylet-Session": sessionId },
     signal: controller.signal,
     maxRetries: 0,
     onPayload(payload) {

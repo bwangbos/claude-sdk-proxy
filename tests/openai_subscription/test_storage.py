@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.openai_subscription.storage import (
+from quaylet.openai_subscription.storage import (
     Credentials,
     CredentialStore,
     UnsafeCredentialStorageError,
@@ -121,7 +121,7 @@ async def test_refresh_lock_excludes_a_separate_process(tmp_path: Path) -> None:
 import asyncio
 import pathlib
 import sys
-from claude_sdk_proxy.openai_subscription.storage import CredentialStore
+from quaylet.openai_subscription.storage import CredentialStore
 async def main():
     try:
         store = CredentialStore(pathlib.Path(sys.argv[1]), lock_timeout=0.05)

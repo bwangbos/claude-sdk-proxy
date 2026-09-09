@@ -5,9 +5,9 @@ import re
 
 import pytest
 
-from claude_sdk_proxy.anthropic_api import parse_anthropic_request
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import (
+from quaylet.anthropic_api import parse_anthropic_request
+from quaylet.app import create_app
+from quaylet.domain import (
     BackendFailure,
     CanonicalMessage,
     ImageBlock,
@@ -17,11 +17,11 @@ from claude_sdk_proxy.domain import (
     ToolResultBlock,
     UnsupportedFeature,
 )
-from claude_sdk_proxy.images import render_image, result_identity
-from claude_sdk_proxy.openai_api import parse_openai_request
-from claude_sdk_proxy.sdk_history import seed_history
-from claude_sdk_proxy.sdk_session import SdkSession
-from claude_sdk_proxy.session_identity import request_fingerprint
+from quaylet.images import render_image, result_identity
+from quaylet.openai_api import parse_openai_request
+from quaylet.sdk_history import seed_history
+from quaylet.sdk_session import SdkSession
+from quaylet.session_identity import request_fingerprint
 from tests.fixtures.image_data import solid_png
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.fakes import FakeConversationSession
@@ -114,7 +114,7 @@ def test_image_only_user_prompt(dialect):
 
 
 def test_image_error_tool_results_are_rejected():
-    from claude_sdk_proxy.tool_contract import validate_tool_results
+    from quaylet.tool_contract import validate_tool_results
 
     result = ToolResultBlock("call_a", (ImageBlock("image/png", solid_png()),), True)
     with pytest.raises(RequestValidationError):
@@ -125,7 +125,7 @@ def test_image_error_tool_results_are_rejected():
     "limit", ["MAX_IMAGES", "MAX_IMAGE_TOTAL_BYTES", "MAX_IMAGE_BYTES"]
 )
 def test_images_have_bounded_request_budget(monkeypatch, limit):
-    import claude_sdk_proxy.images as images
+    import quaylet.images as images
 
     body = image_body()
     monkeypatch.setattr(images, limit, 0)
@@ -134,7 +134,7 @@ def test_images_have_bounded_request_budget(monkeypatch, limit):
 
 
 def test_nested_tool_images_count_toward_budget(monkeypatch):
-    import claude_sdk_proxy.images as images
+    import quaylet.images as images
 
     image = ImageBlock("image/png", solid_png())
     monkeypatch.setattr(images, "MAX_IMAGES", 0)
@@ -182,7 +182,7 @@ async def test_image_http_replay_and_rebase(stream):
     app = create_app(models=("sonnet",), session_factory=factory)
     body = image_body()
     body["stream"] = stream
-    headers = {"x-claude-proxy-session": "image"}
+    headers = {"x-quaylet-session": "image"}
     async with lifespan_app(app):
         first = await post_json(app, "/v1/messages", body, headers=headers)
         replay = await post_json(app, "/v1/messages", body, headers=headers)

@@ -3,8 +3,8 @@ import json
 import httpx
 import pytest
 
-from claude_sdk_proxy.app import create_app as _create_app
-from claude_sdk_proxy.openai_subscription.backend import Backend
+from quaylet.app import create_app as _create_app
+from quaylet.openai_subscription.backend import Backend
 from tests.gateway.asgi_client import lifespan_app, post_json, request
 from tests.gateway.fakes import FakeSessionFactory
 
@@ -77,11 +77,11 @@ async def test_subscription_route_uses_fixed_auth_and_truthful_identity(path, st
                 headers={
                     "authorization": "Bearer caller-secret",
                     "chatgpt-account-id": "evil",
-                    "x-claude-proxy-session": "not a valid Claude session",
+                    "x-quaylet-session": "not a valid Claude session",
                 },
             )
         assert result.status == 200
-        assert result.headers["x-claude-proxy-actual-model"] == "gpt-6-astra-snapshot"
+        assert result.headers["x-quaylet-actual-model"] == "gpt-6-astra-snapshot"
         assert b"hello" in result.body
         assert captured[0].headers["authorization"] == "Bearer access"
         assert captured[0].headers["chatgpt-account-id"] == "acct"
@@ -114,7 +114,7 @@ async def test_missing_usage_and_unobserved_model_are_not_invented(path, stream)
             )
             result = await post_json(app, path, body(stream, **extra))
         assert result.status == 200
-        assert "x-claude-proxy-actual-model" not in result.headers
+        assert "x-quaylet-actual-model" not in result.headers
         if not stream:
             assert result.json["usage"] is None
         else:
@@ -144,7 +144,7 @@ async def test_explicit_fallback_rejected_without_upstream(path):
         )
         async with lifespan_app(app):
             result = await post_json(
-                app, path, body(), {"x-claude-proxy-refusal-fallback": "auto"}
+                app, path, body(), {"x-quaylet-refusal-fallback": "auto"}
             )
         assert result.status == 400
         assert not captured
@@ -228,7 +228,7 @@ async def test_reasoning_interleaving_refusal_accounting_and_late_model(path, st
             result = await post_json(app, path, body(stream, **extra))
         assert result.status == 200
         if stream:
-            assert "x-claude-proxy-actual-model" not in result.headers
+            assert "x-quaylet-actual-model" not in result.headers
             fs = frames(result)
             assert not any("error" in f for f in fs)
             if path.endswith("completions"):
@@ -281,7 +281,7 @@ async def test_reasoning_interleaving_refusal_accounting_and_late_model(path, st
                     "output_tokens": 20,
                 }
         else:
-            assert result.headers["x-claude-proxy-actual-model"] == "gpt-6-astra-late"
+            assert result.headers["x-quaylet-actual-model"] == "gpt-6-astra-late"
             if path.endswith("completions"):
                 assert result.json["choices"][0]["message"]["refusal"] == "Cannot help"
             else:

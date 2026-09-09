@@ -4,7 +4,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from claude_sdk_proxy.openai_subscription.backend import Backend
+from quaylet.openai_subscription.backend import Backend
 from tests.fixtures.image_data import solid_png
 from tests.gateway.asgi_client import lifespan_app, post_json
 

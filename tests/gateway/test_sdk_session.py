@@ -30,7 +30,7 @@ from claude_agent_sdk import (
     ToolResultBlock as SdkToolResultBlock,
 )
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     BackendFailure,
     CanonicalMessage,
     Completed,
@@ -41,9 +41,9 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
-from claude_sdk_proxy.sdk_session import SdkSession
-from claude_sdk_proxy.sdk_text_protocol import valid_message_diagnostics
-from claude_sdk_proxy.sdk_tool_protocol import RawSdkMessageValidator
+from quaylet.sdk_session import SdkSession
+from quaylet.sdk_text_protocol import valid_message_diagnostics
+from quaylet.sdk_tool_protocol import RawSdkMessageValidator
 from tests.gateway.fakes import (
     FakeSdkClient,
     FixedTemporaryDirectory,

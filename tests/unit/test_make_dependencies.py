@@ -8,22 +8,22 @@ import pytest
 
 _NATIVE_OUTPUTS = (
     "build/bin/darwin-probe",
-    "build/lib/libclaude_proxy_lifecycle.dylib",
-    "build/lib/libclaude_proxy_lifecycle_fault.dylib",
-    "build/bin/claude-proxy-supervisor",
-    "build/bin/claude-proxy-supervisor-probe",
-    "build/bin/claude-proxy-anchor",
-    "build/bin/claude-proxy-probe-child",
-    "build/bin/claude-proxy-task6-test-cli",
+    "build/lib/libquaylet_lifecycle.dylib",
+    "build/lib/libquaylet_lifecycle_fault.dylib",
+    "build/bin/quaylet-supervisor",
+    "build/bin/quaylet-supervisor-probe",
+    "build/bin/quaylet-anchor",
+    "build/bin/quaylet-probe-child",
+    "build/bin/quaylet-task6-test-cli",
 )
 _NATIVE_SOURCES = (
     "darwin_probe.c",
     "lifecycle.c",
     "lifecycle.h",
-    "claude_supervisor.c",
-    "claude_anchor.c",
-    "claude_probe_child.c",
-    "claude_task6_test_cli.c",
+    "quaylet_supervisor.c",
+    "quaylet_anchor.c",
+    "quaylet_probe_child.c",
+    "quaylet_task6_test_cli.c",
 )
 
 
@@ -118,7 +118,7 @@ def test_check_executes_native_unit_and_darwin_once_before_static_analysis(
         "uv:run pytest --strict-markers --forbid-skips -W error "
         "tests/openai_subscription",
         "uv:run ruff check .",
-        "uv:run mypy src/claude_sdk_proxy",
+        "uv:run mypy src/quaylet",
     ]
 
 
@@ -160,5 +160,5 @@ def test_offline_release_includes_real_pi_integration_before_static_checks(
         "uv:run pytest --strict-markers --forbid-skips -W error "
         "tests/openai_subscription",
         "uv:run ruff check .",
-        "uv:run mypy src/claude_sdk_proxy",
+        "uv:run mypy src/quaylet",
     ]

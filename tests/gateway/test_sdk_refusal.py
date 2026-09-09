@@ -15,8 +15,8 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import (
+from quaylet.app import create_app
+from quaylet.domain import (
     BackendFailure,
     CanonicalMessage,
     Completed,
@@ -24,7 +24,7 @@ from claude_sdk_proxy.domain import (
     ResponseIdentity,
     ToolDefinition,
 )
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.sdk_session import SdkSession
 from tests.gateway.asgi_client import (
     _LIFESPAN_STATES,
     lifespan_app,
@@ -268,10 +268,10 @@ async def test_unexpected_sdk_fallback_is_explicit_and_never_publishes_replaceme
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from claude_sdk_proxy.http_errors import error_detail
-    from claude_sdk_proxy.tool_session_actor import _redact_backend
+    from quaylet.http_errors import error_detail
+    from quaylet.tool_session_actor import _redact_backend
 
-    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    caplog.set_level(logging.INFO, logger="quaylet.diagnostics")
     data = {
         **_notice(api_refusal_category="cyber").data,
         "subtype": "model_refusal_fallback",
@@ -306,7 +306,7 @@ async def test_protocol_failure_logs_location_without_sdk_payload(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    caplog.set_level(logging.INFO, logger="quaylet.diagnostics")
     with pytest.raises(BackendFailure):
         await _collect_sdk_refusal(tmp_path, (_notice(content="SECRET_PAYLOAD"),))
     records = [r.msg for r in caplog.records if isinstance(r.msg, dict)]
@@ -326,7 +326,7 @@ async def test_http_fallback_failure_is_explicit_and_correlated(
     dialect: str,
     stream: bool,
 ) -> None:
-    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    caplog.set_level(logging.INFO, logger="quaylet.diagnostics")
     notice = SystemMessage(
         "model_refusal_fallback",
         {
@@ -587,7 +587,7 @@ async def test_terminal_sdk_failure_is_logged_before_redaction(
     caplog: pytest.LogCaptureFixture,
     missing_result: bool,
 ) -> None:
-    caplog.set_level(logging.INFO, logger="claude_sdk_proxy.diagnostics")
+    caplog.set_level(logging.INFO, logger="quaylet.diagnostics")
     messages = tuple(raw_text_events("answer", "sdk-1", model="claude-opus-5"))
     if not missing_result:
         messages += (_result(stop_reason="end_turn", terminal_reason="api_error"),)
@@ -758,8 +758,8 @@ async def test_http_refusal_replays_and_can_recover_earlier_history(
         first = await post_json(
             app, path, _opus_http_body(dialect, first_messages, False)
         )
-        session_id = first.headers["x-claude-proxy-session"]
-        headers = {"x-claude-proxy-session": session_id}
+        session_id = first.headers["x-quaylet-session"]
+        headers = {"x-quaylet-session": session_id}
         refused = await post_json(
             app, path, _opus_http_body(dialect, refusal_messages, stream), headers
         )

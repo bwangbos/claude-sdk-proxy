@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from claude_sdk_proxy.app import create_app
+from quaylet.app import create_app
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.test_transcript_recovery import completed_result_tail
 from tests.live.test_gateway_tools import (
@@ -25,8 +25,8 @@ pytestmark = [pytest.mark.live, pytest.mark.anyio]
 async def test_live_complete_tool_results_recover_without_reexecuting_tools(
     dialect, suspended
 ):
-    assert os.environ.get("CLAUDE_PROXY_LIVE") == "1"
-    model = os.environ["CLAUDE_PROXY_LIVE_MODEL"]
+    assert os.environ.get("QUAYLET_LIVE") == "1"
+    model = os.environ["QUAYLET_LIVE_MODEL"]
     body = completed_result_tail()
     body["model"] = model
     body["messages"][0]["content"] = (
@@ -84,8 +84,8 @@ async def test_live_complete_tool_results_recover_without_reexecuting_tools(
         assert marker in _text(dialect, message)
         if suspended:
             assert (
-                response.headers["x-claude-proxy-session"]
-                == boundary.headers["x-claude-proxy-session"]
+                response.headers["x-quaylet-session"]
+                == boundary.headers["x-quaylet-session"]
             )
         # The recovered session remains usable, including its returned header.
         continued = copy.deepcopy(body)
@@ -98,7 +98,7 @@ async def test_live_complete_tool_results_recover_without_reexecuting_tools(
             path,
             continued,
             headers={
-                "x-claude-proxy-session": response.headers["x-claude-proxy-session"]
+                "x-quaylet-session": response.headers["x-quaylet-session"]
             },
         )
         assert second.status == 200, second.json

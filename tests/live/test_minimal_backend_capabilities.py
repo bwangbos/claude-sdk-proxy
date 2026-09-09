@@ -6,17 +6,17 @@ from typing import Any
 
 import pytest
 
-from claude_sdk_proxy.capability_cli import main
+from quaylet.capability_cli import main
 
 pytestmark = pytest.mark.live
 
 
 def _model_or_skip() -> str:
-    if os.environ.get("CLAUDE_PROXY_LIVE") != "1":
-        pytest.skip("set CLAUDE_PROXY_LIVE=1 to enable the capability probe")
-    model = os.environ.get("CLAUDE_PROXY_MODEL")
+    if os.environ.get("QUAYLET_LIVE") != "1":
+        pytest.skip("set QUAYLET_LIVE=1 to enable the capability probe")
+    model = os.environ.get("QUAYLET_MODEL")
     if not model:
-        pytest.skip("set nonempty CLAUDE_PROXY_MODEL for the capability probe")
+        pytest.skip("set nonempty QUAYLET_MODEL for the capability probe")
     return model
 
 

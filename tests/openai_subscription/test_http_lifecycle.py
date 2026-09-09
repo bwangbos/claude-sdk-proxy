@@ -4,8 +4,8 @@ import json
 import httpx
 import pytest
 
-from claude_sdk_proxy.domain import BackendFailure
-from claude_sdk_proxy.openai_subscription.backend import Backend
+from quaylet.domain import BackendFailure
+from quaylet.openai_subscription.backend import Backend
 from tests.gateway.asgi_client import lifespan_app, post_json, post_json_then_disconnect
 from tests.gateway.fakes import FakeConversationSession
 
@@ -15,7 +15,7 @@ from .test_http import PATHS, body, create_app, frames
 
 @pytest.mark.anyio
 async def test_claude_precontent_error_retains_verified_identity_headers():
-    from claude_sdk_proxy.app import create_app as real_create_app
+    from quaylet.app import create_app as real_create_app
 
     class Failure(FakeConversationSession):
         async def stream_generation(self, prompt):
@@ -30,7 +30,7 @@ async def test_claude_precontent_error_retains_verified_identity_headers():
             app, "/v1/chat/completions", body(True, model="sonnet-5")
         )
     assert result.status == 502
-    assert result.headers["x-claude-proxy-actual-model"] == "sonnet-5"
+    assert result.headers["x-quaylet-actual-model"] == "sonnet-5"
 
 
 @pytest.mark.anyio
@@ -149,7 +149,7 @@ async def test_precontent_retry_drains_stale_identity_before_headers(path):
         async with lifespan_app(app):
             result = await post_json(app, path, body(True))
         assert result.status == 200
-        assert "x-claude-proxy-actual-model" not in result.headers
+        assert "x-quaylet-actual-model" not in result.headers
         assert b"stale-model" not in result.body
         assert b"hello" in result.body
 

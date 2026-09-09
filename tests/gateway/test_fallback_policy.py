@@ -2,10 +2,10 @@ import json
 
 import pytest
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import RequestValidationError
-from claude_sdk_proxy.fallback_policy import native_allowlist, resolve_fallback
-from claude_sdk_proxy.sdk_session import SdkSession
+from quaylet.app import create_app
+from quaylet.domain import RequestValidationError
+from quaylet.fallback_policy import native_allowlist, resolve_fallback
+from quaylet.sdk_session import SdkSession
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.fakes import (
     FakeSdkClient,
@@ -97,7 +97,7 @@ async def test_invalid_policy_value_is_400_in_both_dialects(path, body) -> None:
     app = create_app(models=("sonnet-5",), session_factory=FakeSessionFactory(()))
     async with lifespan_app(app):
         response = await post_json(
-            app, path, body, {"x-claude-proxy-refusal-fallback": "AUTO"}
+            app, path, body, {"x-quaylet-refusal-fallback": "AUTO"}
         )
     assert response.status == 400
 
@@ -136,7 +136,7 @@ async def test_auto_without_allowed_target_is_rejected_before_factory_launch(
     )
     async with lifespan_app(app):
         response = await post_json(
-            app, path, body, {"x-claude-proxy-refusal-fallback": "auto"}
+            app, path, body, {"x-quaylet-refusal-fallback": "auto"}
         )
 
     assert response.status == 400

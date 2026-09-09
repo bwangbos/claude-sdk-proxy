@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.isolation import IsolationConfig, build_agent_options
+from quaylet.isolation import IsolationConfig, build_agent_options
 
 
 def _supervisor(tmp_path: Path) -> Path:

@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from claude_sdk_proxy.domain import (
+from quaylet.domain import (
     CanonicalMessage,
     RequestValidationError,
     TextBlock,
@@ -12,13 +12,13 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
     ToolResultBlock,
 )
-from claude_sdk_proxy.openai_subscription import translation as tr
-from claude_sdk_proxy.openai_subscription.replay import (
+from quaylet.openai_subscription import translation as tr
+from quaylet.openai_subscription.replay import (
     ReplayCache,
     decode_reasoning,
     encode_reasoning,
 )
-from claude_sdk_proxy.thinking import ThinkingOptions
+from quaylet.thinking import ThinkingOptions
 
 
 def request(**kwargs):
@@ -150,7 +150,7 @@ def test_foreign_reasoning_degrades_and_matching_reasoning_replays():
             CanonicalMessage.user_text("next"),
         ),
     )
-    from claude_sdk_proxy.openai_subscription.replay import envelope_scope
+    from quaylet.openai_subscription.replay import envelope_scope
 
     signature = encode_reasoning(
         item,

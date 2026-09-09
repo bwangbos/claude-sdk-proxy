@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_sdk_proxy.environment import (
+from quaylet.environment import (
     EnvironmentAmbiguityError,
     EnvironmentConfig,
     build_child_environment,

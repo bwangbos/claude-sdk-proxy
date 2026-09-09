@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "claude-sdk-proxy"
+name = "quaylet"
 version = "0.0.0"
-description = "Local OpenAI- and Anthropic-compatible gateway for Claude Agent SDK"
+description = "Local API gateway for Claude and ChatGPT subscriptions"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -21,13 +21,13 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/bwangbos/claude-sdk-proxy"
-Issues = "https://github.com/bwangbos/claude-sdk-proxy/issues"
+Repository = "https://github.com/bwangbos/quaylet"
+Issues = "https://github.com/bwangbos/quaylet/issues"
 
 [project.scripts]
-claude-proxy = "claude_sdk_proxy.cli:main"
-claude-proxy-capabilities = "claude_sdk_proxy.capability_cli:main"
-claude-proxy-probe = "claude_sdk_proxy.probe_cli:main"
+quaylet = "quaylet.cli:main"
+quaylet-capabilities = "quaylet.capability_cli:main"
+quaylet-probe = "quaylet.probe_cli:main"
 
 [dependency-groups]
 dev = [
@@ -57,4 +57,4 @@ select = ["E", "F", "I", "UP"]
 [tool.mypy]
 python_version = "3.14"
 strict = true
-files = ["src/claude_sdk_proxy"]
+files = ["src/quaylet"]

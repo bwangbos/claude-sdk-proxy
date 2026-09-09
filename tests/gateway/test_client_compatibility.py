@@ -5,9 +5,9 @@ import copy
 import pytest
 from openai.types.chat import ChatCompletionMessage
 
-from claude_sdk_proxy.app import create_app
-from claude_sdk_proxy.domain import Completed, TextDelta, ToolCall
-from claude_sdk_proxy.openai_api import parse_openai_request
+from quaylet.app import create_app
+from quaylet.domain import Completed, TextDelta, ToolCall
+from quaylet.openai_api import parse_openai_request
 from tests.gateway.asgi_client import lifespan_app, post_json
 from tests.gateway.fakes import FakeSessionFactory
 from tests.gateway.test_tool_http import RepeatedRoundSession, tool_body
@@ -34,7 +34,7 @@ def tool_backend():
 async def test_empty_tool_assistant_content_can_continue(explicit, empty):
     backend = tool_backend()
     app = create_app(models=("sonnet",), session_factory=lambda *a, **k: backend)
-    headers = {"x-claude-proxy-session": "serial"} if explicit else {}
+    headers = {"x-quaylet-session": "serial"} if explicit else {}
     body = tool_body("openai")
     async with lifespan_app(app):
         first = await post_json(app, "/v1/chat/completions", body, headers=headers)
@@ -59,7 +59,7 @@ async def test_returned_implicit_session_header_resumes_tool_wait():
     body = tool_body("openai")
     async with lifespan_app(app):
         first = await post_json(app, "/v1/chat/completions", body)
-        headers = {"x-claude-proxy-session": first.headers["x-claude-proxy-session"]}
+        headers = {"x-quaylet-session": first.headers["x-quaylet-session"]}
         body["messages"] += [
             first.json["choices"][0]["message"],
             {"role": "tool", "tool_call_id": "call_one", "content": "result"},
@@ -68,8 +68,8 @@ async def test_returned_implicit_session_header_resumes_tool_wait():
         assert result.status == 200, result.json
         assert result.json["choices"][0]["message"]["content"] == "done"
         assert (
-            result.headers["x-claude-proxy-session"]
-            == headers["x-claude-proxy-session"]
+            result.headers["x-quaylet-session"]
+            == headers["x-quaylet-session"]
         )
 
 
@@ -80,7 +80,7 @@ async def test_returned_implicit_header_can_rebase_and_continue():
     body = {"model": "sonnet", "messages": [{"role": "user", "content": "one"}]}
     async with lifespan_app(app):
         first = await post_json(app, "/v1/chat/completions", body)
-        headers = {"x-claude-proxy-session": first.headers["x-claude-proxy-session"]}
+        headers = {"x-quaylet-session": first.headers["x-quaylet-session"]}
         rewritten = {
             "model": "sonnet",
             "messages": [
