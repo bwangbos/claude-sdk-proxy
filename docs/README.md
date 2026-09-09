@@ -38,7 +38,7 @@
 Updating Git does not restart a running proxy or edit local Pi settings; follow
 the root README to activate the revision you checked out.
 Live observations are dated, account-specific evidence, not guarantees about
-future Claude behavior or model availability.
+future provider behavior or model availability.
 
 ## Historical designs and research
 

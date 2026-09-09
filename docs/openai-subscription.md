@@ -49,12 +49,60 @@ Do not use Claude aliases for this backend. There are no OpenAI aliases, and
 Claude's default model and optional refusal fallback are unchanged. Confirm the
 configured provider split with `GET /v1/models`.
 
+To serve both providers, explicitly include the Claude models too; repeated
+`--model` values replace the default allowlist. For example:
+
+```bash
+uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8 \
+  --model gpt-6-astra --model gpt-5.6-sol
+```
+
+The server's `--refusal-fallback` default affects only Claude. A ChatGPT request
+explicitly asking for `X-Quaylet-Refusal-Fallback: auto` is rejected; no OpenAI
+model downgrade is performed.
+
 Supported explicit reasoning efforts are `low`, `medium`, `high`, `xhigh`, and
 `max`; omitting the control retains the provider default. Omission does not
 claim to disable internal reasoning. `none`, disabled/budget thinking forms,
 and `ultra` are rejected. `max_tokens` and `max_completion_tokens` are accepted
 for frontend compatibility but are not enforced upstream. The proxy does not
 truncate a tool argument or invent a stop reason to simulate that limit.
+
+## Pi and other harnesses
+
+Use a custom provider pointed at Quaylet's local base URL, not Pi's direct
+subscription provider. The transport describes the frontend API, not the
+upstream provider: Astra and Sol work through either Chat Completions or
+Anthropic Messages. Use the Anthropic Messages frontend for Pi image-returning
+tools, as described in the [root README](../README.md#pi-with-images-and-screenshots).
+
+Start from the README's compatible custom-provider settings and add exact model
+IDs `gpt-6-astra` and `gpt-5.6-sol` to its model list. Server configuration alone
+does not populate Pi's custom model picker. Use an arbitrary non-secret local
+API key placeholder; Quaylet uses its own saved OAuth login upstream.
+
+For each ChatGPT model, use `reasoning: true` and this thinking-level mapping
+instead of the Claude mapping:
+
+```json
+{
+  "off": null,
+  "minimal": null,
+  "low": "low",
+  "medium": "medium",
+  "high": "high",
+  "xhigh": "xhigh",
+  "max": "max"
+}
+```
+
+Place that object in the model's `thinkingLevelMap`. Choose a supported effort
+such as `low`; do not send Claude's `none`/disabled thinking form. Omitting
+reasoning controls leaves the upstream default in place, not guaranteed off.
+Client-side `contextWindow`, output limits, and cost estimates are harness
+configuration, not account-limit discovery or guarantees enforced by Quaylet.
+No harness code modification is required; preserve complete tool pairs and
+opaque metadata when the chosen frontend can round-trip it.
 
 ## Data, tools, images, and replay
 
@@ -74,6 +122,13 @@ reasoning fidelity and degrade to visible-history translation. An Anthropic
 not evidence that Anthropic or OpenAI produced redacted reasoning. Preserve it
 unchanged if the client supports it. Pi may display it as
 `[Reasoning redacted]`.
+
+`--max-sessions` bounds the number of retained replay entries; there is also a
+64 MiB aggregate cache ceiling. Cache misses do not reject an otherwise complete
+transcript. Tool calls finish the current HTTP response; Quaylet does not hold
+an upstream agent waiting while the harness executes tools. Independent
+conversations sharing a prefix are not routed through Claude's session registry,
+and `X-Quaylet-Session` is not used to select an OpenAI conversation.
 
 Late upstream model identity can update later stream chunks and non-streaming
 JSON, but cannot retroactively change HTTP headers or an Anthropic

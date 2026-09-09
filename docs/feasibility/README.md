@@ -1,5 +1,10 @@
 # Quaylet Claude gateway reference and historical probes
 
+This reference's SDK session, fallback, and parked-tool rules are specific to
+Claude-backed models. Quaylet also has an opt-in direct ChatGPT backend; use its
+[provider guide](../openai-subscription.md) for Astra/Sol authentication,
+reasoning, stateless tool continuation, accounting, and replay behavior.
+
 This package ships a single-user localhost text/image-and-caller-tool gateway
 and retains the earlier trusted-local feasibility probes as historical comparator
 evidence. The authoritative offline release gate, including the real Pi provider integration,

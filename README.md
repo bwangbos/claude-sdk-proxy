@@ -51,8 +51,8 @@ Quaylet on 127.0.0.1
 ```
 
 For tool use, the proxy exposes only the tool definitions supplied by the
-caller. Claude returns structured tool calls, the harness executes them, and the
-harness sends the structured results back. The proxy does not execute caller
+caller. The selected model returns structured tool calls, the harness executes
+them, and the harness sends the structured results back. The proxy does not execute caller
 operations and does not enable Claude Code built-ins, ambient MCP servers,
 skills, plugins, subagents, or auto-memory.
 
@@ -110,6 +110,30 @@ Expected health response:
 {"status":"ok"}
 ```
 
+### Add ChatGPT models
+
+Log in explicitly, then stop the earlier server before starting this combined
+configuration on the same port:
+
+```bash
+uv run quaylet login openai
+uv run quaylet auth-status openai
+uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8 \
+  --model gpt-6-astra --model gpt-5.6-sol
+```
+
+Each request's `model` chooses its backend. Both providers use the same two
+HTTP APIs; `/v1/models` lists the configured models and their providers.
+Starting without `--model` still exposes only `sonnet-5`. Explicit `--model`
+values replace that default rather than adding to it. A ChatGPT-only launch
+does not require a Claude login.
+
+The [ChatGPT guide](docs/openai-subscription.md) covers reasoning, harness
+configuration, replay limitations, and the unofficial subscription transport.
+Included subscription limits apply; accounts permitting credit overage may
+consume credits. Quaylet does not enforce account billing policy or fall back
+to API-key billing.
+
 ## Renamed from Claude SDK Proxy
 
 Quaylet is a clean-cut rename: the Python package and command are `quaylet`,
@@ -131,6 +155,10 @@ to use its existing managed login. ChatGPT credentials now live under
 Historical reports retain the names and commands used at their recorded revision.
 
 ## Configure Pi
+
+The examples below configure the **Claude-backed models**. For Astra and Sol,
+see [Pi with ChatGPT models](docs/openai-subscription.md#pi-and-other-harnesses);
+their reasoning settings differ from Claude's.
 
 Add either or both providers below under `providers` in
 `~/.pi/agent/models.json`. Merge them with providers already in that file rather
@@ -487,8 +515,8 @@ call ID, including in replay and imported/rebased histories.
 Limits apply to the **entire submitted transcript**, including tool results:
 20 images, 3 MiB decoded per image, and 12 MiB decoded in total. Use canonical
 base64 for PNG, JPEG, GIF, or WebP. The proxy checks encoding, size, and MIME
-signatures; Claude still validates image decoding and dimensions. Remote URLs,
-file URLs, non-`auto` OpenAI image detail, image error results, PDFs, audio, and
+signatures; the selected provider still validates image decoding and dimensions.
+Remote URLs, file URLs, non-`auto` OpenAI image detail, image error results, PDFs, audio, and
 image generation are not supported. Return tool failures as text.
 
 ## API surface
@@ -620,6 +648,7 @@ and non-null unsupported controls are still rejected. The OpenAI `user` field
 is accepted as advisory metadata, not as a conversation identifier.
 
 Usage is reported per public response, not as cumulative SDK-session totals.
+For **Claude-backed models**, the arithmetic is as follows:
 Anthropic keeps `input_tokens`, `cache_read_input_tokens`, and
 `cache_creation_input_tokens` separate. OpenAI `prompt_tokens` includes all three;
 `prompt_tokens_details.cached_tokens` and `cache_write_tokens` break out cache
@@ -627,8 +656,14 @@ reads and writes. Cache detail fields are omitted if the backend did not supply
 them. `total_tokens` is the full prompt count plus output. An Anthropic
 `input_tokens` value of 2 can therefore be valid for a heavily cached turn.
 
+For **ChatGPT-backed models**, upstream input totals already include cached
+input, and output totals already include reasoning tokens; neither is added
+again. Missing usage remains unavailable rather than being estimated. See the
+[ChatGPT accounting and replay details](docs/openai-subscription.md#data-tools-images-and-replay).
+
 ## Tools
 
+The fixed-session rules in this section describe Claude-backed conversations.
 Tool definitions must be sent on every request in a tool-enabled conversation
 and must remain unchanged along with the system prompt and API dialect. Model
 and effort must remain unchanged until every pending tool result has completed;
@@ -644,6 +679,12 @@ partial batches and changed pending call definitions are rejected.
 The detailed [gateway reference](docs/feasibility/README.md) contains complete
 Anthropic and OpenAI tool request examples, schema limits, timeout behavior, and
 error semantics.
+
+For ChatGPT-backed conversations, each HTTP response returns its tool calls and
+finishes; no backend agent stays parked waiting for results. Send the complete
+transcript, tools, and matched results on the next request. Shared conversation
+prefixes do not collide through Claude's session registry. Incomplete tool
+boundaries are rejected before an upstream request is made.
 
 ## Claude-backed sessions and compaction
 
@@ -681,6 +722,17 @@ history, and replay entries. A client can recover by submitting its complete
 transcript, including already-executed tool results; the proxy cannot reconstruct
 history or missing results on its own.
 
+## ChatGPT-backed continuation and compaction
+
+The ChatGPT backend sends a full transcript with `store:false` on each upstream
+request. Compaction replaces the transcript; discarded history and reasoning
+are not reattached. A bounded in-memory cache preserves opaque replay metadata
+when it can match the account, model, configuration, and visible history
+unambiguously. After eviction or restart, complete visible transcripts remain
+usable, but opaque reasoning preservation may be lost. It does not use the
+Claude session header or parked-tool machinery. See the
+[provider guide](docs/openai-subscription.md#data-tools-images-and-replay).
+
 ## Server options
 
 ```text
@@ -699,12 +751,20 @@ uv run quaylet \
 - Repeat `--model` to expose multiple pinned models; the default is `sonnet-5`.
 - `--refusal-fallback` defaults to `off`; `auto` requires both `opus-5` and
   `opus-4.8` when Opus 5 is configured.
-- Idle sessions are evicted least-recently-used when capacity is reached.
+- For Claude, idle sessions are evicted least-recently-used when capacity is reached.
 - In-flight and tool-waiting sessions are never evicted.
 - If every retained session is busy, the API returns HTTP `503` with
   `session_capacity`.
 - Generation and tool-result waits default to 300 seconds; backend teardown is
   bounded separately.
+
+The retained-session, parked-tool, and `session_capacity` rules above apply to
+Claude. For ChatGPT, `--max-sessions` bounds replay-cache entries, also capped at
+64 MiB in aggregate; it does not impose Claude's session selection. The
+tool-result waiting timeout does not apply to this stateless backend. Explicit
+per-request `X-Quaylet-Refusal-Fallback: auto` is rejected for ChatGPT; there is
+no model fallback. The server's default refusal-fallback setting applies only
+to Claude requests.
 
 Example with all pinned models and opt-in fallback:
 
@@ -808,13 +868,24 @@ make release-offline
 ```
 
 It builds the native lifecycle helpers and runs unit, Darwin lifecycle, gateway,
-official-client, and real-Pi integration tests with warnings, skips, and marker
+direct ChatGPT, official-client, and real-Pi integration tests with warnings, skips, and marker
 mistakes treated as failures. It also runs Ruff and strict mypy checks. The
 faster development gate is:
 
 ```bash
 make check
 ```
+
+For the complete non-live test inventory, including reset and rename tests:
+
+```bash
+uv run pytest -q -m 'not live'
+```
+
+The [rename verification record](docs/verification/2026-09-09-quaylet-rename.md)
+discloses the existing reset/domain test failure and fork warnings in that
+broader inventory; do not interpret the narrower Make targets as proof that
+every collected test passes.
 
 Claude live subscription tests remain separate and explicit:
 
@@ -845,5 +916,6 @@ implementation plans are audit records, not current feature restrictions.
 
 This project is open source under the [MIT License](LICENSE).
 Dependencies, including the Claude Agent SDK, retain their own licenses.
-Using Claude services remains subject to the terms governing your account;
-this project's license does not replace those terms.
+Applicable Pi source notices are retained in [third_party/](third_party/).
+Using Claude or ChatGPT services remains subject to the terms governing your
+accounts; this project's license does not replace those terms.
