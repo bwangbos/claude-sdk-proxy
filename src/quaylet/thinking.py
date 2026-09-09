@@ -4,12 +4,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, Never, cast
 
+from quaylet.model_catalog import OPENAI_EFFORTS
+
 type ThinkingMode = Literal["disabled", "adaptive", "enabled"]
 type ThinkingEffort = Literal["low", "medium", "high", "xhigh", "max"]
 type ThinkingDisplay = Literal["summarized", "omitted"]
 
 _EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _DISPLAYS = frozenset({"summarized", "omitted"})
+_REQUIRES_ADAPTIVE = frozenset({"fable-5.1", "claude-fable-5-1"})
 
 # Snapshot of Claude Code 2.1.259 model metadata. Moving aliases are listed
 # explicitly so a future alias change cannot accidentally grant capabilities to
@@ -27,6 +30,9 @@ _LATEST_ADAPTIVE_EFFORTS: dict[str, frozenset[str]] = {
         "sonnet-5",
         "opus-4.8",
         "claude-opus-4-8",
+        "claude-opus-4-7",
+        "fable-5.1",
+        "claude-fable-5-1",
     )
 }
 _FOUR_SIX_EFFORTS = frozenset({"low", "medium", "high", "max"})
@@ -37,6 +43,9 @@ _ADAPTIVE_EFFORTS: dict[str, frozenset[str]] = {
     "claude-sonnet-4-6": _FOUR_SIX_EFFORTS,
 }
 _ENABLED_EFFORTS: dict[str, frozenset[str]] = {
+    "haiku-4.5": frozenset(),
+    "claude-haiku-4-5": frozenset(),
+    "claude-haiku-4-5-20251001": frozenset(),
     "claude-opus-4-5": frozenset({"low", "medium", "high"}),
     "claude-opus-4-5-20251101": frozenset({"low", "medium", "high"}),
     "claude-sonnet-4-5": frozenset(),
@@ -52,8 +61,32 @@ class ThinkingOptions:
     display: ThinkingDisplay | None = None
 
 
+def describe_thinking(model: str) -> str:
+    """Describe configured capabilities using the request validation tables."""
+    if model in OPENAI_EFFORTS:
+        mode, efforts = "", OPENAI_EFFORTS[model]
+    elif model in _ADAPTIVE_EFFORTS:
+        mode = "adaptive(required)" if model in _REQUIRES_ADAPTIVE else "off/adaptive"
+        efforts = _ADAPTIVE_EFFORTS[model]
+    elif model in _ENABLED_EFFORTS:
+        mode, efforts = "off/manual-budget", _ENABLED_EFFORTS[model]
+    else:
+        return "off"
+    levels = ",".join(
+        effort
+        for effort in ("low", "medium", "high", "xhigh", "max")
+        if effort in efforts
+    )
+    return " ".join(part for part in (mode, levels) if part)
+
+
 def parse_openai_thinking(body: Mapping[str, object], model: str) -> ThinkingOptions:
     value = body.get("reasoning_effort")
+    if model in _REQUIRES_ADAPTIVE:
+        if value is None:
+            return ThinkingOptions(mode="adaptive")
+        if value == "none":
+            _invalid("reasoning_effort", "model requires adaptive thinking")
     if value is None or value == "none":
         return ThinkingOptions()
     if not isinstance(value, str) or value not in _EFFORTS:
@@ -86,12 +119,16 @@ def parse_anthropic_thinking(body: Mapping[str, object], model: str) -> Thinking
 
     raw = body.get("thinking")
     if raw is None:
+        if model in _REQUIRES_ADAPTIVE:
+            return ThinkingOptions(mode="adaptive", effort=effort)
         if effort is not None:
             _invalid("output_config", "effort requires adaptive or enabled thinking")
         return ThinkingOptions()
     if not isinstance(raw, Mapping):
         _invalid("thinking", "must be an object or null")
     mode = raw.get("type")
+    if model in _REQUIRES_ADAPTIVE and mode != "adaptive":
+        _invalid("thinking", "model requires adaptive thinking")
     if not isinstance(mode, str) or mode not in {"disabled", "adaptive", "enabled"}:
         _invalid("thinking", "type must be disabled, adaptive, or enabled")
     allowed = {

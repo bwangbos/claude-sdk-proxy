@@ -30,10 +30,10 @@ responses. The calling harness remains responsible for executing its own tools.
 - Pi automatic compaction and `/compact`
 - Generic full-transcript import and rebasing at completed turn boundaries
 - In-memory continuation, retry replay, bounded session capacity, and teardown
-- Version-pinned Sonnet 5, Opus 5, and Opus 4.8 model choices
+- Explicit, version-pinned Claude and ChatGPT [model choices](docs/models.md)
 - Sonnet/Opus thinking controls and model/effort changes between completed turns
 - Separate reasoning streams, native signed-thinking replay, and refusal recovery
-- Direct ChatGPT routing for exact `gpt-6-astra` and `gpt-5.6-sol` IDs
+- Direct ChatGPT routing for Astra, Sol, Terra, Luna, GPT-5.5, and Codex Spark
 
 The current compatibility suite targets Pi `0.85.1`, Claude Agent SDK `0.2.152`,
 Python `3.14`, and macOS. Official OpenAI and Anthropic Python clients are also
@@ -98,15 +98,22 @@ cd quaylet
 uv sync --dev
 ```
 
-Choose a server configuration:
+List the selectable models and their capabilities without starting a server:
+
+```bash
+uv run quaylet models
+```
+
+This is the bundled catalog, not an account-access check. Choose a server configuration:
 
 | Provider | Start command |
 | --- | --- |
-| Claude | `uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8` |
-| ChatGPT | `uv run quaylet --model gpt-6-astra --model gpt-5.6-sol` |
+| Claude subset | `uv run quaylet --model sonnet-5 opus-5 opus-4.8` |
+| ChatGPT subset | `uv run quaylet --model gpt-6-astra gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna gpt-5.5 gpt-5.3-codex-spark` |
+| Entire catalog | `uv run quaylet --all-models` |
 
-For ChatGPT, run `uv run quaylet login openai` first. At least one `--model`
-is required: bare `uv run quaylet` exits with a configuration error without
+For ChatGPT, run `uv run quaylet login openai` first. Either `--model` or
+`--all-models` is required: bare `uv run quaylet` exits with a configuration error without
 starting a server. Choose one command above, or combine models as shown below;
 do not start both commands on the same port.
 
@@ -131,15 +138,18 @@ configuration on the same port:
 ```bash
 uv run quaylet login openai
 uv run quaylet auth-status openai
-uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8 \
-  --model gpt-6-astra --model gpt-5.6-sol
+uv run quaylet --all-models
 ```
 
 Each request's `model` chooses its backend. Both providers use the same two
 HTTP APIs; `/v1/models` lists the configured models and their providers.
 Only explicitly configured models are exposed, with no provider preference.
+`--all-models` explicitly selects the bundled [catalog](docs/models.md); it is
+not account discovery or a guarantee of model access. To choose a subset, use
+`--model sonnet-5 opus-4.8 gpt-6-astra`. Repeating `--model` still works, but
+cannot be combined with `--all-models`.
 A ChatGPT-only launch does not require a Claude login; a Claude-only launch
-does not require a ChatGPT login. Login, logout, auth-status, and help commands
+does not require a ChatGPT login. Models, login, logout, auth-status, and help commands
 do not require `--model`.
 
 The [ChatGPT guide](docs/openai-subscription.md) covers reasoning, harness
@@ -170,7 +180,7 @@ Historical reports retain the names and commands used at their recorded revision
 
 ## Configure Pi
 
-The examples below configure the **Claude-backed models**. For Astra and Sol,
+The examples below configure the **Claude-backed models**. For ChatGPT models,
 see [Pi with ChatGPT models](docs/openai-subscription.md#pi-and-other-harnesses);
 their reasoning settings differ from Claude's.
 
@@ -550,7 +560,9 @@ such as `charset=utf-8` are accepted.
 The following controls describe Claude-backed models. The direct ChatGPT
 backend has separate exact-model and effort rules in its [provider guide](docs/openai-subscription.md).
 
-`model` must resolve to one of the server's repeated `--model` values.
+`model` must resolve to one of the server's selected models (`--model` or
+`--all-models`). See the [catalog and capability table](docs/models.md) for
+Haiku, Fable, older Claude versions, and verification limits.
 `sonnet-5`, `opus-5`, and `opus-4.8` pin SDK models `claude-sonnet-5`,
 `claude-opus-5`, and `claude-opus-4-8`, respectively. Deprecated inputs
 `sonnet` and `opus` normalize to the first two pinned choices. `GET /v1/models`
@@ -753,7 +765,7 @@ Claude session header or parked-tool machinery. See the
 uv run quaylet \
   [--host 127.0.0.1] \
   [--port 8317] \
-  --model MODEL [--model MODEL]... \
+  (--model MODEL [MODEL ...] | --all-models) \
   [--refusal-fallback {off,auto}] \
   [--max-sessions 8] \
   [--tool-result-timeout 300] \
@@ -762,8 +774,8 @@ uv run quaylet \
 ```
 
 - `--host` accepts loopback IP addresses only.
-- At least one `--model` is required; repeat it to expose multiple models from
-  either provider. There is no default model or provider.
+- Choose `--model` with space-separated names, or `--all-models`. Repeating
+  `--model` remains supported. There is no default model or provider.
 - `--refusal-fallback` defaults to `off`; `auto` requires both `opus-5` and
   `opus-4.8` when Opus 5 is configured.
 - For Claude, idle sessions are evicted least-recently-used when capacity is reached.

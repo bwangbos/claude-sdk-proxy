@@ -4,6 +4,7 @@ import pytest
 
 from quaylet.domain import (
     CanonicalMessage,
+    ImageBlock,
     RequestValidationError,
     TextBlock,
     TextRequest,
@@ -67,6 +68,54 @@ def test_explicit_supported_efforts(model, effort):
         "effort": effort,
         "summary": "auto",
     }
+
+
+@pytest.mark.parametrize(
+    "model,effort",
+    [
+        ("gpt-5.6-terra", "max"),
+        ("gpt-5.6-luna", "max"),
+        ("gpt-5.5", "xhigh"),
+        ("gpt-5.3-codex-spark", "xhigh"),
+    ],
+)
+def test_additional_models_send_correct_upstream_model_and_effort(model, effort):
+    req = replace(
+        request(), model=model, thinking=ThinkingOptions(mode="adaptive", effort=effort)
+    )
+    body = tr.build_body(req, "acct")
+    assert body["model"] == model
+    assert body["reasoning"]["effort"] == effort
+
+
+@pytest.mark.parametrize("model", ["gpt-5.5", "gpt-5.3-codex-spark"])
+def test_model_specific_effort_rejects_max(model):
+    req = replace(
+        request(), model=model, thinking=ThinkingOptions(mode="adaptive", effort="max")
+    )
+    with pytest.raises(RequestValidationError) as error:
+        tr.build_body(req, "acct")
+    assert error.value.field == "reasoning_effort"
+
+
+@pytest.mark.parametrize("in_tool_result", [False, True])
+def test_spark_rejects_images_including_tool_results(in_tool_result):
+    from tests.fixtures.image_data import solid_png
+
+    image = ImageBlock("image/png", solid_png())
+    history = (
+        (
+            CanonicalMessage.user_text("look"),
+            CanonicalMessage("assistant", (ToolCallBlock("c", "look", {}),)),
+            CanonicalMessage("user", (ToolResultBlock("c", (image,), False),)),
+        )
+        if in_tool_result
+        else (CanonicalMessage("user", (image,)),)
+    )
+    req = replace(request(), model="gpt-5.3-codex-spark", messages=history)
+    with pytest.raises(RequestValidationError) as error:
+        tr.build_body(req, "acct")
+    assert error.value.field == "messages"
 
 
 @pytest.mark.parametrize(

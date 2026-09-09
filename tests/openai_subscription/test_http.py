@@ -13,6 +13,39 @@ from .test_backend import Auth, Bytes, sse, terminal, text_item
 PATHS = ["/v1/messages", "/v1/chat/completions"]
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "model", ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.3-codex-spark"]
+)
+@pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize("stream", [False, True])
+async def test_additional_models_route_to_subscription_in_both_dialects(
+    model, path, stream
+):
+    captured = []
+
+    def handler(r):
+        captured.append(json.loads(r.content))
+        event = terminal([text_item()])
+        event["response"]["model"] = model
+        return httpx.Response(200, stream=Bytes(sse(event)))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        app = create_app(
+            models=(model,), subscription_backend=Backend(Auth(), client=client)
+        )
+        async with lifespan_app(app):
+            listing = await request(app, "GET", "/v1/models")
+            assert [(m["id"], m["owned_by"]) for m in listing.json["data"]] == [
+                (model, "openai")
+            ]
+            response = await post_json(app, path, body(stream, model=model))
+        assert response.status == 200
+        assert b"hello" in response.body
+        assert captured[0]["model"] == model
+        assert captured[0]["instructions"] == ""
+
+
 def create_app(**kwargs):
     return _create_app(session_factory=FakeSessionFactory(("fake Claude",)), **kwargs)
 

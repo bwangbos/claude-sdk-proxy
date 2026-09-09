@@ -13,7 +13,9 @@ import uvicorn
 
 from quaylet.app import create_app
 from quaylet.diagnostics import close_logging, configure_logging
+from quaylet.model_catalog import ALL_MODELS, OPENAI_MODELS, TEXT_ONLY_MODELS
 from quaylet.openai_subscription.auth import CredentialManager
+from quaylet.thinking import describe_thinking
 
 
 def _port(value: str) -> int:
@@ -42,15 +44,29 @@ def _parser() -> argparse.ArgumentParser:
         description="Quaylet local API gateway for Claude and ChatGPT subscriptions"
     )
     commands = parser.add_subparsers(dest="command")
+    commands.add_parser(
+        "models",
+        help="List the supported model catalog offline",
+        description=(
+            "List the supported model catalog offline, without login or a server."
+        ),
+    )
     for command in ("login", "logout", "auth-status"):
         subparser = commands.add_parser(command)
         subparser.add_argument("provider", choices=("openai",))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=_port, default=8317)
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
         "--model",
-        action="append",
-        help="Model to expose; required for serving, repeatable",
+        action="extend",
+        nargs="+",
+        help="Models to expose (space-separated; flag may be repeated)",
+    )
+    selection.add_argument(
+        "--all-models",
+        action="store_true",
+        help="Expose every model in Quaylet's supported subscription catalog",
     )
     parser.add_argument("--refusal-fallback", choices=("off", "auto"), default="off")
     parser.add_argument("--max-sessions", type=_positive, default=8)
@@ -74,17 +90,20 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "models":
+        _list_models()
+        return 0
     if args.command is not None:
         return asyncio.run(_auth_command(args.command))
-    if not args.model:
-        parser.error("at least one --model is required to start the server")
+    if not args.model and not args.all_models:
+        parser.error("--model or --all-models is required to start the server")
     try:
         host = ipaddress.ip_address(args.host)
     except ValueError:
         parser.error("--host must be a loopback IP address")
     if not host.is_loopback:
         parser.error("--host must be a loopback IP address")
-    models = tuple(args.model)
+    models = ALL_MODELS if args.all_models else tuple(args.model)
     try:
         app = create_app(
             models=models,
@@ -103,6 +122,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         if handler is not None:
             close_logging(handler, file_output=args.log is not None)
     return 0
+
+
+def _list_models() -> None:
+    print("Supported catalog, not account access or live availability verification.")
+    print(f"{'MODEL':<26} {'PROVIDER':<9} {'IMAGES':<7} THINKING")
+    for model in ALL_MODELS:
+        provider = "ChatGPT" if model in OPENAI_MODELS else "Claude"
+        images = "no" if model in TEXT_ONLY_MODELS else "yes"
+        print(f"{model:<26} {provider:<9} {images:<7} {describe_thinking(model)}")
+    print("\nSelect with --model MODEL [MODEL ...], or --all-models.")
+    print("Manual budgets use /v1/messages; omitted ChatGPT thinking uses its default.")
+    print("New Claude entries remain live-unverified; see docs/models.md for evidence.")
 
 
 async def _auth_command(command: str) -> int:

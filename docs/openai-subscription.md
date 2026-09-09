@@ -1,7 +1,8 @@
 # ChatGPT subscription backend
 
-Configure this backend by including `gpt-6-astra` or `gpt-5.6-sol` in the
-server's `--model` arguments. Quaylet requires explicit model selection for
+Configure this backend by including a [ChatGPT catalog model](models.md) in
+`--model`, or select the complete catalog with `--all-models`.
+Quaylet requires explicit model selection for
 both providers; there is no default model or provider. This project is not an
 OpenAI product, and documenting the integration is not an endorsement or a
 statement that the fixed, unofficial subscription endpoint is authorized for
@@ -38,10 +39,11 @@ Status output contains no access or refresh token. Logout is likewise explicit:
 uv run quaylet logout openai
 ```
 
-After login, expose one or both exact model IDs:
+After login, expose any subset of the exact model IDs:
 
 ```bash
-uv run quaylet --model gpt-6-astra --model gpt-5.6-sol
+uv run quaylet --model gpt-6-astra gpt-5.6-sol gpt-5.6-terra \
+  gpt-5.6-luna gpt-5.5 gpt-5.3-codex-spark
 ```
 
 They use the existing Chat Completions and Anthropic Messages frontend paths.
@@ -49,20 +51,20 @@ Do not use Claude aliases for this backend. There are no OpenAI aliases;
 Claude's optional refusal fallback is independent of this backend. Confirm the
 configured provider split with `GET /v1/models`.
 
-To serve both providers, explicitly include the Claude models too; repeated
-`--model` values define the entire allowlist. For example:
+To serve both providers, include Claude models too, or use `--all-models`.
+Space-separated (or repeated) `--model` values define the entire allowlist:
 
 ```bash
-uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8 \
-  --model gpt-6-astra --model gpt-5.6-sol
+uv run quaylet --model sonnet-5 opus-5 opus-4.8 gpt-6-astra gpt-5.6-sol
 ```
 
 The server's `--refusal-fallback` default affects only Claude. A ChatGPT request
 explicitly asking for `X-Quaylet-Refusal-Fallback: auto` is rejected; no OpenAI
 model downgrade is performed.
 
-Supported explicit reasoning efforts are `low`, `medium`, `high`, `xhigh`, and
-`max`; omitting the control retains the provider default. Omission does not
+Supported explicit reasoning efforts are `low`, `medium`, `high`, and `xhigh`;
+Astra, Sol, Terra, and Luna additionally support `max`. Omitting the control
+retains the provider default. Omission does not
 claim to disable internal reasoning. `none`, disabled/budget thinking forms,
 and `ultra` are rejected. `max_tokens` and `max_completion_tokens` are accepted
 for frontend compatibility but are not enforced upstream. The proxy does not
@@ -72,12 +74,12 @@ truncate a tool argument or invent a stop reason to simulate that limit.
 
 Use a custom provider pointed at Quaylet's local base URL, not Pi's direct
 subscription provider. The transport describes the frontend API, not the
-upstream provider: Astra and Sol work through either Chat Completions or
+upstream provider: all catalog ChatGPT models work through either Chat Completions or
 Anthropic Messages. Use the Anthropic Messages frontend for Pi image-returning
 tools, as described in the [root README](../README.md#pi-with-images-and-screenshots).
 
 Start from the README's compatible custom-provider settings and add exact model
-IDs `gpt-6-astra` and `gpt-5.6-sol` to its model list. Server configuration alone
+IDs from the [catalog](models.md) to its model list. Server configuration alone
 does not populate Pi's custom model picker. Use an arbitrary non-secret local
 API key placeholder; Quaylet uses its own saved OAuth login upstream.
 
@@ -96,8 +98,10 @@ instead of the Claude mapping:
 }
 ```
 
-Place that object in the model's `thinkingLevelMap`. Choose a supported effort
-such as `low`; do not send Claude's `none`/disabled thinking form. Omitting
+Place that object in the model's `thinkingLevelMap`
+(`max` must be `null` for GPT-5.5 and Spark). Spark is text-only: set its Pi
+`input` to `["text"]`; image requests, including image tool results, are rejected.
+Choose an effort such as `low`; do not send Claude's `none`/disabled thinking form. Omitting
 reasoning controls leaves the upstream default in place, not guaranteed off.
 Client-side `contextWindow`, output limits, and cost estimates are harness
 configuration, not account-limit discovery or guarantees enforced by Quaylet.

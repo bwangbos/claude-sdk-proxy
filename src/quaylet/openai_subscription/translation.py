@@ -15,6 +15,7 @@ from quaylet.domain import (
     ToolCallBlock,
     ToolResultBlock,
 )
+from quaylet.model_catalog import OPENAI_EFFORTS, OPENAI_MODELS, TEXT_ONLY_MODELS
 from quaylet.thinking import ThinkingDisplay, ThinkingEffort, ThinkingOptions
 
 from .replay import (
@@ -26,7 +27,7 @@ from .replay import (
     plain,
 )
 
-MODELS = ("gpt-6-astra", "gpt-5.6-sol")
+MODELS = OPENAI_MODELS
 EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
@@ -88,10 +89,23 @@ def validate_request(request: TextRequest) -> None:
         raise RequestValidationError(
             "thinking", "reasoning token budgets are unsupported"
         )
-    if thinking.effort is not None and thinking.effort not in EFFORTS:
+    if (
+        thinking.effort is not None
+        and thinking.effort not in OPENAI_EFFORTS[request.model]
+    ):
         raise RequestValidationError(
             "reasoning_effort", "unsupported subscription effort"
         )
+    if request.model in TEXT_ONLY_MODELS:
+        for message in request.messages:
+            for block in message.blocks:
+                parts = (
+                    block.content if isinstance(block, ToolResultBlock) else (block,)
+                )
+                if any(isinstance(part, ImageBlock) for part in parts):
+                    raise RequestValidationError(
+                        "messages", "model does not support image inputs"
+                    )
     if request.refusal_fallback != "off":
         raise RequestValidationError(
             "refusal_fallback", "subscription fallback is unsupported"
