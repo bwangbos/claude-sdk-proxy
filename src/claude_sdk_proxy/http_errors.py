@@ -14,6 +14,7 @@ from claude_sdk_proxy.domain import (
     RequestValidationError,
     UnsupportedFeature,
 )
+from claude_sdk_proxy.openai_subscription.backend import SubscriptionFailure
 from claude_sdk_proxy.session_turn import (
     SessionCapacity,
     SessionConflict,
@@ -110,6 +111,39 @@ def _session_error(error: SessionMismatch | SessionConflict) -> ErrorDetail:
 
 
 def error_detail(error: Exception) -> ErrorDetail:
+    if isinstance(error, SubscriptionFailure):
+        status, code, message = {
+            "authentication": (
+                401,
+                "authentication_error",
+                "Proxy OpenAI login is required.",
+            ),
+            "access_denied": (
+                403,
+                "permission_error",
+                "OpenAI subscription access was denied.",
+            ),
+            "rate_limit": (
+                429,
+                "rate_limit_error",
+                "OpenAI subscription rate limit reached.",
+            ),
+            "timeout": (
+                504,
+                "backend_timeout",
+                "OpenAI subscription request timed out.",
+            ),
+            "closed": (
+                503,
+                "backend_unavailable",
+                "OpenAI subscription backend is closed.",
+            ),
+        }.get(
+            error.category,
+            (502, "backend_error", "OpenAI subscription request failed."),
+        )
+        record("request_rejected", code=code, reason=error.category, status=status)
+        return ErrorDetail(status, code, message)
     if isinstance(error, BackendFailure):
         reason = str(error).partition(":")[0]
         messages = {

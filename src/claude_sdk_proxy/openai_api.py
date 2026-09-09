@@ -10,6 +10,7 @@ from claude_sdk_proxy.domain import (
     ConversationEvent,
     InputUsage,
     RedactedThinkingBlock,
+    RefusalDelta,
     RequestValidationError,
     ResponseIdentity,
     TextBlock,
@@ -21,6 +22,10 @@ from claude_sdk_proxy.domain import (
     ToolCall,
 )
 from claude_sdk_proxy.model_catalog import canonical_model
+from claude_sdk_proxy.openai_subscription.translation import (
+    MODELS,
+    parse_subscription_thinking,
+)
 from claude_sdk_proxy.openai_tools import (
     parse_openai_messages,
     parse_openai_tools,
@@ -85,7 +90,11 @@ def parse_openai_request(
     model = canonical_model(required_string(body, "model"))
     if model not in {canonical_model(value) for value in allowed_models}:
         raise RequestValidationError("model", "model is not configured")
-    thinking = parse_openai_thinking(body, model)
+    thinking = (
+        parse_subscription_thinking(body, "openai")
+        if model in MODELS
+        else parse_openai_thinking(body, model)
+    )
     stream = boolean(body, "stream")
     if "store" in body and body["store"] is not False:
         raise RequestValidationError("store", "must be exactly false")
@@ -93,7 +102,7 @@ def parse_openai_request(
     max_tokens = _openai_max_tokens(body)
     tools = parse_openai_tools(body)
     validate_openai_tool_controls(body)
-    system, messages = parse_openai_messages(body)
+    system, messages = parse_openai_messages(body, subscription=model in MODELS)
     try:
         return TextRequest(
             model,
@@ -122,6 +131,9 @@ def render_openai_response(
     created: int = 0,
 ) -> dict[str, object]:
     normalized = (TextBlock(blocks),) if isinstance(blocks, str) else blocks
+    message = _response_message(normalized)
+    if completed.refusal is not None:
+        message["refusal"] = completed.refusal
     return {
         "id": request_id,
         "object": "chat.completion",
@@ -130,12 +142,14 @@ def render_openai_response(
         "choices": [
             {
                 "index": 0,
-                "message": _response_message(normalized),
+                "message": message,
                 "logprobs": None,
                 "finish_reason": _openai_stop_reason(completed.stop_reason),
             }
         ],
-        "usage": _openai_usage(completed.usage),
+        "usage": None
+        if completed.provider == "openai-subscription" and completed.usage is None
+        else _openai_usage(completed.usage),
     }
 
 
@@ -181,6 +195,10 @@ def encode_openai_event(
     if isinstance(event, TextDelta):
         return (
             _sse(_chunk(request_id, model, {"content": event.text}, created=created)),
+        )
+    if isinstance(event, RefusalDelta):
+        return (
+            _sse(_chunk(request_id, model, {"refusal": event.text}, created=created)),
         )
     if isinstance(event, ToolCall):
         index = 0 if state is None else state.next_tool_index
@@ -229,7 +247,9 @@ def encode_openai_event(
                     "created": created,
                     "model": model,
                     "choices": [],
-                    "usage": _openai_usage(event.usage),
+                    "usage": None
+                    if event.provider == "openai-subscription" and event.usage is None
+                    else _openai_usage(event.usage),
                 }
             )
         )
@@ -323,6 +343,10 @@ def _openai_usage(usage: Mapping[str, Any] | None) -> dict[str, object]:
         details["cache_write_tokens"] = cache_creation
     if details:
         normalized["prompt_tokens_details"] = details
+    if usage is not None and "reasoning_tokens" in usage:
+        normalized["completion_tokens_details"] = {
+            "reasoning_tokens": usage_counter(usage, "reasoning_tokens")
+        }
     return normalized
 
 

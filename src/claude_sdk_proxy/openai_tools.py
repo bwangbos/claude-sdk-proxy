@@ -77,6 +77,8 @@ def validate_openai_tool_controls(body: Mapping[str, object]) -> None:
 
 def parse_openai_messages(
     body: Mapping[str, object],
+    *,
+    subscription: bool = False,
 ) -> tuple[str, tuple[CanonicalMessage, ...]]:
     value = body.get("messages")
     if not isinstance(value, list) or not value:
@@ -101,10 +103,10 @@ def parse_openai_messages(
                 messages.append(CanonicalMessage("user", _text_content(raw, "user")))
             index += 1
         elif role == "assistant":
-            messages.append(_assistant_message(raw))
+            messages.append(_assistant_message(raw, subscription=subscription))
             index += 1
         elif role == "tool":
-            results, index = _tool_results(value, index)
+            results, index = _tool_results(value, index, subscription=subscription)
             messages.append(CanonicalMessage("user", results))
         elif role in {"function"}:
             raise UnsupportedFeature("messages", "tool roles are not supported")
@@ -172,7 +174,9 @@ def _user_parts(content: object) -> tuple[TextBlock | ImageBlock, ...]:
     return tuple(parts)
 
 
-def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
+def _assistant_message(
+    raw: Mapping[str, object], *, subscription: bool = False
+) -> CanonicalMessage:
     # SDK response dumps include these fields even when the feature is absent.
     nullable_metadata = {"refusal", "annotations", "audio", "function_call"}
     raw = {
@@ -180,6 +184,12 @@ def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
         for key, value in raw.items()
         if key not in nullable_metadata or value is not None
     }
+    if subscription and "refusal" in raw:
+        refusal = raw["refusal"]
+        if not isinstance(refusal, str):
+            raise RequestValidationError("messages", "refusal must be a string or null")
+        raw = {**raw, "content": _assistant_text(raw) + refusal}
+        del raw["refusal"]
     if set(raw) - _ASSISTANT_FIELDS:
         raise _message_field_error(raw)
     for field in _REASONING_FIELDS:
@@ -205,7 +215,7 @@ def _assistant_message(raw: Mapping[str, object]) -> CanonicalMessage:
             blocks.append(TextBlock(text))
     elif content is not None:
         raise RequestValidationError("messages", "assistant content must be a string")
-    blocks.extend(_tool_call(item) for item in calls)
+    blocks.extend(_tool_call(item, subscription=subscription) for item in calls)
     return CanonicalMessage("assistant", tuple(blocks))
 
 
@@ -220,11 +230,13 @@ def _assistant_text(raw: Mapping[str, object]) -> str:
     raise RequestValidationError("messages", "assistant content must be a string")
 
 
-def _tool_call(raw: object) -> ToolCallBlock:
+def _tool_call(raw: object, *, subscription: bool = False) -> ToolCallBlock:
     if not isinstance(raw, Mapping) or set(raw) - _TOOL_CALL_FIELDS:
         raise RequestValidationError("messages", "tool calls must be objects")
     identifier = raw.get("id")
-    if not isinstance(identifier, str) or _CALL_ID.fullmatch(identifier) is None:
+    if not isinstance(identifier, str) or (
+        not subscription and _CALL_ID.fullmatch(identifier) is None
+    ):
         raise RequestValidationError("messages", "tool call ID is invalid")
     if raw.get("type") != "function":
         raise UnsupportedFeature("messages", "only function calls are supported")
@@ -248,7 +260,7 @@ def _tool_call(raw: object) -> ToolCallBlock:
 
 
 def _tool_results(
-    value: list[object], index: int
+    value: list[object], index: int, *, subscription: bool = False
 ) -> tuple[tuple[ToolResultBlock, ...], int]:
     results: list[ToolResultBlock] = []
     while index < len(value):
@@ -260,7 +272,9 @@ def _tool_results(
         if set(raw) - _TOOL_MESSAGE_FIELDS:
             raise _message_field_error(raw)
         identifier, content = raw.get("tool_call_id"), raw.get("content")
-        if not isinstance(identifier, str) or _CALL_ID.fullmatch(identifier) is None:
+        if not isinstance(identifier, str) or (
+            not subscription and _CALL_ID.fullmatch(identifier) is None
+        ):
             raise RequestValidationError("messages", "tool result ID is invalid")
         if isinstance(content, list):
             parts = tuple(

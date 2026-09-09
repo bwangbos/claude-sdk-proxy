@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ipaddress
+import json
 import math
+import sys
+import webbrowser
 from collections.abc import Sequence
 
 import uvicorn
 
 from claude_sdk_proxy.app import create_app
 from claude_sdk_proxy.diagnostics import close_logging, configure_logging
+from claude_sdk_proxy.openai_subscription.auth import CredentialManager
 
 
 def _port(value: str) -> int:
@@ -34,6 +39,10 @@ def _positive_finite_float(value: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Private localhost Claude gateway")
+    commands = parser.add_subparsers(dest="command")
+    for command in ("login", "logout", "auth-status"):
+        subparser = commands.add_parser(command)
+        subparser.add_argument("provider", choices=("openai",))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=_port, default=8317)
     parser.add_argument("--model", action="append")
@@ -59,6 +68,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command is not None:
+        return asyncio.run(_auth_command(args.command))
     try:
         host = ipaddress.ip_address(args.host)
     except ValueError:
@@ -84,6 +95,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         if handler is not None:
             close_logging(handler, file_output=args.log is not None)
     return 0
+
+
+async def _auth_command(command: str) -> int:
+    manager = CredentialManager()
+    try:
+        if command == "login":
+            await manager.login(open_browser=_open_browser)
+            print("OpenAI subscription login saved for this proxy.")
+        elif command == "logout":
+            await manager.logout()
+            print("Proxy OpenAI subscription credentials removed.")
+        else:
+            print(json.dumps(await manager.status()))
+        return 0
+    except Exception:
+        print("OpenAI authentication operation failed.", file=sys.stderr)
+        return 1
+    finally:
+        await manager.close()
+
+
+def _open_browser(url: str) -> None:
+    webbrowser.open(url)
 
 
 if __name__ == "__main__":

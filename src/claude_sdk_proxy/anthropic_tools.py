@@ -110,6 +110,8 @@ def validate_anthropic_tool_choice(body: Mapping[str, object]) -> None:
 
 def parse_anthropic_messages(
     body: Mapping[str, object],
+    *,
+    subscription: bool = False,
 ) -> tuple[CanonicalMessage, ...]:
     value = body.get("messages")
     if not isinstance(value, list) or not value:
@@ -129,12 +131,16 @@ def parse_anthropic_messages(
         if not isinstance(role, str) or role not in {"user", "assistant"}:
             raise RequestValidationError("messages", "role must be user or assistant")
         parsed_role = cast(Role, role)
-        messages.append(CanonicalMessage(parsed_role, _parse_content(raw, parsed_role)))
+        messages.append(
+            CanonicalMessage(
+                parsed_role, _parse_content(raw, parsed_role, subscription=subscription)
+            )
+        )
     return tuple(messages)
 
 
 def _parse_content(
-    raw: Mapping[str, object], role: Role
+    raw: Mapping[str, object], role: Role, *, subscription: bool = False
 ) -> str | tuple[CanonicalBlock, ...]:
     content = raw.get("content")
     if isinstance(content, str):
@@ -145,11 +151,15 @@ def _parse_content(
     # replay identical to the existing canonical empty assistant text entry.
     if not content and role == "assistant":
         return ""
-    blocks = tuple(_parse_block(item, role) for item in content)
+    blocks = tuple(
+        _parse_block(item, role, subscription=subscription) for item in content
+    )
     return blocks
 
 
-def _parse_block(raw: object, role: Role) -> CanonicalBlock:
+def _parse_block(
+    raw: object, role: Role, *, subscription: bool = False
+) -> CanonicalBlock:
     if not isinstance(raw, Mapping):
         raise RequestValidationError("messages", "content blocks must be objects")
     raw = without_cache_hint(raw)
@@ -188,7 +198,9 @@ def _parse_block(raw: object, role: Role) -> CanonicalBlock:
                 "messages", "tool use block fields are invalid"
             )
         identifier, name, arguments = raw.get("id"), raw.get("name"), raw.get("input")
-        if not isinstance(identifier, str) or _TOOL_ID.fullmatch(identifier) is None:
+        if not isinstance(identifier, str) or (
+            not subscription and _TOOL_ID.fullmatch(identifier) is None
+        ):
             raise RequestValidationError("messages", "tool use ID is invalid")
         if not isinstance(name, str) or not isinstance(arguments, Mapping):
             raise RequestValidationError("messages", "tool use block is invalid")
@@ -202,7 +214,9 @@ def _parse_block(raw: object, role: Role) -> CanonicalBlock:
             )
         identifier = raw.get("tool_use_id")
         is_error = raw.get("is_error", False)
-        if not isinstance(identifier, str) or _TOOL_ID.fullmatch(identifier) is None:
+        if not isinstance(identifier, str) or (
+            not subscription and _TOOL_ID.fullmatch(identifier) is None
+        ):
             raise RequestValidationError("messages", "tool result ID is invalid")
         if type(is_error) is not bool:
             raise RequestValidationError(

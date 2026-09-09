@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Any, cast
 
 from claude_sdk_proxy.anthropic_tools import (
@@ -16,6 +17,7 @@ from claude_sdk_proxy.domain import (
     ConversationEvent,
     InputUsage,
     RedactedThinkingBlock,
+    RefusalDelta,
     RequestValidationError,
     ResponseIdentity,
     TextBlock,
@@ -28,6 +30,10 @@ from claude_sdk_proxy.domain import (
     ToolDefinition,
 )
 from claude_sdk_proxy.model_catalog import canonical_model
+from claude_sdk_proxy.openai_subscription.translation import (
+    MODELS,
+    parse_subscription_thinking,
+)
 from claude_sdk_proxy.text_api import (
     boolean,
     reject_fields,
@@ -63,6 +69,8 @@ class AnthropicStreamState:
     next_block_index: int = 0
     lazy_blocks: bool = False
     open_thinking_index: int | None = None
+    subscription: bool = False
+    thinking_indices: dict[int, int] = dataclass_field(default_factory=dict)
 
 
 def parse_anthropic_request(
@@ -72,7 +80,11 @@ def parse_anthropic_request(
     model = canonical_model(required_string(body, "model"))
     if model not in {canonical_model(value) for value in allowed_models}:
         raise RequestValidationError("model", "model is not configured")
-    thinking = parse_anthropic_thinking(body, model)
+    thinking = (
+        parse_subscription_thinking(body, "anthropic")
+        if model in MODELS
+        else parse_anthropic_thinking(body, model)
+    )
     system = ""
     if "system" in body:
         value = body["system"]
@@ -91,7 +103,7 @@ def parse_anthropic_request(
     stream = boolean(body, "stream")
     tools = parse_anthropic_tools(body)
     validate_anthropic_tool_choice(body)
-    messages = parse_anthropic_messages(body)
+    messages = parse_anthropic_messages(body, subscription=model in MODELS)
     try:
         return TextRequest(
             model,
@@ -125,7 +137,9 @@ def render_anthropic_response(
         "content": [_response_block(block) for block in normalized],
         "stop_reason": _anthropic_stop_reason(completed.stop_reason),
         "stop_sequence": None,
-        "usage": _anthropic_usage(completed.usage),
+        "usage": None
+        if completed.provider == "openai-subscription" and completed.usage is None
+        else _anthropic_usage(completed.usage),
     }
 
 
@@ -158,7 +172,9 @@ def encode_anthropic_start(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {**input_usage, "output_tokens": 0},
+                "usage": {"input_tokens": None, "output_tokens": None}
+                if state is not None and state.subscription
+                else {**input_usage, "output_tokens": 0},
             },
         },
     )
@@ -182,6 +198,57 @@ def encode_anthropic_event(
         if state is None:
             raise ValueError("thinking streaming requires block state")
         chunks: list[bytes] = []
+        if state.subscription:
+            index = state.thinking_indices.get(event.index)
+            if index is None:
+                index = state.next_block_index
+                state.next_block_index += 1
+                state.thinking_indices[event.index] = index
+                block = event.block if isinstance(event, ThinkingCompleted) else None
+                content = (
+                    _response_block(block)
+                    if isinstance(block, RedactedThinkingBlock)
+                    else {"type": "thinking", "thinking": "", "signature": ""}
+                )
+                chunks.append(
+                    _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": content,
+                        },
+                    )
+                )
+            if isinstance(event, ThinkingDelta):
+                chunks.append(
+                    _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "thinking_delta", "thinking": event.text},
+                        },
+                    )
+                )
+            else:
+                if isinstance(event.block, ThinkingBlock):
+                    chunks.append(
+                        _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": {
+                                    "type": "signature_delta",
+                                    "signature": event.block.signature,
+                                },
+                            },
+                        )
+                    )
+                chunks.append(_content_block_stop(index))
+                del state.thinking_indices[event.index]
+            return tuple(chunks)
         if state.open_text_index is not None:
             chunks.append(_content_block_stop(state.open_text_index))
             state.open_text_index = None
@@ -234,7 +301,7 @@ def encode_anthropic_event(
             chunks.append(_content_block_stop(index))
             state.open_thinking_index = None
         return tuple(chunks)
-    if isinstance(event, TextDelta):
+    if isinstance(event, (TextDelta, RefusalDelta)):
         if enabled:
             chunks = []
             assert state is not None
@@ -273,7 +340,13 @@ def encode_anthropic_event(
                     "stop_reason": _anthropic_stop_reason(event.stop_reason),
                     "stop_sequence": None,
                 },
-                "usage": {"output_tokens": usage_counter(event.usage, "output_tokens")},
+                "usage": (
+                    {"input_tokens": None, "output_tokens": None}
+                    if event.usage is None
+                    else _anthropic_usage(event.usage)
+                )
+                if event.provider == "openai-subscription"
+                else {"output_tokens": usage_counter(event.usage, "output_tokens")},
             },
         ),
         _sse("message_stop", {"type": "message_stop"}),

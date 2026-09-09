@@ -30,6 +30,10 @@ MAX_SIGNATURE_BYTES = 1024 * 1024
 MAX_CACHE_BYTES = 64 * 1024 * 1024
 
 
+def _invalid_constant(value: str) -> None:
+    raise ValueError("nonstandard JSON constant")
+
+
 def plain(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {k: plain(v) for k, v in value.items()}
@@ -271,7 +275,8 @@ def decode_assistant(
         value = json.loads(
             base64.b64decode(
                 signature[len(ASSISTANT_PREFIX) :], altchars=b"-_", validate=True
-            )
+            ),
+            parse_constant=_invalid_constant,
         )
         if not isinstance(value, dict) or set(value) != {
             "v",
@@ -295,6 +300,9 @@ def decode_assistant(
         output = value["output"]
         if not isinstance(output, list) or len(output) > 1024:
             return None
+        # JSON exponents can overflow to infinity even with parse_constant set.
+        # Validate every opaque metadata field before passing it to HTTP JSON.
+        packed(output)
         for item in output:
             if not isinstance(item, dict) or not isinstance(item.get("id"), str):
                 return None

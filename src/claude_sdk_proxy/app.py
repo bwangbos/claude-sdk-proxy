@@ -34,6 +34,7 @@ from claude_sdk_proxy.diagnostics import DiagnosticContextMiddleware
 from claude_sdk_proxy.domain import (
     BackendFailure,
     Completed,
+    ConversationEvent,
     InputUsage,
     RedactedThinkingBlock,
     RequestValidationError,
@@ -61,6 +62,8 @@ from claude_sdk_proxy.openai_api import (
     parse_openai_request,
     render_openai_response,
 )
+from claude_sdk_proxy.openai_subscription.backend import Backend as SubscriptionBackend
+from claude_sdk_proxy.openai_subscription.translation import MODELS as OPENAI_MODELS
 from claude_sdk_proxy.sdk_session import SdkSession
 from claude_sdk_proxy.session_turn import TurnLeaseProtocol
 from claude_sdk_proxy.sessions import SessionRegistry
@@ -75,6 +78,7 @@ def create_app(
     teardown_timeout_seconds: float = 5.0,
     max_sessions: int = 8,
     refusal_fallback: RefusalFallback = "off",
+    subscription_backend: SubscriptionBackend | None = None,
 ) -> Starlette:
     if max_sessions <= 0:
         raise ValueError("max sessions must be positive")
@@ -90,19 +94,28 @@ def create_app(
     allowed_models = frozenset(model_order)
 
     @asynccontextmanager
-    async def lifespan(_: Starlette) -> AsyncIterator[dict[str, SessionRegistry]]:
+    async def lifespan(_: Starlette) -> AsyncIterator[dict[str, object]]:
         registry = SessionRegistry(
             session_factory,
             turn_timeout_seconds=turn_timeout_seconds,
             tool_result_timeout_seconds=tool_result_timeout_seconds,
             teardown_timeout_seconds=teardown_timeout_seconds,
             max_sessions=max_sessions,
-            configured_models=model_order,
+            configured_models=tuple(m for m in model_order if m not in OPENAI_MODELS),
         )
+        subscription = subscription_backend
+        if subscription is None and allowed_models.intersection(OPENAI_MODELS):
+            subscription = SubscriptionBackend(
+                max_sessions=max_sessions, timeout=turn_timeout_seconds
+            )
         try:
-            yield {"registry": registry}
+            yield {"registry": registry, "subscription": subscription}
         finally:
-            await registry.close()
+            try:
+                if subscription is not None:
+                    await subscription.close()
+            finally:
+                await registry.close()
 
     app = Starlette(
         routes=[
@@ -126,7 +139,12 @@ async def _health(_: Request) -> Response:
 
 async def _models(request: Request) -> Response:
     data = [
-        {"id": model, "object": "model", "created": 0, "owned_by": "anthropic"}
+        {
+            "id": model,
+            "object": "model",
+            "created": 0,
+            "owned_by": "openai" if model in OPENAI_MODELS else "anthropic",
+        }
         for model in cast(tuple[str, ...], request.app.state.model_order)
     ]
     return JSONResponse({"object": "list", "data": data})
@@ -161,16 +179,43 @@ async def _handle(request: Request, *, dialect: str) -> Response:
         parsed = parser(cast(Mapping[str, object], body), allowed)
         policy = resolve_fallback(
             request.headers.getlist("x-claude-proxy-refusal-fallback"),
-            cast(RefusalFallback, request.app.state.refusal_fallback),
+            "off"
+            if parsed.model in OPENAI_MODELS
+            else cast(RefusalFallback, request.app.state.refusal_fallback),
         )
-        native_allowlist(parsed.model, request.app.state.model_order, policy)
+        if parsed.model not in OPENAI_MODELS:
+            for message in parsed.messages:
+                for block in message.blocks:
+                    opaque = (
+                        block.signature
+                        if isinstance(block, ThinkingBlock)
+                        else block.data
+                        if isinstance(block, RedactedThinkingBlock)
+                        else ""
+                    )
+                    if opaque.startswith("openai-subscription:"):
+                        raise RequestValidationError(
+                            "messages", "OpenAI metadata cannot be sent to Claude"
+                        )
+            native_allowlist(
+                parsed.model,
+                tuple(
+                    m for m in request.app.state.model_order if m not in OPENAI_MODELS
+                ),
+                policy,
+            )
         parsed = replace(parsed, refusal_fallback=policy)
         monitor = DisconnectMonitor(request.receive)
         await monitor.start()
-        registry = cast(SessionRegistry, request.state.registry)
-        lease = await registry.open_turn(
-            parsed, request.headers.get("x-claude-proxy-session")
-        )
+        lease: TurnLeaseProtocol
+        if parsed.model in OPENAI_MODELS:
+            subscription = cast(SubscriptionBackend, request.state.subscription)
+            lease = await subscription.open_turn(parsed)
+        else:
+            registry = cast(SessionRegistry, request.state.registry)
+            lease = await registry.open_turn(
+                parsed, request.headers.get("x-claude-proxy-session")
+            )
     except asyncio.CancelledError:
         if monitor is not None and monitor.consume_disconnect_cancellation():
             return cast(Response, monitor.wrap(None))
@@ -210,6 +255,10 @@ async def _stream_response(
             raise BackendFailure("backend_model_mismatch")
         _identity_headers(lease, identity)
         first = await anext(stream)
+        while isinstance(first, ResponseIdentity):
+            identity = first
+            _identity_headers(lease, identity)
+            first = await anext(stream)
     except asyncio.CancelledError:
         await cleanup_best_effort(lease, stream)
         if monitor.consume_disconnect_cancellation():
@@ -224,25 +273,36 @@ async def _stream_response(
         return cast(Response, monitor.wrap(response))
     if dialect == "openai":
         openai_state = OpenAIStreamState()
+        current_identity: ResponseIdentity = identity
+
+        def render_event(event: ConversationEvent) -> tuple[bytes, ...]:
+            nonlocal current_identity
+            if isinstance(event, ResponseIdentity):
+                current_identity = event
+                return ()
+            return encode_openai_event(
+                request_id,
+                current_identity.actual_model,
+                event,
+                request.include_usage,
+                openai_state,
+                created=created,
+            )
+
         stream_response = EventStreamResponse(
             lease,
             stream,
             first,
             encode_openai_start(request_id, identity.actual_model, created=created),
-            lambda event: encode_openai_event(
-                request_id,
-                identity.actual_model,
-                event,
-                request.include_usage,
-                openai_state,
-                created=created,
-            ),
+            render_event,
             lambda error: encode_openai_error(
                 error_detail(error).code, error_detail(error).message
             ),
         )
         return cast(Response, monitor.wrap(stream_response))
-    anthropic_state = AnthropicStreamState(lazy_blocks=True)
+    anthropic_state = AnthropicStreamState(
+        lazy_blocks=True, subscription=request.model in OPENAI_MODELS
+    )
     stream_response = EventStreamResponse(
         lease,
         stream,
@@ -278,11 +338,11 @@ async def _nonstream_response(
     identity: ResponseIdentity | None = None
     try:
         async for event in stream:
-            if identity is None:
-                if not isinstance(event, ResponseIdentity):
-                    raise BackendFailure("backend_model_mismatch")
+            if isinstance(event, ResponseIdentity):
                 identity = event
                 continue
+            if identity is None:
+                raise BackendFailure("backend_model_mismatch")
             if isinstance(event, TextDelta):
                 if blocks and isinstance(blocks[-1], TextBlock):
                     blocks[-1] = TextBlock(blocks[-1].text + event.text)
@@ -313,6 +373,8 @@ async def _nonstream_response(
         response = error_response(dialect, BackendFailure("missing completion"))
         return cast(Response, monitor.wrap(response))
     rendered: tuple[TextBlock | ToolCall | ThinkingBlock | RedactedThinkingBlock, ...]
+    if dialect == "anthropic" and completed.refusal is not None:
+        blocks.append(TextBlock(completed.refusal))
     if not blocks and completed.stop_reason == "refusal":
         rendered = () if dialect == "anthropic" else (TextBlock(""),)
     else:
@@ -337,6 +399,9 @@ async def _nonstream_response(
 
 def _identity_headers(lease: TurnLeaseProtocol, identity: ResponseIdentity) -> None:
     lease.response_headers["X-Claude-Proxy-Requested-Model"] = identity.requested_model
-    lease.response_headers["X-Claude-Proxy-Actual-Model"] = identity.actual_model
+    if identity.verified:
+        lease.response_headers["X-Claude-Proxy-Actual-Model"] = identity.actual_model
+    else:
+        lease.response_headers.pop("X-Claude-Proxy-Actual-Model", None)
     if identity.fallback:
         lease.response_headers["X-Claude-Proxy-Fallback"] = "true"

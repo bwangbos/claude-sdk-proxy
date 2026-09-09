@@ -210,7 +210,15 @@ async def test_carrier_is_single_and_bounded_with_multiple_reasoning_items(monke
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "change", ["native-output", "missing-binding", "duplicate-carrier"]
+    "change",
+    [
+        "native-output",
+        "missing-binding",
+        "duplicate-carrier",
+        "nan",
+        "infinity",
+        "overflow",
+    ],
 )
 async def test_carrier_cannot_override_visible_history_or_ambiguity(change):
     import base64
@@ -238,9 +246,19 @@ async def test_carrier_cannot_override_visible_history_or_ambiguity(change):
             raw["output"][0]["content"][0]["text"] = "injected answer"
         elif change == "missing-binding":
             raw.pop("scope")
+        elif change in {"nan", "infinity", "overflow"}:
+            raw["output"][0]["content"][0]["annotations"] = [
+                {"opaque": float("nan" if change == "nan" else "inf")}
+            ]
         modified = RedactedThinkingBlock(
             ASSISTANT_PREFIX
-            + base64.urlsafe_b64encode(json.dumps(raw).encode()).decode()
+            + base64.urlsafe_b64encode(
+                (
+                    json.dumps(raw).replace("Infinity", "1e999")
+                    if change == "overflow"
+                    else json.dumps(raw)
+                ).encode()
+            ).decode()
         )
         blocks = (TextBlock("hello"), modified) + (
             (modified,) if change == "duplicate-carrier" else ()
@@ -257,4 +275,5 @@ async def test_carrier_cannot_override_visible_history_or_ambiguity(change):
             "role": "assistant",
             "content": [{"type": "output_text", "text": "hello"}],
         }
+        json.dumps(build_body(continued, "acct"), allow_nan=False)
         await backend.close()
