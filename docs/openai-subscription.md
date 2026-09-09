@@ -88,6 +88,9 @@ tool arguments/results, upstream error bodies, or raw provider identifiers.
 The deterministic suite uses mock transport and proves translation, replay,
 cancellation, accounting shapes, client compatibility, and credential/header
 isolation. It does not prove current endpoint access or account authorization.
+The bounded 2026-09-08 execution and its explicit limitations are recorded in
+the [live verification follow-up](verification/2026-09-08-openai-live.md);
+results from that account and date do not establish future or general access.
 After completing the new proxy login, start a separate test-owned proxy on an
 alternate loopback port with both exact models in one terminal and run the
 bounded live battery in another:

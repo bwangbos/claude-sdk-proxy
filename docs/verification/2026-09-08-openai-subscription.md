@@ -4,6 +4,10 @@ This record separates deterministic observations at commit-under-test from live
 claims. It does not replace the usage and limitation contract in the
 [opt-in guide](../openai-subscription.md).
 
+A later explicitly authorized run is recorded separately in the
+[live follow-up](2026-09-08-openai-live.md). The statements below remain the
+historical pre-live checkpoint and are not rewritten by that later evidence.
+
 ## Deterministically observed
 
 - The complete subscription test directory passed: 217 tests using mock HTTP,
