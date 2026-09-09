@@ -183,6 +183,11 @@ class TextDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class RefusalDelta:
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class ThinkingDelta:
     index: int
     text: str
@@ -218,6 +223,8 @@ class InputUsage:
 class Completed:
     stop_reason: str | None
     usage: Mapping[str, Any] | None
+    provider: str = "claude"
+    refusal: str | None = None
 
     def __post_init__(self) -> None:
         if self.usage is not None:
@@ -229,6 +236,7 @@ class ResponseIdentity:
     requested_model: str
     actual_model: str
     fallback: bool
+    verified: bool = True
 
 
 type BackendEvent = TextDelta | ToolCall | Completed
@@ -392,6 +400,7 @@ type ConversationEvent = (
     InputUsage
     | ResponseIdentity
     | TextDelta
+    | RefusalDelta
     | ThinkingDelta
     | ThinkingCompleted
     | ToolCall
