@@ -115,6 +115,8 @@ def test_check_executes_native_unit_and_darwin_once_before_static_analysis(
         "uv:run pytest --strict-markers --forbid-skips -W error tests/unit",
         "uv:run pytest --strict-markers --forbid-skips -W error tests/darwin",
         "uv:run pytest --strict-markers --forbid-skips -W error tests/gateway",
+        "uv:run pytest --strict-markers --forbid-skips -W error "
+        "tests/openai_subscription",
         "uv:run ruff check .",
         "uv:run mypy src/claude_sdk_proxy",
     ]
@@ -123,6 +125,24 @@ def test_check_executes_native_unit_and_darwin_once_before_static_analysis(
 def test_gateway_target_runs_only_gateway_tests(tmp_path: Path) -> None:
     assert _run_make_target(tmp_path, "gateway") == [
         "uv:run pytest --strict-markers --forbid-skips -W error tests/gateway"
+    ]
+
+
+def test_openai_subscription_target_runs_only_deterministic_subscription_tests(
+    tmp_path: Path,
+) -> None:
+    assert _run_make_target(tmp_path, "openai-subscription") == [
+        "uv:run pytest --strict-markers --forbid-skips -W error "
+        "tests/openai_subscription"
+    ]
+
+
+def test_openai_live_target_does_not_supply_its_own_opt_in(tmp_path: Path) -> None:
+    makefile = Path(__file__).resolve().parents[2] / "Makefile"
+    assert "OPENAI_SUBSCRIPTION_LIVE=1" not in makefile.read_text()
+    assert _run_make_target(tmp_path, "live-openai") == [
+        "uv:run pytest --strict-markers --forbid-skips -W error "
+        "tests/live_openai -m live"
     ]
 
 
@@ -137,6 +157,8 @@ def test_offline_release_includes_real_pi_integration_before_static_checks(
         "uv:run pytest --strict-markers --forbid-skips -W error tests/darwin",
         "uv:run pytest --strict-markers --forbid-skips -W error tests/gateway",
         "uv:run pytest --strict-markers --forbid-skips -W error tests/integration",
+        "uv:run pytest --strict-markers --forbid-skips -W error "
+        "tests/openai_subscription",
         "uv:run ruff check .",
         "uv:run mypy src/claude_sdk_proxy",
     ]

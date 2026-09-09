@@ -4,6 +4,15 @@ from claude_sdk_proxy import cli
 from claude_sdk_proxy.openai_subscription.auth import AuthenticationError
 
 
+def test_help_describes_opt_in_chatgpt_backend(capsys):
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["--help"])
+    assert raised.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "Claude gateway" in help_text
+    assert "opt-in ChatGPT backend" in help_text
+
+
 @pytest.mark.parametrize("command", ["login", "logout", "auth-status"])
 def test_auth_commands_use_proxy_manager_without_starting_server(
     monkeypatch, capsys, command

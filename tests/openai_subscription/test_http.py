@@ -291,6 +291,95 @@ async def test_reasoning_interleaving_refusal_accounting_and_late_model(path, st
 
 
 @pytest.mark.anyio
+async def test_anthropic_sdk_assembled_stream_preserves_metadata_on_continuation():
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_native",
+        "summary": [{"type": "summary_text", "text": "brief"}],
+        "encrypted_content": "ciphertext",
+    }
+    message = text_item("answer")
+    first_events = (
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {**reasoning, "summary": [], "encrypted_content": ""},
+        },
+        {
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "brief",
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_native",
+                "summary": reasoning["summary"],
+            },
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {**message, "content": []},
+        },
+        {
+            "type": "response.output_text.delta",
+            "output_index": 1,
+            "content_index": 0,
+            "delta": "answer",
+        },
+        terminal([reasoning, message]),
+    )
+    captured = []
+
+    def handler(r):
+        captured.append(json.loads(r.content))
+        events = first_events if len(captured) == 1 else (terminal([text_item("ok")]),)
+        return httpx.Response(200, stream=Bytes(sse(*events), fragmented=True))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        app = create_app(
+            models=("gpt-6-astra",), subscription_backend=Backend(Auth(), client=client)
+        )
+        async with lifespan_app(app):
+            first = await post_json(app, "/v1/messages", body(stream=True))
+            assert first.status == 200
+            from anthropic.lib.streaming._messages import accumulate_event
+
+            snapshot = None
+            for frame in frames(first):
+                snapshot = accumulate_event(event=frame, current_snapshot=snapshot)
+            assistant = {
+                "role": "assistant",
+                "content": [
+                    block.model_dump(mode="json", exclude_unset=True, by_alias=True)
+                    for block in snapshot.content
+                ],
+            }
+            second = await post_json(
+                app,
+                "/v1/messages",
+                body(
+                    messages=body()["messages"]
+                    + [assistant, {"role": "user", "content": "next"}]
+                ),
+            )
+            assert second.status == 200
+
+    native_assistant = [
+        item for item in captured[1]["input"] if item.get("role") == "assistant"
+    ]
+    assert native_assistant == [message]
+    native_reasoning = [
+        item for item in captured[1]["input"] if item.get("type") == "reasoning"
+    ]
+    assert native_reasoning == [reasoning]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("path", PATHS)
 @pytest.mark.parametrize(
     "effort", ["low", "medium", "high", "xhigh", "max", "none", "ultra"]

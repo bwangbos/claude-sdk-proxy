@@ -5,7 +5,7 @@ CLANG := $(shell xcrun --find clang)
 SDKROOT := $(shell xcrun --show-sdk-path)
 C17_FLAGS := -std=c17 -Wall -Wextra -Werror -pedantic
 
-.PHONY: native unit darwin gateway integration release-offline live-core live-tools check
+.PHONY: native unit darwin gateway integration openai-subscription release-offline live-core live-tools live-openai check
 
 native: build/bin/darwin-probe build/lib/libclaude_proxy_lifecycle.dylib build/lib/libclaude_proxy_lifecycle_fault.dylib build/bin/claude-proxy-supervisor build/bin/claude-proxy-supervisor-probe build/bin/claude-proxy-anchor build/bin/claude-proxy-probe-child build/bin/claude-proxy-task6-test-cli
 
@@ -51,7 +51,10 @@ gateway:
 integration:
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/integration
 
-release-offline: unit darwin gateway integration
+openai-subscription:
+	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/openai_subscription
+
+release-offline: unit darwin gateway integration openai-subscription
 	uv run ruff check .
 	uv run mypy src/claude_sdk_proxy
 
@@ -61,6 +64,9 @@ live-core:
 live-tools:
 	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/live -m live -k tool
 
-check: unit darwin gateway
+live-openai:
+	uv run pytest $(PYTEST_RELEASE_FLAGS) tests/live_openai -m live
+
+check: unit darwin gateway openai-subscription
 	uv run ruff check .
 	uv run mypy src/claude_sdk_proxy

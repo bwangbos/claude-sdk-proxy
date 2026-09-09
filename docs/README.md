@@ -2,6 +2,12 @@
 
 ## Current usage and verification
 
+- [Opt-in direct ChatGPT backend](openai-subscription.md): login, exact models,
+  fixed endpoint and billing boundary, replay/reasoning limitations, usage,
+  diagnostics, and the explicitly gated live battery.
+- [Direct ChatGPT verification checkpoint](verification/2026-09-08-openai-subscription.md):
+  deterministic evidence and explicitly unverified live gates.
+
 - [Opus 4.8 vision verification](research/2026-09-07-opus-4-8-vision-verification.md):
   direct images and image tool results through both APIs, image-history rebasing,
   stock Pi's Anthropic read-tool workflow, and the text/image configuration update.

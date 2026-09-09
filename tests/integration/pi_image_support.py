@@ -10,7 +10,7 @@ from tests.fixtures.image_data import solid_png
 from tests.integration.pi_gateway_support import communicate_or_reap
 
 
-def image_provider(base_url: str) -> dict:
+def image_provider(base_url: str, *, model: str = "sonnet-5") -> dict:
     return {
         "baseUrl": base_url,
         "api": "anthropic-messages",
@@ -23,7 +23,7 @@ def image_provider(base_url: str) -> dict:
         },
         "models": [
             {
-                "id": "sonnet-5",
+                "id": model,
                 "name": "Claude local images",
                 "reasoning": False,
                 "input": ["text", "image"],
@@ -35,11 +35,19 @@ def image_provider(base_url: str) -> dict:
     }
 
 
-async def run_pi_image(base_url: str, directory: Path) -> str:
+async def run_pi_image(
+    base_url: str, directory: Path, *, provider_model: str = "sonnet-5"
+) -> str:
     config = directory / "pi-config"
     config.mkdir()
     (config / "models.json").write_text(
-        json.dumps({"providers": {"proxy-images": image_provider(base_url)}})
+        json.dumps(
+            {
+                "providers": {
+                    "proxy-images": image_provider(base_url, model=provider_model)
+                }
+            }
+        )
     )
     fixture = directory / "color.png"
     fixture.write_bytes(base64.b64decode(solid_png()))
@@ -48,7 +56,7 @@ async def run_pi_image(base_url: str, directory: Path) -> str:
         "--provider",
         "proxy-images",
         "--model",
-        "sonnet",
+        provider_model,
         "--no-session",
         "--no-extensions",
         "--no-skills",

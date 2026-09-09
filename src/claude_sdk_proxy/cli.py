@@ -38,7 +38,9 @@ def _positive_finite_float(value: str) -> float:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Private localhost Claude gateway")
+    parser = argparse.ArgumentParser(
+        description="Private localhost Claude gateway with an opt-in ChatGPT backend"
+    )
     commands = parser.add_subparsers(dest="command")
     for command in ("login", "logout", "auth-status"):
         subparser = commands.add_parser(command)

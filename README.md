@@ -1,11 +1,12 @@
 # Claude SDK Proxy
 
-An MIT-licensed, local HTTP compatibility gateway that lets OpenAI- and
-Anthropic-compatible agent harnesses use the Claude login already available on
-your machine.
+An MIT-licensed, local HTTP compatibility gateway for OpenAI- and
+Anthropic-compatible agent harnesses. The default backend uses the Claude login
+already available on your machine; an experimental direct ChatGPT backend is
+separately authenticated and explicitly enabled.
 
-The proxy exposes familiar API endpoints on loopback, translates requests into
-Claude Agent SDK sessions, and returns standard streaming or non-streaming
+The proxy exposes familiar API endpoints on loopback, translates requests to a
+configured provider backend, and returns standard streaming or non-streaming
 responses. The calling harness remains responsible for executing its own tools.
 
 > [!IMPORTANT]
@@ -29,6 +30,7 @@ responses. The calling harness remains responsible for executing its own tools.
 - Version-pinned Sonnet 5, Opus 5, and Opus 4.8 model choices
 - Sonnet/Opus thinking controls and model/effort changes between completed turns
 - Separate reasoning streams, native signed-thinking replay, and refusal recovery
+- Opt-in direct ChatGPT routing for exact `gpt-6-astra` and `gpt-5.6-sol` IDs
 
 The current compatibility suite targets Pi `0.85.1`, Claude Agent SDK `0.2.152`,
 Python `3.14`, and macOS. Official OpenAI and Anthropic Python clients are also
@@ -42,10 +44,8 @@ Pi or another agent harness
         │ OpenAI Chat Completions or Anthropic Messages
         ▼
 Claude SDK Proxy on 127.0.0.1
-        │
-        │ Claude Agent SDK session
-        ▼
-Claude through your existing local login
+        ├── default: Claude Agent SDK → existing Claude login
+        └── opt-in: fixed ChatGPT subscription SSE endpoint → proxy-owned login
 ```
 
 For tool use, the proxy exposes only the tool definitions supplied by the
@@ -60,7 +60,7 @@ native tool-use instructions and schemas.
 
 ## Requirements
 
-- macOS with a working local Claude login
+- macOS with a working local Claude login for the default backend
 - Python `>=3.14,<3.15`
 - [`uv`](https://docs.astral.sh/uv/)
 - Pi `0.85.1` if you are using the Pi integration
@@ -77,6 +77,11 @@ read the macOS Keychain even when `claude` works in your terminal.
 The Agent SDK normally selects its bundled Claude Code executable. A successful
 system `claude` check establishes login access, not that the proxy uses that same
 CLI version. Keep the locked SDK dependency when reproducing runtime behavior.
+
+For the separate direct ChatGPT backend, read the
+[opt-in guide](docs/openai-subscription.md). Its new login, exact model IDs,
+fixed unofficial endpoint, account-limit/credit boundary, and unverified live
+gates do not change or replace this default Claude setup.
 
 ## Quick start
 
@@ -478,6 +483,9 @@ such as `charset=utf-8` are accepted.
 
 ### Model and thinking controls
 
+The following controls describe Claude-backed models. The direct ChatGPT
+backend has separate exact-model and effort rules in its [opt-in guide](docs/openai-subscription.md).
+
 `model` must resolve to one of the server's repeated `--model` values.
 `sonnet-5`, `opus-5`, and `opus-4.8` pin SDK models `claude-sonnet-5`,
 `claude-opus-5`, and `claude-opus-4-8`, respectively. Deprecated inputs
@@ -615,7 +623,7 @@ The detailed [gateway reference](docs/feasibility/README.md) contains complete
 Anthropic and OpenAI tool request examples, schema limits, timeout behavior, and
 error semantics.
 
-## Sessions and compaction
+## Claude-backed sessions and compaction
 
 The gateway keeps linear SDK sessions in memory. Most clients can rely on
 transcript matching without custom headers. If a client supports a unique
@@ -786,13 +794,16 @@ faster development gate is:
 make check
 ```
 
-Live subscription tests are separate and explicit because they invoke Claude:
+Claude live subscription tests remain separate and explicit:
 
 ```bash
 CLAUDE_PROXY_LIVE=1 CLAUDE_PROXY_LIVE_MODEL=sonnet-5 \
   .venv/bin/pytest -q --strict-markers --forbid-skips -W error \
   tests/live/test_gateway_text.py tests/live/test_gateway_tools.py
 ```
+
+The direct ChatGPT backend has a different login and isolated opt-in target;
+see its [live verification instructions](docs/openai-subscription.md#diagnostics-and-live-verification).
 
 See the [documentation index](docs/README.md) for the current gateway reference,
 verification records, and historical designs. Old feasibility verdicts and
@@ -803,7 +814,7 @@ implementation plans are audit records, not current feature restrictions.
 - The server is constrained to loopback and assumes a trusted local caller.
 - It does not validate incoming API keys.
 - Prompts, tool schemas, tool arguments, and returned tool results are sent to
-  Claude through the Agent SDK; this is not an offline inference server.
+  the configured Claude or ChatGPT backend; this is not an offline inference server.
 - Built-in Claude Code tools and ambient configuration are disabled.
 - Do not put the gateway behind a public reverse proxy or expose its port to
   other machines.
