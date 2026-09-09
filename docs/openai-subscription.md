@@ -1,8 +1,8 @@
-# Opt-in direct ChatGPT backend
+# ChatGPT subscription backend
 
-This backend is experimental and disabled unless `gpt-6-astra` or
-`gpt-5.6-sol` is explicitly included in the proxy's `--model` arguments. The
-default remains the Claude-backed `sonnet-5` gateway. This project is not an
+Configure this backend by including `gpt-6-astra` or `gpt-5.6-sol` in the
+server's `--model` arguments. Quaylet requires explicit model selection for
+both providers; there is no default model or provider. This project is not an
 OpenAI product, and documenting the integration is not an endorsement or a
 statement that the fixed, unofficial subscription endpoint is authorized for
 your account. Check the terms and limits applicable to your account before use.
@@ -45,12 +45,12 @@ uv run quaylet --model gpt-6-astra --model gpt-5.6-sol
 ```
 
 They use the existing Chat Completions and Anthropic Messages frontend paths.
-Do not use Claude aliases for this backend. There are no OpenAI aliases, and
-Claude's default model and optional refusal fallback are unchanged. Confirm the
+Do not use Claude aliases for this backend. There are no OpenAI aliases;
+Claude's optional refusal fallback is independent of this backend. Confirm the
 configured provider split with `GET /v1/models`.
 
 To serve both providers, explicitly include the Claude models too; repeated
-`--model` values replace the default allowlist. For example:
+`--model` values define the entire allowlist. For example:
 
 ```bash
 uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8 \

@@ -138,7 +138,7 @@ def test_cli_json_log_file_has_request_diagnostics(monkeypatch, tmp_path):
         error_detail(SessionMismatch("session system does not match"))
 
     monkeypatch.setattr(cli.uvicorn, "run", run)
-    assert cli.main(["--log", str(path), "--log-json"]) == 0
+    assert cli.main(["--model", "sonnet-5", "--log", str(path), "--log-json"]) == 0
     event = json.loads(path.read_text())
     assert event["event"] == "request_rejected"
     assert event["reason"] == "system_changed"

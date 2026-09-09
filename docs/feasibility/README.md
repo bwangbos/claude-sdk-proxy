@@ -1,7 +1,7 @@
 # Quaylet Claude gateway reference and historical probes
 
 This reference's SDK session, fallback, and parked-tool rules are specific to
-Claude-backed models. Quaylet also has an opt-in direct ChatGPT backend; use its
+Claude-backed models. For Quaylet's direct ChatGPT backend, use its
 [provider guide](../openai-subscription.md) for Astra/Sol authentication,
 reasoning, stateless tool continuation, accounting, and replay behavior.
 
@@ -29,7 +29,7 @@ normal host login context where `claude` is authenticated; a sandboxed process
 may not be able to read the macOS Keychain item even though the CLI works in a
 terminal.
 
-Install the locked dependencies and launch the default model on loopback:
+Install the locked dependencies and explicitly select a model on loopback:
 
 ```bash
 uv sync --dev
@@ -41,6 +41,7 @@ The server listens at `http://127.0.0.1:8317`. It exposes
 `GET /health`. `--host` accepts loopback IP addresses only. Repeat `--model`
 to expose more than one pinned model. The canonical choices are `sonnet-5`,
 `opus-5`, and `opus-4.8`; legacy `sonnet`/`opus` inputs normalize to version 5.
+There is no default model: server startup requires at least one `--model`.
 `/v1/models` lists only configured canonical names, not the account's full model
 catalog. `--max-sessions` sets the positive retained-session limit and defaults
 to 8.

@@ -47,7 +47,11 @@ def _parser() -> argparse.ArgumentParser:
         subparser.add_argument("provider", choices=("openai",))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=_port, default=8317)
-    parser.add_argument("--model", action="append")
+    parser.add_argument(
+        "--model",
+        action="append",
+        help="Model to expose; required for serving, repeatable",
+    )
     parser.add_argument("--refusal-fallback", choices=("off", "auto"), default="off")
     parser.add_argument("--max-sessions", type=_positive, default=8)
     parser.add_argument(
@@ -72,13 +76,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command is not None:
         return asyncio.run(_auth_command(args.command))
+    if not args.model:
+        parser.error("at least one --model is required to start the server")
     try:
         host = ipaddress.ip_address(args.host)
     except ValueError:
         parser.error("--host must be a loopback IP address")
     if not host.is_loopback:
         parser.error("--host must be a loopback IP address")
-    models = tuple(args.model or ("sonnet-5",))
+    models = tuple(args.model)
     try:
         app = create_app(
             models=models,

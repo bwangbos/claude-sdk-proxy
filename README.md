@@ -3,9 +3,10 @@
 **Your subscriptions. Your harness.**
 
 An MIT-licensed, local HTTP compatibility gateway for OpenAI- and
-Anthropic-compatible agent harnesses. The default backend uses the Claude login
-already available on your machine; an experimental direct ChatGPT backend is
-separately authenticated and explicitly enabled.
+Anthropic-compatible agent harnesses, powered by your Claude or ChatGPT
+subscription. Choose the models to expose explicitly; neither provider is a
+default. Claude uses your existing managed login, while ChatGPT uses a
+separate Quaylet-owned login.
 
 The proxy exposes familiar API endpoints on loopback, translates requests to a
 configured provider backend, and returns standard streaming or non-streaming
@@ -32,7 +33,7 @@ responses. The calling harness remains responsible for executing its own tools.
 - Version-pinned Sonnet 5, Opus 5, and Opus 4.8 model choices
 - Sonnet/Opus thinking controls and model/effort changes between completed turns
 - Separate reasoning streams, native signed-thinking replay, and refusal recovery
-- Opt-in direct ChatGPT routing for exact `gpt-6-astra` and `gpt-5.6-sol` IDs
+- Direct ChatGPT routing for exact `gpt-6-astra` and `gpt-5.6-sol` IDs
 
 The current compatibility suite targets Pi `0.85.1`, Claude Agent SDK `0.2.152`,
 Python `3.14`, and macOS. Official OpenAI and Anthropic Python clients are also
@@ -46,8 +47,8 @@ Pi or another agent harness
         │ OpenAI Chat Completions or Anthropic Messages
         ▼
 Quaylet on 127.0.0.1
-        ├── default: Claude Agent SDK → existing Claude login
-        └── opt-in: fixed ChatGPT subscription SSE endpoint → proxy-owned login
+        ├── Claude models → Claude Agent SDK → existing Claude login
+        └── ChatGPT models → subscription SSE endpoint → Quaylet-owned login
 ```
 
 For tool use, the proxy exposes only the tool definitions supplied by the
@@ -62,12 +63,14 @@ native tool-use instructions and schemas.
 
 ## Requirements
 
-- macOS with a working local Claude login for the default backend
+- macOS (the currently verified platform)
 - Python `>=3.14,<3.15`
 - [`uv`](https://docs.astral.sh/uv/)
 - Pi `0.85.1` if you are using the Pi integration
+- A login for each provider you choose: existing Claude authentication or
+  `quaylet login openai` for ChatGPT
 
-Confirm that Claude authentication works in a normal terminal before starting:
+For Claude models, confirm authentication works in a normal terminal:
 
 ```bash
 claude -p "Reply with OK"
@@ -80,22 +83,32 @@ The Agent SDK normally selects its bundled Claude Code executable. A successful
 system `claude` check establishes login access, not that the proxy uses that same
 CLI version. Keep the locked SDK dependency when reproducing runtime behavior.
 
-For the separate direct ChatGPT backend, read the
-[opt-in guide](docs/openai-subscription.md). Its new login, exact model IDs,
-fixed unofficial endpoint, account-limit/credit boundary, and bounded live
-verification do not change or replace this default Claude setup.
+For ChatGPT models, read the [provider guide](docs/openai-subscription.md) for
+login, exact model IDs, the fixed unofficial endpoint, account-limit/credit
+boundary, and bounded live verification. You need only the authentication for
+the providers you configure.
 
 ## Quick start
 
-Clone the repository, install the locked dependencies, and start the default
-`sonnet-5` model:
+Clone the repository and install the locked dependencies:
 
 ```bash
 git clone https://github.com/bwangbos/quaylet.git
 cd quaylet
 uv sync --dev
-uv run quaylet --model sonnet-5
 ```
+
+Choose a server configuration:
+
+| Provider | Start command |
+| --- | --- |
+| Claude | `uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8` |
+| ChatGPT | `uv run quaylet --model gpt-6-astra --model gpt-5.6-sol` |
+
+For ChatGPT, run `uv run quaylet login openai` first. At least one `--model`
+is required: bare `uv run quaylet` exits with a configuration error without
+starting a server. Choose one command above, or combine models as shown below;
+do not start both commands on the same port.
 
 The server listens on `http://127.0.0.1:8317` by default. In another terminal:
 
@@ -110,7 +123,7 @@ Expected health response:
 {"status":"ok"}
 ```
 
-### Add ChatGPT models
+### Serve both providers
 
 Log in explicitly, then stop the earlier server before starting this combined
 configuration on the same port:
@@ -124,9 +137,10 @@ uv run quaylet --model sonnet-5 --model opus-5 --model opus-4.8 \
 
 Each request's `model` chooses its backend. Both providers use the same two
 HTTP APIs; `/v1/models` lists the configured models and their providers.
-Starting without `--model` still exposes only `sonnet-5`. Explicit `--model`
-values replace that default rather than adding to it. A ChatGPT-only launch
-does not require a Claude login.
+Only explicitly configured models are exposed, with no provider preference.
+A ChatGPT-only launch does not require a Claude login; a Claude-only launch
+does not require a ChatGPT login. Login, logout, auth-status, and help commands
+do not require `--model`.
 
 The [ChatGPT guide](docs/openai-subscription.md) covers reasoning, harness
 configuration, replay limitations, and the unofficial subscription transport.
@@ -534,7 +548,7 @@ such as `charset=utf-8` are accepted.
 ### Model and thinking controls
 
 The following controls describe Claude-backed models. The direct ChatGPT
-backend has separate exact-model and effort rules in its [opt-in guide](docs/openai-subscription.md).
+backend has separate exact-model and effort rules in its [provider guide](docs/openai-subscription.md).
 
 `model` must resolve to one of the server's repeated `--model` values.
 `sonnet-5`, `opus-5`, and `opus-4.8` pin SDK models `claude-sonnet-5`,
@@ -739,7 +753,7 @@ Claude session header or parked-tool machinery. See the
 uv run quaylet \
   [--host 127.0.0.1] \
   [--port 8317] \
-  [--model MODEL]... \
+  --model MODEL [--model MODEL]... \
   [--refusal-fallback {off,auto}] \
   [--max-sessions 8] \
   [--tool-result-timeout 300] \
@@ -748,7 +762,8 @@ uv run quaylet \
 ```
 
 - `--host` accepts loopback IP addresses only.
-- Repeat `--model` to expose multiple pinned models; the default is `sonnet-5`.
+- At least one `--model` is required; repeat it to expose multiple models from
+  either provider. There is no default model or provider.
 - `--refusal-fallback` defaults to `off`; `auto` requires both `opus-5` and
   `opus-4.8` when Opus 5 is configured.
 - For Claude, idle sessions are evicted least-recently-used when capacity is reached.

@@ -4,7 +4,7 @@
 
 - [Quaylet rename verification](verification/2026-09-09-quaylet-rename.md): clean-cut
   names, packaging, unchanged dependencies, offline evidence, and archive handling.
-- [Opt-in direct ChatGPT backend](openai-subscription.md): login, exact models,
+- [ChatGPT subscription backend](openai-subscription.md): login, exact models,
   fixed endpoint and billing boundary, replay/reasoning limitations, usage,
   diagnostics, and the explicitly gated live battery.
 - [Direct ChatGPT live follow-up](verification/2026-09-08-openai-live.md):

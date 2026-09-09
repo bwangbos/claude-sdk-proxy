@@ -7,8 +7,26 @@ import pytest
 from quaylet import cli
 
 
+@pytest.mark.parametrize("argv", [[], ["--port", "8318"]])
+def test_cli_requires_models_before_constructing_server(
+    argv: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "create_app", lambda **kwargs: calls.append("app"))
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: calls.append("run"))
+
+    with pytest.raises(SystemExit) as error:
+        cli.main(argv)
+
+    assert error.value.code == 2
+    assert "--model" in capsys.readouterr().err
+    assert calls == []
+
+
+@pytest.mark.parametrize("model", ["sonnet-5", "gpt-6-astra"])
 def test_cli_uses_loopback_defaults_and_configured_model(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -16,7 +34,7 @@ def test_cli_uses_loopback_defaults_and_configured_model(
         captured.update(app=app, host=host, port=port)
 
     monkeypatch.setattr(cli.uvicorn, "run", run)
-    assert cli.main([]) == 0
+    assert cli.main(["--model", model]) == 0
     assert (captured["host"], captured["port"]) == ("127.0.0.1", 8317)
 
 
@@ -66,7 +84,7 @@ def test_cli_threads_configured_max_sessions(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(cli, "create_app", create_app)
     monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
 
-    assert cli.main(["--max-sessions", "3"]) == 0
+    assert cli.main(["--model", "sonnet-5", "--max-sessions", "3"]) == 0
     assert captured == {
         "models": ("sonnet-5",),
         "max_sessions": 3,
@@ -98,7 +116,7 @@ def test_cli_threads_configured_tool_result_timeout(
     monkeypatch.setattr(cli, "create_app", create_app)
     monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
 
-    assert cli.main(["--tool-result-timeout", "12.5"]) == 0
+    assert cli.main(["--model", "sonnet-5", "--tool-result-timeout", "12.5"]) == 0
     assert captured["tool_result_timeout_seconds"] == 12.5
 
 
@@ -111,7 +129,7 @@ def test_cli_threads_refusal_fallback_policy(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(cli, "create_app", create_app)
     monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
-    assert cli.main(["--refusal-fallback", "off"]) == 0
+    assert cli.main(["--model", "sonnet-5", "--refusal-fallback", "off"]) == 0
     assert captured["refusal_fallback"] == "off"
 
 
@@ -132,5 +150,5 @@ def test_cli_rejects_nonpositive_max_sessions(value: str) -> None:
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.2", "localhost"])
 def test_cli_rejects_every_nonliteral_loopback_host(host: str) -> None:
     with pytest.raises(SystemExit) as error:
-        cli.main(["--host", host])
+        cli.main(["--model", "sonnet-5", "--host", host])
     assert error.value.code == 2
